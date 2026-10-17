@@ -60,11 +60,6 @@ user doesn't like the current design.
 When a design is a live page, it doesn't need separate desktop and mobile views. Maybe make the
 preview resizable instead; the user is open to ideas.
 
-### Feature selection in design artifacts
-
-Design artifacts need the feature selection that the repo's design rounds (`design/`) have. The
-user thinks it isn't in design artifacts yet.
-
 ### An Open in Editor button
 
 Add an Open in Editor button, as t3code has.

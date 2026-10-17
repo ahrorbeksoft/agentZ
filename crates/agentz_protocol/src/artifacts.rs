@@ -143,7 +143,7 @@ pub struct DesignState {
     pub topics: u32,
     /// The first topic's variants, not counting today's.
     pub variants: u32,
-    /// Topics with a pick.
+    /// Topics with a pick (in a multi topic, something wanted or none of them).
     pub decided: u32,
     /// When the latest version was submitted; changing a pick clears it.
     pub submitted_at: Option<u64>,
@@ -205,6 +205,11 @@ pub struct DesignTopic {
     /// The variant the agent recommends, by name.
     #[serde(default)]
     pub recommended: Option<String>,
+    /// Pick any (the design board's multi topics): the variants are features or options that
+    /// go together, and the user marks each one they want, or none, in place of picking one.
+    /// Its variants may be words only, and it has no today's.
+    #[serde(default)]
+    pub multi: bool,
 }
 
 impl DesignTopic {
@@ -248,6 +253,32 @@ impl DesignTopic {
             Some(index) => Self::letter(index),
             None => key.to_string(),
         }
+    }
+
+    /// What the user chose here, or `None` while it's undecided: "B. Compare table, also C.
+    /// Slider by size"; in a multi topic "A. Export, C. Search" or "none of these". `short`
+    /// gives the letters: "B, also C", "A, C".
+    pub fn answer(&self, picks: &TopicPicks, short: bool) -> Option<String> {
+        let say = |key: &String| {
+            if short {
+                self.short_label(key)
+            } else {
+                self.label(key)
+            }
+        };
+        let list = |keys: &[String]| keys.iter().map(say).collect::<Vec<_>>().join(", ");
+        if self.multi {
+            if picks.wanted.is_empty() {
+                return picks.none.then(|| "none of these".to_string());
+            }
+            return Some(list(&picks.wanted));
+        }
+        let pick = picks.pick.as_ref()?;
+        let mut text = say(pick);
+        if !picks.also.is_empty() {
+            text.push_str(&format!(", also {}", list(&picks.also)));
+        }
+        Some(text)
     }
 }
 
@@ -314,10 +345,13 @@ impl DesignPicks {
         self.topics.get(index).cloned().unwrap_or_default()
     }
 
-    pub fn decided(&self) -> u32 {
-        self.topics
+    /// How many of the design's topics have their answer.
+    pub fn decided(&self, design: &Design) -> u32 {
+        design
+            .topics
             .iter()
-            .filter(|topic| topic.pick.is_some())
+            .enumerate()
+            .filter(|(index, topic)| topic.answer(&self.topic(*index), true).is_some())
             .count() as u32
     }
 
@@ -343,6 +377,12 @@ pub struct TopicPicks {
     /// Others to take parts of (+ Also).
     #[serde(default)]
     pub also: Vec<String>,
+    /// A multi topic's variants wanted, by name, in their order in the topic.
+    #[serde(default)]
+    pub wanted: Vec<String>,
+    /// A multi topic's "None of these": decided with nothing wanted.
+    #[serde(default)]
+    pub none: bool,
     /// A comment per variant, by name or [`TODAY`].
     #[serde(default)]
     pub comments: BTreeMap<String, String>,
@@ -420,7 +460,7 @@ impl DesignDefaults {
              topic{today}. {sizes} {variants_as} agentZ checks every design against them and \
              sends back one that differs, unless it has a deviationReason: one sentence on why \
              this design needs to, which the user sees. Follow the defaults when the user hasn't \
-             asked for something else.",
+             asked for something else. They don't apply to a multi topic.",
             self.variants,
             if self.variants == 1 { "" } else { "s" },
         )
@@ -429,7 +469,7 @@ impl DesignDefaults {
     /// How a design differs from these defaults, a thing each ("topic 2 has 5 variants, not
     /// 3"); empty when it follows them. Only what the defaults decide: how many variants a
     /// topic has, whether today's is there, which sizes and whether pictures, live pages or
-    /// both.
+    /// both. A multi topic lists features in words, so none of it applies to one.
     pub fn deviations(&self, design: &Design) -> Vec<String> {
         let mut found = Vec::new();
         let place = |index: usize| {
@@ -441,6 +481,9 @@ impl DesignDefaults {
         };
         let plural = |count: usize| if count == 1 { "" } else { "s" };
         for (index, topic) in design.topics.iter().enumerate() {
+            if topic.multi {
+                continue;
+            }
             let count = topic.variants.len();
             if count != usize::from(self.variants) {
                 found.push(format!(
@@ -459,6 +502,7 @@ impl DesignDefaults {
         let variants: Vec<&DesignVariant> = design
             .topics
             .iter()
+            .filter(|topic| !topic.multi)
             .flat_map(|topic| &topic.variants)
             .collect();
         let wants_desktop = self.sizes != DesignSizes::Phone;
@@ -853,5 +897,83 @@ mod tests {
                 "3 variants lack a live page",
             ]
         );
+    }
+
+    fn features() -> DesignTopic {
+        DesignTopic {
+            title: "Features".to_string(),
+            multi: true,
+            variants: vec![
+                variant("Export", false, false, false),
+                variant("Search", false, false, false),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pick_any_topic_is_left_out_of_the_deviations() {
+        let defaults = DesignDefaults::default();
+        // Two variants, no today's and no pictures would all differ in a pick-one topic.
+        assert!(
+            defaults
+                .deviations(&design(vec![
+                    topic(3, true, true, false, false),
+                    features()
+                ]))
+                .is_empty()
+        );
+        let mut one = features();
+        one.multi = false;
+        assert_eq!(
+            defaults.deviations(&design(vec![one])),
+            [
+                "the topic has 2 variants, not 3",
+                "the topic has no today's version",
+                "2 variants lack a desktop version",
+                "2 variants lack a picture",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_topic_says_what_the_user_chose() {
+        let picks = TopicPicks {
+            wanted: vec!["Export".to_string(), "Search".to_string()],
+            ..TopicPicks::default()
+        };
+        let multi = features();
+        assert_eq!(
+            multi.answer(&picks, false).as_deref(),
+            Some("A. Export, B. Search")
+        );
+        assert_eq!(multi.answer(&picks, true).as_deref(), Some("A, B"));
+        let none = TopicPicks {
+            none: true,
+            ..TopicPicks::default()
+        };
+        assert_eq!(multi.answer(&none, true).as_deref(), Some("none of these"));
+        assert_eq!(multi.answer(&TopicPicks::default(), true), None);
+
+        let one = topic(3, true, true, false, false);
+        let picked = TopicPicks {
+            pick: Some("B".to_string()),
+            also: vec!["C".to_string()],
+            ..TopicPicks::default()
+        };
+        assert_eq!(one.answer(&picked, true).as_deref(), Some("B, also C"));
+        assert_eq!(
+            one.answer(&picked, false).as_deref(),
+            Some("B. B, also C. C")
+        );
+        assert_eq!(one.answer(&TopicPicks::default(), true), None);
+
+        let design = design(vec![one, multi]);
+        let picks = DesignPicks {
+            topics: vec![picked, none],
+            ..DesignPicks::default()
+        };
+        assert_eq!(picks.decided(&design), 2);
+        assert_eq!(DesignPicks::default().decided(&design), 0);
     }
 }

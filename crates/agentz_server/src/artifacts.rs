@@ -335,7 +335,12 @@ impl ArtifactStore {
             return Ok(());
         }
         // A comment is a change too, but only a pick takes back the Submit (topic 16 A).
-        if all.topics[topic].pick != picks.pick || all.topics[topic].also != picks.also {
+        let before = &all.topics[topic];
+        if before.pick != picks.pick
+            || before.also != picks.also
+            || before.wanted != picks.wanted
+            || before.none != picks.none
+        {
             all.submitted_at = None;
             all.sent = false;
         }
@@ -553,6 +558,11 @@ fn check_design(design: &Design, files: &[(String, Vec<u8>)]) -> Result<()> {
             "topic {number} ({}) has no variants",
             topic.title
         );
+        ensure!(
+            !(topic.multi && topic.today.is_some()),
+            "topic {number} ({}) is multi, so it has no today's version",
+            topic.title
+        );
         let mut names = std::collections::HashSet::new();
         for variant in topic.today.iter().chain(&topic.variants) {
             ensure!(
@@ -577,8 +587,10 @@ fn check_design(design: &Design, files: &[(String, Vec<u8>)]) -> Result<()> {
                     "{name} isn't among the design's files"
                 );
             }
+            // A multi topic's features can be told in words alone.
             ensure!(
-                variant.picture.is_some()
+                topic.multi
+                    || variant.picture.is_some()
                     || variant.page.is_some()
                     || variant.phone_picture.is_some()
                     || variant.phone_page.is_some(),
@@ -713,28 +725,40 @@ fn carry_over(
         let before = old_picks.topic(old_index);
         let exists = |key: &String| topic.variant(key).is_some();
         let mut topic_picks = TopicPicks {
-            pick: before.pick.clone().filter(exists),
-            also: before
-                .also
-                .iter()
-                .filter(|key| exists(key))
-                .cloned()
-                .collect(),
             comments: before
                 .comments
                 .iter()
                 .filter(|(key, _)| exists(key))
                 .map(|(key, comment)| (key.clone(), comment.clone()))
                 .collect(),
+            ..TopicPicks::default()
         };
-        if let Some(gone) = before.pick.as_ref().filter(|key| !exists(key)) {
-            picks
-                .dropped
-                .push(format!("{prefix}{}", old_topic.label(gone)));
+        // What the topic was before decides what comes over: a topic that has changed between
+        // pick one and pick any keeps its comments only.
+        if topic.multi && old_topic.multi {
+            topic_picks.wanted = before
+                .wanted
+                .iter()
+                .filter(|key| exists(key))
+                .cloned()
+                .collect();
+            topic_picks.none = before.none;
+        } else if !topic.multi && !old_topic.multi {
+            topic_picks.pick = before.pick.clone().filter(exists);
+            topic_picks.also = before
+                .also
+                .iter()
+                .filter(|key| exists(key) && Some(*key) != before.pick.as_ref())
+                .cloned()
+                .collect();
         }
-        topic_picks
-            .also
-            .retain(|key| Some(key) != topic_picks.pick.as_ref());
+        for key in before.pick.iter().chain(&before.wanted) {
+            if !exists(key) {
+                picks
+                    .dropped
+                    .push(format!("{prefix}{}", old_topic.label(key)));
+            }
+        }
         picks.topics.push(topic_picks);
     }
     design.gone = gone;
@@ -753,9 +777,32 @@ fn design_has_title(title: &str, topics: &[DesignTopic]) -> bool {
 }
 
 /// A topic's picks as the page sent them, checked against the design: only its variants, the
-/// pick not also an Also, comments trimmed and empty ones dropped.
+/// pick not also an Also, what's wanted once each in the topic's order, comments trimmed and
+/// empty ones dropped.
 fn clean_picks(topic: &DesignTopic, picks: TopicPicks) -> Result<TopicPicks> {
     let known = |key: &String| topic.variant(key).is_some();
+    if topic.multi {
+        ensure!(
+            picks.pick.is_none() && picks.also.is_empty(),
+            "topic {:?} is pick any: mark what's wanted, not a pick",
+            topic.title
+        );
+    } else {
+        ensure!(
+            picks.wanted.is_empty() && !picks.none,
+            "topic {:?} is pick one: it has no wanted or none of these",
+            topic.title
+        );
+    }
+    for key in &picks.wanted {
+        ensure!(known(key), "{key:?} isn't one of the topic's variants");
+    }
+    let wanted: Vec<String> = topic
+        .variants
+        .iter()
+        .filter(|variant| picks.wanted.contains(&variant.name))
+        .map(|variant| variant.name.clone())
+        .collect();
     if let Some(pick) = &picks.pick {
         ensure!(known(pick), "{pick:?} isn't one of the topic's variants");
     }
@@ -781,6 +828,8 @@ fn clean_picks(topic: &DesignTopic, picks: TopicPicks) -> Result<TopicPicks> {
     Ok(TopicPicks {
         pick: picks.pick,
         also,
+        none: picks.none && wanted.is_empty(),
+        wanted,
         comments,
     })
 }
@@ -790,11 +839,10 @@ pub(crate) fn design_state(design: &Design, picks: &DesignPicks) -> DesignState 
     DesignState {
         topics: design.topics.len() as u32,
         variants: first.map_or(0, |topic| topic.variants.len() as u32),
-        decided: (0..design.topics.len())
-            .filter(|index| picks.topic(*index).pick.is_some())
-            .count() as u32,
+        decided: picks.decided(design),
         submitted_at: picks.submitted_at,
         pick: match design.topics.as_slice() {
+            [topic] if topic.multi => topic.answer(&picks.topic(0), true),
             [topic] => picks.topic(0).pick.map(|pick| topic.short_label(&pick)),
             _ => None,
         },
@@ -814,8 +862,9 @@ pub(crate) fn design_state(design: &Design, picks: &DesignPicks) -> DesignState 
 /// A design as the agent reads it (topic 24 B), like a design round's README and
 /// `decisions.md` together: whether it's submitted, the intro, then a heading per topic with
 /// the pick by letter and name, the topic's description, and every variant, today's first,
-/// with its words, its files by name, whether it's picked, an Also or recommended, and its
-/// comment. An agent reading another thread's design learns what the pick was up against.
+/// with its words, its files by name, whether it's picked, an Also, wanted or recommended,
+/// and its comment. An agent reading another thread's design learns what the pick was up
+/// against.
 pub(crate) fn design_text(
     title: &str,
     version: u32,
@@ -824,9 +873,7 @@ pub(crate) fn design_text(
     picks: &DesignPicks,
 ) -> String {
     let total = design.topics.len();
-    let decided = (0..total)
-        .filter(|index| picks.topic(*index).pick.is_some())
-        .count();
+    let decided = picks.decided(design);
     let state = if picks.submitted_at.is_some() {
         "submitted".to_string()
     } else {
@@ -845,22 +892,16 @@ pub(crate) fn design_text(
     for (index, topic) in design.topics.iter().enumerate() {
         let topic_picks = picks.topic(index);
         text.push('\n');
-        let heading = match &topic_picks.pick {
-            Some(pick) => {
-                let mut heading = topic.label(pick);
-                if !topic_picks.also.is_empty() {
-                    let also: Vec<String> = topic_picks
-                        .also
-                        .iter()
-                        .map(|key| topic.label(key))
-                        .collect();
-                    heading.push_str(&format!(", also {}", also.join(", ")));
-                }
-                heading
-            }
-            None => "not decided".to_string(),
-        };
-        text.push_str(&format!("## {}. {}: {heading}\n", index + 1, topic.title));
+        let heading = topic
+            .answer(&topic_picks, false)
+            .unwrap_or_else(|| "not decided".to_string());
+        // Untagged variants of a pick-any topic are the ones the user doesn't want.
+        let kind = if topic.multi { " (pick any)" } else { "" };
+        text.push_str(&format!(
+            "## {}. {}{kind}: {heading}\n",
+            index + 1,
+            topic.title
+        ));
         if !topic.description.is_empty() {
             text.push_str(&format!("{}\n", topic.description));
         }
@@ -895,6 +936,9 @@ fn variant_text(
     }
     if picks.also.iter().any(|also| also == key) {
         tags.push("also");
+    }
+    if picks.wanted.iter().any(|wanted| wanted == key) {
+        tags.push("wanted");
     }
     if key != TODAY && topic.recommended.as_deref() == Some(key) {
         tags.push("recommended");
@@ -935,30 +979,22 @@ fn variant_text(
     }
 }
 
-/// What Submit's message says (topic 17 B): "Submitted: picked B, also C, with 2 comments.",
-/// or with several topics, each topic's pick by its title.
+/// What Submit's message says (topic 17 B): "Submitted: picked B, also C, with 2 comments."
+/// ("wanted A, C" for a pick-any topic), or with several topics, each topic's pick by its
+/// title.
 pub(crate) fn submit_summary(design: &Design, picks: &DesignPicks) -> String {
     let short = |index: usize, topic: &DesignTopic| {
-        let topic_picks = picks.topic(index);
-        match &topic_picks.pick {
-            Some(pick) => {
-                let mut text = topic.short_label(pick);
-                if !topic_picks.also.is_empty() {
-                    let also: Vec<String> = topic_picks
-                        .also
-                        .iter()
-                        .map(|key| topic.short_label(key))
-                        .collect();
-                    text.push_str(&format!(", also {}", also.join(", ")));
-                }
-                text
-            }
-            None => "not decided".to_string(),
-        }
+        topic
+            .answer(&picks.topic(index), true)
+            .unwrap_or_else(|| "not decided".to_string())
     };
     let mut text = match design.topics.as_slice() {
-        [topic] => match picks.topic(0).pick {
-            Some(_) => format!("Submitted: picked {}", short(0, topic)),
+        [topic] if topic.multi => match topic.answer(&picks.topic(0), true) {
+            Some(answer) => format!("Submitted: wanted {answer}"),
+            None => "Submitted with nothing marked".to_string(),
+        },
+        [topic] => match topic.answer(&picks.topic(0), true) {
+            Some(answer) => format!("Submitted: picked {answer}"),
             None => "Submitted with nothing picked".to_string(),
         },
         topics => {
@@ -1338,6 +1374,7 @@ mod tests {
                         ("Three tiers".to_string(), " ".to_string()),
                     ]
                     .into(),
+                    ..TopicPicks::default()
                 },
             )
             .expect("picks");
@@ -1412,6 +1449,7 @@ mod tests {
                 variant("Slider by size", "One plan priced by size."),
             ],
             recommended: Some("Compare table".to_string()),
+            ..DesignTopic::default()
         };
         let other = DesignTopic {
             title: "The yearly discount".to_string(),
@@ -1436,6 +1474,7 @@ mod tests {
                         (TODAY.to_string(), "Keep its footer.".to_string()),
                     ]
                     .into(),
+                    ..TopicPicks::default()
                 },
                 TopicPicks {
                     comments: [("20% off".to_string(), "What do others give?".to_string())].into(),
@@ -1485,6 +1524,276 @@ mod tests {
              **B. 20% off**\n\
              - Files: 20% off.png (picture)\n\
              - The user's comment: What do others give?\n"
+        );
+    }
+
+    fn features(id: Option<ArtifactId>, names: &[&str]) -> Publish {
+        let topic = DesignTopic {
+            title: "Features to build".to_string(),
+            multi: true,
+            variants: names
+                .iter()
+                .map(|name| DesignVariant {
+                    name: name.to_string(),
+                    description: format!("{name}, in words."),
+                    ..DesignVariant::default()
+                })
+                .collect(),
+            ..DesignTopic::default()
+        };
+        Publish {
+            id,
+            title: "Features".to_string(),
+            content: Content::Design {
+                design: Design {
+                    topics: vec![topic],
+                    ..Design::default()
+                },
+                files: Vec::new(),
+            },
+            thread_id: ThreadId(1),
+            project_id: ProjectId(7),
+            agent_id: None,
+        }
+    }
+
+    fn wanted(names: &[&str]) -> TopicPicks {
+        TopicPicks {
+            wanted: names.iter().map(|name| name.to_string()).collect(),
+            ..TopicPicks::default()
+        }
+    }
+
+    #[test]
+    fn a_pick_any_topic_is_told_in_words_and_wanted_variant_by_variant() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let (id, _) = store
+            .publish(features(None, &["Export", "Search", "Sharing"]))
+            .expect("features without pictures");
+        let state = |store: &ArtifactStore| {
+            store
+                .get(&id)
+                .and_then(|artifact| artifact.design.clone())
+                .expect("design state")
+        };
+        assert_eq!(state(&store).status(), "Waiting for you");
+
+        // What's wanted is kept once each, in the topic's order.
+        store
+            .set_picks(&id, 1, 0, wanted(&["Sharing", "Export", "Sharing"]))
+            .expect("wanted");
+        assert_eq!(
+            store.read_picks(&id, 1).topic(0).wanted,
+            ["Export".to_string(), "Sharing".to_string()]
+        );
+        let design = store.read_design(&id, 1).expect("design");
+        assert_eq!(state(&store).decided, 1);
+        assert_eq!(state(&store).pick.as_deref(), Some("A, C"));
+
+        // Nothing wanted is a decision only when the user says so.
+        store
+            .set_picks(&id, 1, 0, wanted(&[]))
+            .expect("none wanted");
+        assert_eq!(state(&store).decided, 0);
+        store
+            .set_picks(
+                &id,
+                1,
+                0,
+                TopicPicks {
+                    none: true,
+                    ..wanted(&[])
+                },
+            )
+            .expect("none of these");
+        assert_eq!(state(&store).decided, 1);
+        assert_eq!(state(&store).pick.as_deref(), Some("none of these"));
+        assert_eq!(
+            submit_summary(&design, &store.read_picks(&id, 1)),
+            "Submitted: wanted none of these."
+        );
+        // Wanting something takes the None back.
+        store
+            .set_picks(
+                &id,
+                1,
+                0,
+                TopicPicks {
+                    none: true,
+                    ..wanted(&["Search"])
+                },
+            )
+            .expect("wanted over none");
+        assert!(!store.read_picks(&id, 1).topic(0).none);
+
+        // A change to what's wanted takes back the Submit; a comment doesn't.
+        store.submit(&id, 1, false).expect("submit");
+        assert_eq!(state(&store).status(), "Decided");
+        store
+            .set_picks(
+                &id,
+                1,
+                0,
+                TopicPicks {
+                    comments: [("Search".to_string(), "Just titles.".to_string())].into(),
+                    ..wanted(&["Search"])
+                },
+            )
+            .expect("comment");
+        assert!(state(&store).submitted_at.is_some());
+        store
+            .set_picks(&id, 1, 0, wanted(&["Search", "Sharing"]))
+            .expect("one more");
+        assert!(state(&store).submitted_at.is_none());
+
+        // A pick-any topic takes no pick, and only its variants.
+        let pick = TopicPicks {
+            pick: Some("Export".to_string()),
+            ..TopicPicks::default()
+        };
+        assert!(store.set_picks(&id, 1, 0, pick).is_err());
+        assert!(store.set_picks(&id, 1, 0, wanted(&["Nothing"])).is_err());
+    }
+
+    #[test]
+    fn a_pick_one_topic_takes_no_wanted_and_a_pick_any_topic_no_today() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let (id, _) = store
+            .publish(design(None, &[("Three tiers", "", b"a")]))
+            .expect("publish");
+        assert!(
+            store
+                .set_picks(&id, 1, 0, wanted(&["Three tiers"]))
+                .is_err()
+        );
+        let none = TopicPicks {
+            none: true,
+            ..TopicPicks::default()
+        };
+        assert!(store.set_picks(&id, 1, 0, none).is_err());
+
+        let mut with_today = features(None, &["Export"]);
+        if let Content::Design { design, .. } = &mut with_today.content {
+            design.topics[0].today = Some(DesignVariant {
+                name: "Today's".to_string(),
+                ..DesignVariant::default()
+            });
+        }
+        assert!(store.publish(with_today).is_err());
+        // Words alone is for a pick-any topic only.
+        let mut plain = features(None, &["Export"]);
+        if let Content::Design { design, .. } = &mut plain.content {
+            design.topics[0].multi = false;
+        }
+        assert!(store.publish(plain).is_err());
+    }
+
+    #[test]
+    fn what_is_wanted_carries_over_to_the_next_version_by_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut store = ArtifactStore::load(temp.path());
+        let (id, _) = store
+            .publish(features(None, &["Export", "Search", "Sharing"]))
+            .expect("publish");
+        store
+            .set_picks(
+                &id,
+                1,
+                0,
+                TopicPicks {
+                    comments: [("Search".to_string(), "Titles only.".to_string())].into(),
+                    ..wanted(&["Export", "Search"])
+                },
+            )
+            .expect("wanted");
+        store.submit(&id, 1, false).expect("submit");
+
+        // v2: Search is gone and Comments is new.
+        store
+            .publish(features(
+                Some(id.clone()),
+                &["Export", "Sharing", "Comments"],
+            ))
+            .expect("v2");
+        let picks = store.read_picks(&id, 2);
+        assert_eq!(picks.topic(0).wanted, ["Export".to_string()]);
+        assert_eq!(picks.dropped, ["B. Search".to_string()]);
+        assert_eq!(picks.carried_from, Some(1));
+        assert_eq!(picks.submitted_at, None);
+        assert!(
+            picks.topic(0).comments.is_empty(),
+            "Search took its comment"
+        );
+
+        // Said as a pick-one topic, it's a new question: the comments are all that stay.
+        let mut single = features(Some(id.clone()), &["Export", "Sharing"]);
+        if let Content::Design { design, .. } = &mut single.content {
+            design.topics[0].multi = false;
+            for variant in &mut design.topics[0].variants {
+                variant.picture = Some(format!("{}.png", variant.name));
+            }
+        }
+        if let Content::Design { files, .. } = &mut single.content {
+            *files = vec![
+                ("Export.png".to_string(), b"a".to_vec()),
+                ("Sharing.png".to_string(), b"b".to_vec()),
+            ];
+        }
+        store.publish(single).expect("v3");
+        let picks = store.read_picks(&id, 3);
+        assert!(picks.topic(0).wanted.is_empty());
+        assert_eq!(picks.topic(0).pick, None);
+    }
+
+    #[test]
+    fn the_agent_reads_what_is_wanted_in_a_pick_any_topic() {
+        let design = Design {
+            topics: vec![DesignTopic {
+                title: "Features to build".to_string(),
+                multi: true,
+                variants: vec![
+                    DesignVariant {
+                        name: "Export".to_string(),
+                        description: "As CSV.".to_string(),
+                        ..DesignVariant::default()
+                    },
+                    DesignVariant {
+                        name: "Search".to_string(),
+                        ..DesignVariant::default()
+                    },
+                    DesignVariant {
+                        name: "Sharing".to_string(),
+                        ..DesignVariant::default()
+                    },
+                ],
+                recommended: Some("Search".to_string()),
+                ..DesignTopic::default()
+            }],
+            ..Design::default()
+        };
+        let picks = DesignPicks {
+            topics: vec![wanted(&["Export", "Search"])],
+            ..DesignPicks::default()
+        };
+        assert_eq!(
+            design_text("Features", 1, "storefront", &design, &picks),
+            "# Features, v1: 1 of 1 decided, not submitted\n\
+             From storefront. The user's picks and comments so far.\n\
+             \n\
+             ## 1. Features to build (pick any): A. Export, B. Search\n\
+             \n\
+             **A. Export (wanted):** As CSV.\n\
+             \n\
+             **B. Search (wanted, recommended)**\n\
+             \n\
+             **C. Sharing**\n"
+        );
+        assert_eq!(submit_summary(&design, &picks), "Submitted: wanted A, B.");
+        assert_eq!(
+            submit_summary(&design, &DesignPicks::default()),
+            "Submitted with nothing marked."
         );
     }
 

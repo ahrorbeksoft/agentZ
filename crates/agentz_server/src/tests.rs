@@ -9925,6 +9925,119 @@ async fn designs_that_differ_from_the_defaults_need_a_reason() {
         .await;
 }
 
+/// A pick-any topic is features in words: no pictures, no today's and none of the design
+/// defaults' counts, picked variant by variant over the page's API, and said so in what the
+/// agent reads and what Submit sends.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pick_any_topic_is_published_in_words_and_marked_over_the_pages() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    let pages = session.artifacts.pages.clone().expect("a pages server");
+    let (address, token) = (pages.address.as_str(), &pages.token);
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+
+    let design = |multi: bool| {
+        json!({
+            "title": "Roadmap",
+            "topics": [{
+                "title": "Features to build",
+                "multi": multi,
+                "variants": [
+                    {"name": "Export", "description": "As CSV."},
+                    {"name": "Search"},
+                    {"name": "Sharing"},
+                    {"name": "Comments"},
+                ],
+            }],
+        })
+    };
+    // In a pick-one topic, a variant without a picture or a page is sent back.
+    let sent_back = client
+        .call_tool(
+            ToolCaller::Thread(thread),
+            "agentz_design_publish",
+            design(false),
+        )
+        .await;
+    assert!(sent_back.is_error, "{}", sent_back.value);
+    let mut with_today = design(true);
+    with_today["topics"][0]["today"] = json!({"name": "Today's", "description": "Nothing."});
+    let sent_back = client
+        .call_tool(
+            ToolCaller::Thread(thread),
+            "agentz_design_publish",
+            with_today,
+        )
+        .await;
+    assert!(sent_back.is_error, "{}", sent_back.value);
+
+    let published = client
+        .tool(thread, "agentz_design_publish", design(true))
+        .await;
+    let design_id = published["artifactId"].as_str().expect("an artifact id");
+    let picks = |body: serde_json::Value| {
+        json!({"id": design_id, "version": 1, "topic": 0, "picks": body}).to_string()
+    };
+    let picks_path = format!("/api/picks?t={token}");
+    let (status, _) = page_request(
+        address,
+        "POST",
+        &picks_path,
+        &picks(json!({"wanted": ["Sharing", "Export"]})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, reply) = page_request(
+        address,
+        "POST",
+        &picks_path,
+        &picks(json!({"pick": "Export"})),
+    )
+    .await;
+    assert!(status != 200, "a pick in a pick-any topic: {reply}");
+
+    let read = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": design_id}),
+        )
+        .await;
+    let text = read["text"].as_str().expect("the picks as text");
+    assert!(
+        text.contains("## 1. Features to build (pick any): A. Export, C. Sharing\n"),
+        "{text}"
+    );
+    assert!(text.contains("**A. Export (wanted):** As CSV.\n"), "{text}");
+    assert!(text.contains("**B. Search**\n"), "{text}");
+
+    let submit = json!({"id": design_id, "version": 1, "send": true, "note": ""});
+    let (status, _) = page_request(
+        address,
+        "POST",
+        &format!("/api/submit?t={token}"),
+        &submit.to_string(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    client
+        .wait_until(|client| {
+            client
+                .user_messages(thread)
+                .iter()
+                .any(|message| message.contains("Submitted: wanted A, C."))
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn artifacts_are_published_served_and_sent_back() {
     use agentz_protocol::artifacts::ArtifactId;

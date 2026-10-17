@@ -96,12 +96,14 @@ impl Server {
                 .ok_or_else(|| invalid(format!("topic {number} needs a title.")))?
                 .to_string();
             let description = text(&topic, "description", MAX_TEXT_CHARS)?;
+            let multi = topic.bool("multi")?.unwrap_or(false);
             let today = match topic.0.get("today") {
                 None | Some(Value::Null) => None,
                 Some(Value::Object(today)) => Some(variant(
                     &Arguments(today),
                     number,
                     agentz_protocol::artifacts::TODAY,
+                    false,
                     &mut files,
                 )?),
                 Some(_) => {
@@ -110,6 +112,11 @@ impl Server {
                     )));
                 }
             };
+            if multi && today.is_some() {
+                return Err(invalid(format!(
+                    "topic {number} is multi, which has no today: leave it out."
+                )));
+            }
             let given = topic
                 .array("variants")?
                 .ok_or_else(|| invalid(format!("topic {number} needs its variants.")))?;
@@ -134,6 +141,7 @@ impl Server {
                     &Arguments(given),
                     number,
                     &DesignTopic::letter(place),
+                    multi,
                     &mut files,
                 )?);
             }
@@ -157,6 +165,7 @@ impl Server {
                 today,
                 variants,
                 recommended,
+                multi,
             });
         }
         // The description tells agents the defaults, but a session may have listed its tools
@@ -691,6 +700,7 @@ fn variant(
     arguments: &Arguments,
     topic: usize,
     key: &str,
+    words_only: bool,
     files: &mut DesignFiles,
 ) -> Result<DesignVariant, Failure> {
     let is_today = key == agentz_protocol::artifacts::TODAY;
@@ -710,7 +720,12 @@ fn variant(
     let phone = format!("{base}-phone");
     let phone_picture = files.add(arguments, "phonePicture", &phone, &PICTURES)?;
     let phone_page = files.add(arguments, "phonePage", &phone, &PAGES)?;
-    if picture.is_none() && page.is_none() && phone_picture.is_none() && phone_page.is_none() {
+    if !words_only
+        && picture.is_none()
+        && page.is_none()
+        && phone_picture.is_none()
+        && phone_page.is_none()
+    {
         return Err(invalid(format!(
             "{name:?} in topic {topic} needs a picture or a page."
         )));
@@ -748,7 +763,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
         })
     };
     let mut variant_required = variant(
-        "A variant: a name, a picture and/or a page (one is required), and what's good and bad about it.",
+        "A variant: a name, a picture and/or a page (one is required, except in a multi topic), and what's good and bad about it.",
     );
     variant_required["required"] = json!(["name"]);
     let today = variant(
@@ -777,7 +792,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
         json!({
             "name": "agentz_design_publish",
             "title": "Publish a design",
-            "description": format!("Publish a design for the user to pick from in their browser: a few variants of a thing (a page, a screen, a flow, a component, a name), which agentZ draws as cards to pick between, take parts of with + Also, and comment on. Most designs have one topic; give several only for separate decisions (the plans page, then the checkout's plan picker). For each variant, make a picture (a screenshot or mock) or a live page first, then give them by their paths. Give what's there now as today, so the user can keep it. agentZ checks the design before publishing and keeps the user's picks with it: read them with agentz_artifact_read, whenever you like or once the user submits (they may say so in the thread). Each publish is a new version at the same link: pass artifactId to add one after the user's comments; picks carry over by variant name, so keep names, and a variant you leave out takes its pick with it. The answer's url opens it. {defaults}"),
+            "description": format!("Publish a design for the user to pick from in their browser: a few variants of a thing (a page, a screen, a flow, a component, a name), which agentZ draws as cards to pick between, take parts of with + Also, and comment on. Most designs have one topic; give several only for separate decisions (the plans page, then the checkout's plan picker). To ask which features or options to build, not which one, make that a multi topic: each variant is a feature the user marks Want this or not. For each variant, make a picture (a screenshot or mock) or a live page first, then give them by their paths. Give what's there now as today, so the user can keep it. agentZ checks the design before publishing and keeps the user's picks with it: read them with agentz_artifact_read, whenever you like or once the user submits (they may say so in the thread). Each publish is a new version at the same link: pass artifactId to add one after the user's comments; picks carry over by variant name, so keep names, and a variant you leave out takes its pick with it. The answer's url opens it. {defaults}"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -796,6 +811,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
                                 "today": today,
                                 "variants": {"type": "array", "minItems": 1, "maxItems": MAX_VARIANTS, "items": variant_required, "description": "The variants, lettered A, B, C… in this order."},
                                 "recommended": {"type": "string", "maxLength": 256, "description": "The variant you recommend, by its name or letter."},
+                                "multi": {"type": "boolean", "description": "Pick any: the variants are features or options that go together, and the user marks each one they want (or none) instead of choosing one. Then a variant may be words alone (its name and description, with a picture or page only when it helps), there's no today and no variant count or size to follow."},
                             },
                             "required": ["title", "variants"],
                             "additionalProperties": false,

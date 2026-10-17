@@ -23,6 +23,7 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .nav .n { width: 14px; text-align: right; color: var(--placeholder); font-size: 11px; flex: none; }
 .nav .t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .nav .s { font-size: 10px; font-weight: 600; color: var(--solid-background); background: var(--success); border-radius: 4px; padding: 0 5px; flex: none; }
+.nav .s.nothing { background: var(--selected); color: var(--muted); }
 .nav .c { width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex: none; }
 .nav .sep { border-top: 1px solid var(--border); margin: 10px 4px 6px; }
 
@@ -68,7 +69,10 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .alsob { flex: none; border: 1px dashed var(--border); border-radius: 7px; padding: 4px 8px; font-size: 11.5px; color: var(--muted); white-space: nowrap; background: none; cursor: pointer; }
 .alsob:hover { color: var(--text); }
 .opt.also .alsob { border-color: var(--success); color: var(--success); }
-.pick:disabled, .alsob:disabled { cursor: default; opacity: .7; }
+.pick:disabled, .alsob:disabled, .noneof:disabled { cursor: default; opacity: .7; }
+.noneof { align-self: flex-start; border: 1px dashed var(--border); border-radius: 7px; padding: 5px 11px; font-size: 12px; color: var(--muted); background: none; cursor: pointer; }
+.noneof:hover { color: var(--text); }
+.noneof.on { border-color: var(--success); color: var(--success); }
 .comment { flex: 1; min-width: 0; height: 26px; resize: none; overflow: hidden; background: var(--background); border: 1px solid var(--border); border-radius: 7px; color: var(--text); padding: 4px 8px; font-size: 12px; line-height: 1.4; }
 .comment::placeholder { color: var(--placeholder); }
 .comment:focus { outline: none; border-color: var(--accent); }
@@ -122,7 +126,8 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 // The design page agentZ draws (design/artifacts-2, topics 9 to 19): the topics on the left
 // with Summary at the end, a topic's variants in cards to pick, take parts of (+ Also) and
 // comment on, today's version as one to keep, a variant up close, Desktop · Phone, and Submit.
-// Picks are saved on the server as they're made, on the latest version only.
+// A multi topic (pick any) has Want this on each variant, and None of these, in place of
+// Pick and + Also. Picks are saved on the server as they're made, on the latest version only.
 let listing = null;
 let design = null;
 let picks = null;
@@ -132,6 +137,7 @@ let topic = 0;
 let mode = null;
 let closeUp = null;
 let cards = [];
+let noneButton = null;
 let saving = 0;
 let saveError = '';
 let saveQueue = Promise.resolve();
@@ -154,11 +160,26 @@ function entries(index) {
 }
 
 function topicPicks(index) {
-  while (picks.topics.length <= index) picks.topics.push({ pick: null, also: [], comments: {} });
+  while (picks.topics.length <= index) picks.topics.push({ pick: null, also: [], wanted: [], none: false, comments: {} });
   const entry = picks.topics[index];
   entry.also = entry.also || [];
+  entry.wanted = entry.wanted || [];
+  entry.none = !!entry.none;
   entry.comments = entry.comments || {};
   return entry;
+}
+
+const isMulti = (index) => !!design.topics[index].multi;
+
+// What's wanted in a multi topic, in the topic's order.
+function wantedKeys(index) {
+  const entry = topicPicks(index);
+  return design.topics[index].variants.map((variant) => variant.name).filter((name) => entry.wanted.includes(name));
+}
+
+// Desktop or phone, for a topic's cards: a topic of words alone has neither.
+function phoneView(index) {
+  return mode === 'phone' && entries(index).some(({ variant }) => variant.picture || variant.page || variant.phone_picture || variant.phone_page);
 }
 
 // "B. Compare table", or "Today’s page (today’s)".
@@ -175,19 +196,25 @@ function shortLabel(index, key) {
   return place < 0 ? key : letter(place);
 }
 
-// "B. Compare table, also C. Slider by size", or null when nothing's picked.
+// "B. Compare table, also C. Slider by size", in a multi topic "A. Export, C. Search" or
+// "None of these", or null when nothing's picked.
 function pickText(index) {
   const entry = topicPicks(index);
+  if (isMulti(index)) {
+    const wanted = wantedKeys(index);
+    if (wanted.length) return wanted.map((key) => label(index, key)).join(', ');
+    return entry.none ? 'None of these' : null;
+  }
   if (!entry.pick) return null;
   let text = label(index, entry.pick);
   if (entry.also.length) text += ', also ' + entry.also.map((key) => label(index, key)).join(', ');
   return text;
 }
 
-const decidedCount = () => design.topics.filter((_, index) => topicPicks(index).pick).length;
+const decidedCount = () => design.topics.filter((_, index) => pickText(index)).length;
 const commentCount = () => design.topics.reduce((sum, _, index) => sum + Object.values(topicPicks(index).comments).filter((text) => text.trim()).length, 0);
 const hasComment = (index) => Object.values(topicPicks(index).comments).some((text) => text.trim());
-const anyPicks = () => design.topics.some((_, index) => topicPicks(index).pick || topicPicks(index).also.length || hasComment(index));
+const anyPicks = () => design.topics.some((_, index) => pickText(index) || topicPicks(index).also.length || hasComment(index));
 const variantsOf = () => design.topics.flatMap((designTopic) => [designTopic.today, ...designTopic.variants].filter(Boolean));
 const hasPhone = () => variantsOf().some((variant) => variant.phone_picture || variant.phone_page);
 const hasDesktop = () => variantsOf().some((variant) => variant.picture || variant.page);
@@ -238,11 +265,18 @@ function renderNav() {
   const nav = $('nav');
   const rows = design.topics.map((designTopic, index) => {
     const entry = topicPicks(index);
+    // A multi topic's badge is its wanted letters ("AC"), or ∅ for none of them.
+    let badge = null;
+    if (isMulti(index)) {
+      const wanted = wantedKeys(index);
+      if (wanted.length) badge = h('span', { class: 's', text: wanted.map((key) => shortLabel(index, key)).join('') });
+      else if (entry.none) badge = h('span', { class: 's nothing', text: '∅' });
+    } else if (entry.pick) badge = h('span', { class: 's', text: shortLabel(index, entry.pick) });
     return h('a', { class: index === topic ? 'on' : '', onclick: () => goTopic(index) },
       h('span', { class: 'n', text: String(index + 1) }),
       h('span', { class: 't', text: designTopic.title, title: designTopic.title }),
       hasComment(index) ? h('span', { class: 'c', title: 'Commented' }) : null,
-      entry.pick ? h('span', { class: 's', text: shortLabel(index, entry.pick) }) : null);
+      badge);
   });
   fill(nav,
     h('h5', { text: listing.artifact.title, title: listing.artifact.title }),
@@ -309,6 +343,7 @@ function renderBanners() {
 function renderPage() {
   const page = $('page');
   cards = [];
+  noneButton = null;
   const banners = h('div', { class: 'banners', id: 'banners' });
   if (topic >= design.topics.length) {
     fill(page, banners, h('div', { class: 'heading', text: 'Summary' }), h('div', { class: 'how', text: 'What you picked in each topic, and your comments.' }), summaryTable());
@@ -316,13 +351,16 @@ function renderPage() {
     return;
   }
   const designTopic = design.topics[topic];
-  const phone = mode === 'phone';
+  const phone = phoneView(topic);
   const count = designTopic.variants.length;
-  const how = readOnly()
-    ? h('div', { class: 'how', text: 'An earlier version: its picks are as they were.' })
-    : h('div', { class: 'how' }, h('b', { text: 'Pick one' }), ', then ', h('b', { text: '+ Also' }), ' on any others to take parts of. Keys: ', h('b', { text: count > 1 ? `1–${Math.min(count, 9)}` : '1' }), ' pick.');
+  const keys = h('b', { text: count > 1 ? `1–${Math.min(count, 9)}` : '1' });
+  let how;
+  if (readOnly()) how = h('div', { class: 'how', text: 'An earlier version: its picks are as they were.' });
+  else if (designTopic.multi) how = h('div', { class: 'how' }, h('b', { text: 'Pick any' }), ': ', h('b', { text: 'Want this' }), ' on each one you want, or ', h('b', { text: 'None of these' }), '. Keys: ', keys, ' want.');
+  else how = h('div', { class: 'how' }, h('b', { text: 'Pick one' }), ', then ', h('b', { text: '+ Also' }), ' on any others to take parts of. Keys: ', keys, ' pick.');
   const grid = h('div', { class: 'grid' + (phone ? ' phone' : '') });
   entries(topic).forEach((entry, index) => grid.append(card(topic, entry, index)));
+  noneButton = designTopic.multi ? h('button', { class: 'noneof', onclick: () => wantNone(topic) }) : null;
   fill(page,
     banners,
     topic === 0 && design.intro ? h('p', { class: 'intro', text: design.intro }) : null,
@@ -330,6 +368,7 @@ function renderPage() {
     how,
     designTopic.description ? h('p', { class: 'about', text: designTopic.description }) : null,
     grid,
+    noneButton,
   );
   renderBanners();
   refreshCards();
@@ -355,14 +394,14 @@ function summaryTable() {
 function card(index, entry, place) {
   const designTopic = design.topics[index];
   const variant = entry.variant;
-  const phone = mode === 'phone';
+  const phone = phoneView(index);
   const tags = [];
   if (!entry.today && designTopic.recommended === variant.name) tags.push(h('span', { class: 'otag rec', text: 'Recommended' }));
   if (entry.today) tags.push(h('span', { class: 'otag', text: 'Today' }));
   if (!entry.today && variant.change === 'changed') tags.push(h('span', { class: 'otag new', text: 'Changed' }));
   if (!entry.today && variant.change === 'new') tags.push(h('span', { class: 'otag new', text: 'New' }));
-  const pickButton = h('button', { class: 'pick', onclick: () => pick(index, entry.key) });
-  const alsoButton = entry.today ? null : h('button', { class: 'alsob', onclick: () => toggleAlso(index, entry.key) });
+  const pickButton = h('button', { class: 'pick', onclick: () => (designTopic.multi ? want(index, entry.key) : pick(index, entry.key)) });
+  const alsoButton = entry.today || designTopic.multi ? null : h('button', { class: 'alsob', onclick: () => toggleAlso(index, entry.key) });
   const comment = h('textarea', { class: 'comment', rows: 1, placeholder: `Comment on ${entry.today ? 'today’s' : entry.letter}…` });
   comment.addEventListener('input', () => { fitComment(comment); setComment(index, entry.key, comment.value); });
   comment.addEventListener('blur', () => flushComment(index));
@@ -378,9 +417,10 @@ function card(index, entry, place) {
 
 function preview(index, entry, place) {
   const variant = entry.variant;
-  const phone = mode === 'phone';
+  const phone = phoneView(index);
   const picture = phone ? variant.phone_picture : variant.picture;
   const pageFile = phone ? variant.phone_page : variant.page;
+  if (!picture && !pageFile && design.topics[index].multi) return null;
   if (!picture && !pageFile) return h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone version' : 'No desktop version' });
   const fit = h('div', { class: 'fit', title: 'Show it up close', onclick: () => openCloseUp(index, place, false) });
   if (picture) fit.append(h('img', { src: file(picture), loading: 'lazy', alt: variant.name }));
@@ -409,13 +449,21 @@ function fitComment(comment) {
 // keeps its place).
 function refreshCards() {
   const locked = readOnly();
+  if (noneButton) {
+    const none = topicPicks(topic).none;
+    noneButton.classList.toggle('on', none);
+    noneButton.textContent = none ? '✓ None of these' : 'None of these';
+    noneButton.disabled = locked;
+  }
   for (const { index, entry, element, pickButton, alsoButton, comment } of cards) {
     const entryPicks = topicPicks(index);
-    const picked = entryPicks.pick === entry.key;
+    const multi = isMulti(index);
+    const picked = multi ? entryPicks.wanted.includes(entry.key) : entryPicks.pick === entry.key;
     const also = entryPicks.also.includes(entry.key);
     element.classList.toggle('picked', picked);
     element.classList.toggle('also', also && !picked);
-    pickButton.textContent = picked ? '✓ Picked' : entry.today ? 'Keep today’s' : 'Pick ' + entry.letter;
+    if (multi) pickButton.textContent = picked ? '✓ Wanted' : 'Want this';
+    else pickButton.textContent = picked ? '✓ Picked' : entry.today ? 'Keep today’s' : 'Pick ' + entry.letter;
     pickButton.disabled = locked;
     if (alsoButton) {
       alsoButton.hidden = picked;
@@ -466,6 +514,29 @@ function pick(index, key) {
   save(index);
 }
 
+// A multi topic's Want this: each variant on its own, and wanting any takes None back.
+function want(index, key) {
+  if (readOnly()) return;
+  const entry = topicPicks(index);
+  entry.wanted = entry.wanted.includes(key) ? entry.wanted.filter((other) => other !== key) : [...entry.wanted, key];
+  entry.none = false;
+  picks.submitted_at = null;
+  picks.sent = false;
+  refresh();
+  save(index);
+}
+
+function wantNone(index) {
+  if (readOnly()) return;
+  const entry = topicPicks(index);
+  entry.none = !entry.none;
+  if (entry.none) entry.wanted = [];
+  picks.submitted_at = null;
+  picks.sent = false;
+  refresh();
+  save(index);
+}
+
 function toggleAlso(index, key) {
   if (readOnly()) return;
   const entry = topicPicks(index);
@@ -498,7 +569,7 @@ function save(index) {
   saving++;
   renderSaved();
   const entry = topicPicks(index);
-  const body = { machine: DATA.machine, id: DATA.id, version, topic: index, picks: { pick: entry.pick, also: [...entry.also], comments: { ...entry.comments } } };
+  const body = { machine: DATA.machine, id: DATA.id, version, topic: index, picks: { pick: entry.pick, also: [...entry.also], wanted: [...entry.wanted], none: entry.none, comments: { ...entry.comments } } };
   saveQueue = saveQueue.then(async () => {
     const result = await postJson('/api/picks', body);
     saving--;
@@ -571,7 +642,7 @@ function renderCloseUp() {
   const list = entries(closeUp.index);
   const entry = list[closeUp.place];
   const variant = entry.variant;
-  const phone = mode === 'phone';
+  const phone = phoneView(closeUp.index);
   const picture = phone ? variant.phone_picture : variant.picture;
   const pageFile = phone ? variant.phone_page : variant.page;
   const showPage = !!pageFile && (closeUp.page || !picture);
@@ -635,7 +706,8 @@ window.addEventListener('keydown', (event) => {
     const variants = design.topics[topic].variants;
     const place = Number(event.key) - 1;
     if (place >= variants.length) return;
-    pick(topic, variants[place].name);
+    if (design.topics[topic].multi) want(topic, variants[place].name);
+    else pick(topic, variants[place].name);
   } else return;
   event.preventDefault();
 });

@@ -1467,7 +1467,11 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   is a `.md` file with files to offer as downloads; a design is a title, an intro and topics,
   each with a description, today's (kept with Keep today's), variants (name, description,
   Good, Cost, a picture and/or a live page, at desktop and phone sizes) and the one
-  recommended. Its files are named by topic and letter (`1-B.png`, `1-today-phone.html`).
+  recommended. Its files are named by topic and letter (`1-B.png`, `1-today-phone.html`). A
+  topic can be `multi` ("feature selection", the design board's `type: 'multi'` topics: pick
+  any, for features or options that go together, `DesignTopic::multi`): its variants may be
+  words alone, it has no today's, and the defaults' variant count, today's, sizes and pictures
+  don't apply to it (`deviations` skips it).
   `artifactId` adds a version. 16 MiB a file at most, Claude Code's limit, 128 MiB a design.
   The design tool's description ends with the design defaults (`DesignDefaults::instructions`:
   how many variants, today's, sizes, pictures or pages), the project's or General's
@@ -1481,7 +1485,9 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   like a round's README and decisions.md together (`artifacts::design_text`): whether it's
   submitted, the intro, then a heading per topic with the pick by letter and name, the
   topic's description, and every variant, today's first, with its words, Good, Cost, its
-  files by name, Picked, Also or Recommended, and the user's comment. `files` gives each of
+  files by name, Picked, Also, Wanted or Recommended, and the user's comment (a pick-any
+  topic's heading says "(pick any)", so a variant with no Wanted is one the user doesn't
+  want). `files` gives each of
   the version's files with its path, so the agent looks at a picture or reads a page with its
   own tools; another machine's have no paths, and `file` copies one over to this machine and
   gives its path (`keep_fetched_file`). `agentz_artifact_list` lists the thread's, the
@@ -1493,15 +1499,18 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   along. Deleting the thread keeps its artifacts ("from a deleted thread"); Delete… removes
   one with every version (`Request::DeleteArtifact`).
 - **Picks** (`ArtifactStore::set_picks`, `DesignPicks`): the design page saves each topic's
-  pick (a variant or today's), its + Also and a comment per variant as they're made. Changing
-  one clears Submitted. A new version carries them over by variant name (`carry_over`): a
-  changed variant is marked Changed, a new one New, a gone one takes its pick with it
-  (`dropped`, `gone`), and the design waits for a Submit again.
+  pick (a variant or today's), its + Also and a comment per variant as they're made; in a
+  multi topic, the variants wanted and "None of these" instead (`TopicPicks::wanted`,
+  `none`: a topic is decided once something is wanted or none is, `DesignTopic::answer`).
+  Changing one clears Submitted. A new version carries them over by variant name
+  (`carry_over`): a changed variant is marked Changed, a new one New, a gone one takes its
+  pick with it (`dropped`, `gone`), and the design waits for a Submit again. A topic that
+  changes between pick one and pick any keeps only its comments.
 - **Submit** (`ArtifactRequest::Submit`, `Server::submit_design`): marks the version decided,
   and with "Also send to …" (on at first) puts a short message in the thread as the user's,
   queued while the agent works: the design as a chip (`PromptPart::Conversation`) whose text
   tells the agent to read the picks with `agentz_artifact_read`, then "Submitted: picked B,
-  also A" (`submit_summary`) and the note.
+  also A" ("wanted A, C" for a pick-any topic; `submit_summary`) and the note.
 - **The pages server** (`pages.rs`, its pages in `pages/`, `server/artifact_requests.rs`): a
   small HTTP server on `127.0.0.1`, with the port and a token kept in `artifacts/server.json`.
   Links (`ArtifactPages::link`, `home_link`) carry the token. What an agent made (a
@@ -1522,10 +1531,12 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   - A design (`design.html`, `/api/design`, `/api/picks`, `/api/submit`): the topics on the
     left (each with its pick's letter) and Summary, then the topic's cards: today's first,
     Recommended, Changed and New tags, the picture or the live page scaled down (Open page
-    for the page itself), Pick, + Also and a comment. A close-up (←→, Esc), Desktop · Phone,
+    for the page itself), Pick, + Also and a comment. A pick-any topic has Want this on each
+    card (words-only cards have no picture), None of these under them, and the letters
+    wanted ("AC", or ∅) in the list. A close-up (←→, Esc), Desktop · Phone,
     the progress, Saved, and Submit (Also send, a note, ⌘↩) in the bar; Decided afterwards,
     and a banner on a new version saying what changed and what was dropped. An earlier
-    version is read-only. Keys 1–9 pick, ←→ change topics.
+    version is read-only. Keys 1–9 pick (or want), ←→ change topics.
   - Open pages hear of republishes (a bar to show the new version), picks, deletions and
     theme changes over `/events`.
 - **Another machine's artifacts** are served by this Mac's pages server too, through the app:
