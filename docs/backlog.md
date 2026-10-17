@@ -36,12 +36,6 @@ before it (Factory Droid here, [screenshot](backlog/turn-starts-with-tool-group.
 commands, changed 1 file, and performed 8 other actions" right under the user's message). The
 user sees this a lot and asks whether agentZ is missing a first message in agent responses.
 
-### A remote thread's project icon
-
-A remote thread's card doesn't show its project's icon
-([screenshot](backlog/remote-thread-project-icon.png)): the local agentZ thread has the
-project's "Z" icon, while the remote one, on the SSH machine, shows a red "AZ" letter tile.
-
 ## Features
 
 ### Artifacts move with their thread to another machine

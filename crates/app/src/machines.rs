@@ -767,6 +767,52 @@ impl Machines {
         .map_or_else(|| project.name(), |group| group.name())
     }
 
+    /// The copy whose icon stands for the project, when that isn't the project itself: the
+    /// first copy of its combined project (This Mac's), as the projects list and Settings show
+    /// it. An image picked on this Mac isn't in the other machines' copies, so a thread there
+    /// would show a letter tile. `None` for a project that's alone or is that first copy.
+    pub fn shared_icon_project(
+        &self,
+        machine: MachineId,
+        project: &Project,
+        cx: &App,
+    ) -> Option<(MachineId, Project)> {
+        let repository = project.repository.as_ref()?;
+        let settings = AppSettingsStore::global(cx).read(cx).settings();
+        let logical = |machine: MachineId, project: &Project| {
+            let physical = GroupKey::of_project(ProjectKey {
+                machine,
+                project: project.id,
+            });
+            let mode = settings
+                .project_grouping_overrides
+                .get(&physical)
+                .copied()
+                .unwrap_or(settings.project_grouping);
+            logical_key(project, mode)
+        };
+        let key = logical(machine, project)?;
+        for client in &self.clients {
+            let client = client.read(cx);
+            let other_machine = client.machine();
+            for other in client.projects().read(cx).projects() {
+                let is_copy = other
+                    .repository
+                    .as_ref()
+                    .is_some_and(|other| other.canonical_key == repository.canonical_key)
+                    && logical(other_machine, other).as_ref() == Some(&key);
+                if !is_copy {
+                    continue;
+                }
+                if other_machine == machine && other.id == project.id {
+                    return None;
+                }
+                return Some((other_machine, other.clone()));
+            }
+        }
+        None
+    }
+
     /// The machines a group is on, for its badge (t3code's `ProjectEnvironmentBadge`):
     /// nothing when it's only on this Mac.
     pub fn group_machines_label(&self, group: &ProjectGroup, cx: &App) -> Option<SharedString> {

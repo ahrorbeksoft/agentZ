@@ -256,7 +256,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   in the project (`Request::ProjectImageFiles`, fuzzy searched) or, on This Mac, anywhere (Open
   in Finder). `ProjectIcon` keeps the choice: a file inside the folder as a relative path, so
   every copy uses its own, any other as an absolute one, which only This Mac's copies take.
-  The server serves a chosen file that exists before the favicon it finds.
+  The server serves a chosen file that exists before the favicon it finds. Wherever a project's
+  icon is drawn (`render_project_icon`), a project combined with copies on other machines shows
+  its first copy's, This Mac's (`Machines::shared_icon_project`), so a thread there doesn't
+  show a letter tile for an image only This Mac has.
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
   mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
   branch with a worktree or pasture marker, its subthreads' count by a people icon (accent

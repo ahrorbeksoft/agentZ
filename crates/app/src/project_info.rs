@@ -134,13 +134,21 @@ fn image_format(bytes: &[u8]) -> anyhow::Result<ImageFormat> {
 
 /// The icon, emoji or monogram picked in the project's settings, else its icon file (the one
 /// picked, or the favicon found), else t3code's monogram tile (also shown while an image
-/// loads, and when it fails to).
+/// loads, and when it fails to). A project combined with copies on other machines shows its
+/// first copy's icon, whichever copy it is.
 pub fn render_project_icon(
     machine: MachineId,
     project: &Project,
     size: Pixels,
     cx: &App,
 ) -> AnyElement {
+    let shared = Machines::global(cx)
+        .read(cx)
+        .shared_icon_project(machine, project, cx);
+    let (machine, project) = match &shared {
+        Some((machine, project)) => (*machine, project),
+        None => (machine, project),
+    };
     let name = project.name();
     let is_light = cx.theme().appearance().is_light();
     let font_family = theme::theme_settings(cx).buffer_font(cx).family.clone();
@@ -265,7 +273,7 @@ mod tests {
 
     use agentz_protocol::spaces::SpacesSnapshot;
     use gpui::{Entity, TestAppContext};
-    use projects::ProjectsSnapshot;
+    use projects::{ProjectsSnapshot, RepositoryIdentity};
 
     use super::*;
     use crate::server_client::ServerClient;
@@ -386,6 +394,87 @@ mod tests {
         ];
         view.update(cx, |view, cx| {
             view.0 = fetched.map(|icon| (remote, Some(icon))).into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.borrow(),
+            vec![Request::ProjectFavicon(ProjectId(1))]
+        );
+    }
+
+    /// Some projects as they're given, each on its machine.
+    struct ProjectsDrawn(Vec<(MachineId, Project)>);
+
+    impl Render for ProjectsDrawn {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            h_flex().children(
+                self.0
+                    .iter()
+                    .map(|(machine, project)| render_project_icon(*machine, project, px(16.), cx)),
+            )
+        }
+    }
+
+    /// Project 1 of a repository, with an icon picked or not.
+    fn project_of(repository: &str, icon: Option<ProjectIcon>) -> Project {
+        Project {
+            id: ProjectId(1),
+            path: "/srv/demo".into(),
+            custom_name: None,
+            icon,
+            workspaces: Vec::new(),
+            repository: Some(RepositoryIdentity {
+                canonical_key: repository.into(),
+                root_path: "/srv/demo".into(),
+                remote_name: "origin".into(),
+                remote_url: format!("https://{repository}.git"),
+                display_name: None,
+                owner: None,
+                name: None,
+            }),
+        }
+    }
+
+    /// A thread on another machine shows the icon of its project's first copy, as the projects
+    /// list does: an image picked on this Mac isn't in the other machine's copy, which
+    /// showed a letter tile (or its own icon file) beside the same project's icon.
+    #[gpui::test]
+    fn copies_show_the_first_copys_icon(cx: &mut TestAppContext) {
+        let remote = MachineId::Remote(1);
+        let picked = ProjectIcon::Monogram {
+            text: "Z".into(),
+            color: "rose".into(),
+        };
+        let requests = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let (local, _) = client_with_favicon(MachineId::Local, cx);
+            let (remote_client, requests) = client_with_favicon(remote, cx);
+            for (client, icon) in [(&local, Some(picked)), (&remote_client, None)] {
+                let projects = client.read(cx).projects().clone();
+                projects.update(cx, |projects, cx| {
+                    projects.set_snapshot(
+                        ProjectsSnapshot {
+                            projects: vec![project_of("github.com/demo/demo", icon)],
+                            favicons: vec![(ProjectId(1), "/srv/demo/favicon.png".into())],
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
+            }
+            crate::machines::init_for_test(vec![local, remote_client], cx);
+            requests
+        });
+        let (view, cx) = cx.add_window_view(|_, _| {
+            ProjectsDrawn(vec![(remote, project_of("github.com/demo/demo", None))])
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().is_empty());
+
+        // Another repository's project is alone, so it shows what it has.
+        view.update(cx, |view, cx| {
+            view.0 = vec![(remote, project_of("github.com/demo/other", None))];
             cx.notify();
         });
         cx.run_until_parked();
