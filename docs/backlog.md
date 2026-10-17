@@ -116,6 +116,11 @@ A read's card now shows one line, the tool's summary, where the file's lines sho
 recently and wonders whether an old server is running, or whether an ACP agent (Factory Droid)
 changed something; see "Catch up with Droid's ACP agent".
 
+### Agents ignore a project's artifact design preferences
+
+Agents ignore the project's design preferences for artifacts. Find a way to make them follow
+them.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
