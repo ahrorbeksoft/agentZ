@@ -86,8 +86,8 @@ redraw renders every view again, and at 60 a second a running turn kept the main
 35-45% of a core. Caching the sidebar wouldn't help while a turn runs: a view that animates
 marks its ancestors dirty, and the spinners sit in the sidebar and the thread both. Any new
 looping animation needs `with_max_fps(LOOPING_ANIMATION_FPS)`.
-`markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way
-(see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
+`markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way,
+and `MarkdownStyle::link_chip` draws chosen links as chips (see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
 so an open tool call's output raced the conversation.
 
@@ -101,7 +101,7 @@ so an open tool call's output raced the conversation.
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
-| `text_input` | The text field: one line that scrolls sideways to keep the cursor in view, or several that wrap and grow to a limit, then scroll (`multi_line` with line breaks, as the composer's; `wrapping` without, as a form's text field's). |
+| `text_input` | The text field: one line that scrolls sideways to keep the cursor in view, or several that wrap and grow to a limit, then scroll (`multi_line` with line breaks, as the composer's; `wrapping` without, as a form's text field's). The composer's chips, and the copy that takes them along (`CopiedChip`). |
 | `theme_json` | The bundled JSON themes in `assets/themes`. |
 
 `tooling/bundle-mac.sh` makes `target/bundle/agentZ.app` with the icon
@@ -695,7 +695,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`AgentView::send_after_uploads`); one that fails drops its chip and says why above the
   composer. Other copied files become mentions. On another machine's thread a file is sent to
   that machine first (`Request::UploadFile`, kept in the thread's `attachments/…/files/`) and
-  the mention names the copy there; a folder can't be, so it goes as its path. Paste as Plain
+  the mention names the copy there; a folder can't be, so it goes as its path. Copying or
+  cutting chips gives their text (`@name`, `@Image`) and takes the mentions along in the
+  clipboard's metadata (`text_input::CopiedChip`, one per chip with `Chip::payload`, holding a
+  `CopiedMention`: the prompt part, and the machine and thread it was copied in), so pasting
+  in a composer brings the chips back (`AgentView::paste_copied_chips`) and pasting anywhere
+  else is the text. A sent message's Copy button does it for its images. An image copied in
+  another thread is fetched from it and kept for this one (`Request::Attachment`, then
+  `Request::AddAttachment`, as a pasted image is); a file or thread of another machine pastes
+  as its text. The metadata lives only as long as the clipboard's text is what was copied
+  (GPUI's clipboard keeps it that way on every platform). Paste as Plain
   Text pastes only text. A chat's @ lists Projects, every project's Threads and its own Files
   (see Chats). Artifacts come first (after a chat's Projects; see Artifacts).
 - **Sending mentions** (`PromptPart`, `agent_thread::MessagePart`): a message goes as its parts
@@ -706,7 +715,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   plain text, and an image (`PromptPart::Image`, by its attachment id, read from the thread's
   store) goes only to agents that take images. The user's message shows each mention as Zed
   writes one, `[@name](uri)`, also when an agent replays it; an image is
-  `[@Image](agentz://attachment/<id>)`, and images an agent shows or replays are kept too.
+  `[@Image](agentz://attachment/<id>)`, and images an agent shows or replays are kept too. A
+  sent message draws that link as the composer's chip (see Images).
 - **Timeline** (`agent_view.rs`; t3code's `MessagesTimeline`, picked in `design/thread/`): a
   tool call is one compact row: its kind's icon, then "Ran"/"Running" and the command in the
   code font, "Edited" and the path (or "Edited N files") with +added −removed, or the agent's
@@ -887,9 +897,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   it. Clients fetch one by id (`Request::Attachment`), as a 640-pixel PNG thumbnail (made once
   and kept) or the original, through GPUI's asset cache (`AttachmentImage`); one that failed
   while its machine was offline is fetched again once it's back. Picked in
-  `design/tool-calls/` (topics 4–6): a message's images (`message_pieces`,
-  `without_image_links`) show as 100 × 75 thumbnails cropped to fill, two to a row: the
-  user's above its text, the agent's where they are in its reply. A tool call with an image
+  `design/tool-calls/` (topics 4–6): an agent's images (`message_pieces`) show as 100 × 75
+  thumbnails cropped to fill, two to a row, where they are in its reply. The user's show in
+  their message where they were written ("in this [image] it looks like that"), as the
+  composer's chips, not as thumbnails above the text (changed on the user's word, in the
+  backlog): the markdown crate draws a link as a chip when `MarkdownStyle::link_chip` says so
+  (`LinkChip`: an outlined box, the code font, an icon over room the label leaves; it copies as
+  `@Image`, and still hovers and clicks as the link it is), and `AgentView::markdown` says so
+  for image links. A click on one opens the viewer on it, with arrows through the message's
+  other images. A tool call with an image
   starts closed as any row and opens to the image at most 384 px wide and tall, in a thin
   border; its
   row is measured again once the image loads (`remeasure_loaded_images`), since its
@@ -903,7 +919,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `image_renderer` (added for this) draws them as t3code does: at their own size up to
   480 px, in a thin border, a 16:9 slot while loading (its row measured again once it's
   loaded), "Image unavailable · alt" for one that can't load. Composer chips show their thumbnail on hover
-  (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a thought). Every image
+  (`ImagePreviewTooltip`, and `HoveredImage` for an `@Image` link in a message or thought). Every image
   has a zoom-in cursor (`CursorStyle::ZoomIn`, added to GPUI) and a click opens the original
   in t3code's viewer over the window (`ImageViewer`): the image fit to the window over a dark
   backdrop, with arrows and ← → through the message's or tool call's other images, a caption

@@ -257,22 +257,56 @@ pub(crate) fn message_pieces(text: &str) -> Vec<MessagePiece<'_>> {
     pieces
 }
 
-/// The user's message without its image links, and the images, which show above its text.
-pub(crate) fn without_image_links(text: &str) -> (Cow<'_, str>, Vec<AttachmentId>) {
+/// The message's text without its image links, for where images don't show.
+pub(crate) fn without_image_links(text: &str) -> Cow<'_, str> {
     let links = image_links(text);
     if links.is_empty() {
-        return (Cow::Borrowed(text), Vec::new());
+        return Cow::Borrowed(text);
     }
     let mut rest = String::new();
     let mut text_start = 0;
-    let mut images = Vec::new();
-    for (range, id) in links {
+    for (range, _) in links {
         rest.push_str(&text[text_start..range.start]);
         text_start = range.end;
-        images.push(id);
     }
     rest.push_str(&text[text_start..]);
-    (Cow::Owned(rest.trim().to_string()), images)
+    Cow::Owned(rest.trim().to_string())
+}
+
+/// The images a message links, in order.
+pub(crate) fn message_images(text: &str) -> Vec<AttachmentId> {
+    image_links(text).into_iter().map(|(_, id)| id).collect()
+}
+
+/// What copying an image's mention gives, as the composer's chip does.
+const IMAGE_MENTION: &str = "@Image";
+
+/// The message's text with each image link as `@Image`, as copying the composer's chip gives,
+/// and where each is in the result.
+pub(crate) fn with_image_names(text: &str) -> (String, Vec<(Range<usize>, AttachmentId)>) {
+    let mut named = String::new();
+    let mut images = Vec::new();
+    let mut text_start = 0;
+    for (range, id) in image_links(text) {
+        named.push_str(&text[text_start..range.start]);
+        let start = named.len();
+        named.push_str(IMAGE_MENTION);
+        images.push((start..named.len(), id));
+        text_start = range.end;
+    }
+    named.push_str(&text[text_start..]);
+    (named, images)
+}
+
+/// An image link drawn as the composer draws the image's mention: an outlined box with the
+/// image icon.
+pub(crate) fn image_chip(url: &str) -> Option<markdown::LinkChip> {
+    AttachmentId::from_uri(url)?;
+    Some(markdown::LinkChip {
+        icon: IconName::Image.path().into(),
+        label: "Image".into(),
+        copy_text: IMAGE_MENTION.into(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1009,17 +1043,46 @@ mod tests {
     }
 
     #[test]
-    fn a_users_images_leave_its_text() {
+    fn a_messages_images_can_be_left_out_or_named() {
         let (first, second) = (id("a"), id("b"));
         let text = format!(
             "{} {} The sidebar is cut off.",
             first.markdown_link(),
             second.markdown_link()
         );
-        let (rest, images) = without_image_links(&text);
-        assert_eq!(rest, "The sidebar is cut off.");
-        assert_eq!(images, [first, second]);
-        assert_eq!(without_image_links("Plain"), ("Plain".into(), Vec::new()));
+        assert_eq!(without_image_links(&text), "The sidebar is cut off.");
+        assert_eq!(without_image_links("Plain"), "Plain");
+        assert_eq!(message_images(&text), [first.clone(), second.clone()]);
+
+        let text = format!(
+            "In this {} it looks like that, and this: {}.",
+            first.markdown_link(),
+            second.markdown_link()
+        );
+        let (named, images) = with_image_names(&text);
+        assert_eq!(
+            named,
+            "In this @Image it looks like that, and this: @Image."
+        );
+        assert_eq!(images.len(), 2);
+        assert_eq!(&named[images[0].0.clone()], "@Image");
+        assert_eq!(images[0].1, first);
+        assert_eq!(&named[images[1].0.clone()], "@Image");
+        assert_eq!(images[1].1, second);
+        assert_eq!(with_image_names("Plain"), ("Plain".to_string(), Vec::new()));
+    }
+
+    #[test]
+    fn only_an_attachments_link_is_an_image_chip() {
+        let link = id("a").markdown_link();
+        let uri = link
+            .trim_start_matches(IMAGE_LINK_OPENING)
+            .trim_end_matches(')');
+        assert_eq!(
+            image_chip(uri).map(|chip| chip.copy_text.to_string()),
+            Some("@Image".to_string())
+        );
+        assert!(image_chip("https://example.com/a.png").is_none());
     }
 
     #[test]

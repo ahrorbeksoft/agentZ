@@ -8,7 +8,9 @@ use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::{FileListing, PromptPart};
 use gpui::{AnyElement, App, SharedString};
 use projects::{Mentioned, Project, ThreadId};
+use serde::{Deserialize, Serialize};
 use ui::{ListItem, ListItemSpacing, prelude::*};
+use util::ResultExt as _;
 
 use crate::artifacts_list::artifact_icon;
 use crate::machines::MachineId;
@@ -72,6 +74,32 @@ impl Mention {
             Mentioned::Image(id) => Mention::Image(AttachmentId::parse(id)?),
         })
     }
+
+    /// What copying its chip carries to bring it back where it's pasted
+    /// ([`text_input::CopiedChip`]), for a mention copied in `thread_id` on `machine`. A project
+    /// on another machine, in words, copies as the words.
+    pub(crate) fn copied(&self, machine: MachineId, thread_id: ThreadId) -> Option<String> {
+        let part = match self {
+            Mention::Text(_) => return None,
+            mention => mention.prompt_part(),
+        };
+        serde_json::to_string(&CopiedMention {
+            part,
+            machine,
+            thread: thread_id,
+        })
+        .log_err()
+    }
+}
+
+/// A mention copied from a composer or a sent message.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct CopiedMention {
+    pub part: PromptPart,
+    /// Where it was copied: an image is kept for its thread, and a file or thread is on its
+    /// machine.
+    pub machine: MachineId,
+    pub thread: ThreadId,
 }
 
 /// What the + button's menu narrowed @ to.

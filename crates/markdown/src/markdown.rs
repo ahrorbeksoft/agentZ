@@ -39,8 +39,8 @@ use gpui::{
     ImageFormat, ImageSource, InputHandler, KeyContext, Length, MouseButton, MouseDownEvent,
     MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
     StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
-    TextLayout, TextRun, TextStyle, TextStyleRefinement, UTF16Selection, WrappedLineLayout,
-    actions, canvas, img, point, quad, relative, size,
+    TextLayout, TextRun, TextStyle, TextStyleRefinement, TransformationMatrix, UTF16Selection,
+    WrappedLineLayout, actions, canvas, img, point, quad, relative, size,
 };
 use parser::CodeBlockMetadata;
 use parser::{
@@ -66,12 +66,30 @@ const MERMAID_ZOOM_DEBOUNCE: Duration = Duration::from_millis(300);
 /// If the callback returns `None`, the default link style will be used.
 type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
+/// Tells which links draw as chips, by their destination URL ([`LinkChip`]).
+pub type LinkChipCallback = Rc<dyn Fn(&str, &App) -> Option<LinkChip>>;
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
 type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
 /// Invoked when a mermaid diagram's zoom level changes (via scroll gesture or
 /// the reset button), so a scroll container can keep the diagram anchored.
 pub type MermaidZoomCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A link drawn as an outlined box with an icon and a short label, in place of its text, as a
+/// mention shows in the composer. It still opens and hovers as the link it is.
+#[derive(Clone)]
+pub struct LinkChip {
+    /// The icon's SVG asset path.
+    pub icon: SharedString,
+    pub label: SharedString,
+    /// What copying a selection with the chip in it gives for it.
+    pub copy_text: SharedString,
+}
+
+/// Room for the chip's icon in front of its label, and a little after it. Non-breaking, so a
+/// chip isn't wrapped across rows.
+const LINK_CHIP_ICON_ROOM: &str = "\u{a0}\u{a0}\u{a0}";
+const LINK_CHIP_END: &str = "\u{a0}";
 
 #[derive(Clone, Copy, Default)]
 pub struct BlockQuoteKindColors {
@@ -115,6 +133,7 @@ pub struct MarkdownStyle {
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
     pub link_callback: Option<LinkStyleCallback>,
+    pub link_chip: Option<LinkChipCallback>,
     pub rule_color: Hsla,
     pub block_quote_border_color: Hsla,
     pub block_quote_kind_colors: BlockQuoteKindColors,
@@ -146,6 +165,7 @@ impl Default for MarkdownStyle {
             block_quote: Default::default(),
             link: Default::default(),
             link_callback: None,
+            link_chip: None,
             rule_color: Default::default(),
             block_quote_border_color: Default::default(),
             block_quote_kind_colors: Default::default(),
@@ -1127,7 +1147,7 @@ impl Markdown {
         if self.selection.end <= self.selection.start {
             return;
         }
-        let text = text.text_for_range(self.selection.start..self.selection.end);
+        let text = text.copied_text_for_range(self.selection.start..self.selection.end);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -1157,7 +1177,7 @@ impl Markdown {
                     .rebalanced_markdown_for_selection(range.clone()),
             ));
             self.context_menu_selected_text = rendered_text
-                .map(|text| text.text_for_range(range))
+                .map(|text| text.copied_text_for_range(range))
                 .map(SharedString::new)
                 .or_else(|| self.context_menu_selected_markdown.clone());
         } else {
@@ -2516,8 +2536,9 @@ impl MarkdownElement {
                     markdown.selection.pending = false;
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     {
-                        let text = rendered_text
-                            .text_for_range(markdown.selection.start..markdown.selection.end);
+                        let text = rendered_text.copied_text_for_range(
+                            markdown.selection.start..markdown.selection.end,
+                        );
                         cx.write_to_primary(ClipboardItem::new_string(text))
                     }
                     cx.notify();
@@ -2971,13 +2992,27 @@ impl Element for MarkdownElement {
                             if builder.code_block_stack.is_empty() {
                                 builder.link_depth += 1;
                                 builder.push_link(dest_url.clone(), range.clone());
-                                let style = self
+                                let chip = self
                                     .style
-                                    .link_callback
+                                    .link_chip
                                     .as_ref()
-                                    .and_then(|callback| callback(dest_url, cx))
-                                    .unwrap_or_else(|| self.style.link.clone());
-                                builder.push_text_style(style)
+                                    .and_then(|callback| callback(dest_url, cx));
+                                if let Some(chip) = chip {
+                                    // Its label, in the code font, stands for the link's text.
+                                    let mut style = self.style.inline_code.clone();
+                                    style.background_color = None;
+                                    style.font_size = None;
+                                    builder.push_text_style(style);
+                                    builder.push_link_chip(chip, range.clone());
+                                } else {
+                                    let style = self
+                                        .style
+                                        .link_callback
+                                        .as_ref()
+                                        .and_then(|callback| callback(dest_url, cx))
+                                        .unwrap_or_else(|| self.style.link.clone());
+                                    builder.push_text_style(style)
+                                }
                             }
                         }
                         MarkdownTag::FootnoteDefinition(label) => {
@@ -3233,6 +3268,7 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::Link => {
                         if builder.code_block_stack.is_empty() {
                             builder.link_depth = builder.link_depth.saturating_sub(1);
+                            builder.skips_link_text = false;
                             builder.pop_text_style()
                         }
                     }
@@ -3764,6 +3800,8 @@ struct MarkdownElementBuilder {
     code_block_stack: Vec<Option<Arc<Language>>>,
     code_block_highlights: Arc<CodeBlockHighlights>,
     link_depth: usize,
+    /// Set while inside a link drawn as a chip, whose text its label has replaced.
+    skips_link_text: bool,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
@@ -3852,6 +3890,15 @@ struct PendingLine {
     /// Rendered (not source) indices, so chips hug the glyphs and ignore
     /// unrendered characters like the surrounding backticks
     code_chips: Vec<(Range<usize>, Hsla)>,
+    link_chips: Vec<RenderedLinkChip>,
+}
+
+/// A link drawn as a chip, where it is in a line's rendered text.
+#[derive(Clone)]
+struct RenderedLinkChip {
+    range: Range<usize>,
+    icon: SharedString,
+    copy_text: SharedString,
 }
 
 struct ListStackEntry {
@@ -3885,6 +3932,7 @@ impl MarkdownElementBuilder {
             code_block_stack: Vec::new(),
             code_block_highlights,
             link_depth: 0,
+            skips_link_text: false,
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
@@ -3908,6 +3956,26 @@ impl MarkdownElementBuilder {
                     .push((chip_start..chip_end, background));
             }
         }
+    }
+
+    /// Puts the chip's label where the link's text would be, with room before it for its icon,
+    /// and leaves out the link's own text. The link's whole source maps to the chip, so a click
+    /// or hover on it is on the link.
+    fn push_link_chip(&mut self, chip: LinkChip, source_range: Range<usize>) {
+        let start = self.pending_line.text.len();
+        // A label's spaces don't break the chip across rows either.
+        let label = chip.label.replace(' ', "\u{a0}");
+        self.push_text(
+            &format!("{LINK_CHIP_ICON_ROOM}{label}{LINK_CHIP_END}"),
+            source_range,
+        );
+        let end = self.pending_line.text.len();
+        self.pending_line.link_chips.push(RenderedLinkChip {
+            range: start..end,
+            icon: chip.icon,
+            copy_text: chip.copy_text,
+        });
+        self.skips_link_text = true;
     }
 
     fn push_text_style(&mut self, style: TextStyleRefinement) {
@@ -4125,6 +4193,9 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
+        if self.skips_link_text {
+            return;
+        }
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
             source_index: source_range.start,
@@ -4259,6 +4330,7 @@ impl MarkdownElementBuilder {
             text_align: TextAlign::Left,
             highlights: SmallVec::new(),
             code_chips: SmallVec::new(),
+            link_chips: SmallVec::new(),
         }));
         div()
             .absolute()
@@ -4298,6 +4370,7 @@ impl MarkdownElementBuilder {
             text_align,
             highlights,
             code_chips: line.code_chips.into_iter().collect(),
+            link_chips: line.link_chips.into_iter().collect(),
         });
         self.rendered_lines.push(rendered_line.clone());
         self.append_child(
@@ -4381,9 +4454,21 @@ impl Element for RenderedLineElement {
     ) {
         let layout = self.text.layout();
         self.line.paint_code_chips(window);
+        self.line.paint_link_chip_outlines(window, cx);
         layout.paint_background(window, cx).log_err();
         self.line.paint_highlights(window);
         layout.paint_foreground(window, cx).log_err();
+        self.line.paint_link_chip_icons(window, cx);
+    }
+}
+
+/// Where a chip's outline goes around its text on one row: a little inside the row, so chips
+/// on neighboring rows don't touch.
+fn link_chip_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let inset = bounds.size.height * 0.1;
+    Bounds {
+        origin: point(bounds.origin.x, bounds.origin.y + inset),
+        size: size(bounds.size.width, bounds.size.height - inset * 2.),
     }
 }
 
@@ -4406,9 +4491,87 @@ struct RenderedLine {
     highlights: SmallVec<[(Range<usize>, Hsla); 1]>,
     /// Inline code chip ranges intersecting this line, in rendered indices
     code_chips: SmallVec<[(Range<usize>, Hsla); 1]>,
+    link_chips: SmallVec<[RenderedLinkChip; 1]>,
 }
 
 impl RenderedLine {
+    /// Painted before the glyphs, which draw the label inside: an outline, as the composer
+    /// draws a chip.
+    fn paint_link_chip_outlines(&self, window: &mut Window, cx: &App) {
+        if self.link_chips.is_empty() {
+            return;
+        }
+        let segments = self.wrapped_line_segments();
+        let border = cx.theme().colors().border;
+        for chip in &self.link_chips {
+            self.for_each_bounds_in_rendered_range(&segments, chip.range.clone(), |bounds| {
+                window.paint_quad(quad(
+                    link_chip_bounds(bounds),
+                    px(4.),
+                    Hsla::transparent_black(),
+                    px(1.),
+                    border,
+                    BorderStyle::default(),
+                ));
+            });
+        }
+    }
+
+    /// Painted after the glyphs, on the room in front of the label.
+    fn paint_link_chip_icons(&self, window: &mut Window, cx: &mut App) {
+        if self.link_chips.is_empty() {
+            return;
+        }
+        const ICON_SIZE: Pixels = px(12.);
+        let segments = self.wrapped_line_segments();
+        let color = cx.theme().colors().icon_muted;
+        for chip in &self.link_chips {
+            let mut is_first_row = true;
+            self.for_each_bounds_in_rendered_range(&segments, chip.range.clone(), |bounds| {
+                if !mem::take(&mut is_first_row) {
+                    return;
+                }
+                let bounds = link_chip_bounds(bounds);
+                let icon = Bounds::new(
+                    point(
+                        bounds.left() + px(5.),
+                        bounds.top() + (bounds.size.height - ICON_SIZE) / 2.,
+                    ),
+                    size(ICON_SIZE, ICON_SIZE),
+                );
+                window
+                    .paint_svg(
+                        icon,
+                        chip.icon.clone(),
+                        None,
+                        TransformationMatrix::unit(),
+                        color,
+                        cx,
+                    )
+                    .log_err();
+            });
+        }
+    }
+
+    /// The rendered text between two indices, a chip in it as what copying it gives.
+    fn copied_text(&self, start: usize, end: usize) -> String {
+        let text = self.layout.text();
+        let mut copied = String::new();
+        let mut index = start;
+        for chip in &self.link_chips {
+            if chip.range.end <= start || chip.range.start >= end {
+                continue;
+            }
+            copied.push_str(&text[index..chip.range.start.max(index)]);
+            copied.push_str(&chip.copy_text);
+            index = chip.range.end.min(end).max(index);
+        }
+        if index < end {
+            copied.push_str(&text[index..end]);
+        }
+        copied
+    }
+
     /// Painted before the glyphs so the text renders on top of the chips
     fn paint_code_chips(&self, window: &mut Window) {
         const CHIP_CORNER_RADIUS: Pixels = px(4.);
@@ -5025,6 +5188,15 @@ impl RenderedText {
     }
 
     fn text_for_range(&self, range: Range<usize>) -> String {
+        self.text_in_range(range, false)
+    }
+
+    /// What copying the range gives: its text, with a chip as its `copy_text`.
+    fn copied_text_for_range(&self, range: Range<usize>) -> String {
+        self.text_in_range(range, true)
+    }
+
+    fn text_in_range(&self, range: Range<usize>, chips_as_copy_text: bool) -> String {
         let mut accumulator = String::new();
 
         for line in self.lines.iter() {
@@ -5050,7 +5222,11 @@ impl RenderedText {
             }
             .min(text.len());
 
-            accumulator.push_str(&text[start..end]);
+            if chips_as_copy_text {
+                accumulator.push_str(&line.copied_text(start, end));
+            } else {
+                accumulator.push_str(&text[start..end]);
+            }
             accumulator.push('\n');
         }
         // Remove trailing newline

@@ -10,6 +10,8 @@
 use std::ops::Range;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use gpui::{
     Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
@@ -132,6 +134,43 @@ pub struct Chip {
     pub preview: ChipPreview,
     /// What copying it gives.
     pub copy_text: SharedString,
+    /// What its owner keeps to bring it back when what's copied is pasted ([`CopiedChip`]).
+    pub payload: Option<SharedString>,
+}
+
+/// A chip in copied text: where its `copy_text` is in the text, and its payload. The clipboard
+/// keeps these beside the text, so pasting in the owner brings the chips back; anywhere else
+/// pastes the text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CopiedChip {
+    pub range: Range<usize>,
+    pub payload: String,
+}
+
+impl CopiedChip {
+    /// A copy of `text` that takes its chips along.
+    pub fn clipboard_item(text: String, chips: Vec<CopiedChip>) -> ClipboardItem {
+        if chips.is_empty() {
+            return ClipboardItem::new_string(text);
+        }
+        ClipboardItem::new_string_with_json_metadata(text, chips)
+    }
+
+    /// The text of a copy with chips, and the chips in it.
+    pub fn from_clipboard(item: &ClipboardItem) -> Option<(String, Vec<CopiedChip>)> {
+        let text = item.text()?;
+        let chips: Vec<CopiedChip> = serde_json::from_str(item.metadata()?).ok()?;
+        // The clipboard keeps the metadata only for the text it was copied with, but whatever
+        // else wrote it may not have.
+        let fits = |chip: &CopiedChip| text.get(chip.range.clone()).is_some();
+        let mut previous_end = 0;
+        let is_ordered = chips.iter().all(|chip| {
+            let ordered = chip.range.start >= previous_end && fits(chip);
+            previous_end = chip.range.end;
+            ordered
+        });
+        is_ordered.then_some((text, chips))
+    }
 }
 
 pub struct TextInput {
@@ -532,6 +571,7 @@ impl TextInput {
                 icon,
                 preview,
                 copy_text,
+                payload: None,
             },
         );
         let cursor = range.start + chip_text.len() + 1;
@@ -541,6 +581,13 @@ impl TextInput {
         cx.emit(TextInputEvent::Changed);
         self.pause_blinking(cx);
         id
+    }
+
+    /// Gives a chip what copying it brings along ([`CopiedChip`]).
+    pub fn set_chip_payload(&mut self, id: ChipId, payload: impl Into<SharedString>) {
+        if let Some(chip) = self.chips.iter_mut().find(|chip| chip.id == id) {
+            chip.payload = Some(payload.into());
+        }
     }
 
     /// Takes a chip out of the text, with the space after it.
@@ -602,20 +649,40 @@ impl TextInput {
 
     /// The text of `range`, with each chip as what copying it gives.
     fn text_for_copy(&self, range: Range<usize>) -> String {
+        self.copy_range(range).0
+    }
+
+    /// What copying `range` puts on the clipboard.
+    fn clipboard_item_for(&self, range: Range<usize>) -> ClipboardItem {
+        let (text, chips) = self.copy_range(range);
+        CopiedChip::clipboard_item(text, chips)
+    }
+
+    /// The text of `range`, with each chip as what copying it gives, and where the chips with
+    /// a payload are in that text.
+    fn copy_range(&self, range: Range<usize>) -> (String, Vec<CopiedChip>) {
         let mut text = String::new();
+        let mut copied = Vec::new();
         let mut index = range.start;
         for chip in &self.chips {
             if chip.range.end <= range.start || chip.range.start >= range.end {
                 continue;
             }
             text.push_str(&self.content[index..chip.range.start.max(index)]);
+            let start = text.len();
             text.push_str(&chip.copy_text);
+            if let Some(payload) = &chip.payload {
+                copied.push(CopiedChip {
+                    range: start..text.len(),
+                    payload: payload.to_string(),
+                });
+            }
             index = chip.range.end.min(range.end).max(index);
         }
         if index < range.end {
             text.push_str(&self.content[index..range.end]);
         }
-        text
+        (text, copied)
     }
 
     /// The chip an offset is strictly inside of.
@@ -967,17 +1034,13 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() && !self.masked {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.text_for_copy(self.selected_range.clone()),
-            ));
+            cx.write_to_clipboard(self.clipboard_item_for(self.selected_range.clone()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() && !self.masked {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.text_for_copy(self.selected_range.clone()),
-            ));
+            cx.write_to_clipboard(self.clipboard_item_for(self.selected_range.clone()));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
@@ -2098,7 +2161,7 @@ mod tests {
     fn pasting_keeps_line_breaks_with_several_lines(cx: &mut TestAppContext) {
         let (input, cx) = input(true, cx);
         cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes("secondary-v");
         assert_eq!(text(&input, cx), "a\nb");
     }
 
@@ -2106,7 +2169,7 @@ mod tests {
     fn pasting_into_one_line_joins_lines(cx: &mut TestAppContext) {
         let (input, cx) = input(false, cx);
         cx.write_to_clipboard(ClipboardItem::new_string("a\nb".into()));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes("secondary-v");
         assert_eq!(text(&input, cx), "a b");
     }
 
@@ -2169,7 +2232,7 @@ mod tests {
         cx.simulate_keystrokes("shift-enter");
         assert_eq!(text(&input, cx), "one");
         cx.write_to_clipboard(ClipboardItem::new_string(" two\nthree".into()));
-        cx.simulate_keystrokes("cmd-v");
+        cx.simulate_keystrokes("secondary-v");
         assert_eq!(text(&input, cx), "one two three");
         assert_eq!(height(cx), one_line);
         input.update_in(cx, |input, _, cx| input.set_text("word ".repeat(10), cx));
@@ -2419,7 +2482,78 @@ mod tests {
             icon: "icons/file.svg".into(),
             preview: ChipPreview::Text("".into()),
             copy_text: "@a".into(),
+            payload: None,
         }
+    }
+
+    /// A copy has its chips as text, and takes along those with a payload, where they are in it,
+    /// for the owner to bring back.
+    #[gpui::test]
+    fn copying_chips_takes_their_payloads_along(cx: &mut TestAppContext) {
+        let (input, cx) = input(true, cx);
+        cx.simulate_input("see ");
+        input.update(cx, |input, cx| {
+            let image = input.insert_chip(
+                None,
+                "Image",
+                "icons/image.svg".into(),
+                ChipPreview::Text("".into()),
+                "@Image".into(),
+                cx,
+            );
+            input.set_chip_payload(image, "image 1");
+            input.insert_chip(
+                None,
+                "total.ts",
+                "icons/file.svg".into(),
+                ChipPreview::Text("src/total.ts".into()),
+                "@total.ts".into(),
+                cx,
+            );
+        });
+        cx.simulate_input("now");
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        let item = cx.read_from_clipboard().expect("what was copied");
+        assert_eq!(item.text().as_deref(), Some("see @Image @total.ts now"));
+        let (copied, chips) = CopiedChip::from_clipboard(&item).expect("its chips");
+        // Only the chip that has a payload comes back.
+        assert_eq!(
+            chips,
+            vec![CopiedChip {
+                range: 4..10,
+                payload: "image 1".into()
+            }]
+        );
+        assert_eq!(&copied[chips[0].range.clone()], "@Image");
+
+        // Cutting does too, and a copy with none is plain text.
+        cx.simulate_keystrokes("secondary-x");
+        assert_eq!(text(&input, cx), "");
+        let cut = cx.read_from_clipboard().expect("what was cut");
+        assert!(CopiedChip::from_clipboard(&cut).is_some());
+        input.update(cx, |input, cx| input.insert("plain", cx));
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        let plain = cx.read_from_clipboard().expect("what was copied");
+        assert!(CopiedChip::from_clipboard(&plain).is_none());
+        assert_eq!(plain.text().as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn metadata_that_doesnt_fit_its_text_is_ignored() {
+        let chips = |range| {
+            vec![CopiedChip {
+                range,
+                payload: "x".into(),
+            }]
+        };
+        let item = |text: &str, range| {
+            ClipboardItem::new_string_with_json_metadata(text.to_string(), chips(range))
+        };
+        assert!(CopiedChip::from_clipboard(&item("@Image", 0..6)).is_some());
+        assert!(CopiedChip::from_clipboard(&item("@Image", 0..9)).is_none());
+        assert!(CopiedChip::from_clipboard(&item("é", 0..1)).is_none());
+        let not_chips = ClipboardItem::new_string_with_metadata("a".into(), "{\"a\": 1}".into());
+        assert!(CopiedChip::from_clipboard(&not_chips).is_none());
     }
 
     #[test]

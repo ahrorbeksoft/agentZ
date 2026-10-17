@@ -33,6 +33,7 @@ use agentz_protocol::workspace::{
     remote_branch,
 };
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, PromptPart, Request, Response};
+use anyhow::Context as _;
 use collections::{HashMap, HashSet};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Bounds, ClickEvent, ClipboardEntry,
@@ -48,7 +49,7 @@ use markdown::{
 use projects::{
     PlannedWorkspace, ProjectId, TaskEnd, Thread, ThreadId, UnsentMention, WorkspaceKind,
 };
-use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
+use text_input::{ChipId, ChipPreview, CopiedChip, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
     IconPosition, LOOPING_ANIMATION_FPS, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
@@ -57,9 +58,9 @@ use ui::{
 use util::ResultExt as _;
 
 use crate::mention_menu::{
-    Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget, MentionableArtifact,
-    MentionableProject, MentionableThread, artifact_reference, find_mentions, mention_query,
-    render_mention_menu, target_icon,
+    CopiedMention, Mention, MentionKind, MentionMatch, MentionQuery, MentionTarget,
+    MentionableArtifact, MentionableProject, MentionableThread, artifact_reference, find_mentions,
+    mention_query, render_mention_menu, target_icon,
 };
 
 use crate::agent_icons::agent_icon;
@@ -69,8 +70,8 @@ use crate::agent_login::{
 use crate::artifacts_list::{ShowInList, artifact_icon, render_design_state, thread_group};
 use crate::attachment_image::{
     AttachmentImage, FileImage, ImagePreviewTooltip, ImageViewer, MarkdownImageSource,
-    MessagePiece, ViewedImage, classify_markdown_image, is_loading, message_pieces,
-    render_hover_preview, web_image, without_image_links,
+    MessagePiece, ViewedImage, classify_markdown_image, image_chip, is_loading, message_images,
+    message_pieces, render_hover_preview, web_image, with_image_names, without_image_links,
 };
 use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::confirm_dialog::ConfirmRequest;
@@ -2138,9 +2139,9 @@ impl AgentView {
             self.delegated_subthreads.remove(&index);
             match entry {
                 // An agent may replay a continued thread's first message with what it brought.
+                // Its images show where they are in it, as the composer's chips.
                 Entry::UserMessage(text) => {
-                    let (text, _) = without_image_links(without_handoff(text));
-                    self.sync_markdown((index, 0), &text, cx);
+                    self.sync_markdown((index, 0), without_handoff(text).trim(), cx);
                 }
                 Entry::AgentMessage(text) => {
                     for (part, piece) in message_pieces(text).into_iter().enumerate() {
@@ -2499,6 +2500,10 @@ impl AgentView {
                 _ => None,
             })
             .collect();
+        if !plain && let Some((text, chips)) = CopiedChip::from_clipboard(item) {
+            self.paste_copied_chips(&text, &chips, cx);
+            return;
+        }
         if plain || (paths.is_empty() && images.is_empty()) {
             if let Some(text) = item.text() {
                 self.composer
@@ -2514,6 +2519,122 @@ impl AgentView {
                 self.insert_image(image.format, image.bytes, cx);
             }
         }
+    }
+
+    /// Pastes what a composer or a sent message copied: its text, and the mentions that were
+    /// chips as chips again, where this thread can use them.
+    fn paste_copied_chips(&mut self, text: &str, chips: &[CopiedChip], cx: &mut Context<Self>) {
+        let mut index = 0;
+        let mut after_chip = false;
+        for chip in chips {
+            self.paste_text(&text[index..chip.range.start], after_chip, cx);
+            let copy_text = &text[chip.range.clone()];
+            after_chip = self.paste_chip(copy_text, &chip.payload, cx);
+            index = chip.range.end;
+        }
+        self.paste_text(&text[index..], after_chip, cx);
+    }
+
+    /// Types pasted text. A chip brings the space after it, which the text after it starts with.
+    fn paste_text(&mut self, text: &str, after_chip: bool, cx: &mut Context<Self>) {
+        let text = if after_chip {
+            text.strip_prefix(' ').unwrap_or(text)
+        } else {
+            text
+        };
+        if !text.is_empty() {
+            self.composer
+                .update(cx, |composer, cx| composer.insert(text, cx));
+        }
+    }
+
+    /// One mention of a copy as a chip, or as its text where this thread can't use it: a file
+    /// or thread of another machine, or an image in a thread that takes none. Whether it's a chip.
+    fn paste_chip(&mut self, copy_text: &str, payload: &str, cx: &mut Context<Self>) -> bool {
+        let machine = self.client.read(cx).machine();
+        let copied = serde_json::from_str::<CopiedMention>(payload)
+            .context("a pasted mention")
+            .log_err()
+            .filter(|copied| match copied.part {
+                PromptPart::Path(_) | PromptPart::Thread(_) => copied.machine == machine,
+                PromptPart::Image(_) => self.thread.read(cx).supports_images(),
+                PromptPart::Conversation { .. } | PromptPart::Text(_) => true,
+            });
+        let Some(copied) = copied else {
+            self.composer
+                .update(cx, |composer, cx| composer.insert(copy_text, cx));
+            return false;
+        };
+        if let PromptPart::Image(id) = &copied.part
+            && (copied.machine, copied.thread) != (machine, self.thread_id)
+        {
+            self.insert_image_from(copied.machine, copied.thread, id.clone(), cx);
+            return true;
+        }
+        let Some((label, icon, preview, mention)) = self.mention_chip(&copied.part, cx) else {
+            self.composer
+                .update(cx, |composer, cx| composer.insert(copy_text, cx));
+            return false;
+        };
+        self.insert_mention(None, &label, icon, preview, mention, cx);
+        true
+    }
+
+    /// An image copied in another thread: the chip shows that thread's copy at once, and
+    /// mentions this thread's once it's kept here.
+    fn insert_image_from(
+        &mut self,
+        machine: MachineId,
+        thread_id: ThreadId,
+        id: AttachmentId,
+        cx: &mut Context<Self>,
+    ) {
+        let image = AttachmentImage {
+            machine,
+            thread_id,
+            id: id.clone(),
+        };
+        let preview = ChipPreview::Image(image.thumbnail());
+        let chip = self.insert_pending_chip(None, "Image", IconName::Image, preview, cx);
+        let source = Machines::global(cx).read(cx).client(machine, cx);
+        let client = self.client.clone();
+        let this_thread = self.thread_id;
+        let upload = cx.spawn(async move |this, cx| {
+            let result = async {
+                let source = source.context("the machine it was copied on is gone")?;
+                let response = source
+                    .read_with(cx, |client, _| {
+                        client.request(Request::Attachment {
+                            thread_id,
+                            id,
+                            thumbnail: false,
+                        })
+                    })
+                    .await?;
+                let Response::AttachmentData(data) = response else {
+                    anyhow::bail!("unexpected response: {response:?}");
+                };
+                let response = client
+                    .read_with(cx, |client, _| {
+                        client.request(Request::AddAttachment {
+                            thread_id: this_thread,
+                            mime_type: data.mime_type,
+                            data: data.data,
+                        })
+                    })
+                    .await?;
+                match response {
+                    Response::Attachment(id) => Ok(Mention::Image(id)),
+                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.upload_finished(chip, result, "Couldn't attach the image", cx)
+            })
+            .log_err();
+        });
+        self.uploads.insert(chip, upload);
     }
 
     /// A pasted or dropped file (one copied in Finder too): an image becomes an Image chip,
@@ -2682,7 +2803,7 @@ impl AgentView {
         }
         match result {
             Ok(mention) => {
-                self.mentions.insert(chip, mention);
+                self.set_mention(chip, mention, cx);
                 self.save_unsent_text(cx);
                 if self.send_after_uploads && self.uploads.is_empty() {
                     self.send_after_uploads = false;
@@ -2719,9 +2840,18 @@ impl AgentView {
         let chip = self.composer.update(cx, |composer, cx| {
             composer.insert_chip(range, label, icon.path().into(), preview, copy_text, cx)
         });
-        self.mentions.insert(chip, mention);
+        self.set_mention(chip, mention, cx);
         self.mention_kind = MentionKind::Any;
         cx.notify();
+    }
+
+    /// Records what a chip mentions, and gives it what copying it carries.
+    fn set_mention(&mut self, chip: ChipId, mention: Mention, cx: &mut Context<Self>) {
+        if let Some(payload) = mention.copied(self.client.read(cx).machine(), self.thread_id) {
+            self.composer
+                .update(cx, |composer, _| composer.set_chip_payload(chip, payload));
+        }
+        self.mentions.insert(chip, mention);
     }
 
     /// Forgets what the chips no longer in the composer mentioned.
@@ -5359,18 +5489,11 @@ impl AgentView {
             Entry::UserMessage(_) if self.thread.read(cx).is_task_notice(index) => {
                 div().into_any_element()
             }
-            Entry::UserMessage(text) => {
+            Entry::UserMessage(_) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 if self.is_task_message(index, cx) {
                     return self.render_task_card(index, style, cx);
                 }
-                let (text, images) = without_image_links(without_handoff(text));
-                let has_text = !text.is_empty();
-                // t3code's: the images above the text.
-                let thumbnails = (!images.is_empty()).then(|| {
-                    self.render_message_images(index, &images, 0..images.len(), cx)
-                        .when(has_text, |this| this.mb_2())
-                });
                 // Messages from other threads' agents are marked, as t3code marks
                 // `createdBy: agent`.
                 let sent_by = self.thread.read(cx).prompt_sender(index).map(|sender| {
@@ -5421,10 +5544,7 @@ impl AgentView {
                             .rounded_xl()
                             .bg(user_message_background(cx))
                             .text_ui(cx)
-                            .children(thumbnails)
-                            .when(has_text, |this| {
-                                this.children(self.markdown((index, 0), style, cx))
-                            }),
+                            .children(self.markdown((index, 0), style, cx)),
                     )
                     .child(
                         h_flex()
@@ -5450,11 +5570,9 @@ impl AgentView {
                                                 if let Some(Entry::UserMessage(text)) =
                                                     this.thread.read(cx).entries().get(index)
                                                 {
-                                                    cx.write_to_clipboard(
-                                                        gpui::ClipboardItem::new_string(
-                                                            without_handoff(text).to_string(),
-                                                        ),
-                                                    );
+                                                    let item = this
+                                                        .copied_message(without_handoff(text), cx);
+                                                    cx.write_to_clipboard(item);
                                                 }
                                             }),
                                         ),
@@ -9546,6 +9664,21 @@ impl AgentView {
         cx.notify();
     }
 
+    /// What copying a sent message gives: its text, its images as the `@Image` the composer's
+    /// chips copy as, and with each what pasting it in a composer needs to bring the image back.
+    fn copied_message(&self, text: &str, cx: &App) -> ClipboardItem {
+        let (text, images) = with_image_names(text);
+        let machine = self.client.read(cx).machine();
+        let chips = images
+            .into_iter()
+            .filter_map(|(range, id)| {
+                let payload = Mention::Image(id).copied(machine, self.thread_id)?;
+                Some(CopiedChip { range, payload })
+            })
+            .collect();
+        CopiedChip::clipboard_item(text, chips)
+    }
+
     /// Puts a message in the composer, its mentions as chips.
     fn restore_prompt(&mut self, prompt: &[PromptPart], cx: &mut Context<Self>) {
         self.composer
@@ -9566,55 +9699,65 @@ impl AgentView {
                 after_chip = false;
                 continue;
             }
-            let (label, icon, preview, mention) = match part {
-                PromptPart::Path(path) => {
-                    let label = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
-                    let is_dir =
-                        self.client.read(cx).machine() == MachineId::Local && path.is_dir();
-                    let icon = if is_dir {
-                        IconName::Folder
-                    } else {
-                        IconName::File
-                    };
-                    let preview = ChipPreview::Text(compact_path(path).into());
-                    (label, icon, preview, Mention::Path(path.clone()))
-                }
-                PromptPart::Thread(thread_id) => {
-                    let title: SharedString = self.thread_title(*thread_id, cx).into();
-                    (
-                        title.to_string(),
-                        IconName::Thread,
-                        ChipPreview::Text(title),
-                        Mention::Thread(*thread_id),
-                    )
-                }
-                PromptPart::Image(id) => {
-                    let image = self.attachment_image(id.clone(), cx);
-                    (
-                        "Image".to_string(),
-                        IconName::Image,
-                        ChipPreview::Image(image.thumbnail()),
-                        Mention::Image(id.clone()),
-                    )
-                }
-                PromptPart::Conversation { uri, title, text } => (
-                    title.clone(),
-                    self.conversation_icon(uri, cx),
-                    ChipPreview::Text(title.clone().into()),
-                    Mention::Conversation {
-                        uri: uri.clone(),
-                        title: title.clone(),
-                        text: text.clone(),
-                    },
-                ),
-                PromptPart::Text(_) => continue,
+            let Some((label, icon, preview, mention)) = self.mention_chip(part, cx) else {
+                continue;
             };
             self.insert_mention(None, &label, icon, preview, mention, cx);
             after_chip = true;
         }
+    }
+
+    /// A prompt part's chip, its label, icon and preview, and what it mentions. Text isn't one.
+    fn mention_chip(
+        &self,
+        part: &PromptPart,
+        cx: &App,
+    ) -> Option<(String, IconName, ChipPreview, Mention)> {
+        Some(match part {
+            PromptPart::Path(path) => {
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let is_dir = self.client.read(cx).machine() == MachineId::Local && path.is_dir();
+                let icon = if is_dir {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                };
+                let preview = ChipPreview::Text(compact_path(path).into());
+                (label, icon, preview, Mention::Path(path.clone()))
+            }
+            PromptPart::Thread(thread_id) => {
+                let title: SharedString = self.thread_title(*thread_id, cx).into();
+                (
+                    title.to_string(),
+                    IconName::Thread,
+                    ChipPreview::Text(title),
+                    Mention::Thread(*thread_id),
+                )
+            }
+            PromptPart::Image(id) => {
+                let image = self.attachment_image(id.clone(), cx);
+                (
+                    "Image".to_string(),
+                    IconName::Image,
+                    ChipPreview::Image(image.thumbnail()),
+                    Mention::Image(id.clone()),
+                )
+            }
+            PromptPart::Conversation { uri, title, text } => (
+                title.clone(),
+                self.conversation_icon(uri, cx),
+                ChipPreview::Text(title.clone().into()),
+                Mention::Conversation {
+                    uri: uri.clone(),
+                    title: title.clone(),
+                    text: text.clone(),
+                },
+            ),
+            PromptPart::Text(_) => return None,
+        })
     }
 
     /// A message's text as the queue shows it, its mentions as copying their chips gives.
@@ -9777,6 +9920,9 @@ impl AgentView {
         cx: &Context<Self>,
     ) -> Option<MarkdownElement> {
         let markdown = self.markdowns.get(&key)?;
+        // An image's link draws as the chip the composer draws for it.
+        let mut style = style;
+        style.link_chip = Some(Rc::new(|url, _| image_chip(url)));
         let hovered = cx.weak_entity();
         let clicked = cx.weak_entity();
         let viewer = cx.weak_entity();
@@ -9834,8 +9980,20 @@ impl AgentView {
                     Some(id) => {
                         clicked
                             .update(cx, |this, cx| {
-                                let images = this.viewed_images(&[id], None, cx);
-                                this.view_images(images, 0, cx);
+                                // The viewer goes through all of a user's message's images.
+                                let mut ids = match this.thread.read(cx).entries().get(key.0) {
+                                    Some(Entry::UserMessage(text)) => message_images(text),
+                                    _ => Vec::new(),
+                                };
+                                let index = match ids.iter().position(|other| *other == id) {
+                                    Some(index) => index,
+                                    None => {
+                                        ids = vec![id];
+                                        0
+                                    }
+                                };
+                                let images = this.viewed_images(&ids, None, cx);
+                                this.view_images(images, index, cx);
                             })
                             .ok();
                     }
@@ -14555,7 +14713,7 @@ fn turn_preview(
     };
     let end = turns.get(turn + 1).copied().unwrap_or(entries.len());
     let message = match entries.get(start) {
-        Some(Entry::UserMessage(text)) => compact(&without_image_links(without_handoff(text)).0),
+        Some(Entry::UserMessage(text)) => compact(&with_image_names(without_handoff(text)).0),
         _ => None,
     };
     let reply = entries
@@ -14567,7 +14725,7 @@ fn turn_preview(
             Entry::AgentMessage(text) => Some(text),
             _ => None,
         })
-        .and_then(|text| compact(&without_image_links(text).0));
+        .and_then(|text| compact(&without_image_links(text)));
     (message.unwrap_or_else(|| "User message".into()), reply)
 }
 
@@ -18938,43 +19096,237 @@ mod tests {
         })
     }
 
-    /// The user's images show as thumbnails above the message's text, two to a row, and a
-    /// click opens one with arrows to the others.
+    /// The user's images show in their message where they were written, as the chips the
+    /// composer draws for them and not as thumbnails above it. The mouse on one shows its
+    /// thumbnail, and a click opens it, with arrows to the message's other images.
     #[gpui::test]
-    fn a_messages_images_show_as_thumbnails(cx: &mut TestAppContext) {
+    fn a_messages_images_show_in_place_as_chips(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         let client = view.read_with(cx, |view, _| view.client.clone());
         serve_images(&client, cx);
         let second = AttachmentId::parse(&format!("{}.png", "cd".repeat(32))).expect("an id");
         let message = format!(
-            "{} {} The sidebar is cut off.",
+            "{} In this one the sidebar is cut off, and in this: {} it's not.",
             image_id().markdown_link(),
             second.markdown_link()
         );
         thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(vec![Entry::UserMessage(message)], cx)
+            thread.set_entries_for_test(vec![Entry::UserMessage(message.clone())], cx)
         });
         cx.run_until_parked();
-        let first = cx
-            .debug_bounds("message-image-0-0")
-            .expect("the first thumbnail");
-        let next = cx
-            .debug_bounds("message-image-0-1")
-            .expect("the second thumbnail");
-        assert_eq!(first.size, MESSAGE_IMAGE_SIZE);
-        assert_eq!(next.top(), first.top());
-        assert_eq!(next.left(), first.right() + px(8.));
+        assert!(cx.debug_bounds("message-image-0-0").is_none());
         let markdown = view.read_with(cx, |view, cx| {
             view.markdowns[&(0, 0)].read(cx).source().to_string()
         });
-        assert_eq!(markdown, "The sidebar is cut off.");
+        assert_eq!(markdown, message);
 
-        cx.simulate_click(next.center(), gpui::Modifiers::none());
+        // The first image's chip starts the message's text.
+        let text = cx.debug_bounds("inner").expect("the message's text");
+        let on_chip = gpui::point(text.left() + px(3.), text.top() + px(10.));
+        assert!(cx.debug_bounds("image-hover-preview").is_none());
+        cx.simulate_mouse_move(on_chip, None, gpui::Modifiers::none());
         cx.run_until_parked();
-        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image · 2 of 2"));
-        cx.simulate_keystrokes("right");
+        assert!(cx.debug_bounds("image-hover-preview").is_some());
+        let past_chip = gpui::point(text.left() + px(300.), on_chip.y);
+        cx.simulate_mouse_move(past_chip, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("image-hover-preview").is_none());
+
+        cx.simulate_click(on_chip, gpui::Modifiers::none());
+        cx.run_until_parked();
         assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image · 1 of 2"));
+        cx.simulate_keystrokes("right");
+        assert_eq!(viewer_caption(&view, cx).as_deref(), Some("Image · 2 of 2"));
+    }
+
+    /// A message of only an image shows its chip, and the turn rail names it as the composer's
+    /// chip copies.
+    #[test]
+    fn a_turn_names_its_images_in_its_preview() {
+        let entries = [
+            Entry::UserMessage(format!("Why {} ?", image_id().markdown_link())),
+            Entry::AgentMessage(format!("Because.\n\n{}", image_id().markdown_link())),
+        ];
+        let (message, reply) = turn_preview(&entries, &[0], 0);
+        assert_eq!(message.as_ref(), "Why @Image ?");
+        assert_eq!(reply.as_deref(), Some("Because."));
+    }
+
+    /// Copying a sent message gives its images as `@Image`, and takes along what a composer
+    /// needs to bring each back as a chip: from this thread's store at once, and from another
+    /// thread's once it's fetched and kept here.
+    #[gpui::test]
+    fn pasting_a_copied_message_brings_its_images_along(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requested = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Request>::new()));
+        client.update(cx, |client, _| {
+            let requested = requested.clone();
+            client.answer_for_test(move |request| {
+                requested.borrow_mut().push(request.clone());
+                match request {
+                    Request::Attachment { .. } => Some(Response::AttachmentData(
+                        agentz_protocol::attachments::AttachmentData {
+                            mime_type: "image/png".into(),
+                            data: TINY_PNG.into(),
+                        },
+                    )),
+                    Request::AddAttachment { .. } => Some(Response::Attachment(image_id())),
+                    _ => None,
+                }
+            })
+        });
+        let message = format!("In this {} it looks like that", image_id().markdown_link());
+        let copied = view.read_with(cx, |view, cx| view.copied_message(&message, cx));
+        assert_eq!(
+            copied.text().as_deref(),
+            Some("In this @Image it looks like that")
+        );
+
+        let chips = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.composer.read(cx).chips().len())
+        };
+        let prompt =
+            |cx: &mut VisualTestContext| view.read_with(cx, |view, cx| view.composer_prompt(cx));
+        let expected = vec![
+            PromptPart::Text("In this ".into()),
+            PromptPart::Image(image_id()),
+            PromptPart::Text(" it looks like that".into()),
+        ];
+
+        // An agent that takes no images gets the text.
+        view.update(cx, |view, cx| view.paste_into_composer(&copied, false, cx));
+        assert_eq!(chips(cx), 0);
+        assert_eq!(
+            prompt(cx),
+            PromptPart::text("In this @Image it looks like that")
+        );
+        accept_images(&view, cx);
+
+        // Here: the chip is there at once, with nothing to fetch.
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |composer, cx| composer.set_text("", cx));
+            view.paste_into_composer(&copied, false, cx)
+        });
+        assert_eq!(chips(cx), 1);
+        assert_eq!(prompt(cx), expected);
+        cx.run_until_parked();
+        assert!(!requested.borrow().iter().any(|request| matches!(
+            request,
+            Request::Attachment {
+                thumbnail: false,
+                ..
+            } | Request::AddAttachment { .. }
+        )));
+
+        // As text, where the user asked for no more than that.
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |composer, cx| composer.set_text("", cx));
+            view.paste_into_composer(&copied, true, cx)
+        });
+        assert_eq!(chips(cx), 0);
+        assert_eq!(
+            prompt(cx),
+            PromptPart::text("In this @Image it looks like that")
+        );
+
+        // From another thread: its copy is fetched, and kept for this one.
+        let elsewhere = {
+            let (text, mut chips) = text_input::CopiedChip::from_clipboard(&copied).expect("chips");
+            let mut mention: CopiedMention =
+                serde_json::from_str(&chips[0].payload).expect("a mention");
+            mention.thread = ThreadId(9);
+            chips[0].payload = serde_json::to_string(&mention).expect("json");
+            text_input::CopiedChip::clipboard_item(text, chips)
+        };
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |composer, cx| composer.set_text("", cx));
+            view.paste_into_composer(&elsewhere, false, cx)
+        });
+        assert_eq!(chips(cx), 1);
+        assert_eq!(view.read_with(cx, |view, _| view.uploads.len()), 1);
+        cx.run_until_parked();
+        let requests = requested.borrow();
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            Request::Attachment {
+                thread_id: ThreadId(9),
+                thumbnail: false,
+                ..
+            }
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            Request::AddAttachment {
+                thread_id: ThreadId(2),
+                ..
+            }
+        )));
+        drop(requests);
+        assert_eq!(view.read_with(cx, |view, _| view.uploads.len()), 0);
+        assert_eq!(prompt(cx), expected);
+    }
+
+    /// The agent takes images.
+    fn accept_images(view: &Entity<AgentView>, cx: &mut VisualTestContext) {
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| state.capabilities.prompt_capabilities.image = true,
+                cx,
+            )
+        });
+    }
+
+    /// What the composer copies takes its images along: pasting it in a composer makes them
+    /// chips again, and pasting it anywhere else is its text.
+    #[gpui::test]
+    fn copying_from_the_composer_keeps_its_images(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        serve_images(&client, cx);
+        accept_images(&view, cx);
+        let png = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(TINY_PNG)
+                .expect("a PNG")
+        };
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("In this ");
+        view.update(cx, |view, cx| {
+            view.insert_image(gpui::ImageFormat::Png, png, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_input("it looks like that");
+        let prompt =
+            |cx: &mut VisualTestContext| view.read_with(cx, |view, cx| view.composer_prompt(cx));
+        let written = prompt(cx);
+        assert_eq!(
+            written,
+            [
+                PromptPart::Text("In this ".into()),
+                PromptPart::Image(image_id()),
+                PromptPart::Text(" it looks like that".into()),
+            ]
+        );
+
+        cx.simulate_keystrokes("secondary-a secondary-x");
+        let item = cx.read_from_clipboard().expect("what was cut");
+        assert_eq!(
+            item.text().as_deref(),
+            Some("In this @Image it looks like that")
+        );
+        assert_eq!(prompt(cx), Vec::<PromptPart>::new());
+
+        cx.simulate_keystrokes("secondary-v");
+        cx.run_until_parked();
+        assert_eq!(prompt(cx), written);
     }
 
     /// An image in the agent's reply shows as a thumbnail where it is in the text.
@@ -19114,17 +19466,40 @@ mod tests {
         assert_eq!(copied.as_deref(), Some("Copy this reply"));
     }
 
+    /// What copying a selection with an image's chip in it gives for the chip is what copying
+    /// the composer's chip gives.
+    #[gpui::test]
+    fn copying_a_selected_image_chip_gives_its_mention(cx: &mut TestAppContext) {
+        cx.update(crate::init_for_test);
+        let source = format!("In {} it looks wrong", image_id().markdown_link());
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+            MarkdownView(markdown)
+        });
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds("markdown").expect("the message");
+        let start = gpui::point(bounds.left() + px(1.), bounds.top() + px(8.));
+        let end = gpui::point(bounds.right() - px(1.), bounds.top() + px(8.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_keystrokes("secondary-c");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("In @Image it looks wrong"));
+    }
+
     struct MarkdownView(Entity<Markdown>);
 
     impl Render for MarkdownView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let style = MarkdownStyle {
+                link_chip: Some(Rc::new(|url, _| image_chip(url))),
+                ..MarkdownStyle::default()
+            };
             div()
                 .w(px(600.))
                 .debug_selector(|| "markdown".into())
-                .child(MarkdownElement::new(
-                    self.0.clone(),
-                    MarkdownStyle::default(),
-                ))
+                .child(MarkdownElement::new(self.0.clone(), style))
         }
     }
 
