@@ -16,8 +16,11 @@ arch=$(uname -m)
 server_target="$arch-unknown-linux-musl"
 app_id=dev.agentz.agentZ
 
-# The release profile's debug info would more than double the download.
-CARGO_PROFILE_RELEASE_STRIP=debuginfo cargo build --release -p app --bin agentz
+# The release profile's debug info would more than double the download, and the symbol table
+# that's left is a large part of what remains (Zed's "Strip local symbols from macOS and Linux
+# release bundles": about 100 MB of its binary). A panic's backtrace then has addresses only;
+# rebuild the same commit with `CARGO_PROFILE_RELEASE_STRIP=debuginfo` to read one.
+CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release -p app --bin agentz
 if [ ! -f "target/remote-servers/agentz-server-$server_target" ]; then
     tooling/build-remote-servers.sh "$server_target"
 fi

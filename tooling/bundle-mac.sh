@@ -27,8 +27,10 @@ esac
 mac_targets="aarch64-apple-darwin x86_64-apple-darwin"
 if [ "$universal" = true ]; then
     for target in $mac_targets; do
-        # The release profile's debug info would more than double the download.
-        CARGO_PROFILE_RELEASE_STRIP=debuginfo \
+        # The release profile's debug info would more than double the download, and the symbol
+        # table is a large part of the rest (Zed strips local symbols from its bundles for the
+        # same reason); a panic's backtrace then has addresses only.
+        CARGO_PROFILE_RELEASE_STRIP=symbols \
             cargo build --release -p app -p agentz_server --bin agentz --bin agentz-server \
             --target "$target"
     done
