@@ -96,17 +96,17 @@ background process shows in it ([screenshot](backlog/opencode-subagents-not-work
 turn's footer, then "Running Author Foundation R1+R2 sets: shell" below it, and no Working in
 the sidebar).
 
-### The composer's usage shows the lowest window
+### Choose which usage window the composer shows
 
 The usage badge beside the composer's agent picker ([screenshot](backlog/composer-usage.png),
-"0%" in red beside Claude Agent) shows the lowest of the account's windows. Show only the
-current session (the 5-hour window) instead. The one exception: when a longer window, weekly or
-monthly, is at 0, show that one, even if the current session has plenty left, since nothing
-works until it resets.
+"0%" in red beside Claude Agent) shows the lowest of the account's windows. Make what it shows
+configurable. The choice the user wants: only the current session (the 5-hour window), except
+when a longer window, weekly or monthly, is at 0. Then show that one, even if the current
+session has plenty left, since nothing works until it resets.
 
 The composer's account picker needs the session limits too
 ([screenshot](backlog/account-picker-usage.png), emails covered): each account there shows a
-single "N% left".
+single "N% left". The same setting applies there.
 
 ## Features
 
