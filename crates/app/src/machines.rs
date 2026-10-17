@@ -433,6 +433,19 @@ impl Machines {
     fn sync_servers(&mut self, cx: &mut Context<Self>) {
         self.sync_peers(cx);
         self.sync_design_defaults(cx);
+        self.sync_auto_archive(cx);
+    }
+
+    /// Gives each server the setting for archiving threads left alone, which it keeps.
+    fn sync_auto_archive(&mut self, cx: &mut Context<Self>) {
+        let days = AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .auto_archive
+            .days();
+        for client in self.clients.clone() {
+            client.update(cx, |client, cx| client.set_auto_archive(days, cx));
+        }
     }
 
     /// Gives each server General's design defaults, and those of its projects whose combined

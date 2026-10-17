@@ -154,6 +154,9 @@ pub struct ServerClient {
     peers_sent: Option<Peers>,
     /// The design defaults the server was last given, this connection.
     design_settings_sent: Option<DesignSettings>,
+    /// The days of inactivity the server was last told to archive threads after, this
+    /// connection.
+    auto_archive_sent: Option<Option<u32>>,
     #[cfg(test)]
     sent_for_test: std::cell::RefCell<Vec<Request>>,
     /// Answers requests as the server would, for a test client.
@@ -203,6 +206,7 @@ impl ServerClient {
                 retry_now: None,
                 peers_sent: None,
                 design_settings_sent: None,
+                auto_archive_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
                 #[cfg(test)]
@@ -395,6 +399,16 @@ impl ServerClient {
         }
         self.send(Request::SetDesignDefaults(settings.clone()), cx);
         self.design_settings_sent = Some(settings);
+    }
+
+    /// Tells the server how long a thread may go unused before it archives it, when that's
+    /// changed.
+    pub(crate) fn set_auto_archive(&mut self, days: Option<u32>, cx: &App) {
+        if !self.is_online() || self.auto_archive_sent == Some(days) {
+            return;
+        }
+        self.send(Request::SetAutoArchive(days), cx);
+        self.auto_archive_sent = Some(days);
     }
 
     /// The server was told of this checkout, so its agents may work there. Without one, the
@@ -842,6 +856,7 @@ impl ServerClient {
         self.connection = Some(connection);
         self.peers_sent = None;
         self.design_settings_sent = None;
+        self.auto_archive_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.upload_progress = None;

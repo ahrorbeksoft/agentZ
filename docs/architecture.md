@@ -148,6 +148,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `skills.json` | server | The accounts each of agentZ's skills is kept off (its accounts menu) |
 | `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
+| `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
 | `artifacts/<id>/` | server | An artifact: `meta.json` (title, kind, versions, its thread and project), `pages/<version>.md` (a document) or `.json` (a design), each version's files (`files/<version>/`: a document's downloads, a design's pictures and pages), and a design's picks (`picks/<version>.json`) |
@@ -194,7 +195,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Bundle** (`tooling/bundle-linux.sh`, Zed's `bundle-linux`): `agentz.app` with `bin/agentz`,
   the static musl `agentz-server` beside it (so it can install itself on a machine like this),
   other machines' servers in `remote-servers/`, a desktop entry and the icon. It carries no
-  libraries: the app links only libc, xkbcommon and xcb.
+  libraries: the app links only libc, xkbcommon and xcb. The published builds (this and
+  `bundle-mac.sh --universal`) strip every symbol (`CARGO_PROFILE_RELEASE_STRIP=symbols`), as
+  the remote servers already were. That's what Zed's smaller binaries (~30%) mostly are:
+  stripping local symbols from its bundles took about 100 MB off. Its other size changes are
+  in crates agentZ lacks (editor, rpc, settings), and the gpui and ui ones (#64261, #64262)
+  only trim LLVM IR; agentZ already has the `rodio` features trimmed and `rust-embed`'s
+  `compression` (#64260), and leaves share-generics off, which Zed turned off again (#64335).
+  A panic's backtrace in a published build has addresses only: rebuild the commit with
+  `CARGO_PROFILE_RELEASE_STRIP=debuginfo` to read it.
 
 ### Window, sidebar and settings
 
@@ -305,6 +314,22 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   activity first, the rest keep that order, so a card dragged among them only unpins or
   unarchives. An agent CLI card moves only among the rest. Archiving unpins and drops a
   thread's keys. Agents pin and unpin with `agentz_thread_organize`.
+- **Working group** (`Sidebar::render_threads`, `AppSettings::working_group`; t3code's Working
+  shelf, off by default, Settings › General › Threads › Group working threads): the cards of
+  threads whose agents are working and need nothing from the user (`ThreadStatus::Working`:
+  not blocked on a permission, not awaiting input, subthreads counted) fold out of the list
+  into a Working group under the other cards, with the normal card style and a header like
+  Archived's (open or closed in this window alone). Pinned cards stay put, and while a card is
+  dragged the list is left as it is.
+- **Auto-archive** (`AppSettings::auto_archive`, Settings › General › Threads › Auto-archive
+  threads: Never, After a day, After 3 days, After a week; `agentz_server::server::auto_archive`):
+  the app gives every server the days (`Request::SetAutoArchive`, from `Machines::sync_servers`
+  as it changes and as it connects), and the server keeps them in `auto-archive.json`, so threads
+  archive while the app is closed. It checks at start, as the setting changes and every 10
+  minutes, and archives (`ProjectStore::stale_threads`) the agent threads in the thread list
+  whose last activity (or creation) is older than that, unless pinned, working, blocked,
+  awaiting input or waiting, open in some client, or with something for their agent to do.
+  Chats, Workspaces threads, drafts, subthreads and terminal threads are never archived.
 - **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
   (below, under Agent threads) aren't cards. One with text typed in it is a row above the cards,
   newest first, with its project, a gray "Draft" badge at the end of that line
@@ -744,9 +769,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   its lines dim after the path ("lines 1–120") and opens, as other rows do, to what it got in
   the file view, numbered in a gutter (`tool_calls::read_file_lines`): Claude Agent's own
   numbers ("845→") move out of the text, and other agents' bare text is numbered from where
-  the read started (its location, its input's `offset`, or its title's range). An edit
-  opens to a header per file (its icon, path, +2 −2 and Open, which shows the file in the
-  diff panel: `AgentViewEvent::OpenDiffFile`, `DiffPanel::reveal_file`) over its diff, with
+  the read started (its location, its input's `offset`, or its title's range). Factory Droid
+  (0.244) answers a read with one summary line instead of the file ("Read src/app.html: lines
+  1-109 (109 lines, 3.4 KiB); the file holds the bytes"): the row then shows its range
+  (`tool_calls::read_summary`), has nothing to open, and the line itself isn't shown. An edit of
+  one file opens to its diff, and its row, which already has the path and +2 −2, has Open
+  once opened (`single_diff_in_row`); an edit of several files opens to a header per file
+  (its icon, path, +2 −2 and Open) over each diff. Open shows the file in the
+  diff panel (`AgentViewEvent::OpenDiffFile`, `DiffPanel::reveal_file`). Diffs have
   the new file's line numbers in a gutter when the agent says where each hunk starts
   (`FileDiff::start_line`, from Claude Agent's locations). A new file says "Created" (+3) and
   opens to its lines with numbers, not a diff; "Deleted" (−42) opens to its lines, dimmer;
@@ -818,13 +848,26 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   task ends, Claude Agent goes on with no prompt. A message, thought or tool call while no turn
   runs (and the session is open, and no stop is in flight, whose note doesn't count) makes the
   thread work as for a turn, with its reply as a new message, until the agent's result (a
-  usage update with its cost) or 30 seconds without updates or running tool calls. Messages sent
-  meanwhile wait for it, as for a turn; Stop cancels it.
-- **Stop** (`AgentThread::{cancel, end_unanswered_turn}`; Zed's `cancel_inner` ends the turn at
-  once): Stop sends `session/cancel` and the turn ends when the agent answers its prompt as
-  cancelled. One that hasn't answered 10 seconds later ends as stopped all the same, its
-  running tool calls Stopped, and the agent restarts with its session (Reload Agent), since
-  Factory Droid refuses a prompt while it still has one. Droid never answers a prompt whose
+  usage update with its cost, which doesn't end it while a background task or a tool call is
+  still running) or 30 seconds without updates or running tool calls. Messages sent meanwhile
+  wait for it, as for a turn; Stop cancels it. Its permission requests and questions go with
+  it, so a request nobody can answer any more doesn't keep "Waiting for you" up.
+  A turn that ends while background work goes on (a background task running, or a subagent
+  sent to the background by Factory Droid's Task with `await: false`, `ToolCall::
+  sends_subagent_to_background`) stays working (`linger_for_background_work`) as work of its
+  own: ACP says nothing while it runs, and the agent wakes by itself with the result. It ends
+  as the work does (the last background task stopping or the agent's result), or after 20
+  minutes of 30-second checks (`OWN_WORK_QUIET_ROUNDS`) for work that only seems to run, such
+  as a tool call never closed. The sidebar has no Waiting status for it: the thread shows
+  Working until it's over, then Completed (`Server::is_waiting` holds that back).
+- **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
+  `cancel_inner` ends the turn at once): Stop sends `session/cancel` and the turn ends when the
+  agent answers its prompt as cancelled. One that hasn't answered 5 seconds later
+  (`STOP_TIMEOUT`) ends as stopped all the same, its running tool calls Stopped, and the agent
+  restarts with its session (Reload Agent), since Factory Droid refuses a prompt while it
+  still has one. Stopping work of the agent's own (no prompt in flight, so Droid's `cancel`
+  does nothing) ends it as stopped at once, and if the agent still sends updates 5 seconds
+  later, it restarts the same way; new work of its own is ignored meanwhile. Droid never answers a prompt whose
   session it closed meanwhile: it closes one after 30 minutes without activity, even while
   the turn waits on the user's answer, so agentZ starts it with the longest wait it takes
   (`OVERRIDE_DROID_SESSION_TIMEOUT_MS`, from `AgentDescription::variables`, which every
@@ -974,10 +1017,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in
-  a started thread's composer, what's left of its account's window closest to running out
-  ("62%", leaving out windows past their reset) on a borderless button like the pickers'
-  beside it, yellow at 15% or less and red when used up, with the window's name in its tooltip
-  ("Weekly: 3% left"). It shows once the account has a
+  a started thread's composer, what's left of one of its account's windows ("62%", leaving out
+  windows past their reset) on a borderless button like the pickers' beside it, yellow at 15%
+  or less and red when used up, with the window's name in its tooltip ("Weekly: 3% left").
+  Which window is Settings › General › Threads › Usage shown in the composer
+  (`AppSettings::usage_window`, `usage_limits::shown_window`), which the account picker's rows
+  follow too: the current session, the account's shortest window (the 5-hour one), unless a
+  longer window is used up (then the one that resets last, since nothing works until it does),
+  or the lowest of them all. It shows once the account has a
   read, and not while it's found logged out. A click opens that account's windows (avatar,
   name, plan, the limit rows) with Usage ↗ for the agent's usage page, the card's limit resets
   line, whose Use Reset closes it for the thread's question
@@ -1002,13 +1049,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   existing one), the machine picker (each copy of a combined project with how it stands in
   git, see Project copies in sync), the account picker and the branch, which reads "From main"
   for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
-  only the draft's plan until its first message (`Request::PlanWorkspace`). Changing anything
+  only the draft's plan until its first message (`Request::PlanWorkspace`). In a small pane
+  (under 480 px wide or 420 px high: `AgentView::is_new_thread_compact`) the screen is
+  top-aligned and scrolls, its padding and headline shrink, and the composer's controls wrap
+  onto more lines, so nothing is cut off. Changing anything
   else replaces the draft with a new one, and the old one leaves the store at once
   (`ProjectStore::delete_thread`), so its row doesn't flash in the thread list until the
   server answers. The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
   draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
-  out") and the window closest to running out (`usage_limits::tightest_window`), the draft's
+  out") and the window the usage setting picks (`usage_limits::shown_window`), the draft's
   under "This thread" and the others under "Switch to", as a sent thread's, then Manage
   Accounts…, which opens the agent's Account tab on the thread's machine
   (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`). Another
@@ -1413,6 +1463,10 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   how many variants, today's, sizes, pictures or pages), the project's or General's
   (`DesignSettings::for_project`, `Request::SetDesignDefaults`), so its tool list is made per
   caller (`Request::ListTools { caller }`). Any thread's or chat's agent can publish.
+  Agents treat a description as advice, and a session lists its tools once, so the defaults are
+  also enforced as they are when a design is published (`DesignDefaults::deviations`): one that
+  differs (variants a topic, today's, desktop or phone, pictures or pages) is sent back saying
+  how, unless it has a `deviationReason`, a sentence that then shows in the design's intro.
 - **Reading** (`agentz_artifact_read`): a document's Markdown, or the whole design as text,
   like a round's README and decisions.md together (`artifacts::design_text`): whether it's
   submitted, the intro, then a heading per topic with the pick by letter and name, the
@@ -1535,7 +1589,7 @@ Designed in `design/sounds/` and `design/notifications/`.
   decides "done" against the
   completions it has displayed (`viewed.json`), so viewing in one client doesn't clear another.
 - Statuses by priority: Pending Approval (warning), Awaiting Input (purple, each theme's fourth
-  player color), Working, Waiting, Completed. Agent control's tools report
+  player color), Working, Completed. Agent control's tools report
   `waiting_for_input`.
 - "Displayed" is Zed's `agent_status_visible`: window active, settings closed, thread open.
 - **Sounds** (`sound.rs`, played with `NSSound`): Zed's agent-done sound as a thread finishes,

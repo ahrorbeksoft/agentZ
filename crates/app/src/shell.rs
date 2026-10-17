@@ -1172,7 +1172,7 @@ impl Shell {
         let caption = match status {
             ThreadStatus::PendingApproval => "Waiting for tool confirmation",
             ThreadStatus::AwaitingInput => "Waiting for your input",
-            ThreadStatus::Working | ThreadStatus::Waiting | ThreadStatus::Completed => "Finished",
+            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
         };
         let project = store
             .thread_project(thread.id)
@@ -1231,7 +1231,7 @@ impl Shell {
             .unwrap_or_default();
         let caption = match status {
             ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput => "Needs attention",
-            ThreadStatus::Working | ThreadStatus::Waiting | ThreadStatus::Completed => "Finished",
+            ThreadStatus::Working | ThreadStatus::Completed => "Finished",
         };
         let mut body = format!(
             "{} › {} · {caption}",
@@ -3183,6 +3183,108 @@ mod modal_tests {
             shell.new_thread(&NewThread, window, cx)
         });
         cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_some()));
+    }
+
+    /// Cmd-, (Ctrl-, on Linux) opens Settings from anywhere, a focused terminal included.
+    #[gpui::test]
+    fn cmd_comma_opens_settings_while_a_terminal_has_focus(cx: &mut TestAppContext) {
+        init_places(cx);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        let terminal: projects::Thread = serde_json::from_value(serde_json::json!({
+            "id": 6,
+            "project_id": 1,
+            "title": "demo shell",
+            "terminal": {},
+        }))
+        .expect("a terminal thread");
+        cx.update(|_, cx| {
+            let client = Machines::local(cx);
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                let mut snapshot = store.snapshot();
+                snapshot.threads.push(terminal);
+                store.set_snapshot(snapshot, cx)
+            });
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.open_thread(
+                ThreadKey {
+                    machine: MachineId::Local,
+                    thread: ThreadId(6),
+                },
+                window,
+                cx,
+            )
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            let Some(OpenThread {
+                view: ThreadView::Terminal(view),
+                ..
+            }) = shell
+                .open_threads
+                .get(&shell.active_thread.expect("an open thread"))
+            else {
+                panic!("the terminal thread is open");
+            };
+            assert!(view.focus_handle(cx).is_focused(window));
+        });
+        assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_none()));
+
+        cx.simulate_keystrokes("secondary-,");
+        assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_some()));
+    }
+
+    /// The same in Workspaces, where a terminal pane holds the focus.
+    #[gpui::test]
+    fn cmd_comma_opens_settings_while_a_workspaces_terminal_has_focus(cx: &mut TestAppContext) {
+        use agentz_protocol::layout::{Node, PaneId};
+        use agentz_protocol::spaces::{
+            Pane, PaneContent, PaneTerminal, Space, SpaceId, Tab, TabId,
+        };
+
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let spaces = SpacesSnapshot {
+                spaces: vec![Space {
+                    id: SpaceId(1),
+                    name: None,
+                    folder: "/tmp/demo".into(),
+                    project_id: None,
+                    tabs: vec![Tab {
+                        id: TabId(2),
+                        name: None,
+                        root: Node::Pane(PaneId(3)),
+                        panes: vec![Pane::new(
+                            PaneId(3),
+                            PaneContent::Terminal(PaneTerminal {
+                                folder: "/tmp/demo".into(),
+                                command: None,
+                            }),
+                        )],
+                    }],
+                    git: None,
+                    current: None,
+                }],
+            };
+            let client =
+                ServerClient::new_for_test(MachineId::Local, "This Mac".into(), spaces, cx);
+            crate::machines::init_for_test(vec![client], cx);
+            crate::sidebar::init(cx);
+        });
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        shell.update_in(cx, |shell, window, cx| {
+            shell.set_view(MainView::Workspaces, window, cx)
+        });
+        cx.run_until_parked();
+        let pane = cx.debug_bounds("pane-3").expect("the pane is drawn");
+        cx.simulate_click(pane.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, cx| {
+            shell.spaces_view.read(cx).focused_pane(cx).is_some()
+        }));
+
+        cx.simulate_keystrokes("secondary-,");
         assert!(shell.read_with(cx, |shell, _| shell.settings_page.is_some()));
     }
 

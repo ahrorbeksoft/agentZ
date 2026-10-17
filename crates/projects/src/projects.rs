@@ -1380,6 +1380,30 @@ impl ProjectStore {
         }
     }
 
+    /// The agent threads in the thread list, neither pinned nor busy, whose last activity was
+    /// before `cutoff`: the ones auto-archive archives. A thread with no recorded activity
+    /// or creation time is never stale.
+    pub fn stale_threads(&self, cutoff: SystemTime) -> Vec<ThreadId> {
+        self.threads
+            .iter()
+            .filter(|thread| {
+                thread.can_arrange()
+                    && thread.terminal.is_none()
+                    && thread.archived_at.is_none()
+                    && !thread.is_pinned()
+                    && !self.working_threads.contains(&thread.id)
+                    && !self.blocked_threads.contains(&thread.id)
+                    && !self.awaiting_input_threads.contains(&thread.id)
+                    && !self.waiting_threads.contains(&thread.id)
+                    && thread
+                        .last_activity_at
+                        .or(thread.created_at)
+                        .is_some_and(|last| last < cutoff)
+            })
+            .map(|thread| thread.id)
+            .collect()
+    }
+
     pub fn unarchive_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_some()
@@ -2901,6 +2925,47 @@ mod tests {
         let store = ProjectStore::load(Some(state_path));
         assert_eq!(chats(&store), vec![older, newer]);
         assert!(!store.chats_expanded());
+    }
+
+    #[test]
+    fn only_idle_unpinned_threads_left_alone_are_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(Some(dir.path().join("state.json")));
+        let project = store.add_project(dir.path().join("storefront"));
+        let long_ago = SystemTime::now() - std::time::Duration::from_secs(5 * 86_400);
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        let old_thread = |store: &mut ProjectStore, title: &str| {
+            let id = store.add_thread(project, title, None).expect("thread");
+            let thread = store
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == id)
+                .expect("the thread");
+            thread.last_activity_at = Some(long_ago);
+            id
+        };
+        let stale = old_thread(&mut store, "Fix the cart");
+        let pinned = old_thread(&mut store, "Pinned");
+        store.pin_thread(pinned, None).expect("pin");
+        let working = old_thread(&mut store, "Working");
+        store.set_thread_working(working, true);
+        let archived = old_thread(&mut store, "Archived");
+        store.archive_thread(archived);
+        let chat = store
+            .add_thread(ProjectId::CHATS, "Trip ideas", None)
+            .expect("chat");
+        store
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == chat)
+            .expect("the chat")
+            .last_activity_at = Some(long_ago);
+        let recent = store.add_thread(project, "Just now", None).expect("thread");
+
+        assert_eq!(store.stale_threads(cutoff), vec![stale]);
+        assert!(store.thread(recent).is_some());
+        store.set_thread_working(working, false);
+        assert_eq!(store.stale_threads(cutoff), vec![stale], "just worked");
     }
 
     #[test]

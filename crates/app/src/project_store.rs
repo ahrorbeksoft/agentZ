@@ -32,8 +32,6 @@ use crate::server_client::ServerClient;
 pub enum ThreadStatus {
     /// The agent finished a turn this client hasn't displayed yet.
     Completed,
-    /// The agent's turn ended with its work still going: a background task.
-    Waiting,
     Working,
     /// The agent asked for input (ACP's elicitation) that the user hasn't given yet.
     AwaitingInput,
@@ -159,9 +157,6 @@ impl ProjectStore {
             .any(|id| self.store.is_thread_working(id))
         {
             return Some(ThreadStatus::Working);
-        }
-        if self.store.is_thread_waiting(id) {
-            return Some(ThreadStatus::Waiting);
         }
         let completed_at = self.store.thread(id)?.completed_at?;
         let is_unseen = self
@@ -846,7 +841,8 @@ mod tests {
         assert_eq!(show(&store, cx), Some(ThreadStatus::Working));
         store.set_thread_waiting(thread, true);
         store.set_thread_working(thread, false);
-        assert_eq!(show(&store, cx), Some(ThreadStatus::Waiting));
+        // Its work goes on after the turn, so it isn't complete: no status, no attention.
+        assert_eq!(show(&store, cx), None);
         assert!(attention.borrow().is_empty());
 
         store.set_thread_waiting(thread, false);

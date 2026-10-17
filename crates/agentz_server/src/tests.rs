@@ -1041,10 +1041,7 @@ async fn keeps_an_agent_with_a_background_task() {
         })
         .await;
     client
-        .wait_until(|client| {
-            let thread = client.thread(connection);
-            !thread.is_working() && !thread.state.background_tasks.is_empty()
-        })
+        .wait_until(|client| !client.thread(connection).state.background_tasks.is_empty())
         .await;
     // Archived, so 3 seconds without work would stop it.
     client.ok(Request::ArchiveThread(thread_id)).await;
@@ -1072,7 +1069,7 @@ async fn keeps_an_agent_with_a_background_task() {
 }
 
 /// A turn that leaves a command in the background doesn't complete its thread: the thread
-/// waits, and completes once the agent's work with the command's result has ended.
+/// goes on working, and completes once the agent's work with the command's result has ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_thread_with_a_background_task_completes_after_it() {
     let Some(server) = TestServer::start() else {
@@ -1100,17 +1097,15 @@ async fn a_thread_with_a_background_task_completes_after_it() {
         })
         .await;
     client
-        .wait_until(|client| {
-            let thread = client.thread(connection);
-            !thread.is_working() && !thread.state.background_tasks.is_empty()
-        })
+        .wait_until(|client| !client.thread(connection).state.background_tasks.is_empty())
         .await;
     client.wait_until(is_waiting).await;
+    assert!(client.thread(connection).is_working());
     assert_eq!(completed_at(&client), None);
 
     // The command ends, and the agent goes on with its result.
     client
-        .wait_until(|client| client.thread(connection).is_working())
+        .wait_until(|client| client.thread(connection).state.background_tasks.is_empty())
         .await;
     assert_eq!(completed_at(&client), None);
     client
@@ -1642,6 +1637,88 @@ async fn lists_and_imports_an_agents_sessions() {
     client
         .wait_until(|client| agent_text(client.thread(connection)) == "Fixed it earlier.")
         .await;
+}
+
+/// Threads left alone for as many days as the setting says are archived, but not those used
+/// since, nor one a client has open. The server keeps the setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn threads_left_alone_are_archived_when_asked() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let project_dir = tempfile::tempdir().expect("temp dir");
+    let project_path = project_dir.path().to_path_buf();
+    let sessions_file = data_dir.path().join("sessions.json");
+    let sessions = json!([
+        {"sessionId": "forgotten", "cwd": project_path, "title": "Forgotten",
+         "updatedAt": "2020-01-01T00:00:00Z"},
+        {"sessionId": "open", "cwd": project_path, "title": "Open",
+         "updatedAt": "2020-01-01T00:00:00Z"},
+        {"sessionId": "recent", "cwd": project_path, "title": "Recent",
+         "updatedAt": "2999-01-01T00:00:00Z"},
+    ]);
+    std::fs::write(&sessions_file, sessions.to_string()).expect("writing sessions");
+    command.env.insert(
+        "MOCK_SESSIONS_FILE".into(),
+        sessions_file.to_string_lossy().into_owned(),
+    );
+    let Some(server) = TestServer::start_with_agent(data_dir, project_dir, command) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    client
+        .ok(Request::AddProject {
+            path: project_path.clone(),
+        })
+        .await;
+    let Response::AgentSessions(AgentSessions::Listed(sessions)) = client
+        .ok(Request::ListAgentSessions {
+            agent_id: AgentId::new("mock"),
+            account: None,
+        })
+        .await
+    else {
+        panic!("expected sessions");
+    };
+    let Response::ThreadsImported(imported) = client
+        .ok(Request::ImportAgentSessions {
+            agent_id: AgentId::new("mock"),
+            account: None,
+            sessions,
+            archived: false,
+        })
+        .await
+    else {
+        panic!("expected imported threads");
+    };
+    let [forgotten, open, recent] = imported[..] else {
+        panic!("expected three threads");
+    };
+    client.subscribe_thread(ConnectionId::Thread(open)).await;
+
+    client.ok(Request::SetAutoArchive(Some(3))).await;
+    let is_archived = |client: &TestClient, thread_id: ThreadId| {
+        client
+            .projects
+            .as_ref()
+            .and_then(|projects| {
+                projects
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == thread_id)
+            })
+            .is_some_and(|thread| thread.archived_at.is_some())
+    };
+    client
+        .wait_until(|client| is_archived(client, forgotten))
+        .await;
+    assert!(!is_archived(&client, open), "a client has it open");
+    assert!(!is_archived(&client, recent), "it was used lately");
+    let kept = std::fs::read_to_string(server.data_dir.path().join("auto-archive.json"))
+        .expect("the setting is kept");
+    assert_eq!(kept.trim(), "3");
 }
 
 /// Custom agents are added, changed and removed while the server runs. Saving starts the agent
@@ -3695,20 +3772,7 @@ async fn a_thread_waiting_for_the_reset_still_continues_after_the_agent_goes_on_
             .and_then(|thread| thread.continues_at)
     };
 
-    client
-        .ok(Request::Prompt {
-            connection,
-            prompt: PromptPart::text("background-task 4"),
-        })
-        .await;
-    client
-        .wait_until(|client| {
-            let thread = client.thread(connection);
-            !thread.is_working() && !thread.state.background_tasks.is_empty()
-        })
-        .await;
-    // The account runs out while the command runs.
-    std::fs::write(home.join("usage"), "100").expect("use the account up");
+    // The account runs out as the turn that starts the command ends, with the command running.
     let resets_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("time")
@@ -3718,7 +3782,7 @@ async fn a_thread_waiting_for_the_reset_still_continues_after_the_agent_goes_on_
     client
         .ok(Request::Prompt {
             connection,
-            prompt: PromptPart::text("hello"),
+            prompt: PromptPart::text("background-task 4 limit"),
         })
         .await;
     client
@@ -3726,6 +3790,7 @@ async fn a_thread_waiting_for_the_reset_still_continues_after_the_agent_goes_on_
             let thread = client.thread(connection);
             thread.turn_error().is_some()
                 && !thread.is_working()
+                && !thread.state.background_tasks.is_empty()
                 && client
                     .accounts("mock")
                     .status(Some(work))
@@ -3760,7 +3825,7 @@ async fn a_thread_waiting_for_the_reset_still_continues_after_the_agent_goes_on_
         .await;
     assert_eq!(
         client.user_messages(thread_id),
-        ["background-task 4", "hello", "Continue."]
+        ["background-task 4 limit", "Continue."]
     );
 }
 

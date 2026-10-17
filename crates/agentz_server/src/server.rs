@@ -3,6 +3,7 @@
 mod account_requests;
 mod artifact_requests;
 mod attachment_requests;
+mod auto_archive;
 mod chats;
 mod copy_reads;
 mod custom_agents;
@@ -270,6 +271,8 @@ pub(crate) struct Server {
     agent_titled_threads: HashSet<ThreadId>,
     /// Threads a title was generated for, or is being: once each.
     generated_titles: HashSet<ThreadId>,
+    /// Days of inactivity after which threads are archived ([`Self::archive_stale_threads`]).
+    auto_archive_days: Option<u32>,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
@@ -356,6 +359,7 @@ impl Server {
                 .unwrap_or_default(),
             providers: Vec::new(),
         };
+        let auto_archive_days = auto_archive::load(&data_dir).log_err().flatten();
         let artifacts = ArtifactStore::load(&data_dir);
         let artifact_pages = pages::start(&runtime, &data_dir, inputs.clone());
         let browser_programs = config.agent_control.as_ref().and_then(|control| {
@@ -441,6 +445,7 @@ impl Server {
             title_generation_path: config.title_generation_path,
             agent_titled_threads: HashSet::default(),
             generated_titles: HashSet::default(),
+            auto_archive_days,
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -497,6 +502,7 @@ impl Server {
             }
         }
         server.sweep_drafts();
+        server.archive_stale_threads();
         server.spawn_then(machine_kind::detect(), |server, detected| {
             server.machine_icon.detected = detected;
         });
@@ -523,6 +529,18 @@ impl Server {
                     server.refresh_copy_statuses();
                 }));
                 if inputs.unbounded_send(refresh).is_err() {
+                    break;
+                }
+            }
+        });
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(auto_archive::AUTO_ARCHIVE_INTERVAL).await;
+                let sweep = Input::Run(Box::new(|server: &mut Server| {
+                    server.archive_stale_threads()
+                }));
+                if inputs.unbounded_send(sweep).is_err() {
                     break;
                 }
             }
@@ -1356,6 +1374,10 @@ impl Server {
             }
             Request::SetPageTheme(theme) => {
                 self.set_page_theme(theme);
+                Ok(Response::Ok)
+            }
+            Request::SetAutoArchive(days) => {
+                self.set_auto_archive(days)?;
                 Ok(Response::Ok)
             }
             Request::SetDesignDefaults(settings) => {

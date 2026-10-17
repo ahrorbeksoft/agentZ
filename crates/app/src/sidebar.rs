@@ -338,6 +338,8 @@ pub struct Sidebar {
     chats_shown: usize,
     /// Whether the Shells shelf is open. This window's alone.
     shells_expanded: bool,
+    /// Whether the Working group is open. This window's alone.
+    working_expanded: bool,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadKey>,
     /// A popover waiting out the hover delay, and the thread it's for.
@@ -395,6 +397,7 @@ impl Sidebar {
             archived_shown: ARCHIVED_INITIAL_COUNT,
             chats_shown: CHATS_INITIAL_COUNT,
             shells_expanded: true,
+            working_expanded: true,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -2643,15 +2646,53 @@ impl Sidebar {
             );
         }
 
-        let cards = self.shown_cards(cx);
-        let mut rows = Vec::with_capacity(cards.len() + 2);
+        let mut cards = self.shown_cards(cx);
+        // t3code's Working shelf: threads whose agents work and need nothing from the user
+        // fold out of the list into a group of their own. Pinned ones stay where they were
+        // put, and a drag leaves the list as it is, so the order it moves is the one on screen.
+        let mut working = Vec::new();
+        if drag.is_none()
+            && AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .working_group
+        {
+            let (is_working, rest): (Vec<_>, Vec<_>) =
+                cards.into_iter().partition(|(store, thread)| {
+                    !thread.is_pinned()
+                        && store.read(cx).thread_status(thread.id) == Some(ThreadStatus::Working)
+                });
+            working = is_working;
+            cards = rest;
+        }
+        let mut rows = Vec::with_capacity(cards.len() + working.len() + 3);
         match drag {
             None => {
                 for (store, thread) in cards {
                     let project = store.read(cx).project(thread.project_id).cloned();
                     rows.push(self.render_thread_card(&store, thread, project, None, cx));
                 }
-                if rows.is_empty() {
+                if !working.is_empty() {
+                    rows.push(Self::render_shelf_header(
+                        "working-group-toggle",
+                        "Working",
+                        working.len(),
+                        self.working_expanded,
+                        HeaderTone::Muted,
+                        None,
+                        |this, cx| {
+                            this.working_expanded = !this.working_expanded;
+                            cx.notify();
+                        },
+                        cx,
+                    ));
+                    if self.working_expanded {
+                        for (store, thread) in working {
+                            let project = store.read(cx).project(thread.project_id).cloned();
+                            rows.push(self.render_thread_card(&store, thread, project, None, cx));
+                        }
+                    }
+                } else if rows.is_empty() {
                     rows.push(
                         h_flex()
                             .h_8()
@@ -3854,6 +3895,74 @@ mod view_tests {
         thread
     }
 
+    /// With the setting on, threads whose agents work and need nothing from the user fold into
+    /// a Working group, as t3code's Working shelf does. Pinned ones, and one that's blocked on
+    /// a permission, stay among the cards.
+    #[gpui::test]
+    fn working_threads_group_under_working_when_asked(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        let shown =
+            |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
+        let set_grouping = |on: bool, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                    store.update(|settings| settings.working_group = on, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![
+                    thread(1, false, None),
+                    thread(2, false, None),
+                    pinned(thread(3, false, None), "a"),
+                    thread(4, false, None),
+                ],
+                working_threads: vec![ThreadId(2), ThreadId(3), ThreadId(4)],
+                blocked_threads: vec![ThreadId(4)],
+                ..Default::default()
+            },
+            cx,
+        );
+        // Off by default: every card is where it was.
+        for card in [
+            "thread-card-1",
+            "thread-card-2",
+            "thread-card-3",
+            "thread-card-4",
+        ] {
+            assert!(shown(card, cx));
+        }
+        assert!(!shown("working-group-toggle", cx));
+
+        set_grouping(true, cx);
+        assert!(shown("working-group-toggle", cx));
+        let header = bounds(cx, "working-group-toggle");
+        // Thread 2 works freely, so it's under the header; the others aren't.
+        assert!(bounds(cx, "thread-card-2").top() > header.top());
+        assert!(bounds(cx, "thread-card-1").top() < header.top());
+        assert!(bounds(cx, "thread-card-3").top() < header.top());
+        assert!(bounds(cx, "thread-card-4").top() < header.top());
+
+        // The group closes, and the thread is still its own card when its work is done.
+        cx.simulate_click(header.center(), Modifiers::none());
+        assert!(!shown("thread-card-2", cx));
+        cx.simulate_click(header.center(), Modifiers::none());
+        assert!(shown("thread-card-2", cx));
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![thread(1, false, None), thread(2, false, None)],
+                ..Default::default()
+            },
+            cx,
+        );
+        assert!(!shown("working-group-toggle", cx));
+        assert!(shown("thread-card-2", cx));
+    }
+
     #[gpui::test]
     fn chats_list_in_their_shelf_the_latest_five_first(cx: &mut TestAppContext) {
         let (sidebar, store, cx) = new_sidebar(cx);
@@ -4402,7 +4511,6 @@ pub(crate) fn render_status_pill(status: ThreadStatus, cx: &App) -> impl IntoEle
         ThreadStatus::PendingApproval => ("Pending Approval", Color::Warning),
         ThreadStatus::AwaitingInput => ("Awaiting Input", AWAITING_INPUT_COLOR),
         ThreadStatus::Working => ("Working", Color::Accent),
-        ThreadStatus::Waiting => ("Waiting", Color::Accent),
         ThreadStatus::Completed => ("Completed", Color::Success),
     };
     h_flex().gap_1().child(render_status_dot(status, cx)).child(
@@ -4417,7 +4525,7 @@ pub(crate) fn render_status_dot(status: ThreadStatus, cx: &App) -> impl IntoElem
     let color = match status {
         ThreadStatus::PendingApproval => Color::Warning,
         ThreadStatus::AwaitingInput => AWAITING_INPUT_COLOR,
-        ThreadStatus::Working | ThreadStatus::Waiting => Color::Accent,
+        ThreadStatus::Working => Color::Accent,
         ThreadStatus::Completed => Color::Success,
     };
     div()

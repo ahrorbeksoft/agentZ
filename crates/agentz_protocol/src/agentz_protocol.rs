@@ -797,6 +797,10 @@ pub enum Request {
     /// does, even over a title the user gave it. Answered once the title is set, or with why
     /// it couldn't be (title generation is off, or the CLI failed).
     RegenerateTitle(ThreadId),
+    /// Archives threads left alone for this many days, going by their last activity; `None`
+    /// archives none. The app's setting, given to each server as it connects and as it
+    /// changes. The server keeps it, so threads archive while the app is closed.
+    SetAutoArchive(Option<u32>),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,

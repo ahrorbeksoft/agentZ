@@ -90,6 +90,69 @@ impl ArtifactAutoOpen {
     }
 }
 
+/// Which of an account's usage windows the composer's gauge and the account pickers show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageWindow {
+    /// The current session, the shortest window (the 5-hour one), unless a longer window is
+    /// used up: nothing works until that one resets, so it shows instead.
+    #[default]
+    Session,
+    /// Whichever window has the least left.
+    Tightest,
+}
+
+impl UsageWindow {
+    pub const ALL: [Self; 2] = [Self::Session, Self::Tightest];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "Current session",
+            Self::Tightest => "Lowest",
+        }
+    }
+}
+
+/// How long a thread may go without activity before it's archived, which each machine's server
+/// does while the app is closed too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoArchive {
+    #[default]
+    Never,
+    AfterOneDay,
+    AfterThreeDays,
+    AfterOneWeek,
+}
+
+impl AutoArchive {
+    pub const ALL: [Self; 4] = [
+        Self::Never,
+        Self::AfterOneDay,
+        Self::AfterThreeDays,
+        Self::AfterOneWeek,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::AfterOneDay => "After a day",
+            Self::AfterThreeDays => "After 3 days",
+            Self::AfterOneWeek => "After a week",
+        }
+    }
+
+    /// What the server is given: the days of inactivity.
+    pub fn days(self) -> Option<u32> {
+        match self {
+            Self::Never => None,
+            Self::AfterOneDay => Some(1),
+            Self::AfterThreeDays => Some(3),
+            Self::AfterOneWeek => Some(7),
+        }
+    }
+}
+
 impl PlaySound {
     pub const ALL: [Self; 4] = [
         Self::Never,
@@ -187,8 +250,15 @@ pub struct AppSettings {
     pub show_thinking: bool,
     /// Chats show in the sidebar, New Chat and search. Off, they're hidden and kept.
     pub chats: bool,
+    /// The sidebar groups the threads whose agents are working under Working, t3code's Working
+    /// shelf. Off by default, as there.
+    pub working_group: bool,
+    /// Threads left alone this long are archived, going by their last activity.
+    pub auto_archive: AutoArchive,
     /// When a published artifact's page opens in the browser.
     pub artifact_auto_open: ArtifactAutoOpen,
+    /// Which of an account's windows the composer's usage gauge and its account picker show.
+    pub usage_window: UsageWindow,
     /// What agents' designs are like unless they hear otherwise (`design/artifacts-2`, topic
     /// 21), given to every machine's server for its agents' design tool.
     pub design_defaults: DesignDefaults,
@@ -232,7 +302,10 @@ impl Default for AppSettings {
             use_modifier_to_send: false,
             show_thinking: false,
             chats: true,
+            working_group: false,
+            auto_archive: AutoArchive::default(),
             artifact_auto_open: ArtifactAutoOpen::default(),
+            usage_window: UsageWindow::default(),
             design_defaults: DesignDefaults::default(),
             project_design_defaults: Default::default(),
             play_sound_when_finished: PlaySound::WhenInAnotherThread,

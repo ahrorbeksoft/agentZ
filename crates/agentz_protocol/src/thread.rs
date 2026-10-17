@@ -205,6 +205,37 @@ impl ToolCall {
                 acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
             )
     }
+
+    /// Whether it sent one of the agent's own subagents to the background (Factory Droid's Task
+    /// with `await: false`): the call ends as it starts, and the subagent works on, then wakes
+    /// the agent with its report.
+    pub fn sends_subagent_to_background(&self) -> bool {
+        let Some(input) = self.raw_input.as_deref() else {
+            return false;
+        };
+        if !input.contains("\"subagent_type\"") {
+            return false;
+        }
+        let input = input.trim();
+        let input = match input.strip_prefix("```") {
+            Some(fenced) => fenced
+                .split_once('\n')
+                .map_or("", |(_, body)| body.trim_end().trim_end_matches('`')),
+            None => input,
+        };
+        let Ok(serde_json::Value::Object(input)) = serde_json::from_str(input) else {
+            return false;
+        };
+        input.get("await").and_then(serde_json::Value::as_bool) == Some(false)
+            || input
+                .get("run_in_background")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            || self
+                .text
+                .first()
+                .is_some_and(|text| text.trim_start().starts_with("Task launched in background"))
+    }
 }
 
 /// A message waiting in a thread's queue for the agent to be free.

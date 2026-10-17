@@ -2228,6 +2228,9 @@ fn read_lines(tool_call: &ToolCall) -> Option<String> {
         return None;
     }
     let text = output_text(tool_call)?;
+    if let Some(range) = read_summary(&text) {
+        return Some(range);
+    }
     let count = text
         .lines()
         .filter(|line| !line.starts_with("[File truncated"))
@@ -2238,6 +2241,39 @@ fn read_lines(tool_call: &ToolCall) -> Option<String> {
     })
 }
 
+/// The lines a read got, from the one line Factory Droid sends in place of them once it has put
+/// the file's bytes aside: "Read /src/app.html: lines 1-109 (109 lines, 3.4 KiB); the file
+/// holds the bytes", or "last 5 lines (210 B)" for a read from the end.
+fn read_summary(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.lines().count() != 1 {
+        return None;
+    }
+    let head = text
+        .strip_prefix("Read ")?
+        .strip_suffix("; the file holds the bytes")?;
+    let (head, size) = head.rsplit_once(" (")?;
+    if !size.ends_with(')') {
+        return None;
+    }
+    if let Some((_, range)) = head.rsplit_once(": lines ") {
+        let (start, end) = range.split_once('-')?;
+        let (start, end) = (start.parse::<u32>().ok()?, end.parse::<u32>().ok()?);
+        return Some(format!("lines {start}–{end}"));
+    }
+    let (_, last) = head.rsplit_once(": last ")?;
+    let count = last
+        .strip_suffix(" lines")
+        .or_else(|| last.strip_suffix(" line"))?;
+    count.parse::<u32>().ok()?;
+    Some(format!("last {last}"))
+}
+
+/// Whether a read's output is only that summary, so there are no lines to show.
+pub fn is_read_summary(tool_call: &ToolCall) -> bool {
+    output_text(tool_call).is_some_and(|text| read_summary(&text).is_some())
+}
+
 /// A read's title without the range Claude Agent adds after its path.
 /// What a read got, as a file's lines from the number of its first. Claude Agent numbers each
 /// line itself ("845→text", or `cat -n`'s "   845\ttext"), and those move to the gutter
@@ -2245,6 +2281,9 @@ fn read_lines(tool_call: &ToolCall) -> Option<String> {
 /// the read started at.
 pub fn read_file_lines(tool_call: &ToolCall) -> Option<(u32, Vec<String>)> {
     let text = output_text(tool_call)?;
+    if read_summary(&text).is_some() {
+        return None;
+    }
     let lines: Vec<&str> = text.lines().collect();
     let numbered: Option<Vec<(u32, &str)>> = lines.iter().map(|line| numbered_line(line)).collect();
     if let Some(numbered) = numbered
@@ -3599,6 +3638,43 @@ mod tests {
         assert_eq!(lines(&ranged).map(|(start, _)| start), Some(5));
 
         assert_eq!(lines(&tool_call("Read src/cart.rs", None, None)), None);
+    }
+
+    /// Factory Droid sends one line about a read in place of its lines: that line isn't the
+    /// file's text, so it says which lines the read got and the card has nothing to open.
+    #[test]
+    fn a_reads_summary_line_is_not_its_lines() {
+        let summary = tool_call(
+            "Read src/app.html",
+            None,
+            Some(
+                "Read /Users/me/web/src/app.html: lines 1-109 (109 lines, 3.4 KiB); the file holds the bytes",
+            ),
+        );
+        assert_eq!(read_file_lines(&summary), None);
+        assert!(is_read_summary(&summary));
+        let mut completed = summary;
+        completed.status = acp::ToolCallStatus::Completed;
+        assert_eq!(read_lines(&completed).as_deref(), Some("lines 1–109"));
+
+        let from_end = tool_call(
+            "Read log.txt",
+            None,
+            Some("Read /tmp/log.txt: last 5 lines (210 B); the file holds the bytes"),
+        );
+        assert!(is_read_summary(&from_end));
+        let mut completed = from_end;
+        completed.status = acp::ToolCallStatus::Completed;
+        assert_eq!(read_lines(&completed).as_deref(), Some("last 5 lines"));
+
+        // A file whose own text reads like it is still a file.
+        let file = tool_call(
+            "Read notes.md",
+            None,
+            Some("Read the docs first\nthen start"),
+        );
+        assert!(!is_read_summary(&file));
+        assert!(read_file_lines(&file).is_some());
     }
 
     #[test]

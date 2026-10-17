@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use agentz_protocol::Request;
-use agentz_protocol::accounts::{AccountId, ExtraUsage, LimitResets, LimitWindow};
+use agentz_protocol::accounts::{AccountId, ExtraUsage, LimitResets, LimitWindow, used_up_window};
 use agentz_protocol::agents::AgentId;
 use gpui::{
     AnyElement, App, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -16,6 +16,7 @@ use gpui::{
 };
 use ui::{Tooltip, prelude::*};
 
+use crate::app_settings::UsageWindow;
 use crate::server_client::ServerClient;
 use crate::settings_page::{account_entry, render_entry_avatar};
 use crate::sidebar::format_relative_time;
@@ -735,13 +736,36 @@ pub(crate) fn limit_color(left: u8, cx: &App) -> Hsla {
     }
 }
 
-/// The window closest to running out, which pickers and the gauge show. One past its reset is
-/// left out, its last read being out of date.
-pub(crate) fn tightest_window(windows: &[LimitWindow], now: SystemTime) -> Option<&LimitWindow> {
+/// The window closest to running out. One past its reset is left out, its last read being out
+/// of date.
+fn tightest_window(windows: &[LimitWindow], now: SystemTime) -> Option<&LimitWindow> {
     windows
         .iter()
         .filter(|window| !is_resetting(window, now))
         .min_by_key(|window| window.left_percent())
+}
+
+/// The window the gauge and the pickers show, as the setting says. The current session is the
+/// shortest window, whatever it's called, but a window that's used up stops the account until it
+/// resets, so it shows in its place, however much the session has left. Without any window's
+/// length, the session can't be told, and the tightest shows.
+pub(crate) fn shown_window(
+    windows: &[LimitWindow],
+    which: UsageWindow,
+    now: SystemTime,
+) -> Option<&LimitWindow> {
+    match which {
+        UsageWindow::Tightest => tightest_window(windows, now),
+        UsageWindow::Session => used_up_window(windows, now)
+            .or_else(|| {
+                windows
+                    .iter()
+                    .filter(|window| !is_resetting(window, now))
+                    .filter(|window| window.length.is_some_and(|length| !length.is_zero()))
+                    .min_by_key(|window| window.length)
+            })
+            .or_else(|| tightest_window(windows, now)),
+    }
 }
 
 /// A picker's line for the window: `62% left`, or `Used up · 2h 10m` in red until it resets.
@@ -886,6 +910,70 @@ mod tests {
             ..window
         };
         assert_eq!(format_resets_in(&without_reset, now), None);
+    }
+
+    #[test]
+    fn the_session_window_shows_unless_a_longer_one_is_used_up() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let hours = |hours: u64| Duration::from_secs(hours * 3600);
+        let window = |label: &str, used_percent: f64, length: Option<Duration>| LimitWindow {
+            label: label.into(),
+            used_percent,
+            resets_at: length.map(|length| now + length / 2),
+            length,
+        };
+        let shown = |windows: &[LimitWindow], which| {
+            shown_window(windows, which, now).map(|window| window.label.clone())
+        };
+        let weekly_first = |session: f64, weekly: f64| {
+            vec![
+                window("Weekly", weekly, Some(hours(24 * 7))),
+                window("5-hour", session, Some(hours(5))),
+            ]
+        };
+
+        // The session shows whatever order the windows come in, though the weekly has less left.
+        let windows = weekly_first(10., 80.);
+        assert_eq!(
+            shown(&windows, UsageWindow::Session).as_deref(),
+            Some("5-hour")
+        );
+        assert_eq!(
+            shown(&windows, UsageWindow::Tightest).as_deref(),
+            Some("Weekly")
+        );
+
+        // A weekly window at 0 stops everything, so it shows with the session nearly full.
+        let windows = weekly_first(10., 100.);
+        assert_eq!(
+            shown(&windows, UsageWindow::Session).as_deref(),
+            Some("Weekly")
+        );
+        // The session at 0 shows itself.
+        let windows = weekly_first(100., 50.);
+        assert_eq!(
+            shown(&windows, UsageWindow::Session).as_deref(),
+            Some("5-hour")
+        );
+        // Both at 0: the one that resets last.
+        let windows = weekly_first(100., 100.);
+        assert_eq!(
+            shown(&windows, UsageWindow::Session).as_deref(),
+            Some("Weekly")
+        );
+
+        // A used-up weekly whose reset has passed is out of date, and the session shows.
+        let mut windows = weekly_first(10., 100.);
+        windows[0].resets_at = Some(now - Duration::from_secs(60));
+        assert_eq!(
+            shown(&windows, UsageWindow::Session).as_deref(),
+            Some("5-hour")
+        );
+
+        // Without lengths the session can't be told, so the tightest shows.
+        let windows = vec![window("A", 20., None), window("B", 60., None)];
+        assert_eq!(shown(&windows, UsageWindow::Session).as_deref(), Some("B"));
+        assert_eq!(shown(&[], UsageWindow::Session), None);
     }
 
     /// OpenUsage's pace: the use so far, projected to the reset at the same rate.

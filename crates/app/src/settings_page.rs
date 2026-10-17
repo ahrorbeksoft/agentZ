@@ -54,8 +54,8 @@ use std::collections::BTreeMap;
 use crate::agent_login::{AgentLogin, LoginLayout, LoginStep};
 use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::{
-    AppSettings, AppSettingsStore, ArtifactAutoOpen, MachineProfile, PlaySound, ThemeMode,
-    WindowBackground,
+    AppSettings, AppSettingsStore, ArtifactAutoOpen, AutoArchive, MachineProfile, PlaySound,
+    ThemeMode, UsageWindow, WindowBackground,
 };
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{
@@ -1073,6 +1073,9 @@ impl SettingsPage {
                     ),
                     self.render_modifier_to_send_row(cx),
                     self.render_show_thinking_row(cx),
+                    self.render_working_group_row(cx),
+                    self.render_auto_archive_row(window, cx),
+                    self.render_usage_window_row(window, cx),
                 ],
                 cx,
             ),
@@ -1149,6 +1152,95 @@ impl SettingsPage {
                         store.update(|settings| settings.show_thinking = enabled, cx)
                     })
                 })
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// t3code's Working shelf: the threads whose agents are working, grouped in the sidebar.
+    fn render_working_group_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().working_group;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Group working threads",
+            "Whether the sidebar groups the threads whose agents are working under Working. \
+             Threads waiting for you, and pinned ones, stay where they are.",
+            Switch::new("working-group", enabled.into())
+                .on_click(move |state, _, cx| {
+                    let enabled = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.working_group = enabled, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// Archives threads left alone: every machine's server does it, going by each thread's last
+    /// activity.
+    fn render_auto_archive_row(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.app_settings.read(cx).settings().auto_archive;
+        let app_settings = self.app_settings.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for value in AutoArchive::ALL {
+                let app_settings = app_settings.clone();
+                menu = menu.toggleable_entry(
+                    value.label(),
+                    current == value,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.auto_archive = value, cx)
+                        })
+                    },
+                );
+            }
+            menu
+        });
+        render_row(
+            "Auto-archive threads",
+            "Archives a thread nobody has used for this long, going by its last activity. \
+             Pinned threads, ones that are working or waiting for you, and ones that are open \
+             stay.",
+            div()
+                .debug_selector(|| "auto-archive".to_string())
+                .child(DropdownMenu::new("auto-archive", current.label(), menu))
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// Which of an account's windows the composer's gauge and account picker show.
+    fn render_usage_window_row(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.app_settings.read(cx).settings().usage_window;
+        let app_settings = self.app_settings.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for value in UsageWindow::ALL {
+                let app_settings = app_settings.clone();
+                menu = menu.toggleable_entry(
+                    value.label(),
+                    current == value,
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.usage_window = value, cx)
+                        })
+                    },
+                );
+            }
+            menu
+        });
+        render_row(
+            "Usage shown in the composer",
+            "The window of an account's limits the composer's gauge and its account picker \
+             show. The current session is the shortest window, the 5-hour one, unless a longer \
+             window is used up: then that one shows, since nothing works until it resets.",
+            div()
+                .debug_selector(|| "usage-window".to_string())
+                .child(DropdownMenu::new("usage-window", current.label(), menu))
                 .into_any_element(),
             cx,
         )
@@ -11793,6 +11885,44 @@ mod tests {
         click("project-design-use-general", cx);
         assert!(cx.debug_bounds("project-design-variants").is_none());
         assert_eq!(last_sent(&devbox, cx), sent(general, Vec::new()));
+    }
+
+    /// Auto-archive is the app's setting, which every machine's server is given as it's
+    /// chosen, and again after a reconnect: the server keeps it for when the app is closed.
+    #[gpui::test]
+    fn the_auto_archive_choice_goes_to_every_machine(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        cx.update(|cx| {
+            for client in [&local, &devbox] {
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+            }
+        });
+        let last_sent = |client: &Entity<ServerClient>, cx: &mut TestAppContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .rev()
+                    .find_map(|request| match request {
+                        Request::SetAutoArchive(days) => Some(days),
+                        _ => None,
+                    })
+            })
+        };
+        assert_eq!(last_sent(&local, cx), Some(None));
+
+        cx.update(|cx| {
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| settings.auto_archive = AutoArchive::AfterThreeDays,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        for client in [&local, &devbox] {
+            assert_eq!(last_sent(client, cx), Some(Some(3)));
+        }
     }
 
     /// The icon chosen is the whole project's, a file inside it too; a file picked outside it

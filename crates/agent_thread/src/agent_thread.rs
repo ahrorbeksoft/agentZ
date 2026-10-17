@@ -74,7 +74,12 @@ const OWN_WORK_GRACE: Duration = Duration::from_secs(15);
 
 /// How long a stopped turn waits for the agent to answer its prompt, as ACP says it must,
 /// before it ends without the answer.
-const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many quiet checks ([`OWN_WORK_QUIET`] apart) in a row a turn waits for subagents the
+/// agent sent to the background, or for a tool call that never ends, before it counts as done:
+/// twenty minutes. Background tasks the agent reports are waited for as long as they run.
+const OWN_WORK_QUIET_ROUNDS: u32 = 40;
 
 pub enum AgentThreadEvent {
     /// The agent started or finished working on a prompt.
@@ -239,6 +244,8 @@ enum MessageKind {
     OwnWorkOverdue(u64),
     /// [`STOP_TIMEOUT`] passed since the turn with this count was stopped.
     StopOverdue(u64),
+    /// [`STOP_TIMEOUT`] passed since the agent's work of its own was stopped.
+    OwnWorkStopOverdue,
     /// The owner's work after the agent's work of its own is done.
     OwnWorkEnded,
     /// The agent reported on one of its own subagents, in the session given.
@@ -452,6 +459,17 @@ pub struct AgentThread {
     own_work_from: usize,
     /// The agent's work of its own ended, and the owner's work after a turn is being done.
     own_work_ending: bool,
+    /// The agent sent subagents to the background in the turn that just ended and hasn't gone
+    /// on with their reports yet (Factory Droid wakes itself with them, with no prompt).
+    detached_subagents: bool,
+    /// How many checks in a row found the agent's work of its own quiet while background work
+    /// kept it going, to give up on work that never ends.
+    own_work_quiet_rounds: u32,
+    /// The user stopped the agent's work of its own, and [`STOP_TIMEOUT`] hasn't passed: what
+    /// the agent sends meanwhile isn't new work, unless it never stops.
+    own_work_stopped: bool,
+    /// The updates the agent sent after that stop.
+    updates_after_stop: u64,
     /// A background task ended by itself while the agent was idle, and the agent is expected
     /// to go on with its result for up to [`OWN_WORK_GRACE`].
     own_work_due: bool,
@@ -818,6 +836,10 @@ impl AgentThread {
             own_work_updates: 0,
             own_work_from: 0,
             own_work_ending: false,
+            detached_subagents: false,
+            own_work_quiet_rounds: 0,
+            own_work_stopped: false,
+            updates_after_stop: 0,
             own_work_due: false,
             tasks_ended: 0,
             stops_in_flight: 0,
@@ -1222,9 +1244,13 @@ impl AgentThread {
                             acp::ElicitationScope::Session(_)
                         )
                 });
-                self.set_working(false);
-                if let Some(parts) = self.after_turn.pop_front() {
-                    self.send_after_turn(parts);
+                if self.turn_goes_on_in_background() {
+                    self.linger_for_background_work();
+                } else {
+                    self.set_working(false);
+                    if let Some(parts) = self.after_turn.pop_front() {
+                        self.send_after_turn(parts);
+                    }
                 }
             }
             MessageKind::Steered { parts, result } => self.steered(parts, result),
@@ -1240,18 +1266,42 @@ impl AgentThread {
                 if !self.working_on_its_own {
                     return;
                 }
-                let since = self.own_work_from.min(self.view.entries.len());
-                let is_waiting = self.view.entries[since..].iter().any(|entry| {
-                    matches!(entry, Entry::ToolCall(tool_call) if matches!(
-                        tool_call.status,
-                        acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
-                    ))
-                }) || !self.view.state.permission_requests.is_empty()
+                let is_quiet = updates == self.own_work_updates;
+                self.own_work_quiet_rounds = if is_quiet {
+                    self.own_work_quiet_rounds + 1
+                } else {
+                    0
+                };
+                // What the agent reports, or asks of the user, is waited for as long as it
+                // lasts. What it only seems to be doing (a call it never ended, subagents it
+                // sent off that may have reported already) is given up on after a while.
+                let is_reported = !self.view.state.background_tasks.is_empty()
+                    || !self.view.state.permission_requests.is_empty()
                     || !self.view.state.elicitations.is_empty();
-                if updates == self.own_work_updates && !is_waiting {
+                let seems_going =
+                    self.detached_subagents || self.has_running_tool_call_since(self.own_work_from);
+                let gives_up = self.own_work_quiet_rounds >= OWN_WORK_QUIET_ROUNDS;
+                if is_quiet && !is_reported && (!seems_going || gives_up) {
+                    if seems_going {
+                        log::warn!(
+                            "{} sent nothing for {:?} while it seemed to work; counting it done",
+                            self.view.state.agent_name,
+                            OWN_WORK_QUIET * OWN_WORK_QUIET_ROUNDS
+                        );
+                    }
                     self.end_own_work();
                 } else {
                     self.check_own_work_later();
+                }
+            }
+            MessageKind::OwnWorkStopOverdue => {
+                self.own_work_stopped = false;
+                if std::mem::take(&mut self.updates_after_stop) > 0 && !self.is_working() {
+                    log::warn!(
+                        "{} went on after its work of its own was stopped; restarting it",
+                        self.view.state.agent_name
+                    );
+                    self.restart_stopped_agent();
                 }
             }
             MessageKind::OwnWorkOverdue(ended) => {
@@ -2519,6 +2569,9 @@ impl AgentThread {
         // The prompt's turn ends the work, if the agent was working on its own.
         self.working_on_its_own = false;
         self.own_work_ending = false;
+        self.own_work_stopped = false;
+        self.updates_after_stop = 0;
+        self.detached_subagents = false;
         self.prompts_sent += 1;
         self.set_working(true);
         let Some(hook) = self.turn_hook.clone() else {
@@ -2563,8 +2616,17 @@ impl AgentThread {
             self.set_working(false);
         }
         self.cancel_permission_requests();
-        // No prompt's answer will end it.
+        // No prompt's answer will end it. An agent that works on anyway (Factory Droid ignores
+        // a cancel when it has no prompt) is restarted, once it's had time to stop.
         if self.working_on_its_own {
+            self.turn_outcome = TurnOutcome::Stopped;
+            self.detached_subagents = false;
+            self.own_work_stopped = true;
+            self.updates_after_stop = 0;
+            self.spawn(async move {
+                tokio::time::sleep(STOP_TIMEOUT).await;
+                MessageKind::OwnWorkStopOverdue
+            });
             self.end_own_work();
         }
     }
@@ -2583,20 +2645,29 @@ impl AgentThread {
     /// ends a stopped turn at once, and the agent restarts (Reload Agent): one that kept the
     /// turn refuses the next prompt.
     fn end_unanswered_turn(&mut self) {
-        let Some(command) = self.view.state.command.clone() else {
+        if self.view.state.command.is_none() {
             return;
-        };
+        }
         log::warn!(
             "{} didn't answer the stop of its turn in {STOP_TIMEOUT:?}; restarting it",
             self.view.state.agent_name
         );
-        self.stop_running_tool_calls();
-        self.view.state.last_stop_reason = Some(acp::StopReason::Cancelled);
         self.last_message = None;
         // The prompt's own end, with its hook, stops with the agent.
         if let (Some(hook), Some(runtime)) = (self.turn_hook.clone(), &self.runtime) {
             runtime.spawn(hook(TurnPoint::Ended));
         }
+        self.restart_stopped_agent();
+    }
+
+    /// Restarts an agent that went on after it was stopped, keeping what waits for the end of
+    /// the turn.
+    fn restart_stopped_agent(&mut self) {
+        let Some(command) = self.view.state.command.clone() else {
+            return;
+        };
+        self.stop_running_tool_calls();
+        self.view.state.last_stop_reason = Some(acp::StopReason::Cancelled);
         let after_turn = std::mem::take(&mut self.after_turn);
         self.restart_with(command, None);
         self.after_turn = after_turn;
@@ -2730,6 +2801,17 @@ impl AgentThread {
         } else if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
             task.stopping = false;
         }
+        // Stopping the last of what held the turn open ends it, with the agent's note of the
+        // stop in it, rather than waiting for the agent to be quiet.
+        if self.working_on_its_own
+            && !self.own_work_ending
+            && self.stops_in_flight == 0
+            && !self.detached_subagents
+            && self.view.state.background_tasks.is_empty()
+            && !self.has_running_tool_call_since(self.own_work_from)
+        {
+            self.end_own_work();
+        }
     }
 
     fn apply_background_task_update(&mut self, update: BackgroundTaskUpdate) {
@@ -2854,21 +2936,78 @@ impl AgentThread {
             && self.session.is_some()
             && self.view.state.status == ConnectionStatus::Ready
             && self.stops_in_flight == 0
-            && matches!(
-                update,
+            && !self.own_work_stopped
+            && match update {
                 acp::SessionUpdate::AgentMessageChunk(_)
-                    | acp::SessionUpdate::AgentThoughtChunk(_)
-                    | acp::SessionUpdate::ToolCall(_)
-            )
+                | acp::SessionUpdate::AgentThoughtChunk(_)
+                | acp::SessionUpdate::ToolCall(_) => true,
+                // OpenCode starts a tool call with an update, and a running one is work.
+                acp::SessionUpdate::ToolCallUpdate(update) => {
+                    !update.fields.status.as_ref().is_some_and(|status| {
+                        matches!(
+                            status,
+                            acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
+                        )
+                    }) && !self.view.entries.iter().any(|entry| {
+                        matches!(entry, Entry::ToolCall(tool_call) if tool_call.id == update.tool_call_id)
+                    })
+                }
+                _ => false,
+            }
     }
 
     fn start_own_work(&mut self) {
+        log::info!("{} is working without a prompt", self.view.state.agent_name);
         self.working_on_its_own = true;
         self.own_work_from = self.view.entries.len();
+        self.own_work_quiet_rounds = 0;
         // Its reply is its own, not more of the last turn's.
         self.new_message_due = true;
         self.set_working(true);
         self.check_own_work_later();
+    }
+
+    /// Whether the turn whose prompt was just answered goes on: the agent left work running in
+    /// the background (Claude Agent's background tasks) or sent subagents off to report later
+    /// (Factory Droid's Task that doesn't wait). It's still working until all of that stops.
+    fn turn_goes_on_in_background(&mut self) -> bool {
+        if self.turn_outcome != TurnOutcome::Completed
+            || self.session.is_none()
+            || self.view.state.status != ConnectionStatus::Ready
+        {
+            return false;
+        }
+        let from = self.turn_started_entries.min(self.view.entries.len());
+        self.detached_subagents = self.view.entries[from..].iter().any(|entry| {
+            matches!(entry, Entry::ToolCall(tool_call) if tool_call.sends_subagent_to_background())
+        });
+        !self.view.state.background_tasks.is_empty() || self.detached_subagents
+    }
+
+    /// Keeps the thread working past its prompt's answer, as the agent's work of its own, so
+    /// what it does as the background work ends is one turn with this one: one footer, and no
+    /// idle thread in between.
+    fn linger_for_background_work(&mut self) {
+        log::info!(
+            "{}'s turn ended with work in the background; waiting for it",
+            self.view.state.agent_name
+        );
+        self.working_on_its_own = true;
+        self.own_work_from = self.view.entries.len();
+        self.own_work_quiet_rounds = 0;
+        self.new_message_due = true;
+        self.check_own_work_later();
+    }
+
+    /// Whether a tool call from the entry on is still running.
+    fn has_running_tool_call_since(&self, entry: usize) -> bool {
+        let since = entry.min(self.view.entries.len());
+        self.view.entries[since..].iter().any(|entry| {
+            matches!(entry, Entry::ToolCall(tool_call) if matches!(
+                tool_call.status,
+                acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
+            ))
+        })
     }
 
     fn check_own_work_later(&mut self) {
@@ -2882,6 +3021,10 @@ impl AgentThread {
     /// The agent's work of its own ended. It's a turn, so the owner's work after a turn (a
     /// checkpoint) is done for it too, and then what waited for it goes.
     fn end_own_work(&mut self) {
+        log::info!(
+            "{}'s work without a prompt ended",
+            self.view.state.agent_name
+        );
         self.working_on_its_own = false;
         let Some(hook) = self.turn_hook.clone() else {
             self.own_work_ended();
@@ -2896,6 +3039,16 @@ impl AgentThread {
 
     fn own_work_ended(&mut self) {
         self.own_work_ending = false;
+        // As at a prompt's end: no one waits for an answer any more, and an agent that never
+        // cancels its request (Factory Droid's) would leave it shown.
+        self.cancel_permission_requests();
+        self.cancel_elicitations(|elicitation| {
+            !elicitation.opened
+                && matches!(
+                    elicitation.request.scope(),
+                    acp::ElicitationScope::Session(_)
+                )
+        });
         self.set_working(false);
         if let Some(parts) = self.after_turn.pop_front() {
             self.send_after_turn(parts);
@@ -3022,6 +3175,7 @@ impl AgentThread {
         if !working {
             self.working_on_its_own = false;
             self.own_work_ending = false;
+            self.detached_subagents = false;
         }
         if working == self.is_working() {
             return;
@@ -3120,17 +3274,25 @@ impl AgentThread {
                 if self.dropping_replay && is_conversation_update(&notification.update) {
                     return;
                 }
+                if self.own_work_stopped && is_conversation_update(&notification.update) {
+                    self.updates_after_stop += 1;
+                }
                 if self.starts_own_work(&notification.update) {
                     self.start_own_work();
                 }
-                // Claude Agent reports its cost with each result, its own work's too.
+                // Claude Agent reports its cost with each result, its own work's too. Work it
+                // left running (a background task, a tool call still going) isn't over, though.
                 let ends_own_work = self.working_on_its_own
+                    && self.view.state.background_tasks.is_empty()
+                    && !self.has_running_tool_call_since(self.own_work_from)
                     && matches!(
                         &notification.update,
                         acp::SessionUpdate::UsageUpdate(update) if update.cost.is_some()
                     );
                 if self.working_on_its_own && is_conversation_update(&notification.update) {
                     self.own_work_updates += 1;
+                    // The agent woke, with the subagents' reports or by itself.
+                    self.detached_subagents = false;
                 }
                 self.apply_update(notification.update);
                 if let Some(title) = self.pending_title.take() {
@@ -4838,6 +5000,19 @@ mod tests {
             self.wait_up_to(Duration::from_secs(5), done).await
         }
 
+        /// Lets the thread hear what the agent says for a while.
+        async fn handle_messages_for(&mut self, duration: Duration) {
+            tokio::time::timeout(duration, async {
+                loop {
+                    let message = self.inbox.next().await.expect("the inbox closed");
+                    self.thread.handle(message);
+                    self.events.extend(self.thread.take_events());
+                }
+            })
+            .await
+            .ok();
+        }
+
         async fn wait_up_to(&mut self, timeout: Duration, done: impl Fn(&AgentThread) -> bool) {
             let waited = tokio::time::timeout(timeout, async {
                 while !done(&self.thread) {
@@ -5130,8 +5305,9 @@ mod tests {
     }
 
     /// A command the agent sends to the background shows until it ends, as Claude Agent reports
-    /// it (JetBrains AIR's async tasks). The agent then goes on with no prompt: the thread works
-    /// until its result, with a message of its own, and what was sent meanwhile goes after.
+    /// it (JetBrains AIR's async tasks). The turn doesn't end with its prompt's answer: the
+    /// thread works while the command runs and then through what the agent goes on with, with
+    /// no prompt, until its result, all one turn. What was sent meanwhile goes after.
     #[tokio::test(flavor = "multi_thread")]
     async fn shows_background_tasks_and_the_work_after_them() {
         let Some(command) = mock_agent(&[]) else {
@@ -5143,24 +5319,31 @@ mod tests {
             .await;
         thread.update(|thread| thread.send("background-task 1".into()));
         thread
-            .wait_until(|thread| !thread.is_working() && !thread.state.background_tasks.is_empty())
+            .wait_until(|thread| {
+                thread.state.last_stop_reason.is_some() && !thread.state.background_tasks.is_empty()
+            })
             .await;
         let task = thread.thread.state.background_tasks[0].clone();
         assert_eq!(task.name.as_ref(), "Sleep for 1 seconds");
         assert_eq!(task.kind.as_ref(), "shell");
         assert_eq!(task.tool_call_id, Some(acp::ToolCallId::new("bash-1")));
         assert!(task.can_stop);
-        assert!(thread.thread.is_waiting());
+        assert!(
+            thread.thread.is_working(),
+            "the answer to the prompt doesn't end a turn with work in the background"
+        );
+        assert!(thread.thread.state.finished_turns.is_empty());
 
-        // Once it ends, the agent's work with its result is due, and then it's on.
+        // Once it ends, the agent goes on with its result, still the same turn.
         thread
             .wait_until(|thread| thread.state.background_tasks.is_empty())
             .await;
-        assert!(thread.thread.is_waiting() || thread.thread.is_working());
+        assert!(thread.thread.is_working());
         thread
-            .wait_until(|thread| thread.is_working() && thread.state.background_tasks.is_empty())
+            .wait_until(|thread| {
+                last_agent_message(thread).as_deref() == Some("The command finished.")
+            })
             .await;
-        assert!(!thread.thread.is_waiting());
         thread.update(|thread| thread.steer("next".into()));
         thread
             .wait_until(|thread| {
@@ -5173,8 +5356,8 @@ mod tests {
             ["Started in the background.", "The command finished."]
         );
         assert_eq!(user_messages(&thread.thread), ["background-task 1", "next"]);
-        // Each piece of work counts as a turn.
-        assert_eq!(thread.thread.state.finished_turns.len(), 3);
+        // The command and what followed it are one turn, and the message sent after is another.
+        assert_eq!(thread.thread.state.finished_turns.len(), 2);
     }
 
     /// Claude Agent runs each subagent in a session of its own once the client says it takes
@@ -5377,8 +5560,12 @@ mod tests {
             .await;
         thread.update(|thread| thread.send("background-task 30".into()));
         thread
-            .wait_until(|thread| !thread.is_working() && !thread.state.background_tasks.is_empty())
+            .wait_until(|thread| {
+                thread.state.last_stop_reason.is_some() && !thread.state.background_tasks.is_empty()
+            })
             .await;
+        // The turn goes on while the task runs.
+        assert!(thread.thread.is_working());
         thread.update(|thread| thread.stop_background_task("task-1"));
         assert!(thread.thread.state.background_tasks[0].stopping);
         thread
@@ -6055,6 +6242,124 @@ mod tests {
             agent_text(&thread.thread),
             "Done, with the turn lost.Echo: hello"
         );
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
+        );
+    }
+
+    /// Factory Droid's turn ends with its prompt's answer while the subagents it sent to the
+    /// background still run, and it goes on by itself once they report. The thread keeps
+    /// working through that, as one turn, until it's stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_with_subagents_in_the_background_is_not_over() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("droid-task background".into()));
+        thread
+            .wait_until(|thread| thread.state.last_stop_reason.is_some())
+            .await;
+        assert_eq!(
+            last_agent_message(&thread.thread).as_deref(),
+            Some("The worker runs on its own.")
+        );
+        assert!(thread.thread.is_working(), "its subagent still runs");
+        assert!(thread.thread.state.finished_turns.is_empty());
+
+        thread.update(AgentThread::cancel);
+        assert!(!thread.thread.is_working());
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+        assert_eq!(
+            thread.thread.state.finished_turns[0].outcome,
+            TurnOutcome::Stopped
+        );
+
+        // The next turn is its own.
+        thread.update(|thread| thread.send("hello".into()));
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert_eq!(thread.thread.state.finished_turns.len(), 2);
+    }
+
+    /// OpenCode starts a command with a tool call update after its turn ended. That's work: the
+    /// thread works again until the command is done and the agent's result is in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_that_starts_after_the_turn_is_work() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("late-shell".into()));
+        thread
+            .wait_until(|thread| thread.state.last_stop_reason.is_some())
+            .await;
+        assert!(!thread.thread.is_working(), "nothing is running yet");
+
+        thread.wait_until(|thread| thread.works_on_its_own()).await;
+        assert!(thread.thread.is_working());
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(
+            thread
+                .thread
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Entry::ToolCall(call) if call.status == acp::ToolCallStatus::Completed)),
+            "the command finished before the thread did"
+        );
+        assert_eq!(thread.thread.state.finished_turns.len(), 2);
+    }
+
+    /// Stopping the work an agent goes on with by itself ends it at once. Factory Droid has no
+    /// prompt to cancel then and works on, so once it's had time to stop, it's restarted, and
+    /// until then what it sends doesn't make the thread work again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_work_of_its_own_that_goes_on_restarts_the_agent() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(command) = mock_agent(&[history_file]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("droid-wake".into()));
+        thread.wait_until(|thread| thread.works_on_its_own()).await;
+        thread.update(AgentThread::cancel);
+        assert!(!thread.thread.is_working());
+        assert_eq!(
+            thread
+                .thread
+                .state
+                .finished_turns
+                .last()
+                .map(|turn| turn.outcome),
+            Some(TurnOutcome::Stopped)
+        );
+        thread.handle_messages_for(Duration::from_secs(2)).await;
+        assert!(!thread.thread.is_working(), "what it sends isn't new work");
+
+        thread
+            .wait_up_to(STOP_TIMEOUT + Duration::from_secs(5), |thread| {
+                thread.last_stop_reason() == Some(&acp::StopReason::Cancelled)
+            })
+            .await;
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("hello".into()));
+        thread.wait_until(|thread| !thread.is_working()).await;
         assert_eq!(
             thread.thread.last_stop_reason(),
             Some(&acp::StopReason::EndTurn)

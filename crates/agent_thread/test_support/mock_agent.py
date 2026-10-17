@@ -14,7 +14,8 @@ async tasks (`_meta.jetbrains.air.capabilities` has "asyncTasks"), it reports th
 Claude Agent does, and stops it on `_session/async_task/stop`, noting the stop in the
 conversation. Once the command is done, it says so a word at a time with no prompt, as Claude
 Agent goes on when a background task ends, and ends with a usage update with its cost.
-"subagents [seconds]" runs two subagents at once, as Claude Agent does: to a client that takes
+"background-task [seconds] limit" uses the account's limit up as its turn ends, which fails
+with "Usage limit reached", the command still running. "subagents [seconds]" runs two subagents at once, as Claude Agent does: to a client that takes
 its native subagent sessions (`_meta.jetbrains.air.capabilities` has "nativeSubagentSessions"),
 it announces each (`subagent_spawned`), sends their searches, reads and reports in their own
 sessions, a step every 0.2 seconds (or the seconds given), and ends each with
@@ -36,7 +37,11 @@ until the turn is cancelled, which it then answers as cancelled, without ending 
 tool call. "network-error" starts a reply, then fails as a turn
 does once an agent gives up on a lost connection; sent again, it's echoed. "lost-turn" replies
 but never answers the prompt, even once the turn is cancelled, as Factory Droid loses a turn
-once it has put a session that waited on the user to sleep.
+once it has put a session that waited on the user to sleep. "late-shell" answers its prompt,
+then starts a command with a tool call update and completes it two seconds later, ending with
+a usage update with its cost, as OpenCode's shell runs after its turn. "droid-wake" answers its prompt, then
+goes on without one for twenty seconds, no matter that it's cancelled, as Droid does when its
+subagents report.
 
 With MOCK_LOGIN_FILE set, sessions need that file to exist (otherwise they fail with
 "authentication required" and a pairing code, as Factory Droid does); "mock-login" creates
@@ -403,6 +408,29 @@ def work_in_background(session_id):
         time.sleep(0.5)
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session_id, "update": text_chunk("agent_message_chunk", ".")}})
+    send_result_cost(session_id)
+
+
+def work_without_prompt(session_id):
+    for _ in range(40):
+        time.sleep(0.5)
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id, "update": text_chunk("agent_message_chunk", ".")}})
+
+
+def run_late_shell(session_id):
+    """As OpenCode starts a command after its turn ended: a tool call that begins with an update,
+    then completes, and the result's cost."""
+    time.sleep(0.5)
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session_id, "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "late-shell",
+            "title": "Running the sets", "kind": "execute", "status": "in_progress"}}})
+    time.sleep(2)
+    send({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": session_id, "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "late-shell",
+            "status": "completed"}}})
     send_result_cost(session_id)
 
 
@@ -1029,6 +1057,18 @@ for line in sys.stdin:
             # As Factory Droid loses a turn once it has put a session that waited on the user
             # to sleep: it replies, but never answers the prompt, even once it's cancelled.
             update(params["sessionId"], text_chunk("agent_message_chunk", "Done, with the turn lost."))
+        elif prompt_text == "late-shell":
+            update(params["sessionId"], text_chunk("agent_message_chunk", "Started the sets."))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+            threading.Thread(target=run_late_shell, args=(params["sessionId"],),
+                             daemon=True).start()
+        elif prompt_text == "droid-wake":
+            # As Factory Droid goes on by itself once its subagents report: a turn with no
+            # prompt that ignores a cancel, since it has no prompt to cancel.
+            update(params["sessionId"], text_chunk("agent_message_chunk", "Waiting for the reports."))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+            threading.Thread(target=work_without_prompt, args=(params["sessionId"],),
+                             daemon=True).start()
         elif prompt_text == "running":
             update(params["sessionId"], {"sessionUpdate": "tool_call", "toolCallId": "running-1",
                                          "title": "sleep 60", "kind": "execute",
@@ -1125,7 +1165,10 @@ for line in sys.stdin:
                              daemon=True).start()
         elif prompt_text == "background-task" or prompt_text.startswith("background-task "):
             session_id = params["sessionId"]
-            seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 1
+            words = prompt_text.split()
+            seconds = float(words[1]) if len(words) > 1 else 1
+            # "limit" uses the account up as the turn ends, with the command still running.
+            runs_into_limit = words[-1] == "limit"
             background_task_count += 1
             task_id = f"task-{background_task_count}"
             tool_call_id = f"bash-{background_task_count}"
@@ -1147,7 +1190,13 @@ for line in sys.stdin:
                     "canStop": True, "toolCallId": tool_call_id,
                     "outputFilePath": f"/tmp/mock-tasks/{task_id}.output"})
             update(session_id, text_chunk("agent_message_chunk", "Started in the background."))
-            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+            if runs_into_limit and USAGE_FILE:
+                with open(USAGE_FILE, "w") as file:
+                    file.write("100")
+                send({"jsonrpc": "2.0", "id": message["id"],
+                      "error": {"code": -32603, "message": "Usage limit reached"}})
+            else:
+                send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
             threading.Thread(target=run_background_task,
                              args=(session_id, task_id, seconds, stop), daemon=True).start()
         elif prompt_text == "subagents" or prompt_text.startswith("subagents "):

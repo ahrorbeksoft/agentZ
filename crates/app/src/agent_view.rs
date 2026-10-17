@@ -97,7 +97,7 @@ use crate::tool_calls::{
     ToolCallKind, WebHit,
 };
 use crate::usage_limits::{
-    LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, tightest_window,
+    LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, shown_window,
 };
 use crate::window_background;
 use crate::{NewChat, OpenFolder, ToggleDiff, ToggleTerminalDrawer};
@@ -142,21 +142,24 @@ pub(crate) const RESIZE_EDGE_SIZE: Pixels = px(6.);
 const COMPACT_HEADER_WIDTH: Pixels = px(480.);
 /// Narrower than this, the header's branch shows only its icon.
 const BRANCH_ICON_WIDTH: Pixels = px(560.);
-/// This narrow or narrower, the header's project shows only its icon.
-const PROJECT_ICON_WIDTH: Pixels = px(360.);
-/// The least the header leaves the title: everything else gives way first.
+/// This narrow or narrower, the header's project shows only its icon. Wide enough that its
+/// name, at its longest, fits beside the title's least and the ⋯ button.
+const PROJECT_ICON_WIDTH: Pixels = px(400.);
+/// The least the header leaves the title: the branch gives way first. The project's name never
+/// shrinks, so this is what holds while a long title truncates.
 const MIN_HEADER_TITLE_WIDTH: Pixels = px(120.);
-/// How fast the header's branch and project's name shrink against the title's 1: the branch
-/// gives way first, then the title, and the project's name only once the title is at its
-/// least.
+/// How fast the header's branch shrinks against the title's 1, so it gives way first.
 const BRANCH_SHRINK: f32 = 1000.;
-const PROJECT_NAME_SHRINK: f32 = 0.001;
 /// The least the branch shrinks to before the project and title do: its icon and a few
 /// letters.
 const MIN_BRANCH_WIDTH: Pixels = px(72.);
 /// Narrower than this, the composer's agent and account show only their icon and avatar
 /// (`design/thread-narrow`, topic 3B).
 const COMPACT_COMPOSER_WIDTH: Pixels = px(560.);
+/// Narrower or shorter than this, the new thread screen shrinks its headline and gaps and
+/// wraps what's under its composer, as in a pane of a 3×3 Workspaces view.
+const COMPACT_NEW_THREAD_WIDTH: Pixels = px(480.);
+const COMPACT_NEW_THREAD_HEIGHT: Pixels = px(420.);
 
 /// The drawer's top edge, being dragged to resize it.
 struct DraggedDrawerEdge;
@@ -475,6 +478,8 @@ pub struct AgentView {
     /// The view's width when it was last drawn, which the header and composer fit; zero
     /// until then.
     view_width: Pixels,
+    /// Its height, which the new thread screen fits.
+    view_height: Pixels,
     turn_rail_hover: TurnRailHover,
     /// Where the turn rail's strips were last drawn, to find the turn under the mouse.
     turn_rail_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -748,6 +753,7 @@ impl AgentView {
             },
             conversation_width: px(0.),
             view_width: px(0.),
+            view_height: px(0.),
             turn_rail_hover: TurnRailHover::default(),
             turn_rail_bounds: Rc::default(),
             synced_revisions: Vec::new(),
@@ -2358,12 +2364,39 @@ impl AgentView {
         }
     }
 
-    fn send(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+    fn send(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.mention_query.is_some() && !self.mention_matches.is_empty() {
             self.accept_mention(self.mention_index, cx);
             return;
         }
+        if self.steer_next_queued_message(window, cx) {
+            return;
+        }
         self.send_message(cx);
+    }
+
+    /// The key that queued a message, pressed again in the focused, empty composer, steers the
+    /// message next in the queue: nothing else could be meant by it. A message already
+    /// steering is left alone, since steering it again would stop it.
+    fn steer_next_queued_message(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        if self.is_archived
+            || !self.composer.focus_handle(cx).is_focused(window)
+            || !self.composer.read(cx).plain_text().trim().is_empty()
+        {
+            return false;
+        }
+        let thread = self.thread.read(cx);
+        if !thread.is_working() || thread.state.steering_queued {
+            return false;
+        }
+        let Some(next) = thread.state.queued_messages.first() else {
+            return false;
+        };
+        let id = next.id;
+        self.list_state.scroll_to_end();
+        self.thread
+            .update(cx, |thread, cx| thread.steer_queued_message(id, cx));
+        true
     }
 
     fn send_message(&mut self, cx: &mut Context<Self>) {
@@ -3585,11 +3618,11 @@ impl AgentView {
         let row = self.waiting_row(cx);
         let is_above = Self::waiting_out_of_view(&self.list_state, row)?;
         let warning = cx.theme().status().warning;
-        let background = cx
-            .theme()
-            .colors()
-            .panel_background
-            .blend(warning.opacity(0.16));
+        // Opaque, as the panel's background is see-through over a blurred window and the text
+        // behind the pill would show through.
+        let mut panel = cx.theme().colors().panel_background;
+        panel.a = 1.;
+        let background = panel.blend(warning.opacity(0.16));
         Some(
             h_flex()
                 .absolute()
@@ -3677,14 +3710,14 @@ impl AgentView {
     /// draws it again when that changes.
     fn render_view_measure(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        let drawn_width = self.view_width;
+        let drawn_size = (self.view_width, self.view_height);
         canvas(
             move |bounds, window, cx| {
-                let width = bounds.size.width;
-                if width != drawn_width {
+                let size = (bounds.size.width, bounds.size.height);
+                if size != drawn_size {
                     window.defer(cx, move |_, cx| {
                         view.update(cx, |view, cx| {
-                            view.view_width = width;
+                            (view.view_width, view.view_height) = size;
                             cx.notify();
                         })
                         .log_err();
@@ -3708,6 +3741,12 @@ impl AgentView {
 
     fn is_header_compact(&self) -> bool {
         self.is_narrower_than(COMPACT_HEADER_WIDTH)
+    }
+
+    /// Whether the new thread screen is small: a pane among many in the Workspaces view.
+    fn is_new_thread_compact(&self) -> bool {
+        self.is_narrower_than(COMPACT_NEW_THREAD_WIDTH)
+            || (self.view_height > px(0.) && self.view_height < COMPACT_NEW_THREAD_HEIGHT)
     }
 
     fn is_composer_compact(&self) -> bool {
@@ -4174,13 +4213,10 @@ impl AgentView {
         let icon = render_project_icon(machine, project, px(14.), cx);
         let hover = cx.theme().colors().ghost_element_hover;
         let shows_name = !self.is_at_most(PROJECT_ICON_WIDTH);
-        // Its name keeps its width while the title truncates, and only shrinks once the
-        // title is down to its least; very narrow it shows only its icon, which never shrinks.
+        // Its name never shrinks, only the title truncates (a name over its cap still does); very
+        // narrow it shows only its icon.
         h_flex()
-            .when(shows_name, |crumb| {
-                crumb.min_w_0().flex_shrink(PROJECT_NAME_SHRINK)
-            })
-            .when(!shows_name, |crumb| crumb.flex_none())
+            .flex_none()
             .gap_1()
             .child(
                 h_flex()
@@ -6166,6 +6202,12 @@ impl AgentView {
         let action = tool_call_action(tool_call, &kind, names_questions);
         let has_content = match &kind {
             ToolCallKind::ToolSearch(_) => false,
+            // Droid's summary of a read says what the lines are; the file has them.
+            _ if matches!(action, AgentAction::Read { .. })
+                && tool_calls::is_read_summary(tool_call) =>
+            {
+                false
+            }
             _ => {
                 !tool_call.text.is_empty()
                     || !tool_call.diffs.is_empty()
@@ -6274,6 +6316,10 @@ impl AgentView {
         } else {
             Vec::new()
         };
+        let diff_open = is_open
+            .then(|| single_diff_in_row(tool_call, &kind, &action))
+            .flatten()
+            .map(|diff| diff.path.clone());
         let colors = cx.theme().colors();
         let row = h_flex()
             .id(("tool-call-row", index))
@@ -6346,6 +6392,28 @@ impl AgentView {
                                     // The row behind it opens and closes on a click.
                                     cx.stop_propagation();
                                     cx.emit(AgentViewEvent::OpenThread(thread_id));
+                                })),
+                        ),
+                )
+            })
+            .when_some(diff_open, |this, path| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("tool-diff-open-{index}-0"))
+                        .child(
+                            Button::new(("tool-diff-open", index), "Open")
+                                .label_size(LabelSize::Small)
+                                .color(Color::Accent)
+                                .end_icon(
+                                    Icon::new(IconName::ArrowUpRight)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    // The row behind it opens and closes on a click.
+                                    cx.stop_propagation();
+                                    cx.emit(AgentViewEvent::OpenDiffFile(path.clone()));
                                 })),
                         ),
                 )
@@ -6577,10 +6645,12 @@ impl AgentView {
             }
             (None, Some(view)) => output.push(view),
             (None, None) => {
+                let with_header = single_diff_in_row(tool_call, kind, action).is_none();
                 for (diff_index, diff) in tool_call.diffs.iter().enumerate() {
                     output.push(self.render_file_diff(
                         diff,
                         (index, diff_index),
+                        with_header,
                         folder.as_deref(),
                         window,
                         cx,
@@ -6785,10 +6855,12 @@ impl AgentView {
     /// One file's change in an edit: a header with its icon, its path, the lines it added and
     /// removed, and Open, which shows the file in the diff panel; then the diff, with the new
     /// file's line numbers in a gutter, as Zed's editor shows a diff. Long lines scroll sideways.
+    /// An edit of one file has no header: its row says the same and has the Open.
     fn render_file_diff(
         &self,
         diff: &FileDiff,
         (entry, part): (usize, usize),
+        with_header: bool,
         folder: Option<&Path>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6907,7 +6979,7 @@ impl AgentView {
             .line_height(rems_from_px(18_f32))
             .child(lines);
         v_flex()
-            .child(header)
+            .when(with_header, |this| this.child(header))
             .child(with_scrollbar(
                 scroller,
                 div().w_full(),
@@ -10153,7 +10225,7 @@ impl AgentView {
         )
     }
 
-    /// The thread's account's window closest to running out, which the composer's gauge shows.
+    /// The thread's account's window the composer's gauge shows, as the usage setting says.
     fn gauged_window(&self, cx: &App) -> Option<LimitWindow> {
         let agent_id = self.agent_id.as_ref()?;
         let account = self.store.read(cx).thread(self.thread_id)?.account;
@@ -10162,11 +10234,20 @@ impl AgentView {
         if accounts.logged_in(account) == Some(false) {
             return None;
         }
-        tightest_window(&accounts.status(account)?.status.windows, SystemTime::now()).cloned()
+        let which = crate::app_settings::AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .usage_window;
+        shown_window(
+            &accounts.status(account)?.status.windows,
+            which,
+            SystemTime::now(),
+        )
+        .cloned()
     }
 
-    /// Beside the agent, what's left of the thread's account's window closest to running out,
-    /// opening that account's windows.
+    /// Beside the agent, what's left of the window the usage setting picks, opening the thread's
+    /// account's windows.
     fn render_usage_gauge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let window = self.gauged_window(cx)?;
         let agent_id = self.agent_id.clone()?;
@@ -10905,7 +10986,8 @@ impl AgentView {
     /// where the thread works. Until the first message, the agent, checkout and machine can
     /// still change.
     fn render_new_thread(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let headline = self.render_new_thread_headline(cx);
+        let is_compact = self.is_new_thread_compact();
+        let headline = self.render_new_thread_headline(is_compact, cx);
         let screen = v_flex()
             .id("new-thread")
             .debug_selector(|| "new-thread".into())
@@ -10913,14 +10995,22 @@ impl AgentView {
             .min_h_0()
             .w_full()
             .items_center()
-            .justify_center()
-            .px_4()
+            .map(|this| if is_compact { this.p_2() } else { this.px_4() })
             .overflow_y_scroll()
             .child(
                 v_flex()
                     .w_full()
                     .max_w(NEW_THREAD_WIDTH)
-                    .gap_6()
+                    // Centered while it fits. Once it doesn't (a small pane), it starts at the
+                    // top and scrolls, where centering would cut its top off.
+                    .my_auto()
+                    .map(|this| {
+                        if is_compact {
+                            this.gap_3()
+                        } else {
+                            this.gap_6()
+                        }
+                    })
                     .child(headline)
                     .child(
                         v_flex()
@@ -10944,13 +11034,19 @@ impl AgentView {
     /// The new thread's headline. A project's draft names its project, as t3code's
     /// `DraftHeroHeadline` does: the name opens a menu that moves the draft to a chat or
     /// another project, and "or start a chat" sits under it. A chat asks what to talk about.
-    fn render_new_thread_headline(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_new_thread_headline(&self, is_compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let headline = v_flex()
             .debug_selector(|| "new-thread-headline".into())
             .items_center()
             .gap_1()
             .text_center()
-            .text_2xl()
+            .map(|this| {
+                if is_compact {
+                    this.text_base()
+                } else {
+                    this.text_2xl()
+                }
+            })
             .text_color(cx.theme().colors().text);
         if self.is_chat(cx) {
             return headline
@@ -10973,6 +11069,7 @@ impl AgentView {
             .child(
                 h_flex()
                     .justify_center()
+                    .flex_wrap()
                     .child("What should we build in")
                     .child(
                         div()
@@ -11286,16 +11383,22 @@ impl AgentView {
                 )
                 .into_any_element(),
             None if self.in_workspaces(cx) => h_flex()
+                .min_w_0()
+                .flex_wrap()
                 .gap_1()
                 .child(self.render_folder_picker(cx))
                 .children(self.render_account_picker(PickerFor::NewThread, cx))
                 .into_any_element(),
             None if self.is_chat(cx) => h_flex()
+                .min_w_0()
+                .flex_wrap()
                 .gap_1()
                 .children(self.render_chat_machine_picker(cx))
                 .children(self.render_account_picker(PickerFor::NewThread, cx))
                 .into_any_element(),
             None => h_flex()
+                .min_w_0()
+                .flex_wrap()
                 .gap_1()
                 .child(self.render_checkout_picker(cx))
                 .children(self.render_machine_picker(cx))
@@ -11309,8 +11412,10 @@ impl AgentView {
         };
         h_flex()
             .w_full()
+            .flex_wrap()
             .justify_between()
-            .gap_2()
+            .gap_x_2()
+            .gap_y_1()
             .child(left)
             .children(branch)
             .into_any_element()
@@ -12505,8 +12610,12 @@ fn render_account_row(
 }
 
 /// An account as the menus that pick one show it: its avatar, its name over its plan, and the
-/// window closest to running out. Greyed, it can't be picked.
+/// window the usage setting picks. Greyed, it can't be picked.
 fn account_row(entry: &AccountEntry, is_greyed: bool, now: SystemTime, cx: &App) -> Div {
+    let which = crate::app_settings::AppSettingsStore::global(cx)
+        .read(cx)
+        .settings()
+        .usage_window;
     let note: Option<SharedString> = if entry.is_logged_out {
         Some("Logged out".into())
     } else {
@@ -12543,7 +12652,7 @@ fn account_row(entry: &AccountEntry, is_greyed: bool, now: SystemTime, cx: &App)
                     note.map(|note| Label::new(note).size(LabelSize::XSmall).color(note_color)),
                 ),
         )
-        .children(tightest_window(&entry.windows, now).map(|window| {
+        .children(shown_window(&entry.windows, which, now).map(|window| {
             let left = left_label(window, now).size(LabelSize::XSmall);
             div().pl(px(14.)).child(if is_greyed {
                 left.color(Color::Disabled)
@@ -13650,6 +13759,22 @@ fn diff_stat(added: usize, removed: usize) -> impl IntoElement {
         )
 }
 
+/// The one file an edit changed, when its card shows that diff without a header of its own:
+/// the row already says the path and the lines, and has the Open (`design/tool-calls-2`,
+/// topic 2D, for several files each gets a header).
+fn single_diff_in_row<'a>(
+    tool_call: &'a ToolCall,
+    kind: &ToolCallKind,
+    action: &AgentAction,
+) -> Option<&'a FileDiff> {
+    match (tool_call.diffs.as_slice(), kind, action) {
+        ([diff], kind, AgentAction::Other) if !matches!(kind, ToolCallKind::Own { .. }) => {
+            Some(diff)
+        }
+        _ => None,
+    }
+}
+
 /// A plan the agent asks to approve, as Claude Agent's ExitPlanMode is: a change of mode
 /// showing the plan, which is markdown.
 fn is_plan(tool_call: &ToolCall) -> bool {
@@ -14704,6 +14829,41 @@ mod tests {
         assert!(cx.debug_bounds("new-thread").is_some());
     }
 
+    /// In a small pane (one of nine in the Workspaces view) the new thread screen shrinks its
+    /// headline and gaps, wraps what's under the composer, and starts at its top when it
+    /// doesn't fit, rather than being cut off above.
+    #[gpui::test]
+    fn the_new_thread_screen_fits_a_small_pane(cx: &mut TestAppContext) {
+        let (_, cx) = open(1, false, cx);
+        let bounds = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+        };
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        cx.run_until_parked();
+        let roomy_gap = bounds("composer", cx).top() - bounds("new-thread-headline", cx).bottom();
+
+        for (width, height) in [(300., 220.), (420., 300.), (330., 160.)] {
+            cx.simulate_resize(gpui::size(px(width), px(height)));
+            cx.run_until_parked();
+            let screen = bounds("new-thread", cx);
+            let headline = bounds("new-thread-headline", cx);
+            assert!(
+                headline.top() >= screen.top(),
+                "{width}×{height}: the headline is cut off above the screen"
+            );
+            let controls = bounds("composer-controls", cx);
+            assert!(
+                controls.right() <= screen.right(),
+                "{width}×{height}: the composer's controls overflow"
+            );
+            assert!(
+                bounds("composer", cx).top() - headline.bottom() < roomy_gap,
+                "{width}×{height}: the gaps shrink"
+            );
+        }
+    }
+
     #[gpui::test]
     fn a_workspaces_draft_works_in_its_folder(cx: &mut TestAppContext) {
         let (view, cx) = open(4, false, cx);
@@ -15578,7 +15738,7 @@ mod tests {
         assert_eq!(sent()[2], reset);
     }
 
-    /// The composer gauges the thread's account by its window closest to running out, and opens
+    /// The composer gauges the thread's account by the window the usage setting picks, and opens
     /// that account's windows. A logged-out account's last read isn't gauged.
     #[gpui::test]
     fn the_composer_gauges_the_threads_account(cx: &mut TestAppContext) {
@@ -15636,7 +15796,44 @@ mod tests {
                     .map(|window| (window.label.clone(), window.left_percent()))
             })
         };
+        // The current session shows, though the weekly window has less left.
+        assert_eq!(gauged(cx), Some(("5-hour".into(), 62)));
+        let app_settings = cx.update(|_, cx| crate::app_settings::AppSettingsStore::global(cx));
+        app_settings.update(cx, |store, cx| {
+            store.update(
+                |settings| settings.usage_window = crate::app_settings::UsageWindow::Tightest,
+                cx,
+            )
+        });
         assert_eq!(gauged(cx), Some(("Weekly".into(), 9)));
+        app_settings.update(cx, |store, cx| {
+            store.update(
+                |settings| settings.usage_window = crate::app_settings::UsageWindow::Session,
+                cx,
+            )
+        });
+        // A used-up weekly window shows in its place, nothing working till it resets.
+        if let Some(account) = accounts.account_mut(work) {
+            account.status = Some(read(vec![
+                window("5-hour", 38., 5 * hour),
+                window("Weekly", 100., 168 * hour),
+            ]));
+        }
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(gauged(cx), Some(("Weekly".into(), 0)));
+        if let Some(account) = accounts.account_mut(work) {
+            account.status = Some(read(vec![
+                window("5-hour", 38., 5 * hour),
+                window("Weekly", 91., 168 * hour),
+            ]));
+        }
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
         let gauge = cx
             .debug_bounds("usage-gauge")
             .expect("the composer has the gauge");
@@ -15832,6 +16029,7 @@ mod tests {
         };
 
         resize(720., cx);
+        let project_name = width_of("thread-header-project-name", cx).expect("the name is shown");
         assert!(width_of("thread-header-branch", cx).is_some_and(|width| width > px(100.)));
         assert!(cx.debug_bounds("thread-header-changes").is_some());
         assert!(cx.debug_bounds("thread-header-terminal").is_some());
@@ -15844,9 +16042,16 @@ mod tests {
             branch >= MIN_BRANCH_WIDTH && branch < px(100.),
             "{branch:?}"
         );
-        assert!(cx.debug_bounds("thread-header-project-name").is_some());
+        assert_eq!(
+            width_of("thread-header-project-name", cx),
+            Some(project_name)
+        );
 
         resize(520., cx);
+        assert_eq!(
+            width_of("thread-header-project-name", cx),
+            Some(project_name)
+        );
         assert!(width_of("thread-header-branch", cx).is_some_and(|width| width < px(40.)));
         assert!(
             width_of("thread-header-title-slot", cx)
@@ -15857,7 +16062,10 @@ mod tests {
         assert!(cx.debug_bounds("thread-header-branch").is_none());
         assert!(cx.debug_bounds("thread-header-changes").is_none());
         assert!(cx.debug_bounds("thread-header-terminal").is_none());
-        assert!(cx.debug_bounds("thread-header-project-name").is_some());
+        assert_eq!(
+            width_of("thread-header-project-name", cx),
+            Some(project_name)
+        );
         assert!(cx.debug_bounds("thread-options-running").is_some());
         click("thread-options", cx);
         let branch = cx
@@ -15874,7 +16082,7 @@ mod tests {
         assert!(view.read_with(cx, |view, _| view.is_drawer_open));
         assert!(cx.debug_bounds("thread-options-running").is_none());
 
-        for width in [360., 320.] {
+        for width in [400., 360., 320.] {
             resize(width, cx);
             let project = cx
                 .debug_bounds("thread-header-project")
@@ -17065,7 +17273,8 @@ mod tests {
     }
 
     /// Each kind of tool call opens to what it did (`design/tool-calls-2`): a read to its
-    /// lines; an edit has a header per file, whose Open shows the file in the diff panel; a new
+    /// lines; an edit of several files has a header per file, whose Open shows the file in the
+    /// diff panel (one file's row has the Open instead, with no header over its diff); a new
     /// file opens to its lines; a search to its matches by file; a web search to its pages; a
     /// fetch to its notes, as prose.
     #[gpui::test]
@@ -17114,9 +17323,16 @@ mod tests {
             Fetch,
             Some("## toBeCloseTo\n\nCompares **floats**."),
         );
+        let mut one_file = completed_call("one-file", "Edit", Edit, None);
+        one_file.diffs = vec![FileDiff {
+            path: "/tmp/demo/only.ts".into(),
+            old_text: Some("p\n".into()),
+            new_text: "q\n".into(),
+            start_line: Some(1),
+        }];
         // Each between messages, so none folds into a run.
         let mut entries = vec![Entry::UserMessage("Go".into())];
-        for tool_call in [read, edit, created, grep, web, fetch] {
+        for tool_call in [read, edit, created, grep, web, fetch, one_file] {
             entries.push(Entry::ToolCall(tool_call));
             entries.push(Entry::AgentMessage("Next.".into()));
         }
@@ -17148,6 +17364,19 @@ mod tests {
             "Open leaves the card open"
         );
         click("tool-call-row-3", cx);
+
+        // An edit of one file has one header: its row, which has the Open.
+        opened_files.borrow_mut().clear();
+        click("tool-call-row-13", cx);
+        assert!(cx.debug_bounds("tool-diff-13-0").is_some());
+        assert!(cx.debug_bounds("tool-diff-header-13-0").is_none());
+        click("tool-diff-open-13-0", cx);
+        assert_eq!(
+            *opened_files.borrow(),
+            vec![PathBuf::from("/tmp/demo/only.ts")]
+        );
+        click("tool-call-row-13", cx);
+        assert!(cx.debug_bounds("tool-diff-open-13-0").is_none());
 
         let opens_to = |row: usize, part: &str, cx: &mut VisualTestContext| {
             click(format!("tool-call-row-{row}").leak(), cx);
@@ -18212,6 +18441,62 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("queued-messages").is_some());
+    }
+
+    /// Enter in the focused, empty composer steers the message next in the queue, once: a
+    /// message already steering is left as it is.
+    #[gpui::test]
+    fn enter_in_an_empty_composer_steers_the_next_queued_message(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let queue = |steering: bool, cx: &mut VisualTestContext| {
+            thread.update(cx, |thread, cx| {
+                thread.set_queued_messages_for_test(
+                    vec![
+                        QueuedMessage {
+                            id: 3,
+                            prompt: PromptPart::text("Then the docs"),
+                        },
+                        QueuedMessage {
+                            id: 4,
+                            prompt: PromptPart::text("And the changelog"),
+                        },
+                    ],
+                    steering,
+                    cx,
+                );
+            })
+        };
+        let steers = |cx: &mut VisualTestContext| {
+            sent(&client, cx)
+                .iter()
+                .filter(|request| matches!(request, Request::SteerQueuedMessage { id: 3, .. }))
+                .count()
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Run the tests".into())], cx);
+            thread.set_working_for_test(true, cx);
+        });
+        queue(false, cx);
+        cx.run_until_parked();
+
+        // Not while the composer isn't the focus, nor while it has text.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(steers(cx), 0);
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("More");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(steers(cx), 0);
+
+        cx.simulate_keystrokes("enter");
+        assert_eq!(steers(cx), 1);
+
+        queue(true, cx);
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        assert_eq!(steers(cx), 1, "steering again would stop it");
     }
 
     /// The queue shows what the server keeps. Editing a message takes it out of the queue and
