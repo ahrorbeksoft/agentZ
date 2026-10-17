@@ -416,12 +416,87 @@ impl DesignDefaults {
             VariantsAs::Both => "A picture and a live page for each variant.",
         };
         format!(
-            "The user's design defaults, for when they haven't said otherwise (defaults, not \
-             rules: a design that needs more or less may differ): {} variant{} a \
-             topic{today}. {sizes} {variants_as}",
+            "The user's design defaults, for when they haven't said otherwise: {} variant{} a \
+             topic{today}. {sizes} {variants_as} agentZ checks every design against them and \
+             sends back one that differs, unless it has a deviationReason: one sentence on why \
+             this design needs to, which the user sees. Follow the defaults when the user hasn't \
+             asked for something else.",
             self.variants,
             if self.variants == 1 { "" } else { "s" },
         )
+    }
+
+    /// How a design differs from these defaults, a thing each ("topic 2 has 5 variants, not
+    /// 3"); empty when it follows them. Only what the defaults decide: how many variants a
+    /// topic has, whether today's is there, which sizes and whether pictures, live pages or
+    /// both.
+    pub fn deviations(&self, design: &Design) -> Vec<String> {
+        let mut found = Vec::new();
+        let place = |index: usize| {
+            if design.topics.len() > 1 {
+                format!("topic {}", index + 1)
+            } else {
+                "the topic".to_string()
+            }
+        };
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        for (index, topic) in design.topics.iter().enumerate() {
+            let count = topic.variants.len();
+            if count != usize::from(self.variants) {
+                found.push(format!(
+                    "{} has {count} variant{}, not {}",
+                    place(index),
+                    plural(count),
+                    self.variants
+                ));
+            }
+            match (self.include_today, topic.today.is_some()) {
+                (true, false) => found.push(format!("{} has no today's version", place(index))),
+                (false, true) => found.push(format!("{} has today's version", place(index))),
+                _ => {}
+            }
+        }
+        let variants: Vec<&DesignVariant> = design
+            .topics
+            .iter()
+            .flat_map(|topic| &topic.variants)
+            .collect();
+        let wants_desktop = self.sizes != DesignSizes::Phone;
+        let wants_phone = self.sizes != DesignSizes::Desktop;
+        let wants_picture = self.variants_as != VariantsAs::LivePages;
+        let wants_page = self.variants_as != VariantsAs::Pictures;
+        let mut differs = |wanted: bool, has: fn(&DesignVariant) -> bool, what: &str| {
+            let count = variants
+                .iter()
+                .filter(|variant| has(variant) != wanted)
+                .count();
+            if count > 0 {
+                let verb = match (wanted, count) {
+                    (true, 1) => "lacks",
+                    (true, _) => "lack",
+                    (false, 1) => "has",
+                    (false, _) => "have",
+                };
+                found.push(format!("{count} variant{} {verb} {what}", plural(count)));
+            }
+        };
+        differs(
+            wants_desktop,
+            |variant| variant.picture.is_some() || variant.page.is_some(),
+            "a desktop version",
+        );
+        differs(wants_phone, DesignVariant::has_phone, "a phone version");
+        differs(
+            wants_picture,
+            |variant| variant.picture.is_some() || variant.phone_picture.is_some(),
+            "a picture",
+        );
+        differs(
+            wants_page,
+            |variant| variant.page.is_some() || variant.phone_page.is_some(),
+            "a live page",
+        );
+        found
     }
 }
 
@@ -680,4 +755,103 @@ pub struct ListingIcon {
     /// The tile's color as `#rrggbb`, in light themes' shade and in dark ones'.
     pub light: String,
     pub dark: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(name: &str, picture: bool, page: bool, phone: bool) -> DesignVariant {
+        DesignVariant {
+            name: name.to_string(),
+            picture: picture.then(|| "a.png".to_string()),
+            page: page.then(|| "a.html".to_string()),
+            phone_picture: (phone && picture).then(|| "a-phone.png".to_string()),
+            phone_page: (phone && page).then(|| "a-phone.html".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn topic(variants: usize, today: bool, picture: bool, page: bool, phone: bool) -> DesignTopic {
+        DesignTopic {
+            title: "The plans page".to_string(),
+            today: today.then(|| variant("Today's", true, false, false)),
+            variants: (0..variants)
+                .map(|place| variant(&DesignTopic::letter(place), picture, page, phone))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn design(topics: Vec<DesignTopic>) -> Design {
+        Design {
+            topics,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_design_as_the_defaults_say_has_no_deviations() {
+        let defaults = DesignDefaults::default();
+        assert_eq!(
+            defaults.deviations(&design(vec![topic(3, true, true, false, false)])),
+            Vec::<String>::new()
+        );
+
+        let both = DesignDefaults {
+            variants: 2,
+            include_today: false,
+            sizes: DesignSizes::Both,
+            variants_as: VariantsAs::Both,
+        };
+        assert!(
+            both.deviations(&design(vec![topic(2, false, true, true, true)]))
+                .is_empty()
+        );
+        let phone = DesignDefaults {
+            sizes: DesignSizes::Phone,
+            ..defaults
+        };
+        let mut phone_only = topic(3, true, true, false, false);
+        for variant in &mut phone_only.variants {
+            variant.phone_picture = variant.picture.take();
+        }
+        assert!(phone.deviations(&design(vec![phone_only])).is_empty());
+    }
+
+    #[test]
+    fn a_design_says_how_it_differs_from_the_defaults() {
+        let defaults = DesignDefaults::default();
+        assert_eq!(
+            defaults.deviations(&design(vec![topic(1, false, true, false, false)])),
+            [
+                "the topic has 1 variant, not 3",
+                "the topic has no today's version"
+            ]
+        );
+        assert_eq!(
+            defaults.deviations(&design(vec![
+                topic(3, true, true, false, false),
+                topic(5, true, true, true, true),
+            ])),
+            [
+                "topic 2 has 5 variants, not 3",
+                "5 variants have a phone version",
+                "5 variants have a live page",
+            ]
+        );
+        let live = DesignDefaults {
+            variants_as: VariantsAs::LivePages,
+            include_today: false,
+            ..defaults
+        };
+        assert_eq!(
+            live.deviations(&design(vec![topic(3, true, true, false, false)])),
+            [
+                "the topic has today's version",
+                "3 variants have a picture",
+                "3 variants lack a live page",
+            ]
+        );
+    }
 }

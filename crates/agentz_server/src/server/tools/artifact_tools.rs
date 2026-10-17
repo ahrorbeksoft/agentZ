@@ -159,6 +159,29 @@ impl Server {
                 recommended,
             });
         }
+        // The description tells agents the defaults, but a session may have listed its tools
+        // before the user changed them, and agents treat a description as advice. The check
+        // answers with the defaults as they are now.
+        let defaults = self.artifacts.design_defaults(caller.project_id);
+        let deviations = defaults.deviations(&design);
+        if !deviations.is_empty() {
+            let reason = text(arguments, "deviationReason", MAX_TEXT_CHARS)?;
+            let deviations = deviations.join("; ");
+            if reason.is_empty() {
+                return Err(invalid(format!(
+                    "This design isn't as the user's design defaults say ({}) because {deviations}. \
+                     Make it as they say. If this design needs to differ, publish it again with \
+                     deviationReason: one sentence on why, which the user sees.",
+                    defaults.summary().trim_end_matches('.'),
+                )));
+            }
+            let note = format!("Not as your design defaults say ({deviations}): {reason}");
+            design.intro = if design.intro.is_empty() {
+                note
+            } else {
+                format!("{}\n\n{note}", design.intro)
+            };
+        }
         let update = artifact_id(arguments)?;
         let content = async move {
             let mut read = Vec::with_capacity(files.files.len());
@@ -779,6 +802,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
                         },
                     },
                     "artifactId": {"type": "string", "maxLength": 64, "description": "Publish a new version of this design instead of starting one."},
+                    "deviationReason": {"type": "string", "maxLength": MAX_TEXT_CHARS, "description": "One sentence on why this design differs from the user's design defaults, when it must (the user's own request, or what it decides needs more or less). The user sees it. Without it, a design that differs is sent back."},
                     "clientRequestId": client_request_id,
                 },
                 "required": ["title", "topics"],

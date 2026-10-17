@@ -4999,6 +4999,7 @@ async fn agents_work_on_other_machines_through_the_app() {
             "agentz_design_publish",
             json!({
                 "title": "Plans page",
+                "deviationReason": "the test publishes what it needs",
                 "topics": [{
                     "title": "The plans page",
                     "variants": [{"name": "Three cards", "picture": picture}],
@@ -9748,6 +9749,117 @@ async fn the_artifacts_page_shows_projects_icons() {
     );
 }
 
+/// A design that isn't as the user's design defaults say is sent back, with the defaults as they
+/// are now, unless it says why; the reason shows with the design.
+#[tokio::test(flavor = "multi_thread")]
+async fn designs_that_differ_from_the_defaults_need_a_reason() {
+    use agentz_protocol::artifacts::{DesignDefaults, DesignSettings};
+
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread = client.create_thread_in(project_id).await;
+    client.wait_until_ready(thread).await;
+
+    let pictures: Vec<_> = ["today", "a", "b", "c"]
+        .into_iter()
+        .map(|name| {
+            let path = server.project_dir.path().join(format!("{name}.svg"));
+            std::fs::write(&path, "<svg xmlns='http://www.w3.org/2000/svg'/>").expect("picture");
+            path
+        })
+        .collect();
+    let design = |variants: usize, reason: Option<&str>| {
+        let mut arguments = json!({
+            "title": "Plans page",
+            "topics": [{
+                "title": "The plans page",
+                "today": {"picture": pictures[0]},
+                "variants": pictures[1..=variants]
+                    .iter()
+                    .enumerate()
+                    .map(|(place, picture)| json!({
+                        "name": format!("Variant {}", place + 1),
+                        "picture": picture,
+                    }))
+                    .collect::<Vec<_>>(),
+            }],
+        });
+        if let Some(reason) = reason {
+            arguments["deviationReason"] = json!(reason);
+        }
+        arguments
+    };
+    let caller = ToolCaller::Thread(thread);
+
+    let sent_back = client
+        .call_tool(caller.clone(), "agentz_design_publish", design(2, None))
+        .await;
+    assert!(sent_back.is_error, "{}", sent_back.value);
+    let message = sent_back.value["message"].as_str().expect("a message");
+    assert!(
+        message.contains("3 variants, today's included, desktop, pictures"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the topic has 2 variants, not 3"),
+        "{message}"
+    );
+    assert!(message.contains("deviationReason"), "{message}");
+
+    let reason = "the user asked for just two";
+    let published = client
+        .tool(thread, "agentz_design_publish", design(2, Some(reason)))
+        .await;
+    let read = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": published["artifactId"]}),
+        )
+        .await;
+    let text = read["text"].as_str().expect("the design as text");
+    assert!(
+        text.contains(&format!(
+            "Not as your design defaults say (the topic has 2 variants, not 3): {reason}"
+        )),
+        "{text}"
+    );
+
+    client
+        .tool(thread, "agentz_design_publish", design(3, None))
+        .await;
+
+    // What counts is what the user has chosen now, not what the agent's tool list said.
+    client
+        .ok(Request::SetDesignDefaults(DesignSettings {
+            general: DesignDefaults {
+                variants: 2,
+                ..DesignDefaults::default()
+            },
+            projects: Vec::new(),
+        }))
+        .await;
+    let sent_back = client
+        .call_tool(caller, "agentz_design_publish", design(3, None))
+        .await;
+    assert!(sent_back.is_error, "{}", sent_back.value);
+    let message = sent_back.value["message"].as_str().expect("a message");
+    assert!(
+        message.contains("the topic has 3 variants, not 2"),
+        "{message}"
+    );
+    client
+        .tool(thread, "agentz_design_publish", design(2, None))
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn artifacts_are_published_served_and_sent_back() {
     use agentz_protocol::artifacts::ArtifactId;
@@ -9908,6 +10020,7 @@ async fn artifacts_are_published_served_and_sent_back() {
             "agentz_design_publish",
             json!({
                 "title": "Plans page",
+                "deviationReason": "the test publishes what it needs",
                 "topics": [{
                     "title": "The plans page",
                     "today": {"picture": today},
@@ -10017,6 +10130,7 @@ async fn artifacts_are_published_served_and_sent_back() {
             "agentz_design_publish",
             json!({
                 "title": "Plans page",
+                "deviationReason": "the test publishes what it needs",
                 "artifactId": design_id.0,
                 "topics": [{
                     "title": "The plans page",
