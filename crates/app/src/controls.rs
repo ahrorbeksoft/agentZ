@@ -548,7 +548,53 @@ pub(crate) fn copy_to_clipboard(text: &str, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACCOUNT_COLORS, color_hex};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use gpui::{TestAppContext, prelude::*, px, size};
+    use ui::LOOPING_ANIMATION_FPS;
+
+    use super::{ACCOUNT_COLORS, Color, color_hex, spinner};
+
+    struct Spinner {
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl gpui::Render for Spinner {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            spinner(Color::Muted)
+        }
+    }
+
+    /// A spinner draws on a timer, `LOOPING_ANIMATION_FPS` times a second, where it once
+    /// asked for a frame after each one (60 a second), and the main thread with it.
+    #[gpui::test]
+    fn a_spinner_redraws_at_the_looping_rate(cx: &mut TestAppContext) {
+        cx.update(crate::init_for_test);
+        let renders = Rc::new(Cell::new(0));
+        cx.open_window(size(px(100.), px(100.)), {
+            let renders = renders.clone();
+            move |_, _| Spinner { renders }
+        });
+        cx.run_until_parked();
+        let before = renders.get();
+        for _ in 0..100 {
+            cx.executor().advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        let drawn = renders.get() - before;
+        let expected = LOOPING_ANIMATION_FPS as usize;
+        assert!(
+            drawn.abs_diff(expected) <= 2,
+            "drew {drawn} times in a second, expected about {expected}"
+        );
+    }
 
     /// The server gives accounts colors from the menu's, as kept.
     #[test]

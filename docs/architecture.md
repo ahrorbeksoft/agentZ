@@ -79,6 +79,13 @@ thread (`DrawableProvider`) and skips a present when none is ready, and `gpui_ma
 retries it on the next display tick (`present_skipped`). Zed waits in `nextDrawable` on the main
 thread; fullscreen, while a spinner or shimmer redraws every frame, that wait took most of each
 frame and made scrolling lag (zed-industries/zed#7940). Keep this when updating those crates.
+`ui`'s looping animations (the spinners, `LoadingLabel`, `SpinnerLabel`, the pulses of
+`ThreadItem` and `AiSettingItem`) and the app's own (the shimmer, the pulses in `agent_view.rs`)
+redraw at `LOOPING_ANIMATION_FPS` (15) rather than on every frame: no view is cached, so each
+redraw renders every view again, and at 60 a second a running turn kept the main thread at
+35-45% of a core. Caching the sidebar wouldn't help while a turn runs: a view that animates
+marks its ancestors dirty, and the spinners sit in the sidebar and the thread both. Any new
+looping animation needs `with_max_fps(LOOPING_ANIMATION_FPS)`.
 `markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way
 (see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,

@@ -1,4 +1,7 @@
-use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
+use crate::{
+    CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, LOOPING_ANIMATION_FPS, Tooltip,
+    prelude::*,
+};
 
 use gpui::{
     Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
@@ -360,6 +363,7 @@ impl RenderOnce for ThreadItem {
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
                         .repeat()
+                        .with_max_fps(LOOPING_ANIMATION_FPS)
                         .with_easing(pulsating_between(0.4, 0.8)),
                     |label, delta| label.alpha(delta),
                 )

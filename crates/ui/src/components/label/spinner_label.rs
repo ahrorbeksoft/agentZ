@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::{LOOPING_ANIMATION_FPS, prelude::*};
 use gpui::{Animation, AnimationExt, FontWeight};
 use std::time::Duration;
 
@@ -166,7 +166,9 @@ impl RenderOnce for SpinnerLabel {
 
         self.base.with_animation(
             self.variant.animation_id(),
-            Animation::new(duration).repeat(),
+            Animation::new(duration)
+                .repeat()
+                .with_max_fps(LOOPING_ANIMATION_FPS),
             move |mut label, delta| {
                 let frame_index = (delta * frames.len() as f32) as usize % frames.len();
 

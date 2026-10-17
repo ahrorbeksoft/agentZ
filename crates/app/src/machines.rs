@@ -1266,16 +1266,42 @@ impl Machines {
 
     /// Archived top-level threads of every project, most recently archived first.
     pub fn archived_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        self.archived_page(usize::MAX, cx).1
+    }
+
+    /// How many threads are archived, and the `limit` most recently archived of them. The list
+    /// draws a page of them, and only while it's open, so the rest aren't cloned on every
+    /// frame.
+    pub fn archived_page(&self, limit: usize, cx: &App) -> (usize, Vec<(MachineId, Thread)>) {
         let groups = self.visible_groups(cx);
-        let mut threads = self.threads_where(cx, |machine, thread| {
-            thread.archived_at.is_some()
-                && thread.task.is_none()
-                && groups
+        let mut threads: Vec<(MachineId, &Thread)> = Vec::new();
+        for client in &self.clients {
+            let client = client.read(cx);
+            let machine = client.machine();
+            threads.extend(
+                client
+                    .projects()
+                    .read(cx)
+                    .threads()
                     .iter()
-                    .any(|group| group.contains(machine, thread.project_id))
-        });
+                    .filter(|thread| {
+                        thread.archived_at.is_some()
+                            && thread.task.is_none()
+                            && groups
+                                .iter()
+                                .any(|group| group.contains(machine, thread.project_id))
+                    })
+                    .map(|thread| (machine, thread)),
+            );
+        }
         threads.sort_by_key(|(_, thread)| std::cmp::Reverse(thread.archived_at));
-        threads
+        let count = threads.len();
+        let page = threads
+            .into_iter()
+            .take(limit)
+            .map(|(machine, thread)| (machine, thread.clone()))
+            .collect();
+        (count, page)
     }
 
     fn threads_where(

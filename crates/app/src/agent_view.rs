@@ -51,8 +51,8 @@ use projects::{
 use text_input::{ChipId, ChipPreview, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
-    IconPosition, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, Severity, SpinnerLabel,
-    Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
+    IconPosition, LOOPING_ANIMATION_FPS, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
+    Severity, SpinnerLabel, Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -9940,47 +9940,25 @@ impl AgentView {
             let tooltip_description = option.description.clone().map(SharedString::from);
             match &option.kind {
                 acp::SessionConfigKind::Select(select) => {
-                    let mut choices: Vec<(
-                        Option<SharedString>,
-                        acp::SessionConfigValueId,
-                        SharedString,
-                    )> = Vec::new();
-                    match &select.options {
-                        acp::SessionConfigSelectOptions::Ungrouped(options) => {
-                            for choice in options {
-                                choices.push((
-                                    None,
-                                    choice.value.clone(),
-                                    choice.name.clone().into(),
-                                ));
-                            }
-                        }
-                        acp::SessionConfigSelectOptions::Grouped(groups) => {
-                            for group in groups {
-                                let group_name: SharedString = group.name.clone().into();
-                                for choice in &group.options {
-                                    choices.push((
-                                        Some(group_name.clone()),
-                                        choice.value.clone(),
-                                        choice.name.clone().into(),
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    let current_value = select.current_value.clone();
-                    let current_name = choices
-                        .iter()
-                        .find(|(_, value, _)| *value == current_value)
-                        .map(|(_, _, name)| name.clone())
-                        .unwrap_or_else(|| current_value.0.to_string().into());
+                    let current_name = select_choice_name(&select.options, &select.current_value)
+                        .unwrap_or_else(|| select.current_value.0.to_string().into());
                     let thread = self.thread.clone();
                     controls.push(
                         PopoverMenu::new(element_id.clone())
                             .menu(move |window, cx| {
-                                let choices = choices.clone();
-                                let current_value = current_value.clone();
+                                // Read as the menu opens, not on every frame.
+                                let (choices, current_value) = thread
+                                    .read(cx)
+                                    .config_options()
+                                    .iter()
+                                    .find(|option| option.id == config_id)
+                                    .and_then(|option| match &option.kind {
+                                        acp::SessionConfigKind::Select(select) => Some((
+                                            select_choices(&select.options),
+                                            select.current_value.clone(),
+                                        )),
+                                        _ => None,
+                                    })?;
                                 let thread = thread.clone();
                                 let config_id = config_id.clone();
                                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
@@ -10085,26 +10063,28 @@ impl AgentView {
             .modes()
             .filter(|modes| !has_mode_option && modes.available_modes.len() > 1)
         {
-            let current_mode = modes.current_mode_id.clone();
             let current_name: SharedString = modes
                 .available_modes
                 .iter()
-                .find(|mode| mode.id == current_mode)
-                .map(|mode| mode.name.clone())
-                .unwrap_or_else(|| current_mode.0.to_string())
+                .find(|mode| mode.id == modes.current_mode_id)
+                .map_or_else(
+                    || modes.current_mode_id.0.to_string(),
+                    |mode| mode.name.clone(),
+                )
                 .into();
-            let available: Vec<(acp::SessionModeId, SharedString)> = modes
-                .available_modes
-                .iter()
-                .map(|mode| (mode.id.clone(), mode.name.clone().into()))
-                .collect();
             let thread = self.thread.clone();
             controls.insert(
                 0,
                 PopoverMenu::new("session-mode")
                     .menu(move |window, cx| {
-                        let available = available.clone();
-                        let current_mode = current_mode.clone();
+                        // Read as the menu opens, not on every frame.
+                        let modes = thread.read(cx).modes()?;
+                        let current_mode = modes.current_mode_id.clone();
+                        let available: Vec<(acp::SessionModeId, SharedString)> = modes
+                            .available_modes
+                            .iter()
+                            .map(|mode| (mode.id.clone(), mode.name.clone().into()))
+                            .collect();
                         let thread = thread.clone();
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                             for (mode_id, name) in available {
@@ -11377,6 +11357,7 @@ impl AgentView {
                             "new-thread-replacing",
                             Animation::new(Duration::from_secs(2))
                                 .repeat()
+                                .with_max_fps(LOOPING_ANIMATION_FPS)
                                 .with_easing(pulsating_between(0.4, 0.8)),
                             |label, delta| label.alpha(delta),
                         ),
@@ -13102,6 +13083,7 @@ impl Render for AgentView {
                                                     "loading-agent-label",
                                                     Animation::new(Duration::from_secs(2))
                                                         .repeat()
+                                                        .with_max_fps(LOOPING_ANIMATION_FPS)
                                                         .with_easing(pulsating_between(0.3, 0.7)),
                                                     |label, delta| label.alpha(delta),
                                                 ),
@@ -14308,6 +14290,56 @@ fn user_message_background(cx: &App) -> Hsla {
     colors.panel_background.blend(colors.text.opacity(0.1))
 }
 
+/// A select setting's choices as its menu lists them: each with the group it's in, if any.
+fn select_choices(
+    options: &acp::SessionConfigSelectOptions,
+) -> Vec<(
+    Option<SharedString>,
+    acp::SessionConfigValueId,
+    SharedString,
+)> {
+    match options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|choice| (None, choice.value.clone(), choice.name.clone().into()))
+            .collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| {
+                let group_name: SharedString = group.name.clone().into();
+                group.options.iter().map(move |choice| {
+                    (
+                        Some(group_name.clone()),
+                        choice.value.clone(),
+                        choice.name.clone().into(),
+                    )
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The name of the choice with the value, found without listing them all.
+fn select_choice_name(
+    options: &acp::SessionConfigSelectOptions,
+    value: &acp::SessionConfigValueId,
+) -> Option<SharedString> {
+    let name = match options {
+        acp::SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .find(|choice| choice.value == *value)
+            .map(|choice| &choice.name),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| &group.options)
+            .find(|choice| choice.value == *value)
+            .map(|choice| &choice.name),
+        _ => None,
+    };
+    name.map(|name| name.clone().into())
+}
+
 /// t3code's `live-tool-shine`: a band of the text color sweeps across a label in the row's
 /// gray, every 2.2 seconds, while the work it names goes on.
 fn shimmering_label(
@@ -14321,7 +14353,9 @@ fn shimmering_label(
     const HALF_BAND: f32 = 4.;
     div().with_animation(
         id,
-        Animation::new(Duration::from_millis(2200)).repeat(),
+        Animation::new(Duration::from_millis(2200))
+            .repeat()
+            .with_max_fps(LOOPING_ANIMATION_FPS),
         move |label, delta| {
             let length = text.chars().count() as f32;
             let center = -HALF_BAND + delta * (length + 2. * HALF_BAND);
@@ -14694,6 +14728,94 @@ mod tests {
     use projects::{Project, ProjectsSnapshot};
 
     use super::*;
+
+    struct Shimmer {
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Render for Shimmer {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            shimmering_label("shimmer", "Thinking", gpui::black(), cx)
+        }
+    }
+
+    /// The shimmer draws on a timer, `LOOPING_ANIMATION_FPS` times a second, not on every frame.
+    #[gpui::test]
+    fn the_shimmer_redraws_at_the_looping_rate(cx: &mut TestAppContext) {
+        cx.update(crate::init_for_test);
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.open_window(gpui::size(px(200.), px(40.)), {
+            let renders = renders.clone();
+            move |_, _| Shimmer { renders }
+        });
+        cx.run_until_parked();
+        let before = renders.get();
+        for _ in 0..100 {
+            cx.executor().advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        let drawn = renders.get() - before;
+        let expected = LOOPING_ANIMATION_FPS as usize;
+        assert!(
+            drawn.abs_diff(expected) <= 2,
+            "drew {drawn} times in a second, expected about {expected}"
+        );
+    }
+
+    #[test]
+    fn a_settings_choices_are_listed_with_their_groups_and_found_by_value() {
+        let ungrouped: acp::SessionConfigSelectOptions = serde_json::from_value(
+            serde_json::json!([{"value": "fast", "name": "Fast"}, {"value": "deep", "name": "Deep"}]),
+        )
+        .expect("ungrouped options");
+        let grouped: acp::SessionConfigSelectOptions = serde_json::from_value(serde_json::json!([
+            {"group": "claude", "name": "Claude", "options": [{"value": "opus", "name": "Opus"}]},
+            {"group": "gpt", "name": "GPT", "options": [{"value": "five", "name": "Five"}]},
+        ]))
+        .expect("grouped options");
+        let listed = |options: &acp::SessionConfigSelectOptions| {
+            select_choices(options)
+                .into_iter()
+                .map(|(group, value, name)| {
+                    (
+                        group.map(|group| group.to_string()),
+                        value.0.to_string(),
+                        name.to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&ungrouped),
+            [
+                (None, "fast".to_string(), "Fast".to_string()),
+                (None, "deep".to_string(), "Deep".to_string()),
+            ]
+        );
+        assert_eq!(
+            listed(&grouped),
+            [
+                (
+                    Some("Claude".to_string()),
+                    "opus".to_string(),
+                    "Opus".to_string()
+                ),
+                (
+                    Some("GPT".to_string()),
+                    "five".to_string(),
+                    "Five".to_string()
+                ),
+            ]
+        );
+        let name = |options: &acp::SessionConfigSelectOptions, value: &str| {
+            select_choice_name(options, &acp::SessionConfigValueId::new(value))
+                .map(|name| name.to_string())
+        };
+        assert_eq!(name(&ungrouped, "deep").as_deref(), Some("Deep"));
+        assert_eq!(name(&grouped, "five").as_deref(), Some("Five"));
+        assert_eq!(name(&grouped, "unknown"), None);
+    }
 
     #[test]
     fn durations_read_like_t3codes() {

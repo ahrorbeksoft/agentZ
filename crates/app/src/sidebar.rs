@@ -2626,8 +2626,15 @@ impl Sidebar {
         }
         let drag = self.thread_drag.as_ref();
         let machines = self.machines.read(cx);
-        let archived = machines.archived_threads(cx);
         let is_archived_expanded = machines.archived_expanded(cx);
+        let (archived_count, archived) = machines.archived_page(
+            if is_archived_expanded {
+                self.archived_shown
+            } else {
+                0
+            },
+            cx,
+        );
 
         // t3code's draft block: interrupted new threads, one click away above the rest.
         let mut draft_rows: Vec<AnyElement> = self
@@ -2824,7 +2831,6 @@ impl Sidebar {
             Some(_) => Some(HeaderTone::Emphasized),
             None => None,
         };
-        let archived_count = archived.len();
         if archived_count > 0 || archive_tone.is_some() {
             let mut archived_rows = vec![Self::render_shelf_header(
                 "archived-shelf-toggle",
@@ -4283,6 +4289,42 @@ mod view_tests {
         // Folded, it stays folded.
         assert!(cx.debug_bounds("archived-shelf-toggle").is_some());
         assert!(cx.debug_bounds("archived-row-1").is_none());
+    }
+
+    /// The list draws a page of the archived threads, newest archived first, and none while
+    /// Archived is folded; the count is of all of them.
+    #[gpui::test]
+    fn archived_threads_come_a_page_at_a_time(cx: &mut TestAppContext) {
+        let (_sidebar, store, cx) = new_sidebar(cx);
+        let archived = |id: u64, seconds: u64| {
+            let mut thread = thread(id, false, None);
+            thread.archived_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+            thread
+        };
+        show_snapshot(
+            &store,
+            ProjectsSnapshot {
+                threads: vec![
+                    thread(1, false, None),
+                    archived(2, 10),
+                    archived(3, 30),
+                    archived(4, 20),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let ids = |page: Vec<(MachineId, Thread)>| -> Vec<u64> {
+            page.into_iter().map(|(_, thread)| thread.id.0).collect()
+        };
+        cx.update(|_, cx| {
+            let machines = Machines::global(cx).read(cx);
+            let (count, page) = machines.archived_page(0, cx);
+            assert_eq!((count, ids(page)), (3, vec![]));
+            let (count, page) = machines.archived_page(2, cx);
+            assert_eq!((count, ids(page)), (3, vec![3, 4]));
+            assert_eq!(ids(machines.archived_threads(cx)), [3, 4, 2]);
+        });
     }
 
     #[gpui::test]

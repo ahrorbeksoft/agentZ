@@ -15,26 +15,19 @@ binding (`secondary-,` in the `Shell` context) reaching `OpenSettings` with a te
 so the cause is likely in what a real Linux keyboard sends (xkb's key and `key_char` for the
 comma while Ctrl is down). Needs a run under a real X or Wayland session.
 
-### The app uses 35–45% CPU while a turn runs
-
-While anything animates (a running turn's shimmering label or a spinner), GPUI redraws the
-whole window each frame at 60 Hz, and nothing is cached, so each frame takes about 5–6 ms of
-the main thread. macOS flagged agentZ for over 50% CPU for 3 minutes on Oct 9, 11 and 12, all
-in this drawing path. A profile showed each frame laying out the whole window again, and
-rebuilding every sidebar thread card (`render_threads`, `render_thread_card`,
-`thread_details`). Two fixes:
-
-- Cache the sidebar and thread views (`AnyView::cached`, as Zed does), so one spinner doesn't
-  rebuild the whole window.
-- Move per-frame work out of `render`: `Machines::archived_threads` sorts the threads, and the
-  agent view clones each agent's `SessionConfigSelectOption` lists, on every frame.
-
 ### A turn often starts without a message
 
 Often a turn's response starts straight with the tool group, with no message from the agent
 before it (Factory Droid here, [screenshot](backlog/turn-starts-with-tool-group.png): "Ran 26
 commands, changed 1 file, and performed 8 other actions" right under the user's message). The
 user sees this a lot and asks whether agentZ is missing a first message in agent responses.
+
+Looked into: agentZ shows every message chunk it gets. In a Factory Droid thread's transcript
+here, Droid opens its turns with thoughts and tool calls and no message: its first message came
+after 1, 4 and 157 entries in the thread's three turns, with 334 thoughts among 709 tool calls
+in the last. So Droid sends no first message, and its thoughts are what sit folded in the "Ran
+N commands…" header. Open question: show something in that place (say the latest thought's
+first line) or leave it as it is.
 
 ## Features
 

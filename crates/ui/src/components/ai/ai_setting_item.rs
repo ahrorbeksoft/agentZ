@@ -1,4 +1,4 @@
-use crate::{IconDecoration, IconDecorationKind, Tooltip, prelude::*};
+use crate::{IconDecoration, IconDecorationKind, LOOPING_ANIMATION_FPS, Tooltip, prelude::*};
 use gpui::{Animation, AnimationExt, SharedString, pulsating_between};
 use std::time::Duration;
 
@@ -165,6 +165,7 @@ impl RenderOnce for AiSettingItem {
                     format!("icon-pulse-{}", id),
                     Animation::new(Duration::from_secs(2))
                         .repeat()
+                        .with_max_fps(LOOPING_ANIMATION_FPS)
                         .with_easing(pulsating_between(0.4, 0.8)),
                     |element, delta| element.opacity(delta),
                 )

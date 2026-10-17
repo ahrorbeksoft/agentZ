@@ -1,4 +1,4 @@
-use crate::prelude::*;
+use crate::{LOOPING_ANIMATION_FPS, prelude::*};
 use gpui::{Animation, AnimationExt, FontWeight};
 use std::time::Duration;
 
@@ -88,7 +88,9 @@ impl RenderOnce for LoadingLabel {
             "loading_label",
             vec![
                 Animation::new(Duration::from_secs(1)),
-                Animation::new(Duration::from_secs(1)).repeat(),
+                Animation::new(Duration::from_secs(1))
+                    .repeat()
+                    .with_max_fps(LOOPING_ANIMATION_FPS),
             ],
             move |mut label, animation_ix, delta| {
                 match animation_ix {
