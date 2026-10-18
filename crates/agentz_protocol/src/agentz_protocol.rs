@@ -16,6 +16,7 @@ pub mod accounts;
 pub mod agents;
 pub mod artifacts;
 pub mod attachments;
+pub mod cloud;
 pub mod diff;
 pub mod editors;
 pub mod layout;

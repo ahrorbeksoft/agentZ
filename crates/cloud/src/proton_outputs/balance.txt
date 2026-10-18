@@ -1,0 +1,3 @@
+Shared Cube balance: $24.27
+Proton runtime: 26.78 hours · deducted $0.7336
+Price: $20 per 730 running hours (about one month), billed per running second from your shared Cube balance

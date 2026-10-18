@@ -1,0 +1,7 @@
+{
+  "machines": 2,
+  "snapshots": 1,
+  "storedBytes": 6442450944,
+  "computedAt": "2026-10-13T10:00:00Z",
+  "limits": { "maxMachines": 5, "maxSnapshots": 10, "maxStoredGiB": 200 }
+}

@@ -1,0 +1,43 @@
+{
+  "machines": [
+    {
+      "id": "m_q4mz7tk2bx5rn3wd6vp2hj4sye",
+      "name": "agents-1",
+      "state": "running",
+      "desiredState": "running",
+      "revision": 3,
+      "operationId": null,
+      "template": { "id": "universal", "version": "2026-10-13.10", "digest": "sha256:9f2c" },
+      "spec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 },
+      "storage": { "sizeGiB": 20, "mountPath": "/data", "persistent": true, "synced": true },
+      "runtime": { "ready": true },
+      "timeoutAt": null,
+      "onTimeout": "pause",
+      "autoSuspendAfterSeconds": 1800,
+      "metadata": {},
+      "vault": true,
+      "guestUser": "alex",
+      "createdAt": "2026-10-13T09:12:04Z",
+      "updatedAt": "2026-10-13T09:12:31Z"
+    },
+    {
+      "id": "m_r7kd2vq4mx5tz3nb6wp2hj4sye",
+      "name": "review-box",
+      "state": "suspended",
+      "desiredState": "suspended",
+      "revision": 7,
+      "operationId": null,
+      "template": { "id": "agent-browser", "version": "2026-10-13.10", "digest": "sha256:41ab" },
+      "spec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 },
+      "timeoutAt": null,
+      "onTimeout": "pause",
+      "autoSuspendAfterSeconds": 1800,
+      "metadata": { "task": "review" },
+      "vault": true,
+      "guestUser": "alex",
+      "createdAt": "2026-10-14T11:02:44Z",
+      "updatedAt": "2026-10-18T08:40:03Z"
+    }
+  ],
+  "nextCursor": null
+}

@@ -1,0 +1,29 @@
+[
+  {
+    "id": "3f1c9a52-8b7e-4d21-9c0a-6e5f4b3a2d10",
+    "name": "devbox-3",
+    "state": "running",
+    "image_id": "ubuntu-noble",
+    "vcpus": 8,
+    "disk_gib": 50,
+    "floor_mib": 2048,
+    "ceiling_mib": 65536,
+    "guest_uuid": "7d2e4f6a-1b3c-4e5d-8f90-a1b2c3d4e5f6",
+    "ip": "192.168.122.10",
+    "error": "",
+    "created": 1792024266.4963777,
+    "updated": 1792244584.5072565,
+    "owner_id": "b8a7c6d5-e4f3-4a2b-9c1d-0e9f8a7b6c5d",
+    "disk_reserved_gib": 50,
+    "billed_to": null,
+    "billing_class": "prepaid",
+    "public_ssh": {
+      "hostname": "ssh.proton.computer",
+      "port": 22021,
+      "enabled": 1,
+      "fingerprint": "SHA256:ExampleFingerprintForTestsOnly000000000000000",
+      "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleHostKeyForTestsOnly0000000000000000"
+    },
+    "last_activity": 1792244584.5072565
+  }
+]

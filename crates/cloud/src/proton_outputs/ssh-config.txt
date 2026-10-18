@@ -1,0 +1,6 @@
+Host proton-devbox-3
+  HostName ssh.proton.computer
+  User ubuntu
+  Port 22021
+  UserKnownHostsFile /Users/alex/.config/proton/known_hosts
+  StrictHostKeyChecking yes

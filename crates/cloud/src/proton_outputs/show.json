@@ -1,0 +1,78 @@
+{
+  "machine": {
+    "id": "3f1c9a52-8b7e-4d21-9c0a-6e5f4b3a2d10",
+    "name": "devbox-3",
+    "state": "running",
+    "image_id": "ubuntu-noble",
+    "vcpus": 8,
+    "disk_gib": 50,
+    "floor_mib": 2048,
+    "ceiling_mib": 65536,
+    "guest_uuid": "7d2e4f6a-1b3c-4e5d-8f90-a1b2c3d4e5f6",
+    "ip": "192.168.122.10",
+    "error": "",
+    "created": 1792024266.4963777,
+    "updated": 1792244584.5072565,
+    "owner_id": "b8a7c6d5-e4f3-4a2b-9c1d-0e9f8a7b6c5d",
+    "disk_reserved_gib": 50,
+    "billed_to": null,
+    "billing_class": "prepaid",
+    "public_ssh": {
+      "hostname": "ssh.proton.computer",
+      "port": 22021,
+      "enabled": 1,
+      "fingerprint": "SHA256:ExampleFingerprintForTestsOnly000000000000000",
+      "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleHostKeyForTestsOnly0000000000000000"
+    },
+    "last_activity": 1792244584.5072565
+  },
+  "operations": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "machine_id": "3f1c9a52-8b7e-4d21-9c0a-6e5f4b3a2d10",
+      "action": "start",
+      "status": "succeeded",
+      "previous_state": "stopped",
+      "result": {
+        "guest_uuid": "7d2e4f6a-1b3c-4e5d-8f90-a1b2c3d4e5f6",
+        "ip": "192.168.122.10",
+        "state": "running"
+      },
+      "error": "",
+      "created": 1792244551.0820708,
+      "started": 1792244551.2862067,
+      "finished": 1792244584.507196
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "machine_id": "3f1c9a52-8b7e-4d21-9c0a-6e5f4b3a2d10",
+      "action": "stop",
+      "status": "succeeded",
+      "previous_state": "running",
+      "result": {
+        "state": "stopped"
+      },
+      "error": "",
+      "created": 1792024460.754625,
+      "started": 1792024460.82336,
+      "finished": 1792024462.820468
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000003",
+      "machine_id": "3f1c9a52-8b7e-4d21-9c0a-6e5f4b3a2d10",
+      "action": "create",
+      "status": "succeeded",
+      "previous_state": null,
+      "result": {
+        "guest_uuid": "7d2e4f6a-1b3c-4e5d-8f90-a1b2c3d4e5f6",
+        "ip": "192.168.122.10",
+        "state": "running"
+      },
+      "error": "",
+      "created": 1792024266.4964392,
+      "started": 1792024266.565523,
+      "finished": 1792024290.6779063
+    }
+  ],
+  "events": []
+}

@@ -66,9 +66,9 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   ```sh
   cargo fmt --all
   cargo clippy -p app -p agent_thread -p projects -p registry -p text_input -p agentz_protocol \
-    -p agentz_server -p agentz_client --all-targets
+    -p agentz_server -p agentz_client -p cloud --all-targets
   cargo test -p app -p agent_thread -p projects -p registry -p agentz_protocol -p agentz_server \
-    -p agentz_client
+    -p agentz_client -p cloud
   ```
   `cargo clippy --workspace` fails on a gpui example that needs an unported crate; that's
   expected.

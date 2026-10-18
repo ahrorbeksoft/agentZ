@@ -1,7 +1,7 @@
 # Cloud machines: plan
 
-Status: researched, nothing built. The UI goes on the design board first (this folder's
-`index.html`); its `decisions.md` will be the spec. Researched on 2026-10-18 from Instabox's
+Status: designed, being built. The UI was picked on the design board: `decisions.md` is its
+spec (topic numbers below are its sections), and `progress.md` tracks the build. Researched on 2026-10-18 from Instabox's
 docs (bundled in its site's script), its SDK (`@insforge/instabox-sdk` 0.5.3) and its CLI's help
 (read from the `instabox-darwin-arm64` binary, not run), and Proton's site, installer and CLI
 (`proton` 0.1.2, a Python file). No provider was used through agentZ: nothing was signed in to
@@ -14,8 +14,8 @@ or made. `proton list` was run once, read-only. Anything not tested is marked *(
   features.
 - **Everything each provider offers**, not only connecting.
 - **The providers' own CLIs.** The user installs a provider's CLI and signs in with it; agentZ
-  finds it and works through it. agentZ has no sign-in of its own and keeps no provider
-  credentials.
+  finds it and works through it. agentZ has no sign-in of its own; the one credential it
+  keeps is an Instabox API key it makes through the CLI, for what only Instabox's API does.
 - **Providers that aren't set up are shown too**, with a Learn More link, and with agentZ's
   promo, invite or referral code once a provider offers one.
 - **Agents run on the cloud machine.** Keeping agents on this Mac and sending only their tools to
@@ -45,10 +45,13 @@ its output. agentZ runs those commands; it never reads the CLI's login.
   minutes while it's open. A provider is then one of:
   - **Not installed**: shown with what it is, its price, Learn More, the install command to
     copy, and agentZ's code when there is one.
-  - **Signed out**: the CLI is there (`--version` answers) but `whoami` fails. agentZ offers
-    Sign In, which opens a terminal running the CLI's login (`instabox login`, `proton login`),
-    as agents' terminal logins run.
+  - **Signed out**: the CLI is there (`--version` answers) but `whoami` fails. agentZ says to
+    run its login (`instabox login`, `proton login`) in a terminal, with Copy; it doesn't sign
+    anyone in (the user's note on topic 3).
   - **Signed in**: `whoami` names the account; its machines are listed.
+
+  More Providers' header has **Check Again**, which looks for the CLIs at once, so a provider
+  set up while Settings is open shows up without waiting.
 - **Commands.** Run with the login shell's environment, in the background, one at a time per
   machine (both CLIs wait on their own operations). Output is read as JSON where the CLI has
   `--json`, otherwise as text, with captured real outputs as test fixtures so a new CLI version
@@ -70,6 +73,33 @@ its output. agentZ runs those commands; it never reads the CLI's login.
 - **An SSH machine already saved** can be linked to the provider machine with the same host and
   port: `proton-cloud` (`proton`, `ssh.proton.computer:22021`) is the Proton computer
   `devbox-3`.
+
+### Instabox's API, for what its CLI doesn't do
+
+Desktop links and CPU and memory exist only in Instabox's API. agentZ may use it where that
+needs nothing from the user (the user's answer), so it makes its own API key once, through the
+signed-in CLI: `instabox keys create --name agentZ --scope machines:read --scope machines:write
+--json`, Instabox's documented way for programs. The key is kept in `cloud/instabox/api-key` in
+the data directory (mode 0600) and sent as `X-API-Key`. When it stops working (revoked, or the
+CLI signed in to another account), agentZ makes a new one and removes the old with `instabox
+keys rm`. It never reads the CLI's own login.
+
+### Threads of a machine that's off
+
+Today the app keeps each machine's projects and threads in memory only: an offline machine's
+threads stay listed while the app runs, and after a restart a machine that's off shows nothing
+until it connects. So a stopped cloud computer's threads would disappear.
+
+- **This Mac keeps the list** of every remote machine (cloud and SSH): its projects and threads
+  (title, agent, state, last activity), written each time it changes, and shown while the
+  machine is off. Only the list, not the conversations (the user's answer): opening a thread
+  of a machine that's off says so until it connects.
+- **A message to a thread of a stopped machine** is held on this Mac (across restarts) and
+  shown in the thread as "Sent when proton-cloud is running", with Cancel. agentZ starts the
+  machine at once when that's free (Instabox), or after topic 5's question when it costs money
+  (Proton), and sends the message once it's connected (topic 11 C). New Thread on a stopped
+  machine works the same way. On an SSH machine, which agentZ can't start, the message waits
+  until the machine is back.
 
 ### Learn More and codes
 
@@ -186,44 +216,40 @@ Catches:
 
 ## Decided
 
-- **The user's own CLIs, signed in by the user** (the user's choice). agentZ detects them, runs
-  them, and keeps no credentials; it never reads their logins.
+- **The user's own CLIs, signed in by the user** (the user's choice). agentZ detects them and
+  runs them, and never reads their logins. The one credential it keeps is the Instabox API key
+  it makes through the CLI (see Instabox's API above).
 - **Providers not set up are listed** with Learn More, their install command, and agentZ's code
   once a provider offers one (the user's choice).
 - **Agents' logins on a cloud machine work as on any SSH machine**: logged in there, through
   the browser logins agentZ already forwards. Copying logins from this Mac is left out: two
   copies of a login whose refresh token works once log each other out.
+- **No sign-in in agentZ** (the user's note on topic 3): a signed-out CLI shows the command to
+  run, and Check Again looks again.
+- **Desktop links and CPU and memory through Instabox's API**, with a key agentZ makes through
+  the CLI (see Instabox's API above).
+- **Only the list of a machine that's off** is kept on this Mac, not its conversations; a
+  message to it is held and starts the machine (see Threads of a machine that's off).
+- **The board's picks** (`decisions.md`): 1 C machines grouped by provider; 2 A providers not
+  set up as rows under the groups; 4 C a menu on Add Machine; 5 C ask before charging the first
+  time per account; 6 B a state badge, one action and a menu; 7 A a page per machine with tabs;
+  8 A snapshots on the machine they came from; 9 B one Remove with a box to delete; 10 B all
+  of an account's machines, always; 11 C start free ones, ask for paid ones; 12 A, B, C and D
+  for idle machines; 13 C cost in the group headers and on the Usage page.
 
-## Open questions
-
-For the user:
-
-- **What only Instabox's API has**: desktop links and CPU and memory. Leave them out, or call
-  the API with the CLI's stored login for just those (agentZ would read `credentials.json`,
-  which it otherwise doesn't)?
-
-On the design board:
-
-1. Where providers live: in Settings › Machines, or a section of their own.
-2. Providers that aren't set up, and signing in.
-3. Creating a machine: provider, template or snapshot, name, size, timeout; what it costs.
-4. Starting something that costs money.
-5. A cloud machine's row: its state and actions.
-6. A machine's page: snapshots, ports, desktop, vault, SSH tokens, timeout.
-7. Instabox snapshots.
-8. Deleting a machine (its disk and threads go with it).
-9. Machines an account already has, and linking an SSH machine already saved.
-10. A stopped or paused machine elsewhere (sidebar, New Thread, a thread on it).
-11. Idle: keep Instabox from pausing while agents work; stop or pause a machine whose agents have
-    all been idle a while; balance warnings.
-12. Cost and usage: Proton's balance, Instabox's limits.
+Nothing is open.
 
 ## Order of work
 
+`progress.md` breaks these into commits and tracks them.
+
 1. The `cloud` crate: descriptions, detection, and both providers' commands and parsers against
-   captured outputs; SSH options in `agentz_client::ssh`.
-2. Providers in this Mac's server, and the protocol.
-3. Cloud machines connecting, with their states.
-4. The UI picked on the board.
-5. Each provider's extras: snapshots, ports, vault, tokens, billing.
-6. Idle handling, as picked.
+   captured outputs.
+2. SSH options in `agentz_client::ssh`, so a machine can be reached without `~/.ssh/config`.
+3. Providers in this Mac's server, and the protocol.
+4. Cloud machines connecting, with their states, and the Machines page (topics 1, 2, 3, 6, 10,
+   13 A).
+5. Adding, starting and removing (topics 4, 5, 9, 11's start).
+6. The machine's page and each provider's extras (topics 7, 8), with Instabox's API.
+7. The list of a machine that's off, and held messages (topic 11).
+8. Idle handling (topic 12) and the Usage page (topic 13 B).
