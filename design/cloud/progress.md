@@ -78,11 +78,20 @@ Notes for whoever continues:
    asks topic 5's question first. Only the first look counts: a machine found running when
    the thread opened isn't started again once it stops. The list of every remote machine's
    projects and threads kept on this Mac, and messages held for a stopped machine, are put
-   off for later (the user, 2026-10-19). Status: done. `ServerClient::start_cloud_machine`
+   off for later (the user, 2026-10-19). Status: done in its own commit ("Start a stopped
+   cloud machine from its thread…"). `ServerClient::start_cloud_machine`
    (the start is under way until the provider lists its machines again after its CLI is
    done), the thread's notice in `agent_view.rs`, and `cloud_machines::charge_question`,
    shared with Settings › Machines.
 8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
-   not started.
+   in progress. The Usage page's Cloud section is done in its own commit ("Show each cloud
+   account's usage on Settings › Usage"): `cloud_providers::render_cloud_usage`, with
+   `cloud_machines::limit_uses` shared with Machines' header line, which turns yellow from 80%
+   of a limit, as Instabox's Account page warns from 80% of storage. Instabox counts storage
+   in GiB (`maxStoredGiB`). Proton's `balance` doesn't say over what period its runtime is
+   counted, so the page calls it "Run time", not "This month". Instabox's idle pause
+   (topic 12 A) is honoured only for accounts an admin gave manual lifecycle
+   (`manualLifecycle` in `whoami --json`); the user's account has none, so it's fixed at
+   30 minutes there.
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
    not started.

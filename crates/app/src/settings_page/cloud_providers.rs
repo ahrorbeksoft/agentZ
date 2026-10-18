@@ -1,18 +1,21 @@
 //! Settings › Machines' cloud providers (design/cloud): a group per provider account, with its
 //! account, usage and every machine it has (topics 1 C, 6 B, 10 B, 13 A), then the providers
-//! that aren't set up, with how to set them up and Check Again (topic 2 A). agentZ signs no one
-//! in: the user installs each CLI and signs in with it (topic 3's note).
+//! that aren't set up, with how to set them up and Check Again (topic 2 A); and Settings ›
+//! Usage's Cloud section (topic 13 C). agentZ signs no one in: the user installs each CLI and
+//! signs in with it (topic 3's note).
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CreateMachine, Lifecycle, MachineAction, Provider, ProviderState,
-    ProviderStatus,
+    Change, CloudMachine, CloudUsage, CreateMachine, Lifecycle, MachineAction, Provider,
+    ProviderState, ProviderStatus,
 };
 use agentz_protocol::{Request, Response};
 use anyhow::anyhow;
-use gpui::{AnyElement, Context, DismissEvent, FontWeight, SharedString, WeakEntity, Window};
+use gpui::{
+    AnyElement, Context, DismissEvent, FontWeight, SharedString, WeakEntity, Window, relative,
+};
 use ui::{
     ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, Switch, ToggleState, Tooltip,
     prelude::*,
@@ -23,13 +26,14 @@ use super::cloud_machine_dialog::DialogKind;
 use super::cloud_machine_page::MachineTab;
 use super::new_cloud_machine::NewCloudMachine;
 use super::{
-    SettingsPage, SettingsPageEvent, connection_line, on_page, render_rows,
+    SettingsPage, SettingsPageEvent, connection_line, on_page, render_rows, render_section,
     render_section_with_actions,
 };
 use crate::app_settings::{CloudLink, MachineProfile};
 use crate::cloud_machines::{
-    MainAction, change_label, charge_question, charges, lifecycle_label, machine_summary,
-    main_action, noun_title, other_changes, provider_icon, signed_in_account, state_color,
+    MainAction, NEAR_LIMIT, about_label, change_label, charge_question, charges, dollars,
+    duration_label, hours_of_balance, lifecycle_label, limit_uses, machine_summary, main_action,
+    near_limit, noun_title, other_changes, provider_icon, signed_in_account, state_color,
     state_label, usage_summary,
 };
 use crate::confirm_dialog::{ConfirmCheckbox, ConfirmRequest};
@@ -40,6 +44,9 @@ use crate::machines::{MachineId, Machines};
 pub(super) const COPIED_FOR: Duration = Duration::from_secs(2);
 /// A machine's and a provider's mark, as a machine's icon is drawn.
 const MARK_SIZE: Pixels = px(28.);
+/// Settings › Usage's columns for what's counted and how much of it is used.
+const USAGE_LABEL_WIDTH: Pixels = px(90.);
+const USAGE_VALUE_WIDTH: Pixels = px(110.);
 
 impl SettingsPage {
     /// Each provider that's signed in or has saved machines as a group, then More Providers.
@@ -152,6 +159,10 @@ impl SettingsPage {
     ) -> AnyElement {
         let description = provider.description();
         let slug = description.program;
+        let is_near_limit = signed_in_account(state).is_some()
+            && state
+                .and_then(|state| state.usage.as_ref())
+                .is_some_and(near_limit);
         let (line, signed_out) = match state.map(|state| &state.status) {
             Some(ProviderStatus::SignedIn { account, .. }) => {
                 let usage = state
@@ -291,7 +302,11 @@ impl SettingsPage {
                     .children(line.map(|line| {
                         Label::new(line)
                             .size(LabelSize::Small)
-                            .color(Color::Muted)
+                            .color(if is_near_limit {
+                                Color::Warning
+                            } else {
+                                Color::Muted
+                            })
                             .truncate()
                     }))
                     .children(copy_sign_in),
@@ -1283,6 +1298,213 @@ impl SettingsPage {
             )
         });
     }
+}
+
+/// Settings › Usage's Cloud section (topic 13 C): an entry per signed-in provider account, with
+/// Instabox's counts as bars against their limits, and Proton's balance, how long it runs a
+/// computer and what its computers ran. These are this Mac's accounts, whichever machine's
+/// agents the page shows.
+pub(super) fn render_cloud_usage(cx: &App) -> Option<AnyElement> {
+    let cloud = Machines::local(cx).read(cx).cloud().clone();
+    let accounts: Vec<AnyElement> = Provider::ALL
+        .into_iter()
+        .filter_map(|provider| {
+            let state = cloud.provider(provider)?;
+            let account = signed_in_account(Some(state))?;
+            Some(render_cloud_usage_account(
+                provider,
+                &account,
+                state.usage.as_ref(),
+                cx,
+            ))
+        })
+        .collect();
+    (!accounts.is_empty()).then(|| render_section("Cloud", accounts, cx))
+}
+
+/// An account's entry: the provider's mark, name, account and price, Add Credit where it bills
+/// a balance, then a line per thing counted.
+fn render_cloud_usage_account(
+    provider: Provider,
+    account: &str,
+    usage: Option<&CloudUsage>,
+    cx: &App,
+) -> AnyElement {
+    let description = provider.description();
+    let slug = description.program;
+    let line = |label: &'static str| {
+        h_flex().gap_3().child(
+            div()
+                .w(USAGE_LABEL_WIDTH)
+                .flex_none()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+        )
+    };
+    let value = |text: String, color: Color| {
+        div().flex_1().min_w_0().child(
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(color)
+                .truncate(),
+        )
+    };
+    let lines: Vec<AnyElement> = match usage {
+        Some(usage @ CloudUsage::Limits { .. }) => limit_uses(usage)
+            .into_iter()
+            .enumerate()
+            .map(|(index, limit)| {
+                let near = limit
+                    .fraction
+                    .is_some_and(|fraction| fraction >= NEAR_LIMIT);
+                line(limit.label)
+                    .child(
+                        div().w(USAGE_VALUE_WIDTH).flex_none().child(
+                            Label::new(limit.used)
+                                .size(LabelSize::Small)
+                                .color(if near { Color::Warning } else { Color::Default }),
+                        ),
+                    )
+                    .children(limit.fraction.map(|fraction| {
+                        render_use_bar(&format!("usage-cloud-{slug}-bar-{index}"), fraction, cx)
+                    }))
+                    .into_any_element()
+            })
+            .collect(),
+        Some(CloudUsage::Balance {
+            balance_micro_usd,
+            running_hours,
+            charged_micro_usd,
+        }) => {
+            let (balance, color) = match balance_micro_usd {
+                Some(balance) => {
+                    let lasts = description
+                        .hourly_micro_usd
+                        .map(|hourly| hours_of_balance(*balance, hourly));
+                    let text = match lasts {
+                        Some(hours) if *balance > 0 => format!(
+                            "{} · {} of one {}",
+                            dollars(*balance),
+                            about_label(hours),
+                            description.noun
+                        ),
+                        _ => dollars(*balance),
+                    };
+                    let color = if *balance <= 0 {
+                        Color::Error
+                    } else if lasts.is_some_and(|hours| hours < 24.) {
+                        Color::Warning
+                    } else {
+                        Color::Default
+                    };
+                    (text, color)
+                }
+                None => ("No prepaid balance".to_string(), Color::Muted),
+            };
+            // Proton doesn't say over what period its runtime is counted.
+            let ran = format!(
+                "{} · {} charged",
+                duration_label((running_hours.max(0.) * 3600.).round() as u64),
+                dollars(*charged_micro_usd)
+            );
+            vec![
+                line("Balance")
+                    .child(value(balance, color))
+                    .into_any_element(),
+                line("Run time")
+                    .child(value(ran, Color::Default))
+                    .into_any_element(),
+            ]
+        }
+        Some(CloudUsage::NotBilled) => vec![
+            Label::new("Billing isn't on for this account.")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        ],
+        None => Vec::new(),
+    };
+    let add_credit = description.add_credit.map(|url| {
+        div()
+            .flex_none()
+            .debug_selector(move || format!("usage-cloud-{slug}-add-credit"))
+            .child(
+                Button::new(
+                    SharedString::from(format!("usage-cloud-{slug}-add-credit")),
+                    "Add Credit",
+                )
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::Small)
+                .color(Color::Muted)
+                .end_icon(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, _, cx| cx.open_url(url)),
+            )
+    });
+    v_flex()
+        .debug_selector(move || format!("usage-cloud-{slug}"))
+        .px_4()
+        .py_3()
+        .gap_2p5()
+        .child(
+            h_flex()
+                .min_h(px(20.))
+                .gap_2()
+                .child(
+                    Icon::new(provider_icon(provider))
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(description.name).weight(FontWeight::MEDIUM))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(format!("{account} · {}", description.price))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+                )
+                .children(add_credit),
+        )
+        .children(lines)
+        .into_any_element()
+}
+
+/// A limit's share used, in the accent color, or the warning color near the limit.
+fn render_use_bar(selector: &str, fraction: f32, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    let fill = if fraction >= NEAR_LIMIT {
+        cx.theme().status().warning
+    } else {
+        colors.text_accent
+    };
+    let fraction = fraction.clamp(0., 1.);
+    let track_selector = selector.to_string();
+    let fill_selector = format!("{selector}-fill");
+    div()
+        .debug_selector(move || track_selector)
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .h(px(6.))
+        .rounded_full()
+        .bg(colors.border)
+        .when(fraction > 0., |track| {
+            track.child(
+                div()
+                    .debug_selector(move || fill_selector)
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(relative(fraction))
+                    .rounded_full()
+                    .bg(fill),
+            )
+        })
+        .into_any_element()
 }
 
 /// A machine its provider is making, named as it was asked for, until it's listed.

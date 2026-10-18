@@ -278,36 +278,108 @@ pub fn usage_summary(usage: &CloudUsage) -> String {
             };
             format!("{balance} · {running_hours:.0} h running")
         }
-        CloudUsage::Limits {
-            machines,
-            max_machines,
-            snapshots,
-            max_snapshots,
-            stored_bytes,
-            max_stored_gib,
-        } => {
-            let of = |count: u32, max: Option<u32>, noun: &str| match max {
-                Some(max) => format!("{count} of {max} {noun}"),
-                None => format!("{count} {noun}"),
-            };
-            let storage = stored_bytes.map(|bytes| {
-                let gb = bytes as f64 / 1e9;
-                match max_stored_gib {
-                    Some(max) => format!("{gb:.0} of {max} GB"),
-                    None => format!("{gb:.0} GB"),
-                }
-            });
-            [
-                Some(of(*machines, *max_machines, "machines")),
-                Some(of(*snapshots, *max_snapshots, "snapshots")),
-                storage,
-            ]
+        CloudUsage::Limits { .. } => limit_uses(usage)
             .into_iter()
-            .flatten()
+            .map(|limit| limit.summary)
             .collect::<Vec<_>>()
-            .join(" · ")
-        }
+            .join(" · "),
         CloudUsage::NotBilled => "Billing isn't on".to_string(),
+    }
+}
+
+/// From this share of a limit used, it's shown in the warning color (topic 13 A).
+pub const NEAR_LIMIT: f32 = 0.8;
+
+/// One of Instabox's counts against its limit.
+#[derive(Debug, PartialEq)]
+pub struct LimitUse {
+    pub label: &'static str,
+    /// "2 of 5", "14 of 200 GB".
+    pub used: String,
+    /// "2 of 5 machines".
+    pub summary: String,
+    /// The share used, without a limit or with a limit of nothing.
+    pub fraction: Option<f32>,
+}
+
+/// Instabox's machines, snapshots and storage against their limits; nothing for other usage.
+pub fn limit_uses(usage: &CloudUsage) -> Vec<LimitUse> {
+    let CloudUsage::Limits {
+        machines,
+        max_machines,
+        snapshots,
+        max_snapshots,
+        stored_bytes,
+        max_stored_gib,
+    } = usage
+    else {
+        return Vec::new();
+    };
+    let share = |used: f64, max: f64| (max > 0.).then(|| (used / max) as f32);
+    let count = |label, noun: &str, used: u32, max: Option<u32>| {
+        let used_text = match max {
+            Some(max) => format!("{used} of {max}"),
+            None => used.to_string(),
+        };
+        LimitUse {
+            label,
+            summary: format!("{used_text} {noun}"),
+            used: used_text,
+            fraction: max.and_then(|max| share(f64::from(used), f64::from(max))),
+        }
+    };
+    let mut uses = vec![
+        count("Machines", "machines", *machines, *max_machines),
+        count("Snapshots", "snapshots", *snapshots, *max_snapshots),
+    ];
+    if let Some(bytes) = stored_bytes {
+        // Instabox counts storage in GiB (`maxStoredGiB`).
+        let gb = *bytes as f64 / f64::from(1u32 << 30);
+        // Under 10 GB, a whole number would say a few megabytes are nothing.
+        let stored = if gb < 10. {
+            format!("{gb:.1}")
+        } else {
+            format!("{gb:.0}")
+        };
+        let used = match max_stored_gib {
+            Some(max) => format!("{stored} of {max} GB"),
+            None => format!("{stored} GB"),
+        };
+        uses.push(LimitUse {
+            label: "Storage",
+            summary: used.clone(),
+            used,
+            fraction: max_stored_gib.and_then(|max| share(gb, max as f64)),
+        });
+    }
+    uses
+}
+
+/// Whether any of the account's limits is nearly used up.
+pub fn near_limit(usage: &CloudUsage) -> bool {
+    limit_uses(usage).iter().any(|limit| {
+        limit
+            .fraction
+            .is_some_and(|fraction| fraction >= NEAR_LIMIT)
+    })
+}
+
+/// How long a balance runs a machine at a price an hour, in hours.
+pub fn hours_of_balance(balance_micro_usd: i64, hourly_micro_usd: u64) -> f64 {
+    if hourly_micro_usd == 0 {
+        return f64::INFINITY;
+    }
+    balance_micro_usd.max(0) as f64 / hourly_micro_usd as f64
+}
+
+/// Roughly how long, in hours: "about 37 days", "about 5 hours", "less than an hour".
+pub fn about_label(hours: f64) -> String {
+    let whole_hours = hours.round() as u64;
+    match whole_hours {
+        0 => "less than an hour".to_string(),
+        1 => "about an hour".to_string(),
+        2..48 => format!("about {whole_hours} hours"),
+        _ => format!("about {:.0} days", hours / 24.),
     }
 }
 
@@ -391,11 +463,60 @@ mod tests {
                 max_machines: Some(5),
                 snapshots: 1,
                 max_snapshots: Some(10),
-                stored_bytes: Some(14_000_000_000),
+                stored_bytes: Some(14 << 30),
                 max_stored_gib: Some(200),
             }),
             "2 of 5 machines · 1 of 10 snapshots · 14 of 200 GB"
         );
+    }
+
+    #[test]
+    fn measures_an_account_against_its_limits_and_balance() {
+        let usage = CloudUsage::Limits {
+            machines: 4,
+            max_machines: Some(5),
+            snapshots: 3,
+            max_snapshots: None,
+            stored_bytes: Some(6_643_454),
+            max_stored_gib: Some(200),
+        };
+        let uses = limit_uses(&usage);
+        let used: Vec<(&str, &str, Option<f32>)> = uses
+            .iter()
+            .map(|limit| (limit.label, limit.used.as_str(), limit.fraction))
+            .collect();
+        assert_eq!(
+            used,
+            [
+                ("Machines", "4 of 5", Some(0.8)),
+                ("Snapshots", "3", None),
+                (
+                    "Storage",
+                    "0.0 of 200 GB",
+                    Some(6_643_454. / (200. * 1_073_741_824.))
+                ),
+            ]
+        );
+        assert!(near_limit(&usage));
+        assert!(!near_limit(&CloudUsage::Limits {
+            machines: 3,
+            max_machines: Some(5),
+            snapshots: 0,
+            max_snapshots: Some(0),
+            stored_bytes: None,
+            max_stored_gib: None,
+        }));
+        assert!(limit_uses(&CloudUsage::NotBilled).is_empty());
+
+        // $24.20 at $20 per 730 hours.
+        let hours = hours_of_balance(24_200_000, 27_397);
+        assert_eq!(about_label(hours), "about 37 days");
+        assert_eq!(
+            about_label(hours_of_balance(-1_000_000, 27_397)),
+            "less than an hour"
+        );
+        assert_eq!(about_label(1.2), "about an hour");
+        assert_eq!(about_label(20.), "about 20 hours");
     }
 
     #[test]

@@ -7102,7 +7102,7 @@ impl SettingsPage {
     }
 
     /// The Usage page: each agent whose accounts' limits are read, as a table of its accounts
-    /// and their windows.
+    /// and their windows, then this Mac's cloud accounts.
     fn render_usage(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let client = self.agents_client(cx);
         let mut agents: Vec<AgentListing> = self
@@ -7140,13 +7140,15 @@ impl SettingsPage {
             })
             .collect();
         if sections.is_empty() {
-            return vec![
+            sections.push(
                 Label::new("No agent on this machine reports its accounts' limits.")
                     .color(Color::Muted)
                     .into_any_element(),
-            ];
+            );
+        } else {
+            sections.push(self.render_usage_timeline(&timeline_agents, now, cx));
         }
-        sections.push(self.render_usage_timeline(&timeline_agents, now, cx));
+        sections.extend(cloud_providers::render_cloud_usage(cx));
         sections
     }
 
@@ -12546,6 +12548,96 @@ mod tests {
                 .is_none()
         });
         assert!(removed);
+    }
+
+    /// Settings › Usage has a Cloud section after the agents, even with no agent that reads
+    /// its limits: Instabox's counts as bars against their limits, and Proton's balance with
+    /// Add Credit (design/cloud topic 13 C). An account that's signed out isn't in it.
+    #[gpui::test]
+    fn the_usage_page_shows_each_cloud_account(cx: &mut TestAppContext) {
+        let signed_in = || ProviderStatus::SignedIn {
+            version: "1.0.0".into(),
+            account: "me@example.com".into(),
+            rules: Default::default(),
+        };
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| {
+                let mut instabox = provider_state(Provider::Instabox, signed_in());
+                instabox.usage = Some(CloudUsage::Limits {
+                    machines: 4,
+                    max_machines: Some(5),
+                    snapshots: 1,
+                    max_snapshots: Some(10),
+                    stored_bytes: Some(14 << 30),
+                    max_stored_gib: Some(200),
+                });
+                let mut proton = provider_state(Provider::Proton, signed_in());
+                proton.usage = Some(CloudUsage::Balance {
+                    balance_micro_usd: Some(24_200_000),
+                    running_hours: 29.35,
+                    charged_micro_usd: 804_000,
+                });
+                client.set_cloud_for_test(
+                    CloudSnapshot {
+                        providers: vec![instabox, proton],
+                        checking: false,
+                    },
+                    cx,
+                );
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Usage, window, cx)
+        });
+        cx.run_until_parked();
+
+        let instabox = cx
+            .debug_bounds("usage-cloud-instabox")
+            .expect("Instabox's account is shown");
+        let proton = cx
+            .debug_bounds("usage-cloud-proton")
+            .expect("Proton's account is shown");
+        assert!(instabox.top() < proton.top());
+
+        // 4 of 5 machines fill four fifths of their bar.
+        let track = cx
+            .debug_bounds("usage-cloud-instabox-bar-0")
+            .expect("a bar for the machines");
+        let fill = cx
+            .debug_bounds("usage-cloud-instabox-bar-0-fill")
+            .expect("the machines used");
+        let share = fill.size.width / track.size.width;
+        assert!((share - 0.8).abs() < 0.01, "{share}");
+        assert!(
+            cx.debug_bounds("usage-cloud-instabox-bar-2").is_some(),
+            "a bar for the storage"
+        );
+        // Only Proton bills a balance; it has no bars.
+        assert!(cx.debug_bounds("usage-cloud-proton-add-credit").is_some());
+        assert!(cx.debug_bounds("usage-cloud-instabox-add-credit").is_none());
+        assert!(cx.debug_bounds("usage-cloud-proton-bar-0").is_none());
+
+        client.update(cx, |client, cx| {
+            let mut cloud = client.cloud().clone();
+            cloud.providers[1].status = ProviderStatus::SignedOut {
+                version: "1.0.0".into(),
+            };
+            client.set_cloud_for_test(cloud, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("usage-cloud-proton").is_none());
+        assert!(cx.debug_bounds("usage-cloud-instabox").is_some());
     }
 
     #[test]
