@@ -906,7 +906,7 @@ mod tests {
                 client.set_cloud_for_test(
                     CloudSnapshot {
                         providers: vec![instabox, proton],
-                        checking: false,
+                        ..Default::default()
                     },
                     cx,
                 );

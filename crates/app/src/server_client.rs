@@ -14,7 +14,7 @@ use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
 };
-use agentz_protocol::cloud::{CloudSnapshot, CloudState, Lifecycle};
+use agentz_protocol::cloud::{CloudActivity, CloudSnapshot, CloudState, Lifecycle};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -218,6 +218,8 @@ pub struct ServerClient {
     /// The days of inactivity the server was last told to archive threads after, this
     /// connection.
     auto_archive_sent: Option<Option<u32>>,
+    /// What this Mac's server was last told of the provider machines' use, this connection.
+    cloud_activity_sent: Option<Vec<CloudActivity>>,
     #[cfg(test)]
     sent_for_test: std::cell::RefCell<Vec<Request>>,
     /// Answers requests as the server would, for a test client.
@@ -274,6 +276,7 @@ impl ServerClient {
                 peers_sent: None,
                 design_settings_sent: None,
                 auto_archive_sent: None,
+                cloud_activity_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
                 #[cfg(test)]
@@ -655,6 +658,16 @@ impl ServerClient {
         }
         self.send(Request::SetAutoArchive(days), cx);
         self.auto_archive_sent = Some(days);
+    }
+
+    /// Tells this Mac's server what's working on each provider machine and whether anything of
+    /// it is open, when that's changed, so it can stop the machines left idle.
+    pub(crate) fn report_cloud_activity(&mut self, activity: Vec<CloudActivity>, cx: &App) {
+        if !self.is_online() || self.cloud_activity_sent.as_ref() == Some(&activity) {
+            return;
+        }
+        self.send(Request::ReportCloudActivity(activity.clone()), cx);
+        self.cloud_activity_sent = Some(activity);
     }
 
     /// The server was told of this checkout, so its agents may work there. Without one, the
@@ -1155,6 +1168,7 @@ impl ServerClient {
         self.peers_sent = None;
         self.design_settings_sent = None;
         self.auto_archive_sent = None;
+        self.cloud_activity_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.cloud_start = None;

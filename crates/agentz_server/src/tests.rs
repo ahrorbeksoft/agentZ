@@ -11308,8 +11308,8 @@ async fn artifacts_are_published_served_and_sent_back() {
 }
 
 /// A fake `proton` CLI in a folder of its own: signed in as `alex@example.com`, with one
-/// computer whose state is kept in a file, so `start` changes what `list` says, and `create
-/// scratch` adds a second.
+/// computer whose state is kept in a file, so `start` and `stop` change what `list` says, and
+/// `create scratch` adds a second. A `balance` file there replaces what `balance` prints.
 #[cfg(unix)]
 fn fake_proton_cli() -> (tempfile::TempDir, std::ffi::OsString) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -11325,8 +11325,9 @@ case "$*" in
   "whoami") echo "alex@example.com" ;;
   "list --json") printf '[{{"id": "c-1", "name": "devbox-3", "state": "%s", "vcpus": 8, "error": "", "public_ssh": {{"hostname": "ssh.proton.computer", "port": 22021, "enabled": 1}}}}%s]' "$(cat '{state}')" "$(cat '{created}' 2>/dev/null)" ;;
   "create scratch --yes") printf ', {{"id": "c-2", "name": "scratch", "state": "running"}}' > '{created}' ;;
-  "balance") printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
+  "balance") cat '{balance}' 2>/dev/null || printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
   "start c-1 --yes") echo running > '{state}'; echo "  start: succeeded" >&2 ;;
+  "stop c-1") echo stopped > '{state}' ;;
   "ssh-config c-1") printf 'Host proton-devbox-3\n  HostName ssh.proton.computer\n  User ubuntu\n  Port 22021\n' ;;
   "show c-1 --json") printf '{{"machine": {{"id": "c-1", "name": "devbox-3", "state": "%s", "last_activity": 1792244584.5}}, "operations": [{{"action": "start", "status": "succeeded", "finished": 1792244584.5}}]}}' "$(cat '{state}')" ;;
   "keys c-1 --key "*) echo "  replaced 1 key" ;;
@@ -11336,6 +11337,7 @@ esac
         log = folder.path().join("log").display(),
         state = state.display(),
         created = folder.path().join("created").display(),
+        balance = folder.path().join("balance").display(),
     );
     let program = folder.path().join("proton");
     std::fs::write(&program, script).expect("writes the CLI");
@@ -11516,4 +11518,274 @@ async fn finds_cloud_providers_and_changes_their_machines() {
     let saved = std::fs::read_to_string(server.data_dir.path().join("cloud.json"))
         .expect("cloud.json was written");
     assert!(saved.contains("devbox-3"));
+}
+
+/// This Mac's server stops a Proton computer once nothing has worked on it or had it open for
+/// as long as its Stop when idle says, and doesn't tell of that stop. It tells of a stop it
+/// didn't ask for, naming what was working, and of a balance that runs out within a day, once,
+/// until an app dismisses them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_idle_cloud_machines_and_tells_of_what_their_provider_did() {
+    use agentz_protocol::cloud::{CloudActivity, CloudState, MachineAction, NoticeKind, Provider};
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (cli, path) = fake_proton_cli();
+    let state = cli.path().join("state");
+    std::fs::write(&state, "running").expect("writes the state");
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        move |config| config.cloud_path = Some(path),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let working = |working: &[&str]| {
+        Request::ReportCloudActivity(vec![CloudActivity {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+            working: working.iter().map(|title| title.to_string()).collect(),
+            open: false,
+        }])
+    };
+    let stop_when_idle = |after: Option<Duration>| Request::CloudMachineAction {
+        provider: Provider::Proton,
+        machine: "c-1".into(),
+        action: MachineAction::StopWhenIdle(after),
+    };
+    let machine_state = |client: &TestClient| {
+        cloud_snapshot(client)
+            .and_then(|cloud| cloud.machine(Provider::Proton, "c-1").cloned())
+            .map(|machine| machine.state)
+    };
+
+    // A thread works on it, so it runs on.
+    client.ok(working(&["Fix the login bug"])).await;
+    client.ok(Request::CheckCloud).await;
+    client.ok(stop_when_idle(Some(Duration::ZERO))).await;
+    client.ok(Request::CheckCloud).await;
+    assert_eq!(machine_state(&client), Some(CloudState::Running));
+    let cloud = cloud_snapshot(&client).expect("the providers were sent");
+    let proton = cloud.provider(Provider::Proton).expect("Proton");
+    assert_eq!(proton.stop_when_idle.get("c-1"), Some(&Duration::ZERO));
+    assert_eq!(cloud.notices, Vec::new());
+    let error = client
+        .request(Request::CloudMachineAction {
+            provider: Provider::Instabox,
+            machine: "m-1".into(),
+            action: MachineAction::StopWhenIdle(Some(Duration::ZERO)),
+        })
+        .await
+        .expect_err("Instabox pauses its own");
+    assert!(error.message.contains("doesn't stop"), "{}", error.message);
+
+    // Once nothing works on it, it's stopped, and that isn't told of.
+    client.ok(working(&[])).await;
+    client
+        .wait_until(|client| machine_state(client) == Some(CloudState::Stopped))
+        .await;
+    let log = std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
+    assert!(log.lines().any(|line| line == "stop c-1"), "{log}");
+    client.ok(Request::CheckCloud).await;
+    assert_eq!(
+        cloud_snapshot(&client).expect("the providers").notices,
+        Vec::new()
+    );
+
+    // Proton suspends it while a thread works on it: that's told, naming the thread.
+    client.ok(stop_when_idle(None)).await;
+    std::fs::write(&state, "running").expect("writes the state");
+    client.ok(working(&["Fix the login bug"])).await;
+    client.ok(Request::CheckCloud).await;
+    std::fs::write(&state, "suspended").expect("writes the state");
+    client.ok(Request::CheckCloud).await;
+    let cloud = cloud_snapshot(&client).expect("the providers");
+    let kinds: Vec<_> = cloud.notices.iter().map(|notice| &notice.kind).collect();
+    assert_eq!(
+        kinds,
+        [&NoticeKind::Stopped {
+            machine: "c-1".into(),
+            name: "devbox-3".into(),
+            state: CloudState::Suspended,
+            working: vec!["Fix the login bug".into()],
+        }]
+    );
+
+    // With $0.30 left, the running computer lasts about 11 hours: that's told once.
+    std::fs::write(
+        cli.path().join("balance"),
+        "Shared Cube balance: $0.30\nProton runtime: 26.78 hours · deducted $0.7336\n",
+    )
+    .expect("writes the balance");
+    std::fs::write(&state, "running").expect("writes the state");
+    client.ok(Request::CheckCloud).await;
+    client.ok(Request::CheckCloud).await;
+    let cloud = cloud_snapshot(&client).expect("the providers");
+    let low: Vec<_> = cloud
+        .notices
+        .iter()
+        .filter_map(|notice| match &notice.kind {
+            NoticeKind::LowBalance {
+                balance_micro_usd,
+                hours_left,
+                running,
+            } => Some((*balance_micro_usd, *hours_left, running.clone())),
+            NoticeKind::Stopped { .. } => None,
+        })
+        .collect();
+    let [(balance, hours_left, running)] = &low[..] else {
+        panic!("not one low-balance notice: {:?}", cloud.notices);
+    };
+    assert_eq!(*balance, 300_000);
+    assert!((10.0..12.0).contains(hours_left), "{hours_left}");
+    assert_eq!(running, &["devbox-3".to_string()]);
+    assert_eq!(cloud.last_notice, 2);
+
+    // Dismissed, they're gone.
+    client
+        .ok(Request::DismissCloudNotices(cloud.last_notice))
+        .await;
+    assert_eq!(
+        cloud_snapshot(&client).expect("the providers").notices,
+        Vec::new()
+    );
+}
+
+/// A fake `instabox` CLI in a folder of its own: signed in as `me@example.com` (a `whoami`
+/// file there replaces what `whoami --json` prints), with one running machine whose idle pause,
+/// in seconds, is kept in a `pause` file, so `auto-suspend` changes what `get` says.
+#[cfg(unix)]
+fn fake_instabox_cli() -> (tempfile::TempDir, std::ffi::OsString) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let folder = tempfile::tempdir().expect("temp dir");
+    let pause = folder.path().join("pause");
+    std::fs::write(&pause, "1800").expect("writes the pause");
+    let script = format!(
+        r#"#!/bin/sh
+echo "$*" >> '{log}'
+case "$*" in
+  "--version") echo "instabox cbecf34a" ;;
+  "whoami --json") cat '{whoami}' 2>/dev/null || echo '{{"login": "me@example.com"}}' ;;
+  "ls --json") echo '[{{"id": "m-1", "name": "agents-1", "state": "running"}}]' ;;
+  "usage --json") echo '{{}}' ;;
+  "get m-1 --json") printf '{{"state": "running", "autoSuspendAfterSeconds": %s}}' "$(cat '{pause}')" ;;
+  "auto-suspend m-1 "*) set -- $*; echo "${{3%s}}" > '{pause}' ;;
+  *) echo "instabox: unknown command: $*" >&2; exit 1 ;;
+esac
+"#,
+        log = folder.path().join("log").display(),
+        whoami = folder.path().join("whoami").display(),
+        pause = pause.display(),
+    );
+    let program = folder.path().join("instabox");
+    std::fs::write(&program, script).expect("writes the CLI");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("makes it runnable");
+    let path = std::ffi::OsString::from(format!("{}:/bin:/usr/bin", folder.path().display()));
+    (folder, path)
+}
+
+/// While an agent works on an Instabox machine, this Mac's server turns its idle pause off, as
+/// it holds off sleep, and sets the one it had back once nothing works on it; one the user picks
+/// meanwhile is the one set back. An account whose pause is fixed can't turn it off, so it's
+/// left alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn holds_off_instabox_idle_pause_while_agents_work() {
+    use agentz_protocol::cloud::{CloudActivity, MachineAction, Provider};
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (cli, path) = fake_instabox_cli();
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        move |config| config.cloud_path = Some(path),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let working = |working: &[&str]| {
+        Request::ReportCloudActivity(vec![CloudActivity {
+            provider: Provider::Instabox,
+            machine: "m-1".into(),
+            working: working.iter().map(|title| title.to_string()).collect(),
+            open: false,
+        }])
+    };
+    let held = |client: &TestClient| {
+        cloud_snapshot(client)
+            .and_then(|cloud| cloud.provider(Provider::Instabox).cloned())
+            .map(|state| state.held_awake.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let pause = || std::fs::read_to_string(cli.path().join("pause")).expect("the pause");
+    let log = || std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
+    client.ok(Request::CheckCloud).await;
+
+    // A thread works on it, so its pause is turned off, and the 30 minutes it had are kept.
+    client.ok(working(&["Fix the login bug"])).await;
+    client
+        .wait_until(|client| held(client) == [("m-1".to_string(), Duration::from_secs(1800))])
+        .await;
+    assert_eq!(pause().trim(), "0");
+
+    // The user picks an hour meanwhile: that's kept, and it stays off.
+    client
+        .ok(Request::CloudMachineAction {
+            provider: Provider::Instabox,
+            machine: "m-1".into(),
+            action: MachineAction::SetIdlePause(Duration::from_secs(3600)),
+        })
+        .await;
+    client
+        .wait_until(|client| held(client) == [("m-1".to_string(), Duration::from_secs(3600))])
+        .await;
+    assert_eq!(pause().trim(), "0");
+
+    // Once nothing works on it, the hour is set back.
+    client.ok(working(&[])).await;
+    client.wait_until(|client| held(client).is_empty()).await;
+    assert_eq!(pause().trim(), "3600");
+    assert!(
+        log().lines().any(|line| line == "auto-suspend m-1 3600s"),
+        "{}",
+        log()
+    );
+
+    // An account whose pause is fixed can't turn it off.
+    std::fs::write(
+        cli.path().join("whoami"),
+        r#"{"login": "me@example.com", "fixedAutoSuspendSeconds": 1800}"#,
+    )
+    .expect("writes whoami");
+    client.ok(Request::CheckCloud).await;
+    let turned_off = log()
+        .lines()
+        .filter(|line| *line == "auto-suspend m-1 0")
+        .count();
+    client.ok(working(&["Fix the login bug"])).await;
+    client.ok(Request::CheckCloud).await;
+    assert!(held(&client).is_empty());
+    assert_eq!(
+        log()
+            .lines()
+            .filter(|line| *line == "auto-suspend m-1 0")
+            .count(),
+        turned_off
+    );
+    assert_eq!(pause().trim(), "3600");
 }

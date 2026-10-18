@@ -703,6 +703,7 @@ impl Server {
     }
 
     pub(crate) async fn run(mut self, mut inbox: mpsc::UnboundedReceiver<Input>) {
+        self.resume_cloud_watch();
         while let Some(input) = inbox.next().await {
             self.handle(input);
             // Take whatever else has arrived, so a burst of agent output is sent as one update.
@@ -952,6 +953,7 @@ impl Server {
             Input::Disconnected(client) => {
                 self.clients.remove(&client);
                 self.relays.client_gone(client);
+                self.cloud_client_gone(client);
                 // Nobody is left to see these login sessions.
                 self.login_sessions
                     .retain(|_, login_session| login_session.owner != Some(client));
@@ -1457,6 +1459,14 @@ impl Server {
             | Request::CloudMachineDetails { .. }
             | Request::CloudMachineAction { .. } => {
                 Err(anyhow!("cloud providers are handled separately"))
+            }
+            Request::ReportCloudActivity(activity) => {
+                self.report_cloud_activity(client, activity);
+                Ok(Response::Ok)
+            }
+            Request::DismissCloudNotices(up_to) => {
+                self.dismiss_cloud_notices(up_to);
+                Ok(Response::Ok)
             }
             Request::SetCleanupRules(rules) => {
                 self.set_cleanup_rules(rules)?;

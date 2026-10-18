@@ -11,7 +11,7 @@ use agentz_protocol::cloud::CloudState;
 use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{
     AnyView, App, Context, Decorations, DismissEvent, DragMoveEvent, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, MouseButton, PathPromptOptions, Subscription, SystemNotification,
@@ -26,6 +26,7 @@ use crate::add_project_modal::{AddProjectModal, AddProjectModalEvent};
 use crate::agent_view::{AgentView, AgentViewEvent, RESIZE_EDGE_SIZE};
 use crate::app_settings::{AppSettingsStore, ArtifactAutoOpen, MachineProfile, is_sidebar_hidden};
 use crate::artifacts_list::{ArtifactsList, ShowInList};
+use crate::cloud_machines::{self, NoticeAction};
 use crate::command_palette::CommandPalette;
 use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
 use crate::diagnostics;
@@ -393,25 +394,46 @@ impl Shell {
             cx.observe(&AppSettingsStore::global(cx), |this, _, cx| {
                 this.push_page_theme(cx)
             }),
+            cx.observe_self(|this, cx| this.sync_open_machines(cx)),
+            cx.observe(&spaces_view, |this, _, cx| this.sync_open_machines(cx)),
         ];
         // Clicking a notification is the user asking for that thread, so it may come forward.
         let shell = cx.entity().downgrade();
         let window_handle = window.window_handle();
         cx.on_system_notification_response(move |response, cx| {
             let place = match thread_from_notification_tag(&response.tag) {
-                Some(thread_id) => Place::Thread(thread_id),
+                Some(thread_id) => Some(Place::Thread(thread_id)),
                 None => match PaneKey::from_notification_tag(&response.tag) {
-                    Some(pane) => Place::Pane(pane),
-                    None => return,
+                    Some(pane) => Some(Place::Pane(pane)),
+                    None => {
+                        let Some((provider, machine)) =
+                            cloud_machines::notification_target(&response.tag)
+                        else {
+                            return;
+                        };
+                        // A cloud notification's button does what it says, and leaves agentZ
+                        // where it is.
+                        if let Some(action) = response
+                            .action_id
+                            .as_deref()
+                            .and_then(NoticeAction::from_id)
+                        {
+                            cloud_machines::act_on_notification(provider, machine, action, cx);
+                            return;
+                        }
+                        None
+                    }
                 },
             };
             let shell = shell.clone();
             window_handle
                 .update(cx, |_, window, cx| {
                     window.activate_window();
-                    shell
-                        .update(cx, |shell, cx| shell.go_to(place, window, cx))
-                        .ok();
+                    if let Some(place) = place {
+                        shell
+                            .update(cx, |shell, cx| shell.go_to(place, window, cx))
+                            .ok();
+                    }
                 })
                 .log_err();
             cx.activate(true);
@@ -1183,6 +1205,21 @@ impl Shell {
             }
             cx.dismiss_system_notification(&notification_tag(thread_id));
         }
+    }
+
+    /// Tells the machines which ones this window has something of open: the threads it holds
+    /// views of, terminal threads included, and the workspace the Workspaces view shows. A
+    /// provider's machine isn't stopped as idle while it does (design/cloud topic 12 B).
+    fn sync_open_machines(&mut self, cx: &mut Context<Self>) {
+        let mut open: HashSet<MachineId> =
+            self.open_threads.keys().map(|key| key.machine).collect();
+        if self.view == MainView::Workspaces
+            && let Some(machine) = self.spaces_view.read(cx).shown_machine()
+        {
+            open.insert(machine);
+        }
+        self.machines
+            .update(cx, |machines, cx| machines.set_open_machines(open, cx));
     }
 
     /// The thread's sound, as the settings say, and a system notification while agentZ isn't

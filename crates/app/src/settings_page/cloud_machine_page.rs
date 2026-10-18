@@ -40,7 +40,7 @@ use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, copy_to_clipboard, icon_tile, status_badge};
 use crate::machines::Machines;
 
-/// "When idle"'s choices, in minutes; zero never pauses.
+/// "When idle"'s choices, in minutes; zero never pauses or stops.
 const IDLE_PAUSES: [u64; 4] = [30, 60, 240, 0];
 /// The keys `ssh` offers by itself. A Proton computer's `ssh-config` names none, so these are
 /// what agentZ reaches it with.
@@ -290,6 +290,8 @@ impl SettingsPage {
                 copy_to_clipboard(&text, cx);
                 self.show_copied(key.clone(), cx);
             }
+            // This Mac's server keeps it, and sends it with the listing.
+            (MachineAction::StopWhenIdle(_), _) => {}
             (MachineAction::DesktopLink { .. } | MachineAction::SshCommand, None) => {
                 let failure = action_failure(action);
                 let name = provider.description().name;
@@ -1104,11 +1106,25 @@ impl SettingsPage {
                 window,
                 cx,
             ));
+        }
+        if description.capabilities.idle_pause {
+            let held = state.and_then(|state| state.held_awake.get(&machine.id).copied());
             lifecycle.push(self.render_idle_pause_row(
                 provider,
                 &machine.id,
                 details,
+                held,
                 &rules,
+                can_act,
+                window,
+                cx,
+            ));
+        }
+        if description.capabilities.idle_stop {
+            lifecycle.push(self.render_stop_when_idle_row(
+                provider,
+                &machine.id,
+                state,
                 can_act,
                 window,
                 cx,
@@ -1218,21 +1234,25 @@ impl SettingsPage {
     }
 
     /// "When idle": how long it idles before it pauses itself, unless the account fixes that.
+    /// While agents work on it, this Mac's server has it off (topic 12 A), and `held` is the
+    /// pause it sets back.
     #[allow(clippy::too_many_arguments)]
     fn render_idle_pause_row(
         &self,
         provider: Provider,
         machine: &str,
         details: &MachineDetails,
+        held: Option<Duration>,
         rules: &AccountRules,
         can_act: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let name = provider.description().name;
+        let description = provider.description();
         let now = SystemTime::now();
         let minutes = rules
             .fixed_idle_pause
+            .or(held.filter(|pause| !pause.is_zero()))
             .or(details.idle_pause)
             .map_or(0, |after| after.as_secs() / 60);
         let (value, short) = match minutes {
@@ -1243,9 +1263,14 @@ impl SettingsPage {
             ),
         };
         let hints = [
-            rules
-                .fixed_idle_pause
-                .map(|_| format!("{name} sets this for your account.")),
+            rules.fixed_idle_pause.map(|_| {
+                // So agentZ can't hold it off while agents work (topic 12 A).
+                format!(
+                    "{} sets this for your account, so turns may stop when it pauses the {}.",
+                    description.name, description.noun
+                )
+            }),
+            held.map(|_| "Off while agents work on it, then set back.".to_string()),
             details.idle_paused_at.map(|at| {
                 format!(
                     "It paused itself for being idle at {}.",
@@ -1297,6 +1322,79 @@ impl SettingsPage {
                         .into_iter()
                         .flatten()
                         .map(|hint| Label::new(hint).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .into_any_element(),
+            Some(dropdown.into_any_element()),
+        )
+    }
+
+    /// "When idle" for a machine this Mac's server stops (topic 12 B): how long it may run with
+    /// no agent working on it and nothing of it open before it's stopped.
+    fn render_stop_when_idle_row(
+        &self,
+        provider: Provider,
+        machine: &str,
+        state: Option<&ProviderState>,
+        can_act: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let minutes = state
+            .and_then(|state| state.stop_when_idle.get(machine))
+            .map_or(0, |after| after.as_secs() / 60);
+        let (value, short) = match minutes {
+            0 => ("Never stops".to_string(), "Never".to_string()),
+            minutes => (
+                format!("Stops after {} idle", minutes_label(minutes)),
+                minutes_label(minutes),
+            ),
+        };
+        let setting = self.is_doing(provider, machine, |action| {
+            matches!(action, MachineAction::StopWhenIdle(_))
+        });
+        let page = cx.weak_entity();
+        let machine_id = machine.to_string();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for choice in IDLE_PAUSES {
+                let machine = machine_id.clone();
+                let label = match choice {
+                    0 => "Never stop".to_string(),
+                    choice => format!("Stop after {}", minutes_label(choice)),
+                };
+                menu = menu.toggleable_entry(
+                    label,
+                    choice == minutes,
+                    IconPosition::End,
+                    None,
+                    on_page(&page, move |page, _, cx| {
+                        let after = (choice > 0).then(|| Duration::from_secs(choice * 60));
+                        page.send_machine_action(
+                            provider,
+                            machine.clone(),
+                            MachineAction::StopWhenIdle(after),
+                            cx,
+                        )
+                    }),
+                );
+            }
+            menu
+        });
+        let dropdown = div()
+            .debug_selector(|| "machine-stop-when-idle".into())
+            .child(
+                DropdownMenu::new("machine-stop-when-idle", short, menu)
+                    .style(DropdownStyle::Outlined)
+                    .disabled(!can_act || setting),
+            );
+        render_value_row(
+            "When idle",
+            v_flex()
+                .gap_0p5()
+                .child(render_value_text(value))
+                .child(
+                    Label::new("Idle is no agent working on it and nothing of it open in agentZ.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 )
                 .into_any_element(),
             Some(dropdown.into_any_element()),
@@ -2044,6 +2142,7 @@ fn action_failure(action: &MachineAction) -> String {
         MachineAction::DesktopLink { view_only: false } => "Couldn't open its desktop".into(),
         MachineAction::DesktopLink { view_only: true } => "Couldn't make a view link".into(),
         MachineAction::ReplaceSshKeys(_) => "Couldn't replace its SSH keys".into(),
+        MachineAction::StopWhenIdle(_) => "Couldn't change when it stops".into(),
     }
 }
 
@@ -2093,7 +2192,7 @@ pub(super) mod tests {
         proton_state.listed_at = listed_at;
         CloudSnapshot {
             providers: vec![instabox, proton_state],
-            checking: false,
+            ..Default::default()
         }
     }
 
@@ -2275,6 +2374,8 @@ pub(super) mod tests {
         ] {
             assert!(cx.debug_bounds(shown).is_some(), "{shown} is shown");
         }
+        // Instabox pauses its own; agentZ stops Proton's.
+        assert!(cx.debug_bounds("machine-stop-when-idle").is_none());
 
         fails_reads.set(true);
         client.update(cx, |client, cx| {
@@ -2299,6 +2400,7 @@ pub(super) mod tests {
         click("cloud-open-proton-c-1", cx);
         assert!(cx.debug_bounds("machine-tab-overview").is_some());
         assert!(cx.debug_bounds("machine-tab-ssh-keys").is_some());
+        assert!(cx.debug_bounds("machine-stop-when-idle").is_some());
         for missing in [
             "machine-tab-snapshots",
             "machine-tab-ports",

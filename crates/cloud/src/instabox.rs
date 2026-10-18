@@ -457,6 +457,9 @@ pub(crate) fn action_args(machine: &str, action: &MachineAction) -> Result<Vec<S
                 "Instabox machines are reached with its certificates, not keys"
             ));
         }
+        MachineAction::StopWhenIdle(_) => {
+            return Err(anyhow!("agentZ stops idle machines itself, not their CLI"));
+        }
     }
     Ok(args)
 }

@@ -12273,6 +12273,9 @@ mod tests {
             listed_at: None,
             error: None,
             changing: Vec::new(),
+            stop_when_idle: Default::default(),
+            balance_low: false,
+            held_awake: Default::default(),
         }
     }
 
@@ -12350,7 +12353,7 @@ mod tests {
                             provider_state(Provider::Instabox, ProviderStatus::NotInstalled),
                             proton,
                         ],
-                        checking: false,
+                        ..Default::default()
                     },
                     cx,
                 );
@@ -12588,7 +12591,7 @@ mod tests {
                 client.set_cloud_for_test(
                     CloudSnapshot {
                         providers: vec![instabox, proton],
-                        checking: false,
+                        ..Default::default()
                     },
                     cx,
                 );

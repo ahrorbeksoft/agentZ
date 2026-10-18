@@ -4,11 +4,13 @@
 use std::rc::Rc;
 use std::time::SystemTime;
 
+use agentz_protocol::Request;
+pub use agentz_protocol::cloud::hours_of_balance;
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CloudState, CloudUsage, Lifecycle, MachineSize, Provider, ProviderState,
-    ProviderStatus,
+    Change, CloudMachine, CloudNotice, CloudState, CloudUsage, Lifecycle, MachineSize, NoticeKind,
+    Provider, ProviderState, ProviderStatus,
 };
-use gpui::{App, Window};
+use gpui::{App, SystemNotification, SystemNotificationAction, Window};
 use ui::{Color, IconName};
 
 use crate::app_settings::AppSettingsStore;
@@ -364,14 +366,6 @@ pub fn near_limit(usage: &CloudUsage) -> bool {
     })
 }
 
-/// How long a balance runs a machine at a price an hour, in hours.
-pub fn hours_of_balance(balance_micro_usd: i64, hourly_micro_usd: u64) -> f64 {
-    if hourly_micro_usd == 0 {
-        return f64::INFINITY;
-    }
-    balance_micro_usd.max(0) as f64 / hourly_micro_usd as f64
-}
-
 /// Roughly how long, in hours: "about 37 days", "about 5 hours", "less than an hour".
 pub fn about_label(hours: f64) -> String {
     let whole_hours = hours.round() as u64;
@@ -421,6 +415,154 @@ pub fn dollars(micro_usd: i64) -> String {
     let sign = if cents < 0 { "-" } else { "" };
     let cents = cents.abs();
     format!("{sign}${}.{:02}", cents / 100, cents % 100)
+}
+
+/// What a cloud notification's button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    AddCredit,
+    Resume,
+    Start,
+}
+
+impl NoticeAction {
+    const ALL: [NoticeAction; 3] = [
+        NoticeAction::AddCredit,
+        NoticeAction::Resume,
+        NoticeAction::Start,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            NoticeAction::AddCredit => "add-credit",
+            NoticeAction::Resume => "resume",
+            NoticeAction::Start => "start",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.id() == id)
+    }
+
+    /// The machine's change it asks for.
+    pub fn change(self) -> Option<Lifecycle> {
+        match self {
+            NoticeAction::AddCredit => None,
+            NoticeAction::Resume => Some(Lifecycle::Resume),
+            NoticeAction::Start => Some(Lifecycle::Start),
+        }
+    }
+
+    fn button(self) -> SystemNotificationAction {
+        SystemNotificationAction {
+            id: self.id().into(),
+            label: self.change().map_or("Add Credit", lifecycle_label).into(),
+        }
+    }
+}
+
+/// The notification for what this Mac's server noticed of a provider's machines (topic 12 C
+/// and D): "Instabox paused devbox5", naming what was working on it, with Resume. Starting a
+/// machine that charges is asked about first, so only a free one's notification starts it.
+pub fn notification(notice: &CloudNotice) -> SystemNotification {
+    let description = notice.provider.description();
+    let slug = description.program;
+    let add_credit = description.add_credit.map(|_| NoticeAction::AddCredit);
+    let (tag, title, body, action) = match &notice.kind {
+        NoticeKind::Stopped {
+            machine,
+            name,
+            state,
+            working,
+        } => {
+            let (verb, back) = match state {
+                CloudState::Pausing | CloudState::Paused => ("paused", NoticeAction::Resume),
+                CloudState::Suspended => ("suspended", NoticeAction::AddCredit),
+                _ => ("stopped", NoticeAction::Start),
+            };
+            let working = match working.as_slice() {
+                [] => "Nothing was working on it.".to_string(),
+                working => format!("Working on it: {}", working.join(", ")),
+            };
+            let (body, action) = match back.change() {
+                Some(change) => {
+                    let offers = description.lifecycle.contains(&change)
+                        && charges(notice.provider, change).is_none();
+                    (working, offers.then_some(back))
+                }
+                None => (format!("Its balance ran out. {working}"), add_credit),
+            };
+            (
+                format!("cloud-{slug}-{machine}"),
+                format!("{} {verb} {name}", description.name),
+                body,
+                action,
+            )
+        }
+        NoticeKind::LowBalance {
+            balance_micro_usd,
+            hours_left,
+            running,
+        } => (
+            format!("cloud-{slug}"),
+            format!(
+                "{}'s balance runs out in {}",
+                description.name,
+                about_label(*hours_left)
+            ),
+            format!(
+                "{} left, with {} running.",
+                dollars(*balance_micro_usd),
+                running.join(", ")
+            ),
+            add_credit,
+        ),
+    };
+    SystemNotification {
+        tag: tag.into(),
+        title: title.into(),
+        body: body.into(),
+        actions: action.into_iter().map(NoticeAction::button).collect(),
+    }
+}
+
+/// Does what a cloud notification's button says: Add Credit opens the provider's billing page,
+/// Resume and Start change the machine through this Mac's server.
+pub fn act_on_notification(
+    provider: Provider,
+    machine: Option<String>,
+    action: NoticeAction,
+    cx: &mut App,
+) {
+    match (action.change(), machine) {
+        (Some(change), Some(machine)) => Machines::local(cx).read(cx).send(
+            Request::ChangeCloudMachine {
+                provider,
+                machine,
+                change,
+            },
+            cx,
+        ),
+        (Some(_), None) => {}
+        (None, _) => {
+            if let Some(url) = provider.description().add_credit {
+                cx.open_url(url);
+            }
+        }
+    }
+}
+
+/// The provider, and the machine when it's about one, that a cloud notification's tag names.
+pub fn notification_target(tag: &str) -> Option<(Provider, Option<String>)> {
+    let named = tag.strip_prefix("cloud-")?;
+    let (program, machine) = match named.split_once('-') {
+        Some((program, machine)) => (program, Some(machine.to_string())),
+        None => (named, None),
+    };
+    let provider = Provider::ALL
+        .into_iter()
+        .find(|provider| provider.description().program == program)?;
+    Some((provider, machine))
 }
 
 #[cfg(test)]
@@ -568,5 +710,119 @@ mod tests {
             "It costs $20 per 730 running hours ($14.20 left). Stopping it stops the charge."
         );
         assert_eq!(noun_title(Provider::Proton), "Computer");
+    }
+
+    /// A notification names the machine, what was working on it, and offers what brings it
+    /// back, unless that charges; a suspended computer and a low balance offer Add Credit.
+    #[test]
+    fn tells_of_what_happened_to_a_cloud_machine() {
+        let notice = |provider: Provider, kind: NoticeKind| CloudNotice {
+            id: 1,
+            provider,
+            kind,
+            at: SystemTime::UNIX_EPOCH,
+        };
+        let stopped = |provider: Provider, state: CloudState, working: &[&str]| {
+            notice(
+                provider,
+                NoticeKind::Stopped {
+                    machine: "m-1".into(),
+                    name: "devbox5".into(),
+                    state,
+                    working: working.iter().map(|title| title.to_string()).collect(),
+                },
+            )
+        };
+        let shown = |notice: CloudNotice| {
+            let notification = notification(&notice);
+            let buttons: Vec<String> = notification
+                .actions
+                .iter()
+                .map(|action| action.label.to_string())
+                .collect();
+            (
+                notification.tag.to_string(),
+                notification.title.to_string(),
+                notification.body.to_string(),
+                buttons,
+            )
+        };
+        let expect = |tag: &str, title: &str, body: &str, buttons: &[&str]| {
+            (
+                tag.to_string(),
+                title.to_string(),
+                body.to_string(),
+                buttons.iter().map(|button| button.to_string()).collect(),
+            )
+        };
+        assert_eq!(
+            shown(stopped(
+                Provider::Instabox,
+                CloudState::Paused,
+                &["Fix the login bug", "Claude Code"]
+            )),
+            expect(
+                "cloud-instabox-m-1",
+                "Instabox paused devbox5",
+                "Working on it: Fix the login bug, Claude Code",
+                &["Resume"]
+            )
+        );
+        assert_eq!(
+            shown(stopped(Provider::Instabox, CloudState::Stopped, &[])),
+            expect(
+                "cloud-instabox-m-1",
+                "Instabox stopped devbox5",
+                "Nothing was working on it.",
+                &["Start"]
+            )
+        );
+        assert_eq!(
+            shown(stopped(Provider::Proton, CloudState::Stopped, &[])),
+            expect(
+                "cloud-proton-m-1",
+                "Proton stopped devbox5",
+                "Nothing was working on it.",
+                &[]
+            )
+        );
+        assert_eq!(
+            shown(stopped(Provider::Proton, CloudState::Suspended, &[])),
+            expect(
+                "cloud-proton-m-1",
+                "Proton suspended devbox5",
+                "Its balance ran out. Nothing was working on it.",
+                &["Add Credit"]
+            )
+        );
+        assert_eq!(
+            shown(notice(
+                Provider::Proton,
+                NoticeKind::LowBalance {
+                    balance_micro_usd: 300_000,
+                    hours_left: 10.9,
+                    running: vec!["devbox-3".into()],
+                }
+            )),
+            expect(
+                "cloud-proton",
+                "Proton's balance runs out in about 11 hours",
+                "$0.30 left, with devbox-3 running.",
+                &["Add Credit"]
+            )
+        );
+
+        assert_eq!(
+            notification_target("cloud-proton-c-1"),
+            Some((Provider::Proton, Some("c-1".into())))
+        );
+        assert_eq!(
+            notification_target("cloud-proton"),
+            Some((Provider::Proton, None))
+        );
+        assert_eq!(notification_target("cloud-cube-c-1"), None);
+        assert_eq!(notification_target("thread-local-5"), None);
+        assert_eq!(NoticeAction::from_id("resume"), Some(NoticeAction::Resume));
+        assert_eq!(NoticeAction::from_id("open"), None);
     }
 }

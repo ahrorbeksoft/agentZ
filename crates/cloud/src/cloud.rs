@@ -229,6 +229,18 @@ impl Cli {
         Ok(details)
     }
 
+    /// How long the machine, by its id, may idle before it pauses itself; `None` when it never
+    /// does.
+    pub async fn idle_pause(&self, machine: &str) -> Result<Option<Duration>> {
+        anyhow::ensure!(
+            self.provider.description().capabilities.idle_pause,
+            "{} machines don't pause when idle",
+            self.name()
+        );
+        let stdout = self.run(&["get", machine, "--json"], READ_TIMEOUT).await?;
+        Ok(instabox::parse_details(&stdout)?.0.idle_pause)
+    }
+
     /// Does a page's action to a machine, by its id, and waits until it's done. Gives what's for
     /// the user to copy or open: an SSH command, a desktop link, a published port's URL.
     pub async fn act(

@@ -18501,15 +18501,21 @@ mod tests {
             listed_at: Some(SystemTime::UNIX_EPOCH),
             error: None,
             changing: Vec::new(),
+            stop_when_idle: Default::default(),
+            balance_low: false,
+            held_awake: Default::default(),
         };
         cx.update(|cx| {
             mac.update(cx, |mac, cx| {
                 let requests = requests.clone();
                 let fails = fails.clone();
                 mac.answer_for_test(move |request| {
-                    requests.borrow_mut().push(request.clone());
-                    (matches!(request, Request::ChangeCloudMachine { .. }) && !fails.get())
-                        .then_some(Response::Ok)
+                    // Only the changes: the machines' activity is reported too.
+                    let change = matches!(request, Request::ChangeCloudMachine { .. });
+                    if change {
+                        requests.borrow_mut().push(request.clone());
+                    }
+                    (change && !fails.get()).then_some(Response::Ok)
                 });
                 mac.set_cloud_for_test(
                     CloudSnapshot {
@@ -18517,7 +18523,7 @@ mod tests {
                             account(Provider::Instabox, "m-1", "review-box", CloudState::Paused),
                             account(Provider::Proton, "c-1", "proton-cloud", CloudState::Stopped),
                         ],
-                        checking: false,
+                        ..Default::default()
                     },
                     cx,
                 );

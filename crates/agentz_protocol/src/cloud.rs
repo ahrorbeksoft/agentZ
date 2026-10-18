@@ -2,6 +2,7 @@
 //! agentZ then reaches over SSH like any other machine. The user installs each CLI and signs in
 //! with it; this Mac's server runs it, and reports what it found in these types.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,12 @@ pub struct Capabilities {
     pub timeouts: bool,
     /// Its machines' SSH keys can be replaced.
     pub ssh_keys: bool,
+    /// agentZ stops its machines once they've been idle the time picked (topic 12 B): they
+    /// bill while they run.
+    pub idle_stop: bool,
+    /// Its machines pause themselves once idle, which agentZ holds off while agents work on
+    /// them (topic 12 A).
+    pub idle_pause: bool,
 }
 
 static INSTABOX: ProviderDescription = ProviderDescription {
@@ -114,6 +121,8 @@ static INSTABOX: ProviderDescription = ProviderDescription {
         metrics: true,
         timeouts: true,
         ssh_keys: false,
+        idle_stop: false,
+        idle_pause: true,
     },
 };
 
@@ -149,6 +158,8 @@ static PROTON: ProviderDescription = ProviderDescription {
         metrics: false,
         timeouts: false,
         ssh_keys: true,
+        idle_stop: true,
+        idle_pause: false,
     },
 };
 
@@ -404,6 +415,9 @@ pub enum MachineAction {
     },
     /// Replaces the SSH keys that reach it with these public key files on this Mac (Proton's).
     ReplaceSshKeys(Vec<std::path::PathBuf>),
+    /// Stops it once no agent has worked on it and nothing on it has been open this long;
+    /// `None` never does. This Mac's server keeps it and does it, not the provider.
+    StopWhenIdle(Option<Duration>),
 }
 
 /// What a new machine is made with.
@@ -471,6 +485,13 @@ pub struct CloudSnapshot {
     /// Looking for the CLIs now (Check Again).
     #[serde(default)]
     pub checking: bool,
+    /// What happened to the machines that the app tells the user of (topic 12 C and D),
+    /// oldest first, until an app has.
+    #[serde(default)]
+    pub notices: Vec<CloudNotice>,
+    /// The last notice's id; ids aren't reused.
+    #[serde(default)]
+    pub last_notice: u64,
 }
 
 impl CloudSnapshot {
@@ -501,6 +522,64 @@ pub struct ProviderState {
     /// What the CLI is doing to its machines now.
     #[serde(default)]
     pub changing: Vec<MachineChange>,
+    /// How long each machine, by its id, may be idle before agentZ stops it (topic 12 B).
+    #[serde(default)]
+    pub stop_when_idle: BTreeMap<String, Duration>,
+    /// The balance's low-balance notice was given, until the balance lasts a day again.
+    #[serde(default)]
+    pub balance_low: bool,
+    /// Machines, by their id, whose idle pause agentZ turned off while agents work on them
+    /// (topic 12 A), with the pause it sets back after; zero when they had none.
+    #[serde(default)]
+    pub held_awake: BTreeMap<String, Duration>,
+}
+
+/// Something the user is told of with a notification, from this Mac's server.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CloudNotice {
+    pub id: u64,
+    pub provider: Provider,
+    pub kind: NoticeKind,
+    pub at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NoticeKind {
+    /// It paused or stopped without agentZ asking (topic 12 D): Instabox's idle pause or
+    /// timeout, Proton's suspension.
+    Stopped {
+        machine: String,
+        name: String,
+        state: CloudState,
+        /// What the app last said was working on it.
+        working: Vec<String>,
+    },
+    /// The balance runs out within a day at the rate its running machines cost (topic 12 C).
+    LowBalance {
+        balance_micro_usd: i64,
+        hours_left: f64,
+        /// The running machines' names.
+        running: Vec<String>,
+    },
+}
+
+/// What the app says of a provider machine's use, for stopping it once it's idle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CloudActivity {
+    pub provider: Provider,
+    pub machine: String,
+    /// What's working on it: its threads' titles, and the agents in its workspaces.
+    pub working: Vec<String>,
+    /// A thread, terminal or workspace of it is open in the app.
+    pub open: bool,
+}
+
+/// How long a balance lasts at a price an hour, in hours.
+pub fn hours_of_balance(balance_micro_usd: i64, hourly_micro_usd: u64) -> f64 {
+    if hourly_micro_usd == 0 {
+        return f64::INFINITY;
+    }
+    balance_micro_usd.max(0) as f64 / hourly_micro_usd as f64
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

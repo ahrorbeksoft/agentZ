@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::time::SystemTime;
 
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
 pub use projects::project_at;
 use projects::{
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use ui::{IconName, SharedString};
 
 use crate::app_settings::{AppSettingsStore, CloudLink, MachineProfile};
+use crate::cloud_machines;
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
 use crate::spaces_view::PaneKey;
@@ -25,7 +26,8 @@ use agentz_client::ssh::Ssh;
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, DesignDefaults, DesignSettings, PageTheme,
 };
-use agentz_protocol::cloud::SshAddress;
+use agentz_protocol::cloud::{CloudActivity, CloudNotice, SshAddress};
+use agentz_protocol::spaces::{PaneAgentState, PaneContent};
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -206,6 +208,11 @@ pub struct Machines {
     /// Where `ssh` dials each SSH machine's target; `None` while it's looked up, or when `ssh`
     /// couldn't say.
     ssh_addresses: HashMap<String, Option<SshAddress>>,
+    /// The machines a window has something of open: a thread, a terminal, or the workspace
+    /// it shows.
+    open_machines: HashSet<MachineId>,
+    /// The last of this Mac's server's cloud notices told to the user.
+    cloud_notices_told: u64,
     _settings_subscription: Subscription,
     _wake_subscription: Subscription,
 }
@@ -241,6 +248,8 @@ pub fn init(cx: &mut App) {
             clients: Vec::new(),
             subscriptions: HashMap::default(),
             ssh_addresses: HashMap::default(),
+            open_machines: HashSet::default(),
+            cloud_notices_told: 0,
             _settings_subscription: cx
                 .observe(&settings, |this: &mut Machines, _, cx| this.sync(cx)),
             _wake_subscription: Machines::observe_wake(cx),
@@ -267,6 +276,8 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
             clients: Vec::new(),
             subscriptions: HashMap::default(),
             ssh_addresses: HashMap::default(),
+            open_machines: HashSet::default(),
+            cloud_notices_told: 0,
             _settings_subscription: cx.observe(&settings, |this: &mut Machines, _, cx| {
                 this.sync_servers(cx)
             }),
@@ -476,6 +487,87 @@ impl Machines {
             }
         }
         self.link_cloud_machines(cx);
+        self.tell_cloud_notices(cx);
+    }
+
+    /// Shows what this Mac's server noticed of the providers' machines (design/cloud topic 12
+    /// C and D) as notifications, once each, and has it drop them.
+    fn tell_cloud_notices(&mut self, cx: &mut Context<Self>) {
+        let local = self.clients[0].read(cx);
+        let new: Vec<&CloudNotice> = local
+            .cloud()
+            .notices
+            .iter()
+            .filter(|notice| notice.id > self.cloud_notices_told)
+            .collect();
+        let Some(last) = new.last().map(|notice| notice.id) else {
+            return;
+        };
+        for notice in new {
+            cx.show_system_notification(cloud_machines::notification(notice));
+        }
+        if local.is_online() {
+            local.send(Request::DismissCloudNotices(last), cx);
+        }
+        self.cloud_notices_told = last;
+    }
+
+    /// Which machines a window has something of open, for stopping the provider machines left
+    /// idle.
+    pub fn set_open_machines(&mut self, open: HashSet<MachineId>, cx: &mut Context<Self>) {
+        if open != self.open_machines {
+            self.open_machines = open;
+            self.sync_cloud_activity(cx);
+        }
+    }
+
+    /// Tells this Mac's server what's working on each provider machine and whether anything of
+    /// it is open (design/cloud topic 12 B): its threads that work or wait on the user, and the
+    /// agents in its workspaces.
+    fn sync_cloud_activity(&mut self, cx: &mut Context<Self>) {
+        let activity: Vec<CloudActivity> = self
+            .clients
+            .iter()
+            .filter_map(|client| {
+                let client = client.read(cx);
+                let Transport::Cloud { link, .. } = client.transport() else {
+                    return None;
+                };
+                let store = client.projects().read(cx);
+                let threads = store
+                    .threads()
+                    .iter()
+                    .filter(|thread| store.root_thread(thread.id) == thread.id)
+                    .filter(|thread| {
+                        store
+                            .thread_status(thread.id)
+                            .is_some_and(|status| status != ThreadStatus::Completed)
+                    })
+                    .map(|thread| thread.title.clone());
+                let agents = client
+                    .spaces()
+                    .spaces
+                    .iter()
+                    .flat_map(|space| &space.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .filter(|pane| !matches!(pane.content, PaneContent::Thread(_)))
+                    .filter_map(|pane| pane.agent.as_ref())
+                    .filter(|agent| {
+                        matches!(
+                            agent.state,
+                            PaneAgentState::Working | PaneAgentState::Blocked
+                        )
+                    })
+                    .map(|agent| agent.name.clone());
+                Some(CloudActivity {
+                    provider: link.provider,
+                    machine: link.machine.clone(),
+                    working: threads.chain(agents).collect(),
+                    open: self.open_machines.contains(&client.machine()),
+                })
+            })
+            .collect();
+        self.clients[0].update(cx, |local, cx| local.report_cloud_activity(activity, cx));
     }
 
     /// Links each SSH machine to the provider's machine it reaches, by the host and port `ssh`
@@ -583,6 +675,7 @@ impl Machines {
         self.sync_peers(cx);
         self.sync_design_defaults(cx);
         self.sync_auto_archive(cx);
+        self.sync_cloud_activity(cx);
     }
 
     /// Gives each server the setting for archiving threads left alone, which it keeps.
@@ -1703,6 +1796,194 @@ mod tests {
     use projects::{Project, ProjectId, RepositoryIdentity};
 
     use super::{GroupKey, MachineId, ProjectGroupingMode, ProjectKey, build_project_groups};
+
+    /// This Mac's server hears what's working on each provider machine and whether anything of
+    /// it is open, each time that changes. Each of its cloud notices is shown once and then
+    /// dismissed, and a notification's buttons add credit or bring the machine back.
+    #[gpui::test]
+    fn tells_this_macs_server_of_cloud_machines_and_shows_its_notices(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use agentz_protocol::Request;
+        use agentz_protocol::cloud::{
+            CloudActivity, CloudNotice, CloudSnapshot, CloudState, Lifecycle, NoticeKind, Provider,
+        };
+        use agentz_protocol::layout::{Node, PaneId};
+        use agentz_protocol::spaces::{
+            Pane, PaneAgent, PaneAgentState, PaneContent, PaneTerminal, Space, SpaceId,
+            SpacesSnapshot, Tab, TabId,
+        };
+        use collections::HashSet;
+
+        use crate::app_settings::CloudLink;
+        use crate::cloud_machines::{NoticeAction, act_on_notification};
+        use crate::server_client::{ServerClient, Transport};
+
+        let spaces = |state: PaneAgentState| {
+            let mut pane = Pane::new(
+                PaneId(1),
+                PaneContent::Terminal(PaneTerminal {
+                    folder: "/root".into(),
+                    command: None,
+                }),
+            );
+            pane.agent = Some(PaneAgent {
+                name: "Claude Code".into(),
+                state,
+                registry_agent: None,
+            });
+            SpacesSnapshot {
+                spaces: vec![Space {
+                    id: SpaceId(1),
+                    name: None,
+                    folder: "/root".into(),
+                    project_id: None,
+                    tabs: vec![Tab {
+                        id: TabId(1),
+                        name: None,
+                        root: Node::Pane(PaneId(1)),
+                        panes: vec![pane],
+                    }],
+                    git: None,
+                    current: None,
+                }],
+            }
+        };
+        let (mac, devbox) = cx.update(|cx| {
+            crate::init_for_test(cx);
+            cx.set_app_identity("dev.agentz.test", "agentZ");
+            let mac = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            mac.update(cx, |mac, cx| mac.set_online_for_test(cx));
+            let devbox = ServerClient::new_for_test(
+                MachineId::Remote(1),
+                "devbox5".into(),
+                spaces(PaneAgentState::Working),
+                cx,
+            );
+            devbox.update(cx, |devbox, _| {
+                devbox.set_transport_for_test(Transport::Cloud {
+                    link: CloudLink {
+                        provider: Provider::Instabox,
+                        machine: "m-1".into(),
+                    },
+                    target: None,
+                })
+            });
+            super::init_for_test(vec![mac.clone(), devbox.clone()], cx);
+            (mac, devbox)
+        });
+        let sent = |cx: &mut gpui::TestAppContext| mac.read_with(cx, |mac, _| mac.sent_for_test());
+        let reports = |cx: &mut gpui::TestAppContext| {
+            sent(cx)
+                .into_iter()
+                .filter_map(|request| match request {
+                    Request::ReportCloudActivity(activity) => Some(activity),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let activity = |working: &[&str], open: bool| {
+            vec![CloudActivity {
+                provider: Provider::Instabox,
+                machine: "m-1".into(),
+                working: working.iter().map(|name| name.to_string()).collect(),
+                open,
+            }]
+        };
+        assert_eq!(reports(cx), [activity(&["Claude Code"], false)]);
+
+        let open = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                super::Machines::global(cx).update(cx, |machines, cx| {
+                    machines.set_open_machines(HashSet::from_iter([MachineId::Remote(1)]), cx)
+                })
+            })
+        };
+        open(cx);
+        open(cx);
+        devbox.update(cx, |devbox, cx| {
+            devbox.set_spaces_for_test(spaces(PaneAgentState::Idle), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            reports(cx),
+            [
+                activity(&["Claude Code"], false),
+                activity(&["Claude Code"], true),
+                activity(&[], true),
+            ]
+        );
+
+        let notice = |id: u64| CloudNotice {
+            id,
+            provider: Provider::Instabox,
+            kind: NoticeKind::Stopped {
+                machine: "m-1".into(),
+                name: "devbox5".into(),
+                state: CloudState::Paused,
+                working: vec![format!("Thread {id}")],
+            },
+            at: std::time::SystemTime::UNIX_EPOCH,
+        };
+        let notices = |ids: &[u64], cx: &mut gpui::TestAppContext| {
+            let cloud = CloudSnapshot {
+                notices: ids.iter().map(|id| notice(*id)).collect(),
+                last_notice: ids.last().copied().unwrap_or_default(),
+                ..Default::default()
+            };
+            mac.update(cx, |mac, cx| mac.set_cloud_for_test(cloud, cx));
+            cx.run_until_parked();
+        };
+        let shown = |cx: &mut gpui::TestAppContext| {
+            cx.shown_system_notifications()
+                .into_iter()
+                .map(|shown| shown.body.to_string())
+                .collect::<Vec<_>>()
+        };
+        let dismissed = |cx: &mut gpui::TestAppContext| {
+            sent(cx)
+                .into_iter()
+                .filter_map(|request| match request {
+                    Request::DismissCloudNotices(up_to) => Some(up_to),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        notices(&[1], cx);
+        assert_eq!(shown(cx), ["Working on it: Thread 1"]);
+        assert_eq!(dismissed(cx), [1]);
+        // Sent again before the server drops it, it isn't shown twice.
+        notices(&[1, 2], cx);
+        assert_eq!(
+            shown(cx),
+            ["Working on it: Thread 1", "Working on it: Thread 2"]
+        );
+        assert_eq!(dismissed(cx), [1, 2]);
+
+        cx.update(|cx| {
+            act_on_notification(
+                Provider::Instabox,
+                Some("m-1".into()),
+                NoticeAction::Resume,
+                cx,
+            );
+            act_on_notification(Provider::Proton, None, NoticeAction::AddCredit, cx);
+        });
+        assert!(sent(cx).contains(&Request::ChangeCloudMachine {
+            provider: Provider::Instabox,
+            machine: "m-1".into(),
+            change: Lifecycle::Resume,
+        }));
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("https://app.cube.computer/billing")
+        );
+    }
 
     fn identity() -> RepositoryIdentity {
         RepositoryIdentity {

@@ -777,6 +777,11 @@ impl SpacesView {
         ))
     }
 
+    /// The machine whose workspace the view shows, or would once it's visible.
+    pub(crate) fn shown_machine(&self) -> Option<MachineId> {
+        self.active_space.map(|key| key.machine)
+    }
+
     pub(crate) fn focused_pane(&self, cx: &App) -> Option<PaneKey> {
         let (_, _, tab) = self.visible_tab(cx)?;
         Some(PaneKey {

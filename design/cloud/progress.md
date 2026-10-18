@@ -84,14 +84,26 @@ Notes for whoever continues:
    done), the thread's notice in `agent_view.rs`, and `cloud_machines::charge_question`,
    shared with Settings › Machines.
 8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
-   in progress. The Usage page's Cloud section is done in its own commit ("Show each cloud
+   done in two commits. The Usage page's Cloud section is in its own ("Show each cloud
    account's usage on Settings › Usage"): `cloud_providers::render_cloud_usage`, with
    `cloud_machines::limit_uses` shared with Machines' header line, which turns yellow from 80%
    of a limit, as Instabox's Account page warns from 80% of storage. Instabox counts storage
    in GiB (`maxStoredGiB`). Proton's `balance` doesn't say over what period its runtime is
-   counted, so the page calls it "Run time", not "This month". Instabox's idle pause
-   (topic 12 A) is honoured only for accounts an admin gave manual lifecycle
-   (`manualLifecycle` in `whoami --json`); the user's account has none, so it's fixed at
-   30 minutes there.
+   counted, so the page calls it "Run time", not "This month". The rest is in the other
+   ("Hold off idle pauses, stop idle machines…"): the app tells this Mac's server what works
+   on each provider machine and whether anything of it is open
+   (`Request::ReportCloudActivity`, from `Machines::sync_cloud_activity` and
+   `Shell::sync_open_machines`), and the server (`server/cloud_requests.rs`), with the app
+   closed too, holds off Instabox's idle pause while agents work (`auto-suspend <machine> 0`,
+   the pause set back after, `ProviderState::held_awake`), stops a Proton computer left idle
+   as long as its page's "When idle" says (`ProviderState::stop_when_idle`), and keeps notices
+   of a stop it didn't ask for and of a balance that runs out within a day
+   (`CloudSnapshot::notices`). The app shows each as a system notification, with Resume,
+   Start or Add Credit where that's free (`cloud_machines::notification`, the shell's
+   notification handler), whatever `notify_when_unfocused` says, and dismisses them
+   (`Request::DismissCloudNotices`). Instabox's idle pause (topic 12 A) is honoured only for
+   accounts an admin gave manual lifecycle (`manualLifecycle` in `whoami --json`); the user's
+   account has none, so it's fixed at 30 minutes there, holding it off is tested with a fake
+   `instabox` only, and the machine's page says turns may stop when Instabox pauses it.
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
    not started.

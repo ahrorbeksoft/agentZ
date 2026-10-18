@@ -828,6 +828,12 @@ pub enum Request {
         machine: String,
         action: cloud::MachineAction,
     },
+    /// What's working on each provider machine the app knows of, and whether it has anything
+    /// of it open, as it changes; each report replaces the last. This Mac's server stops a
+    /// machine left idle from it, with the app closed too.
+    ReportCloudActivity(Vec<cloud::CloudActivity>),
+    /// The app told the user of the notices up to this id, so they're dropped.
+    DismissCloudNotices(u64),
 
     /// Answers [`Response::Ok`] at once, to show the connection still carries messages, as
     /// herdr's heartbeat does after the Mac wakes.
