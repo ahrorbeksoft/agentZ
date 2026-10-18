@@ -9759,6 +9759,10 @@ impl AgentView {
             MachineStatus::Connecting | MachineStatus::Online => {
                 "New messages can be sent once it reconnects.".to_string()
             }
+            MachineStatus::NotRunning(state) => format!(
+                "It's {}. New messages can be sent once it's running.",
+                crate::cloud_machines::state_label(state).to_lowercase()
+            ),
         };
         Callout::new()
             .border_position(ui::CalloutBorderPosition::Top)

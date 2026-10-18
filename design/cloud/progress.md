@@ -34,7 +34,12 @@ Notes for whoever continues:
 4. **Cloud machines in the app**: `MachineProfile`'s source, connecting with the provider's SSH
    options (Instabox's certificate renewed first), the provider's states (a stopped machine
    isn't dialed), and Settings › Machines grouped by provider with More Providers and Check
-   Again (topics 1 C, 2 A, 3's note, 6 B, 10 B, 13 A). Status: not started.
+   Again (topics 1 C, 2 A, 3's note, 6 B, 10 B, 13 A). Status: done in its own commit ("Group
+   Settings › Machines by cloud provider…"): `MachineProfile::cloud`, `Transport::Cloud` and
+   `MachineStatus::NotRunning` in `server_client.rs`, SSH machines linked by address in
+   `machines.rs`, `cloud_machines.rs` for the words and marks, and
+   `settings_page/cloud_providers.rs`. The server renews Instabox's certificate (item 3).
+   Starting asks first (topic 5 C) from the row's button already; item 5 adds it to creating.
 5. **Adding, starting, removing**: Add Machine's menu and each provider's dialog (topic 4 C),
    asking before charging the first time per account (topic 5 C), Remove with a box to delete
    (topic 9 B). Status: not started.

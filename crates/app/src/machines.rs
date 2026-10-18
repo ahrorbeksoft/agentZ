@@ -17,13 +17,15 @@ use projects::{
 use serde::{Deserialize, Serialize};
 use ui::{IconName, SharedString};
 
-use crate::app_settings::{AppSettingsStore, MachineProfile};
+use crate::app_settings::{AppSettingsStore, CloudLink, MachineProfile};
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
 use crate::spaces_view::PaneKey;
+use agentz_client::ssh::Ssh;
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, DesignDefaults, DesignSettings, PageTheme,
 };
+use agentz_protocol::cloud::SshAddress;
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -201,6 +203,9 @@ pub struct Machines {
     /// This Mac first, then the enabled saved machines in their saved order.
     clients: Vec<Entity<ServerClient>>,
     subscriptions: HashMap<MachineId, Vec<Subscription>>,
+    /// Where `ssh` dials each SSH machine's target; `None` while it's looked up, or when `ssh`
+    /// couldn't say.
+    ssh_addresses: HashMap<String, Option<SshAddress>>,
     _settings_subscription: Subscription,
     _wake_subscription: Subscription,
 }
@@ -211,7 +216,17 @@ struct GlobalMachines(Entity<Machines>);
 
 impl Global for GlobalMachines {}
 
-/// Call after the app settings are loaded.
+/// How the app reaches a saved machine: over SSH, or as its provider's machine.
+pub fn transport_of(profile: &MachineProfile) -> Transport {
+    match &profile.cloud {
+        Some(link) => Transport::Cloud {
+            link: link.clone(),
+            target: (!profile.target.is_empty()).then(|| profile.target.clone()),
+        },
+        None => Transport::Ssh(profile.target.clone()),
+    }
+}
+
 /// What the machine the app runs on is called.
 pub const LOCAL_MACHINE_NAME: &str = if cfg!(target_os = "macos") {
     "This Mac"
@@ -225,6 +240,7 @@ pub fn init(cx: &mut App) {
         let mut this = Machines {
             clients: Vec::new(),
             subscriptions: HashMap::default(),
+            ssh_addresses: HashMap::default(),
             _settings_subscription: cx
                 .observe(&settings, |this: &mut Machines, _, cx| this.sync(cx)),
             _wake_subscription: Machines::observe_wake(cx),
@@ -250,6 +266,7 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
         let mut this = Machines {
             clients: Vec::new(),
             subscriptions: HashMap::default(),
+            ssh_addresses: HashMap::default(),
             _settings_subscription: cx.observe(&settings, |this: &mut Machines, _, cx| {
                 this.sync_servers(cx)
             }),
@@ -396,8 +413,7 @@ impl Machines {
             let keep = match client.machine() {
                 MachineId::Local => true,
                 MachineId::Remote(id) => profiles.iter().any(|profile| {
-                    profile.id == id
-                        && Transport::Ssh(profile.target.clone()) == *client.transport()
+                    profile.id == id && transport_of(profile) == *client.transport()
                 }),
             };
             changed |= !keep;
@@ -420,7 +436,7 @@ impl Machines {
                     let client = ServerClient::new(
                         machine,
                         profile.display_label().into(),
-                        Transport::Ssh(profile.target.clone()),
+                        transport_of(profile),
                         cx,
                     );
                     self.add(client, cx);
@@ -444,6 +460,122 @@ impl Machines {
             cx.notify();
         }
         self.sync_servers(cx);
+        self.link_cloud_machines(cx);
+    }
+
+    /// A new listing of the providers' machines: those waiting for theirs to run look again
+    /// now, and SSH machines are linked to the ones they reach.
+    fn cloud_changed(&mut self, cx: &mut Context<Self>) {
+        for client in &self.clients {
+            let waiting = {
+                let client = client.read(cx);
+                matches!(client.transport(), Transport::Cloud { .. }) && !client.is_online()
+            };
+            if waiting {
+                client.update(cx, |client, _| client.retry());
+            }
+        }
+        self.link_cloud_machines(cx);
+    }
+
+    /// Links each SSH machine to the provider's machine it reaches, by the host and port `ssh`
+    /// dials, so it moves into the provider's group (design/cloud topic 10 B).
+    fn link_cloud_machines(&mut self, cx: &mut Context<Self>) {
+        let reachable: Vec<(SshAddress, CloudLink)> = self.clients[0]
+            .read(cx)
+            .cloud()
+            .providers
+            .iter()
+            .flat_map(|state| {
+                state.machines.iter().filter_map(|machine| {
+                    let link = CloudLink {
+                        provider: state.provider,
+                        machine: machine.id.clone(),
+                    };
+                    Some((machine.ssh_address.clone()?, link))
+                })
+            })
+            .collect();
+        if reachable.is_empty() {
+            return;
+        }
+        let settings = AppSettingsStore::global(cx).read(cx).settings();
+        let mut links: Vec<(u64, CloudLink)> = Vec::new();
+        let mut lookups = Vec::new();
+        for profile in settings
+            .machines
+            .iter()
+            .filter(|profile| profile.cloud.is_none() && !profile.target.is_empty())
+        {
+            match self.ssh_addresses.get(&profile.target) {
+                None => lookups.push(profile.target.clone()),
+                // Being looked up, or `ssh` couldn't say.
+                Some(None) => {}
+                Some(Some(address)) => {
+                    let reached = reachable.iter().find(|(reached, _)| {
+                        reached.port == address.port
+                            && reached.host.eq_ignore_ascii_case(&address.host)
+                    });
+                    if let Some((_, link)) = reached
+                        && settings
+                            .cloud_machine(link.provider, &link.machine)
+                            .is_none()
+                        && !links.iter().any(|(_, linked)| linked == link)
+                    {
+                        links.push((profile.id, link.clone()));
+                    }
+                }
+            }
+        }
+        for target in lookups {
+            self.look_up_address(target, cx);
+        }
+        if links.is_empty() {
+            return;
+        }
+        AppSettingsStore::global(cx).update(cx, |store, cx| {
+            store.update(
+                |settings| {
+                    for (id, link) in links {
+                        if let Some(profile) = settings
+                            .machines
+                            .iter_mut()
+                            .find(|profile| profile.id == id)
+                        {
+                            profile.cloud = Some(link);
+                        }
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
+    fn look_up_address(&mut self, target: String, cx: &mut Context<Self>) {
+        self.ssh_addresses.insert(target.clone(), None);
+        let looked_up = reqwest_client::runtime().handle().spawn({
+            let target = target.clone();
+            async move { Ssh::new(&target)?.address().await }
+        });
+        cx.spawn(async move |this, cx| {
+            let address = match looked_up.await {
+                Ok(Ok(address)) => Some(address),
+                Ok(Err(error)) => {
+                    log::warn!("couldn't find where `ssh {target}` dials: {error:#}");
+                    None
+                }
+                Err(error) => {
+                    log::warn!("looking up where `ssh {target}` dials ended: {error}");
+                    None
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.ssh_addresses.insert(target, address);
+                this.link_cloud_machines(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// What each server is told of the app's state, as it changes and as it connects.
@@ -680,6 +812,7 @@ impl Machines {
                     ServerClientEvent::ArtifactPublished(artifact) => {
                         cx.emit(MachinesEvent::ArtifactPublished(machine, artifact.clone()))
                     }
+                    ServerClientEvent::CloudChanged => this.cloud_changed(cx),
                 }),
                 cx.observe(&registry, |_, _, cx| cx.notify()),
                 cx.subscribe(&projects, move |_, _, event, cx| match event {

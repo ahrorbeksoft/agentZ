@@ -6,6 +6,7 @@ mod app_settings;
 mod artifacts_list;
 mod attachment_image;
 mod branch_picker;
+mod cloud_machines;
 mod command_palette;
 mod confirm_dialog;
 mod controls;

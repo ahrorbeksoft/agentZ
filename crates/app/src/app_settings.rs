@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentz_protocol::artifacts::DesignDefaults;
+use agentz_protocol::cloud::Provider;
 use agentz_protocol::spaces::LayoutNode;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Context, Entity, Global, Task, WindowAppearance};
@@ -192,10 +193,22 @@ pub struct MachineProfile {
     #[serde(default)]
     pub label: String,
     /// What to give `ssh`: a host, an alias from `~/.ssh/config`, `user@host`, or
-    /// `ssh://user@host:port`.
+    /// `ssh://user@host:port`. Empty for a cloud machine reached with its provider's options.
     pub target: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// A cloud provider's machine (design/cloud): started and stopped through its CLI, and
+    /// reached with the SSH options it gives, or with `target` when it was saved over SSH
+    /// before it was linked.
+    #[serde(default)]
+    pub cloud: Option<CloudLink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CloudLink {
+    pub provider: Provider,
+    /// The provider's id for it.
+    pub machine: String,
 }
 
 impl MachineProfile {
@@ -206,6 +219,15 @@ impl MachineProfile {
             self.label.trim().to_string()
         }
     }
+}
+
+/// A provider account that starts machines without asking what it costs (design/cloud topic
+/// 5: "Don't ask again for this account").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudAccount {
+    pub provider: Provider,
+    /// Who its CLI is signed in as.
+    pub account: String,
 }
 
 fn default_true() -> bool {
@@ -282,6 +304,8 @@ pub struct AppSettings {
     /// A thread on another machine has been opened in an editor over SSH, so its menu stops
     /// reminding that the SSH key is needed.
     pub opened_over_ssh: bool,
+    /// Cloud accounts whose charges were confirmed once with "Don't ask again".
+    pub charges_without_asking: Vec<CloudAccount>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -325,6 +349,7 @@ impl Default for AppSettings {
             last_editor: None,
             opened_over_ssh: false,
             saved_layouts: Vec::new(),
+            charges_without_asking: Vec::new(),
         }
     }
 }
@@ -343,8 +368,46 @@ impl AppSettings {
             label,
             target,
             enabled: true,
+            cloud: None,
         });
         id
+    }
+
+    /// Saves a provider's machine, switched on, and returns its id.
+    pub fn add_cloud_machine(&mut self, label: String, link: CloudLink) -> u64 {
+        let id = self.add_machine(label, String::new());
+        if let Some(profile) = self.machines.iter_mut().find(|profile| profile.id == id) {
+            profile.cloud = Some(link);
+        }
+        id
+    }
+
+    /// The saved machine of a provider's machine, if it's saved.
+    pub fn cloud_machine(&self, provider: Provider, machine: &str) -> Option<&MachineProfile> {
+        self.machines.iter().find(|profile| {
+            profile
+                .cloud
+                .as_ref()
+                .is_some_and(|link| link.provider == provider && link.machine == machine)
+        })
+    }
+
+    pub fn charges_without_asking(&self, provider: Provider, account: &str) -> bool {
+        self.charges_without_asking
+            .iter()
+            .any(|known| known.provider == provider && known.account == account)
+    }
+
+    /// Whether starting the account's machines asks what it costs first (topic 5 C).
+    pub fn set_asks_before_charging(&mut self, provider: Provider, account: &str, asks: bool) {
+        self.charges_without_asking
+            .retain(|known| !(known.provider == provider && known.account == account));
+        if !asks {
+            self.charges_without_asking.push(CloudAccount {
+                provider,
+                account: account.to_string(),
+            });
+        }
     }
 
     /// Saves a layout, in place of one with the same name.

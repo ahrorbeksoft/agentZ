@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agentz_protocol::ClientKind;
-use agentz_protocol::cloud::SshOptions;
+use agentz_protocol::cloud::{SshAddress, SshOptions};
 use anyhow::{Context as _, Result, anyhow, bail};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{
@@ -487,6 +487,36 @@ impl Ssh {
             bail!("{}", failure_message(&output.status, &output.stderr));
         }
         Ok(())
+    }
+
+    /// Where `ssh` dials the machine once `~/.ssh/config` applies (`ssh -G`): what links an SSH
+    /// machine to the cloud machine it is.
+    pub async fn address(&self) -> Result<SshAddress> {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.arg("-G");
+        self.destination(&mut command);
+        let output = self.output(command, CONTROL_TIMEOUT).await?;
+        if !output.status.success() {
+            bail!("{}", failure_message(&output.status, &output.stderr));
+        }
+        let config = String::from_utf8_lossy(&output.stdout);
+        let value = |key: &str| {
+            config.lines().find_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                (name == key).then(|| value.trim())
+            })
+        };
+        let host = value("hostname").context("ssh -G named no hostname")?;
+        let port = match value("port") {
+            Some(port) => port
+                .parse()
+                .with_context(|| format!("ssh -G named the port {port:?}"))?,
+            None => 22,
+        };
+        Ok(SshAddress {
+            host: host.to_string(),
+            port,
+        })
     }
 
     /// Where the master's socket is once ssh expands `%C` for the machine (`ssh -G`).
@@ -1349,6 +1379,29 @@ esac
             .find_map(|argument| argument.strip_prefix("ControlPath="))
             .map(PathBuf::from)
             .expect("names a control path")
+    }
+
+    /// `ssh -G`'s host name and port, as an SSH machine is linked to a provider's by them.
+    #[tokio::test]
+    async fn reads_the_address_ssh_dials() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let program = scratch.path().join("ssh");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf 'user root\\nhostname ssh.proton.computer\\nport 22021\\nhostkeyalias x\\n'\n",
+        )
+        .expect("writes the fake ssh");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let ssh = Ssh::with_program(program, "proton").expect("valid target");
+        assert_eq!(
+            ssh.address().await.expect("reads the address"),
+            SshAddress {
+                host: "ssh.proton.computer".into(),
+                port: 22021,
+            }
+        );
     }
 
     /// herdr's recovery of a stuck shared connection: a master that answers is kept, one that

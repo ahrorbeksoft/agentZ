@@ -7,6 +7,7 @@ use crate::project_store::ThreadStatus;
 use agentz_protocol::accounts::AccountChoice;
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::artifacts::{Artifact, ArtifactId, PageTheme};
+use agentz_protocol::cloud::CloudState;
 use agentz_protocol::layout::Node;
 use agentz_protocol::workspace::WorkspaceChoice;
 use anyhow::Result;
@@ -2146,6 +2147,17 @@ impl Shell {
                     warning,
                     Color::Muted,
                 ),
+                // Proton suspends a computer whose balance ran out; stopped and paused ones
+                // were meant to be.
+                MachineStatus::NotRunning(state @ (CloudState::Suspended | CloudState::Failed)) => {
+                    (
+                        "Needs attention",
+                        crate::cloud_machines::state_label(state).to_string(),
+                        warning,
+                        Color::Muted,
+                    )
+                }
+                MachineStatus::NotRunning(_) => continue,
             };
             let title: SharedString = format!("{label} · {summary}").into();
             let detail: SharedString = detail.into();

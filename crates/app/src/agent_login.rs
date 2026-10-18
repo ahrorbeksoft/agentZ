@@ -9,7 +9,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use agentz_client::ssh::{HeldForward, LocalForward, Ssh};
+use agentz_client::ssh::{HeldForward, LocalForward};
 
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::AgentId;
@@ -31,7 +31,6 @@ use crate::controls::{
     ActionButton, ActionStyle, code_boxes, copy_to_clipboard, dialog_frame, dialog_title,
     field_label, icon_tile, link_host, spinner, text_field,
 };
-use crate::server_client::Transport;
 use crate::settings_page::{ADD_ACCOUNT_DIALOG_WIDTH, logged_in_title};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -451,20 +450,20 @@ impl AgentLogin {
         if thread.login_page() == Some(&url) {
             self.opened_page = Some(url.clone());
         }
-        let forwards = match thread.client().read(cx).transport() {
-            Transport::Ssh(target) => Some(target.clone()).zip(Some(loopback_forwards(&url))),
-            Transport::Local => None,
-        }
-        .filter(|(_, forwards)| !forwards.is_empty());
+        let forwards = thread
+            .client()
+            .read(cx)
+            .ssh()
+            .map(|ssh| (ssh, loopback_forwards(&url)))
+            .filter(|(_, forwards)| !forwards.is_empty());
         match forwards {
             None => cx.open_url(&url),
-            Some((target, forwards)) => {
+            Some((ssh, forwards)) => {
                 self.forward_error = None;
                 let runtime = reqwest_client::runtime().handle().clone();
                 let forwarding = runtime.spawn({
                     let runtime = runtime.clone();
                     async move {
-                        let ssh = Ssh::new(&target)?;
                         let mut held = Vec::new();
                         for forward in forwards {
                             held.push(ssh.hold_forward(forward, runtime.clone()).await?);

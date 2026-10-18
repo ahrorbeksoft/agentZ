@@ -1,6 +1,8 @@
 //! agentZ's own dialog for confirming a destructive action, such as logging out of an agent:
 //! an icon in the danger tint beside the question, what will happen, and Cancel beside a red
-//! button. It sits in the shell's modal layer, centered, as t3code's dialogs do.
+//! button. It sits in the shell's modal layer, centered, as t3code's dialogs do. A charge (a
+//! cloud computer that bills while it runs) asks in the accent's tint instead, and may offer
+//! not to ask again.
 
 use std::rc::Rc;
 
@@ -9,7 +11,7 @@ use gpui::{
     App, BoxShadow, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, FontWeight,
     KeyBinding, SharedString, Window,
 };
-use ui::prelude::*;
+use ui::{Checkbox, ToggleState, prelude::*};
 
 use crate::controls::{ActionButton, ActionStyle};
 
@@ -30,6 +32,16 @@ pub struct ConfirmRequest {
     pub message: SharedString,
     pub confirm_label: SharedString,
     pub on_confirm: Rc<dyn Fn(&mut Window, &mut App)>,
+    /// A box under the message, unticked, and what ticking it does once confirmed.
+    pub checkbox: Option<ConfirmCheckbox>,
+    /// It costs money rather than losing something.
+    pub is_charge: bool,
+}
+
+#[derive(Clone)]
+pub struct ConfirmCheckbox {
+    pub label: SharedString,
+    pub on_confirm_ticked: Rc<dyn Fn(&mut App)>,
 }
 
 impl ConfirmRequest {
@@ -43,6 +55,8 @@ impl ConfirmRequest {
                 .into(),
             confirm_label: "Log Out".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -70,6 +84,8 @@ impl ConfirmRequest {
             message: message.into(),
             confirm_label: "Log Out".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -120,6 +136,8 @@ impl ConfirmRequest {
             .into(),
             confirm_label: "Use Reset".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -136,6 +154,8 @@ impl ConfirmRequest {
                 .into(),
             confirm_label: "Remove Account".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -156,6 +176,8 @@ impl ConfirmRequest {
             .into(),
             confirm_label: "Delete".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -172,6 +194,8 @@ impl ConfirmRequest {
             message: message.into(),
             confirm_label: "Delete".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 
@@ -187,6 +211,8 @@ impl ConfirmRequest {
             message: message.into(),
             confirm_label: "Clear".into(),
             on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
         }
     }
 }
@@ -194,6 +220,7 @@ impl ConfirmRequest {
 pub struct ConfirmDialog {
     focus_handle: FocusHandle,
     request: ConfirmRequest,
+    is_ticked: bool,
 }
 
 impl EventEmitter<DismissEvent> for ConfirmDialog {}
@@ -211,11 +238,17 @@ impl ConfirmDialog {
         Self {
             focus_handle,
             request,
+            is_ticked: false,
         }
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
+        if self.is_ticked
+            && let Some(checkbox) = &self.request.checkbox
+        {
+            (checkbox.on_confirm_ticked)(cx);
+        }
         (self.request.on_confirm)(window, cx);
     }
 
@@ -228,6 +261,35 @@ impl Render for ConfirmDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
+        let (tint, icon_color, confirm_style) = if self.request.is_charge {
+            (colors.text_accent, Color::Accent, ActionStyle::Primary)
+        } else {
+            (status.error, Color::Error, ActionStyle::Danger)
+        };
+        let checkbox = self.request.checkbox.as_ref().map(|checkbox| {
+            h_flex()
+                .gap_2()
+                .child(
+                    Checkbox::new(
+                        "confirm-dialog-checkbox",
+                        if self.is_ticked {
+                            ToggleState::Selected
+                        } else {
+                            ToggleState::Unselected
+                        },
+                    )
+                    .on_click(cx.listener(
+                        |this, state: &ToggleState, _, cx| {
+                            this.is_ticked = *state == ToggleState::Selected;
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    Label::new(checkbox.label.clone())
+                        .size(LabelSize::Custom(rems_from_px(13_f32))),
+                )
+        });
         v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -257,11 +319,11 @@ impl Render for ConfirmDialog {
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(8.))
-                                    .bg(status.error.opacity(0.12))
+                                    .bg(tint.opacity(0.12))
                                     .child(
                                         Icon::new(self.request.icon)
                                             .size(IconSize::Medium)
-                                            .color(Color::Error),
+                                            .color(icon_color),
                                     ),
                             )
                             .child(
@@ -274,7 +336,8 @@ impl Render for ConfirmDialog {
                         Label::new(self.request.message.clone())
                             .size(LabelSize::Custom(rems_from_px(13_f32)))
                             .color(Color::Muted),
-                    ),
+                    )
+                    .children(checkbox),
             )
             .child(
                 h_flex()
@@ -297,7 +360,7 @@ impl Render for ConfirmDialog {
                             "confirm-dialog-confirm",
                             self.request.confirm_label.clone(),
                         )
-                        .style(ActionStyle::Danger)
+                        .style(confirm_style)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.confirm(&menu::Confirm, window, cx)
                         })),

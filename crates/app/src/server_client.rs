@@ -14,7 +14,7 @@ use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
 };
-use agentz_protocol::cloud::CloudSnapshot;
+use agentz_protocol::cloud::{CloudSnapshot, CloudState};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -37,7 +37,8 @@ use ui::SharedString;
 use util::ResultExt as _;
 
 use crate::agent_icons::AgentIconStore;
-use crate::machines::MachineId;
+use crate::app_settings::CloudLink;
+use crate::machines::{MachineId, Machines};
 use crate::project_store::{ProjectStore, ThreadStatus};
 use crate::registry_store::AgentRegistryStore;
 use crate::terminal_entity::Terminal;
@@ -58,6 +59,9 @@ const WAKE_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// How long a connection has to answer a ping after the Mac wakes (herdr's
 /// `HEARTBEAT_TIMEOUT`).
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a cloud machine that isn't running is looked at again, in this Mac's server's
+/// latest listing (no request is sent for it). A new listing retries it at once.
+const CLOUD_RECHECK_DELAY: Duration = Duration::from_secs(30);
 const SERVER_BINARY_ENV_VAR: &str = "AGENTZ_SERVER_BIN";
 /// A directory of `agentz-server-<rust target>` binaries for other machines.
 const REMOTE_SERVERS_ENV_VAR: &str = "AGENTZ_REMOTE_SERVERS";
@@ -69,6 +73,13 @@ pub enum Transport {
     Local,
     /// An SSH target.
     Ssh(String),
+    /// A cloud provider's machine (design/cloud): dialed only while its provider says it runs,
+    /// with the SSH options its CLI gives through this Mac's server, or with `target` when it
+    /// was saved over SSH before it was linked.
+    Cloud {
+        link: CloudLink,
+        target: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +93,8 @@ pub enum MachineStatus {
         error: SharedString,
         hint: Option<SharedString>,
     },
+    /// A cloud machine its provider says isn't running. It's dialed once it is.
+    NotRunning(CloudState),
 }
 
 /// Why the wait before reconnecting was cut short.
@@ -121,6 +134,8 @@ pub enum ServerClientEvent {
     },
     /// An agent published an artifact or a new version of one while the app was connected.
     ArtifactPublished(Artifact),
+    /// This Mac's server found the cloud providers' machines changed (design/cloud).
+    CloudChanged,
 }
 
 pub struct ServerClient {
@@ -172,6 +187,8 @@ pub struct ServerClient {
     upload_progress: Option<UploadProgress>,
     /// Cuts the wait before the next attempt short.
     retry_now: Option<oneshot::Sender<Retry>>,
+    /// What last reached a machine over SSH, which forwards its ports.
+    ssh: Option<Ssh>,
     /// Asks the connection to show it still works.
     check_connection: Option<mpsc::UnboundedSender<()>>,
     /// When the Mac last woke from sleep.
@@ -232,6 +249,7 @@ impl ServerClient {
                 queued_session_events: None,
                 upload_progress: None,
                 retry_now: None,
+                ssh: None,
                 check_connection: None,
                 woke_at: None,
                 peers_sent: None,
@@ -260,6 +278,16 @@ impl ServerClient {
         if self.label != label {
             self.label = label;
             cx.notify();
+        }
+    }
+
+    /// `ssh` to the machine, for forwarding its ports: a cloud machine's is what last reached
+    /// it.
+    pub fn ssh(&self) -> Option<Ssh> {
+        match &self.transport {
+            Transport::Local => None,
+            Transport::Ssh(target) => Ssh::new(target).log_err(),
+            Transport::Cloud { .. } => self.ssh.clone(),
         }
     }
 
@@ -741,9 +769,15 @@ impl ServerClient {
         &self.artifacts
     }
 
+    /// The cloud providers this Mac's server found, and their machines (design/cloud).
+    pub fn cloud(&self) -> &CloudSnapshot {
+        &self.cloud
+    }
+
     fn set_cloud(&mut self, cloud: CloudSnapshot, cx: &mut Context<Self>) {
         if cloud != self.cloud {
             self.cloud = cloud;
+            cx.emit(ServerClientEvent::CloudChanged);
             cx.notify();
         }
     }
@@ -928,6 +962,12 @@ impl ServerClient {
         self.set_spaces(spaces, cx);
     }
 
+    /// What this Mac's server would say of the cloud providers.
+    #[cfg(test)]
+    pub fn set_cloud_for_test(&mut self, cloud: CloudSnapshot, cx: &mut Context<Self>) {
+        self.set_cloud(cloud, cx);
+    }
+
     /// How the machine is reached, for a test that needs it to be over SSH.
     #[cfg(test)]
     pub fn set_transport_for_test(&mut self, transport: Transport) {
@@ -999,12 +1039,17 @@ impl ServerClient {
     }
 
     fn disconnected(&mut self, status: MachineStatus, cx: &mut Context<Self>) {
+        // A cloud machine that isn't running is looked at again and again, unchanged.
+        let changed =
+            self.connection.is_some() || self.status != status || self.upload_progress.is_some();
         self.connection = None;
         self.check_connection = None;
         self.status = status;
         self.upload_progress = None;
         self.queued_session_events = None;
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     fn apply_session(&mut self, response: Result<Response>, cx: &mut Context<Self>) {
@@ -1034,6 +1079,11 @@ impl ServerClient {
         self.set_cloud(session.cloud, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
+        }
+        // The providers' CLIs are installed here, so only this Mac's server runs them, and it
+        // watches them once an app asks.
+        if self.machine == MachineId::Local {
+            self.send(Request::CheckCloud, cx);
         }
     }
 
@@ -1147,7 +1197,9 @@ async fn maintain_connection(
     let runtime = reqwest_client::runtime().handle().clone();
     let (min_delay, max_delay) = match transport {
         Transport::Local => (MIN_RETRY_DELAY, MAX_RETRY_DELAY),
-        Transport::Ssh(_) => (REMOTE_MIN_RETRY_DELAY, REMOTE_MAX_RETRY_DELAY),
+        Transport::Ssh(_) | Transport::Cloud { .. } => {
+            (REMOTE_MIN_RETRY_DELAY, REMOTE_MAX_RETRY_DELAY)
+        }
     };
     let mut delay = min_delay;
     loop {
@@ -1166,7 +1218,33 @@ async fn maintain_connection(
             }
         })
         .detach();
-        let status = match connect(&runtime, &transport, upload_progress).await {
+        let connected = match prepare_connection(&this, &transport, cx).await {
+            Ok(ssh) => {
+                let shown = this.update(cx, |this, cx| {
+                    if this.status != MachineStatus::Connecting {
+                        this.status = MachineStatus::Connecting;
+                        cx.notify();
+                    }
+                });
+                if shown.is_err() {
+                    return;
+                }
+                connect(&runtime, ssh, upload_progress)
+                    .await
+                    .map_err(|error| {
+                        if error.needs_attention {
+                            MachineStatus::Attention {
+                                error: error.message.into(),
+                                hint: error.hint.map(SharedString::from),
+                            }
+                        } else {
+                            MachineStatus::Reconnecting(error.message.into())
+                        }
+                    })
+            }
+            Err(status) => Err(status),
+        };
+        let status = match connected {
             Ok((connection, mut events, is_outdated)) => {
                 let connected_at = Instant::now();
                 let session = connection.request(Request::SubscribeSession);
@@ -1232,16 +1310,7 @@ async fn maintain_connection(
                 }
                 MachineStatus::Reconnecting(status.into())
             }
-            Err(error) => {
-                if error.needs_attention {
-                    MachineStatus::Attention {
-                        error: error.message.into(),
-                        hint: error.hint.map(SharedString::from),
-                    }
-                } else {
-                    MachineStatus::Reconnecting(error.message.into())
-                }
-            }
+            Err(status) => status,
         };
         let (retry_now, retry_requested) = oneshot::channel();
         let Ok(woke_recently) = this.update(cx, |this, cx| {
@@ -1254,10 +1323,13 @@ async fn maintain_connection(
         };
         let wait = match &status {
             MachineStatus::Attention { .. } => ATTENTION_RETRY_DELAY,
+            MachineStatus::NotRunning(_) => CLOUD_RECHECK_DELAY,
             _ if woke_recently => delay.min(WAKE_RETRY_DELAY),
             _ => delay,
         };
-        log::warn!("{status:?}; retrying in {wait:?}");
+        if !matches!(status, MachineStatus::NotRunning(_)) {
+            log::warn!("{status:?}; retrying in {wait:?}");
+        }
         futures::select_biased! {
             retry = retry_requested.fuse() => {
                 if retry != Ok(Retry::Woke) {
@@ -1268,26 +1340,131 @@ async fn maintain_connection(
                 delay = (delay * 2).min(max_delay);
             }
         }
-        if this
-            .update(cx, |this, cx| {
-                this.status = MachineStatus::Connecting;
-                cx.notify();
-            })
-            .is_err()
+        // A machine that isn't running stays so until it's dialed.
+        if !matches!(status, MachineStatus::NotRunning(_))
+            && this
+                .update(cx, |this, cx| {
+                    this.status = MachineStatus::Connecting;
+                    cx.notify();
+                })
+                .is_err()
         {
             return;
         }
     }
 }
 
+/// What reaches the machine: nothing for this Mac, `ssh` for another. A cloud machine is
+/// dialed only while its provider says it runs.
+async fn prepare_connection(
+    this: &WeakEntity<ServerClient>,
+    transport: &Transport,
+    cx: &mut AsyncApp,
+) -> Result<Option<Ssh>, MachineStatus> {
+    let ssh = match transport {
+        Transport::Local => return Ok(None),
+        Transport::Ssh(target) => Ssh::new(target).map_err(|error| MachineStatus::Attention {
+            error: format!("{error:#}").into(),
+            hint: None,
+        })?,
+        Transport::Cloud { link, target } => cloud_ssh(link, target.as_deref(), cx).await?,
+    };
+    this.update(cx, |this, _| this.ssh = Some(ssh.clone())).ok();
+    Ok(Some(ssh))
+}
+
+/// `ssh` to a provider's machine once this Mac's server lists it running: with its saved
+/// target, or with the options its CLI gives (Instabox renews its certificate for each).
+async fn cloud_ssh(
+    link: &CloudLink,
+    target: Option<&str>,
+    cx: &mut AsyncApp,
+) -> Result<Ssh, MachineStatus> {
+    let description = link.provider.description();
+    let (machine, listed, options) = cx.update(|cx| {
+        let local = Machines::local(cx);
+        let local = local.read(cx);
+        let state = local.cloud().provider(link.provider);
+        let machine = state.and_then(|state| {
+            state
+                .machines
+                .iter()
+                .find(|machine| machine.id == link.machine)
+                .cloned()
+        });
+        let listed = state.is_some_and(|state| state.listed_at.is_some());
+        let options = machine
+            .as_ref()
+            .filter(|machine| machine.state.is_running() && target.is_none())
+            .map(|_| {
+                local.request(Request::CloudSshOptions {
+                    provider: link.provider,
+                    machine: link.machine.clone(),
+                })
+            });
+        (machine, listed, options)
+    });
+    let machine = match machine {
+        Some(machine) => machine,
+        None if listed => {
+            return Err(MachineStatus::Attention {
+                error: format!("It isn't in your {} account anymore.", description.name).into(),
+                hint: None,
+            });
+        }
+        None => {
+            return Err(MachineStatus::Reconnecting(
+                format!("waiting for {} to list its machines", description.name).into(),
+            ));
+        }
+    };
+    if !machine.state.is_running() {
+        return Err(MachineStatus::NotRunning(machine.state));
+    }
+    if let Some(target) = target {
+        return Ssh::new(target).map_err(|error| MachineStatus::Attention {
+            error: format!("{error:#}").into(),
+            hint: None,
+        });
+    }
+    let options = match options {
+        Some(options) => match options.await {
+            Ok(Response::SshOptions(options)) => options,
+            Ok(response) => {
+                return Err(MachineStatus::Reconnecting(
+                    format!("expected SSH options, got {response:?}").into(),
+                ));
+            }
+            Err(error) => {
+                return Err(MachineStatus::Reconnecting(
+                    format!(
+                        "{} couldn't give its SSH options: {error:#}",
+                        description.name
+                    )
+                    .into(),
+                ));
+            }
+        },
+        None => return Err(MachineStatus::NotRunning(machine.state)),
+    };
+    let name = format!("{}-{}", description.program, machine.name);
+    let terminal_command = format!("{} ssh {}", description.program, machine.name);
+    Ssh::with_options(&name, &options, &terminal_command).map_err(|error| {
+        MachineStatus::Attention {
+            error: format!("{error:#}").into(),
+            hint: None,
+        }
+    })
+}
+
 /// The session, and whether the server is older than the one installed.
 async fn connect(
     runtime: &tokio::runtime::Handle,
-    transport: &Transport,
+    ssh: Option<Ssh>,
     upload_progress: mpsc::UnboundedSender<UploadProgress>,
 ) -> Result<(Connection, agentz_client::Events, bool), SshError> {
-    match transport {
-        Transport::Local => connect_local(runtime)
+    match ssh {
+        None => connect_local(runtime)
             .await
             .map(|(connection, events)| {
                 let is_outdated = local_server_is_outdated(&connection);
@@ -1298,40 +1475,32 @@ async fn connect(
                 needs_attention: false,
                 hint: None,
             }),
-        Transport::Ssh(target) => {
-            let target = target.clone();
-            runtime
-                .spawn(async move {
-                    let ssh = Ssh::new(&target).map_err(|error| SshError {
-                        message: format!("{error:#}"),
-                        needs_attention: true,
-                        hint: None,
-                    })?;
-                    agentz_client::ssh::connect(
-                        &ssh,
-                        VERSION,
-                        remote_server_binary,
-                        ClientKind::App,
-                        move |update| {
-                            upload_progress.unbounded_send(update).ok();
-                        },
-                    )
-                    .await
-                })
+        Some(ssh) => runtime
+            .spawn(async move {
+                agentz_client::ssh::connect(
+                    &ssh,
+                    VERSION,
+                    remote_server_binary,
+                    ClientKind::App,
+                    move |update| {
+                        upload_progress.unbounded_send(update).ok();
+                    },
+                )
                 .await
-                .map_err(|error| SshError {
-                    message: format!("the connection task ended: {error}"),
-                    needs_attention: false,
-                    hint: None,
-                })?
-                .map(|connected| {
-                    (
-                        connected.connection,
-                        connected.events,
-                        connected.is_outdated,
-                    )
-                })
-        }
+            })
+            .await
+            .map_err(|error| SshError {
+                message: format!("the connection task ended: {error}"),
+                needs_attention: false,
+                hint: None,
+            })?
+            .map(|connected| {
+                (
+                    connected.connection,
+                    connected.events,
+                    connected.is_outdated,
+                )
+            }),
     }
 }
 

@@ -80,6 +80,8 @@ pub enum IconName {
     Close,
     Cloud,
     CloudDownload,
+    CloudInstabox,
+    CloudProton,
     Code,
     Codeberg,
     Coins,

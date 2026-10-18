@@ -3,6 +3,7 @@
 //! entry per project) and the chosen section's rows on the right.
 
 mod accounts_menu;
+mod cloud_providers;
 mod mcp_servers;
 mod skills;
 mod storage;
@@ -26,6 +27,7 @@ use agentz_protocol::agents::{
     InstallState,
 };
 use agentz_protocol::artifacts::{DesignDefaults, DesignSizes, VariantsAs};
+use agentz_protocol::cloud::Provider;
 use agentz_protocol::title_generation::{TitleGeneration, TitleProvider, effort_label};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
@@ -248,6 +250,11 @@ pub struct SettingsPage {
     /// Why the picture picked couldn't be used.
     picture_error: Option<SharedString>,
     storage_page: storage::StoragePage,
+    /// Why changing a provider's machine failed.
+    cloud_errors: HashMap<Provider, SharedString>,
+    /// A command just copied from Machines, whose button says so for a moment.
+    copied_command: Option<&'static str>,
+    copied_reset: Option<Task<()>>,
     nav_scroll: ScrollHandle,
     /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
     /// made each frame of a scroll slow (taffy measures every row again at each level of
@@ -358,6 +365,9 @@ impl SettingsPage {
             mcp_servers_page: mcp_servers::McpServersPage::List,
             mcp_server_error: None,
             storage_page: storage::StoragePage::default(),
+            cloud_errors: HashMap::new(),
+            copied_command: None,
+            copied_reset: None,
             nav_scroll: ScrollHandle::new(),
             content_list: ListState::new(0, ListAlignment::Top, px(0.)).measure_all(),
             content_scroll_top: ListOffset::default(),
@@ -536,6 +546,10 @@ impl SettingsPage {
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
+        }
+        // A provider's CLI may have been installed or signed in since (design/cloud).
+        if section == Section::Machines {
+            self.check_cloud(cx);
         }
         if let Section::Project(key) = section {
             self.project_copies = self.copy_keys(key, cx);
@@ -7019,6 +7033,8 @@ impl SettingsPage {
             title: format!("{verb} {name}?").into(),
             message: format!("Threads that use it can't continue until it's {again} again.").into(),
             confirm_label: verb.into(),
+            checkbox: None,
+            is_charge: false,
             on_confirm: Rc::new(move |window, cx| {
                 registry.update(cx, |registry, cx| {
                     if is_custom {
@@ -7415,7 +7431,16 @@ impl SettingsPage {
     /// Settings › Machines: this Mac, the saved machines with how their connections are doing,
     /// and the form that adds or edits one (herdr's endpoints).
     fn render_machines(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let profiles = self.app_settings.read(cx).settings().machines.clone();
+        // Cloud machines are under their providers.
+        let profiles: Vec<MachineProfile> = self
+            .app_settings
+            .read(cx)
+            .settings()
+            .machines
+            .iter()
+            .filter(|profile| profile.cloud.is_none())
+            .cloned()
+            .collect();
         let mut rows = vec![self.render_machine_row(None, cx)];
         rows.extend(
             profiles
@@ -7460,12 +7485,14 @@ impl SettingsPage {
                         cx.listener(|_, _, _, cx| cx.emit(SettingsPageEvent::EditMachine(None))),
                     ),
             );
-        vec![render_section_with_actions(
-            "Machines",
+        let mut sections = vec![render_section_with_actions(
+            "This Mac and SSH",
             rows,
             actions.into_any_element(),
             cx,
-        )]
+        )];
+        sections.extend(self.render_cloud_providers(cx));
+        sections
     }
 
     /// t3code's `EnvironmentRow`: the machine's icon (which opens the icon picker), its name
@@ -7488,37 +7515,20 @@ impl SettingsPage {
             Some(profile) => format!("SSH {}", profile.target),
             None => "Local".to_string(),
         };
-        let mut hint = None;
-        let mut server_version = None;
-        let (status, is_error): (String, bool) = match &client {
-            None => ("Off".into(), false),
-            Some(client) => {
-                let client = client.read(cx);
-                match client.status() {
-                    MachineStatus::Connecting => match client.upload_progress() {
-                        Some(progress) => (
-                            format!("Uploading agentz-server · {}%", progress.percent()),
-                            false,
-                        ),
-                        None => ("Connecting".into(), false),
-                    },
-                    MachineStatus::Online => {
-                        if client.is_outdated() {
-                            server_version = client
-                                .connection()
-                                .map(|connection| connection.welcome().server_version.clone());
-                        }
-                        ("Connected".into(), false)
-                    }
-                    MachineStatus::Reconnecting(error) => (format!("Reconnecting: {error}"), true),
-                    MachineStatus::Attention { error, hint: help } => {
-                        hint = help.clone();
-                        (error.to_string(), true)
-                    }
-                }
-            }
+        let connection = match &client {
+            None => ConnectionLine {
+                status: Some("Off".into()),
+                ..ConnectionLine::default()
+            },
+            Some(client) => connection_line(client, cx),
         };
-        let subtitle: SharedString = [Some(transport), Some(status), server_version]
+        let ConnectionLine {
+            status,
+            is_error,
+            hint,
+            server_version,
+        } = connection;
+        let subtitle: SharedString = [Some(transport), status, server_version]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
@@ -7622,6 +7632,7 @@ impl SettingsPage {
             .anchor(gpui::Anchor::TopLeft)
             .offset(gpui::point(px(0.), px(4.)));
         h_flex()
+            .debug_selector(|| format!("machine-row-{id_suffix}"))
             .px_4()
             .py_2p5()
             .gap_3()
@@ -9188,6 +9199,50 @@ fn select_choices(
     }
 }
 
+/// How a machine's connection is doing, under its name.
+#[derive(Default)]
+struct ConnectionLine {
+    /// `None` for a cloud machine that isn't running, whose badge says so.
+    status: Option<String>,
+    is_error: bool,
+    /// What may fix it.
+    hint: Option<SharedString>,
+    /// Its server's version, when there's an update.
+    server_version: Option<String>,
+}
+
+fn connection_line(client: &Entity<ServerClient>, cx: &App) -> ConnectionLine {
+    let client = client.read(cx);
+    let mut line = ConnectionLine::default();
+    match client.status() {
+        MachineStatus::Connecting => {
+            line.status = Some(match client.upload_progress() {
+                Some(progress) => format!("Uploading agentz-server · {}%", progress.percent()),
+                None => "Connecting".into(),
+            })
+        }
+        MachineStatus::Online => {
+            if client.is_outdated() {
+                line.server_version = client
+                    .connection()
+                    .map(|connection| connection.welcome().server_version.clone());
+            }
+            line.status = Some("Connected".into());
+        }
+        MachineStatus::Reconnecting(error) => {
+            line.status = Some(format!("Reconnecting: {error}"));
+            line.is_error = true;
+        }
+        MachineStatus::Attention { error, hint } => {
+            line.status = Some(error.to_string());
+            line.is_error = true;
+            line.hint = hint.clone();
+        }
+        MachineStatus::NotRunning(_) => {}
+    }
+    line
+}
+
 /// t3code's settings section: a small heading over a bordered group of rows.
 fn render_section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
     render_section_with_actions(title, rows, gpui::Empty.into_any_element(), cx)
@@ -9530,6 +9585,10 @@ mod tests {
 
     use agentz_protocol::accounts::{Account, DuplicateLogin, ExtraUsage, LimitPool, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
+    use agentz_protocol::cloud::{
+        CloudMachine, CloudSnapshot, CloudState, CloudUsage, Lifecycle, MachineSize, Provider,
+        ProviderState, ProviderStatus,
+    };
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
     use agentz_protocol::{AgentSettingsChange, ConnectionId, Response};
@@ -9537,6 +9596,7 @@ mod tests {
     use projects::{ImportedSession, ProjectsSnapshot};
 
     use super::*;
+    use crate::app_settings::CloudLink;
     use crate::server_client::ServerClient;
 
     pub(super) fn listing(id: &str, name: &str, install_state: InstallState) -> AgentListing {
@@ -12158,6 +12218,236 @@ mod tests {
         assert_eq!(next_copy(&copies[..1], this_mac(1), |_| true), None);
     }
 
+    fn cloud_machine(id: &str, name: &str, state: CloudState) -> CloudMachine {
+        CloudMachine {
+            id: id.into(),
+            name: name.into(),
+            state,
+            size: MachineSize {
+                vcpus: Some(8),
+                memory_mib: Some(2048),
+                memory_ceiling_mib: Some(65536),
+                disk_gib: Some(50),
+            },
+            template: None,
+            ssh_address: None,
+            created_at: None,
+            error: None,
+        }
+    }
+
+    fn provider_state(provider: Provider, status: ProviderStatus) -> ProviderState {
+        ProviderState {
+            provider,
+            status,
+            machines: Vec::new(),
+            usage: None,
+            listed_at: None,
+            error: None,
+            changing: Vec::new(),
+        }
+    }
+
+    /// Settings › Machines lists SSH machines under This Mac and SSH, and each signed-in
+    /// provider's machines under its account, saved or not (design/cloud topics 1 C, 6 B,
+    /// 10 B); the providers that aren't set up are under More Providers, with Check Again
+    /// (topic 2 A). Starting a machine that charges asks first, until the account says not to
+    /// (topic 5 C), and switching on one that isn't saved saves it.
+    #[gpui::test]
+    fn machines_are_grouped_by_their_cloud_provider(cx: &mut TestAppContext) {
+        let account = "me@example.com";
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings.add_machine(String::new(), "devbox1".into());
+                        settings.add_cloud_machine(
+                            "proton-cloud".into(),
+                            CloudLink {
+                                provider: Provider::Proton,
+                                machine: "c-1".into(),
+                            },
+                        );
+                        settings.add_cloud_machine(
+                            "old".into(),
+                            CloudLink {
+                                provider: Provider::Proton,
+                                machine: "c-gone".into(),
+                            },
+                        );
+                    },
+                    cx,
+                )
+            });
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| {
+                let requests = requests.clone();
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    matches!(
+                        request,
+                        Request::CheckCloud | Request::ChangeCloudMachine { .. }
+                    )
+                    .then_some(Response::Ok)
+                });
+                let mut proton = provider_state(
+                    Provider::Proton,
+                    ProviderStatus::SignedIn {
+                        version: "0.4.0".into(),
+                        account: account.into(),
+                    },
+                );
+                proton.machines = vec![
+                    cloud_machine("c-1", "devbox-3", CloudState::Running),
+                    cloud_machine("c-2", "scratch", CloudState::Stopped),
+                ];
+                proton.usage = Some(CloudUsage::Balance {
+                    balance_micro_usd: Some(24_270_000),
+                    running_hours: 26.78,
+                    charged_micro_usd: 733_600,
+                });
+                client.set_cloud_for_test(
+                    CloudSnapshot {
+                        providers: vec![
+                            provider_state(Provider::Instabox, ProviderStatus::NotInstalled),
+                            proton,
+                        ],
+                        checking: false,
+                    },
+                    cx,
+                );
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        cx.update(|_, cx| {
+            let confirms = confirms.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| {
+                if let SettingsPageEvent::Confirm(request) = event {
+                    confirms.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+        });
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Machines, window, cx)
+        });
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let checks = |cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .iter()
+                    .filter(|request| matches!(request, Request::CheckCloud))
+                    .count()
+            })
+        };
+        let starts = || {
+            let start = Request::ChangeCloudMachine {
+                provider: Provider::Proton,
+                machine: "c-2".into(),
+                change: Lifecycle::Start,
+            };
+            requests
+                .borrow()
+                .iter()
+                .filter(|request| **request == start)
+                .count()
+        };
+
+        // Opening Machines looks for the providers' CLIs again.
+        assert_eq!(checks(cx), 1);
+
+        // The SSH machine is under This Mac and SSH; the cloud machines are under their
+        // account, those it lists first, then the saved one it doesn't list anymore.
+        let ssh = cx
+            .debug_bounds("machine-row-remote-1")
+            .expect("the SSH machine is listed");
+        for saved_cloud_machine in ["machine-row-remote-2", "machine-row-remote-3"] {
+            assert!(
+                cx.debug_bounds(saved_cloud_machine).is_none(),
+                "{saved_cloud_machine} is only under its provider"
+            );
+        }
+        let proton = cx
+            .debug_bounds("cloud-provider-proton")
+            .expect("Proton's account is a group");
+        let devbox = cx
+            .debug_bounds("cloud-row-proton-c-1")
+            .expect("its saved machine is listed");
+        let scratch = cx
+            .debug_bounds("cloud-row-proton-c-2")
+            .expect("the machine that isn't saved is listed");
+        let gone = cx
+            .debug_bounds("cloud-row-proton-c-gone")
+            .expect("a saved machine it doesn't list anymore stays");
+        assert!(ssh.top() < proton.top());
+        assert!(proton.top() < devbox.top() && devbox.top() < scratch.top());
+        assert!(scratch.top() < gone.top());
+
+        // Instabox isn't installed, so it's under More Providers, last.
+        assert!(cx.debug_bounds("cloud-provider-instabox").is_none());
+        let instabox = cx
+            .debug_bounds("cloud-setup-instabox")
+            .expect("Instabox is under More Providers");
+        assert!(gone.top() < instabox.top());
+        click("cloud-check-again", cx);
+        assert_eq!(checks(cx), 2);
+
+        // Starting a Proton computer charges, so it asks first.
+        click("cloud-main-proton-c-2", cx);
+        assert_eq!(starts(), 0);
+        let confirm = confirms
+            .borrow_mut()
+            .pop()
+            .expect("starting a machine that charges asks first");
+        assert!(confirm.is_charge);
+        let checkbox = confirm
+            .checkbox
+            .clone()
+            .expect("it offers not to ask again for the account");
+        cx.update(|window, cx| {
+            (checkbox.on_confirm_ticked)(cx);
+            (confirm.on_confirm)(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(starts(), 1);
+
+        // Once ticked, it doesn't ask again for that account.
+        click("cloud-main-proton-c-2", cx);
+        assert!(confirms.borrow().is_empty());
+        assert_eq!(starts(), 2);
+
+        // Switching on the machine that isn't saved saves it, by its provider's name.
+        click("cloud-switch-proton-c-2", cx);
+        let saved = cx.update(|_, cx| {
+            AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .cloud_machine(Provider::Proton, "c-2")
+                .cloned()
+        });
+        let saved = saved.expect("switching it on saves it");
+        assert!(saved.enabled);
+        assert_eq!(saved.label, "scratch");
+        assert!(saved.target.is_empty());
+    }
     #[test]
     fn login_method_subjects() {
         assert_eq!(

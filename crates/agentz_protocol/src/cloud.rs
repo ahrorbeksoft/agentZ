@@ -45,8 +45,9 @@ pub struct ProviderDescription {
     pub price: &'static str,
     /// agentZ's promo, invite or referral code, once the provider offers one.
     pub code: Option<ProviderCode>,
-    /// Starting or creating a machine costs money, so it's asked first (topic 5).
-    pub charges: bool,
+    /// What a running machine costs, for a provider whose machines bill from when they're
+    /// created or started; starting one is asked about first (topic 5).
+    pub charge: Option<&'static str>,
     /// The lifecycle changes it has.
     pub lifecycle: &'static [Lifecycle],
     pub capabilities: Capabilities,
@@ -85,7 +86,7 @@ static INSTABOX: ProviderDescription = ProviderDescription {
     pitch: "Linux machines for agents: pause and resume, snapshots, public ports, a desktop.",
     price: "Free during the beta",
     code: None,
-    charges: false,
+    charge: None,
     lifecycle: &[
         Lifecycle::Start,
         Lifecycle::Stop,
@@ -117,7 +118,7 @@ static PROTON: ProviderDescription = ProviderDescription {
     pitch: "One persistent Linux computer, with Claude Code, Codex and Docker installed.",
     price: "$20 a month while running",
     code: None,
-    charges: true,
+    charge: Some("$20 per 730 running hours, billed by the second from your Cube balance"),
     lifecycle: &[
         Lifecycle::Start,
         Lifecycle::Stop,

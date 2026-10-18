@@ -81,11 +81,17 @@ impl Choices {
             .and_then(|client| {
                 let client = client.read(cx);
                 match client.transport() {
-                    Transport::Ssh(target) => Some(Remote {
+                    // An editor dials a target from `~/.ssh/config`, which a cloud machine
+                    // reached with its provider's options doesn't have.
+                    Transport::Ssh(target)
+                    | Transport::Cloud {
+                        target: Some(target),
+                        ..
+                    } => Some(Remote {
                         target: target.clone(),
                         label: client.label().clone(),
                     }),
-                    Transport::Local => None,
+                    Transport::Local | Transport::Cloud { target: None, .. } => None,
                 }
             });
         let editors = order(
