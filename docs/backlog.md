@@ -38,7 +38,3 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
-
-### An Open in Editor button
-
-Add an Open in Editor button, as t3code has.

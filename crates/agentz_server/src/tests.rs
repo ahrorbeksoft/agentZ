@@ -405,6 +405,35 @@ async fn refuses_other_protocol_versions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lists_the_editors_installed_and_refuses_one_it_doesnt_know() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    match client.ok(Request::ListEditors).await {
+        Response::Editors(installed) => {
+            for id in installed {
+                assert!(agentz_protocol::editors::find(&id).is_some(), "{id}");
+            }
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+    let error = client
+        .request(Request::OpenInEditor {
+            editor: "notepad".into(),
+            path: server.project_dir.path().to_path_buf(),
+            line: None,
+        })
+        .await
+        .expect_err("an editor agentZ doesn't know");
+    assert!(
+        error.message.contains("unknown editor"),
+        "{}",
+        error.message
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn prompts_a_thread_and_names_it() {
     let Some(server) = TestServer::start() else {
         return;

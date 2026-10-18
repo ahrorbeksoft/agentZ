@@ -17,6 +17,7 @@ pub mod agents;
 pub mod artifacts;
 pub mod attachments;
 pub mod diff;
+pub mod editors;
 pub mod layout;
 pub mod mcp_servers;
 pub mod skills;
@@ -582,6 +583,18 @@ pub enum Request {
         thread_id: ThreadId,
         entry: usize,
     },
+    /// Which of [`editors::EDITORS`] are installed on the server's machine, by id:
+    /// [`Response::Editors`].
+    ListEditors,
+    /// Opens a path in an editor installed on the server's machine ([`Request::ListEditors`]),
+    /// at `line` where the editor takes one. The editor starts detached and the request is
+    /// answered once it has.
+    OpenInEditor {
+        editor: String,
+        path: PathBuf,
+        #[serde(default)]
+        line: Option<u32>,
+    },
     /// Merges a fork back into the thread it was forked from: what happened in the fork since
     /// waits there for its next message ([`thread::merge_handoff`]).
     MergeBack(ThreadId),
@@ -1019,6 +1032,8 @@ pub enum Response {
     TurnsRunning(Vec<String>),
     /// What a finished action did, to show the user.
     Message(String),
+    /// The ids of the editors installed on the machine ([`Request::ListEditors`]).
+    Editors(Vec<String>),
     Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]

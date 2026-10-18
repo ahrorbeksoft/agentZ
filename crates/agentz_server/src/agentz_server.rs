@@ -14,6 +14,7 @@ mod connection;
 mod continuations;
 mod detect;
 mod directories;
+mod editors;
 mod favicons;
 mod git;
 #[cfg(unix)]

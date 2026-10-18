@@ -140,6 +140,9 @@ pub struct ServerClient {
     storage: Storage,
     /// The machine's published artifacts, and where its pages server is.
     artifacts: Artifacts,
+    /// The ids of the editors installed on the machine
+    /// ([`agentz_protocol::editors::EDITORS`]), asked for of this Mac's server only.
+    editors: Vec<String>,
     /// Open threads and login sessions, which get the server's updates.
     threads: HashMap<ConnectionId, WeakEntity<AgentThread>>,
     /// Terminals a view shows, which get the server's frames.
@@ -199,6 +202,7 @@ impl ServerClient {
                 regenerating_titles: HashSet::default(),
                 storage: Storage::default(),
                 artifacts: Artifacts::default(),
+                editors: Vec::new(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
@@ -251,6 +255,41 @@ impl ServerClient {
 
     pub fn is_online(&self) -> bool {
         self.status == MachineStatus::Online
+    }
+
+    /// The editors installed on this Mac, as last asked ([`Self::refresh_editors`]).
+    pub fn editors(&self) -> &[String] {
+        &self.editors
+    }
+
+    /// Asks this Mac's server which editors are installed, which Open in Editor lists. An
+    /// editor installed later shows up the next time it's asked.
+    pub fn refresh_editors(&mut self, cx: &mut Context<Self>) {
+        if self.transport != Transport::Local {
+            return;
+        }
+        let response = self.request(Request::ListEditors);
+        cx.spawn(async move |this, cx| {
+            let editors = match response.await {
+                Ok(Response::Editors(editors)) => editors,
+                Ok(response) => {
+                    log::error!("expected the editors, got {response:?}");
+                    return;
+                }
+                Err(error) => {
+                    log::error!("couldn't list the editors: {error:#}");
+                    return;
+                }
+            };
+            this.update(cx, |this, cx| {
+                if this.editors != editors {
+                    this.editors = editors;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     pub fn connection(&self) -> Option<&Connection> {
@@ -827,6 +866,19 @@ impl ServerClient {
         self.set_spaces(spaces, cx);
     }
 
+    /// How the machine is reached, for a test that needs it to be over SSH.
+    #[cfg(test)]
+    pub fn set_transport_for_test(&mut self, transport: Transport) {
+        self.transport = transport;
+    }
+
+    /// The editors this Mac's server would say are installed.
+    #[cfg(test)]
+    pub fn set_editors_for_test(&mut self, editors: &[&str], cx: &mut Context<Self>) {
+        self.editors = editors.iter().map(|editor| editor.to_string()).collect();
+        cx.notify();
+    }
+
     /// What `send` was given, oldest first.
     #[cfg(test)]
     pub fn sent_for_test(&self) -> Vec<Request> {
@@ -861,6 +913,7 @@ impl ServerClient {
         self.status = MachineStatus::Online;
         self.upload_progress = None;
         self.queued_session_events = Some(Vec::new());
+        self.refresh_editors(cx);
         let threads: Vec<_> = self
             .threads
             .values()

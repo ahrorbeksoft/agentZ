@@ -78,6 +78,7 @@ use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
+use crate::open_in_editor::{self, Choices, OpenWith};
 use crate::project_copies::{CopyRow, fetched_line, render_copy_row};
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
@@ -101,7 +102,7 @@ use crate::usage_limits::{
     LOW_PERCENT, LimitResetAction, UsagePopover, left_label, reset_phrase, shown_window,
 };
 use crate::window_background;
-use crate::{NewChat, OpenFolder, ToggleDiff, ToggleTerminalDrawer};
+use crate::{NewChat, OpenFolder, OpenInEditor, ToggleDiff, ToggleTerminalDrawer};
 
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
 const RENAME_KEY_CONTEXT: &str = "ThreadHeaderRename";
@@ -1994,6 +1995,61 @@ impl AgentView {
             drawer.update(cx, |drawer, cx| drawer.set_full_screen(is_full_screen, cx));
         }
         cx.notify();
+    }
+
+    /// The thread's folder and its machine, which Open in Editor opens. A chat's folder is
+    /// never shown, so it has none.
+    fn editor_target(&self, cx: &App) -> Option<(MachineId, PathBuf)> {
+        if self.is_chat(cx) {
+            return None;
+        }
+        let store = self.store.read(cx);
+        Some((store.machine(), store.thread_folder(self.thread_id)?))
+    }
+
+    /// Cmd-Shift-O: the thread's folder in the editor last used, else the first found.
+    pub fn open_in_editor(&mut self, _: &OpenInEditor, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((machine, _)) = self.editor_target(cx) else {
+            return;
+        };
+        if let Some(editor) = Choices::of(machine, cx).preferred() {
+            self.open_folder_in(editor, cx);
+        }
+    }
+
+    fn open_folder_in(
+        &mut self,
+        editor: &'static agentz_protocol::editors::Editor,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((machine, folder)) = self.editor_target(cx) else {
+            return;
+        };
+        self.continue_error = None;
+        let opened = open_in_editor::open(machine, &folder, editor, None, cx);
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = opened.await {
+                this.update(cx, |this, cx| {
+                    this.continue_error =
+                        Some(format!("Couldn't open in {}: {error:#}", editor.label).into());
+                    cx.notify();
+                })
+                .log_err();
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The header's Open in Editor, before the changes (`design/open-in-editor`, topic 1A).
+    fn render_open_in_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (machine, folder) = self.editor_target(cx)?;
+        Some(open_in_editor::render_split_button(
+            machine,
+            folder,
+            open_with(cx.weak_entity()),
+            cx,
+        ))
     }
 
     /// The drawer under the conversation, or filling the thread's area.
@@ -5256,6 +5312,7 @@ impl AgentView {
         h_flex()
             .flex_none()
             .gap_1p5()
+            .children(self.render_open_in_editor(cx))
             .child(
                 div()
                     .debug_selector(|| "thread-header-changes".into())
@@ -5312,6 +5369,9 @@ impl AgentView {
             has_terminal: !is_chat,
             is_running: !is_chat && !self.hidden_running_commands(cx).is_empty(),
             changes: (!is_chat).then_some((self.changes, self.is_diff_open)),
+            editors: self
+                .editor_target(cx)
+                .map(|(machine, folder)| (Choices::of(machine, cx), folder)),
             artifacts,
         }
     }
@@ -5347,6 +5407,13 @@ impl AgentView {
                 let view = view.clone();
                 let agent_name = agent_name.clone();
                 let header_items = header_items.clone();
+                if header_items
+                    .as_ref()
+                    .is_some_and(|items| items.editors.is_some())
+                {
+                    // So an editor installed since is listed the next time.
+                    Machines::local(cx).update(cx, |client, cx| client.refresh_editors(cx));
+                }
                 let (has_auth_methods, supports_logout, can_reload) = {
                     let thread = thread.read(cx);
                     (
@@ -13229,6 +13296,7 @@ impl Render for AgentView {
             .child(self.render_view_measure(cx))
             .when(!self.is_in_pane, |this| {
                 this.on_action(cx.listener(Self::toggle_terminal_drawer))
+                    .on_action(cx.listener(Self::open_in_editor))
             })
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDrawerEdge>, _, cx| {
@@ -13615,6 +13683,15 @@ pub(crate) fn render_changes_button(changes: ChangeStat, is_open: bool) -> AnyEl
     }
 }
 
+/// What Open in Editor's button and menu start: the view opens its thread's folder in the
+/// editor picked.
+fn open_with(view: WeakEntity<AgentView>) -> OpenWith {
+    Rc::new(move |editor, _, cx| {
+        view.update(cx, |view, cx| view.open_folder_in(editor, cx))
+            .log_err();
+    })
+}
+
 /// What a narrow header moves into its ⋯ menu (`design/thread-narrow`, topic 2C). A chat has
 /// no branch, terminal or changes.
 struct CompactHeaderItems {
@@ -13624,6 +13701,8 @@ struct CompactHeaderItems {
     is_running: bool,
     /// What the thread changed, and whether the Changes panel is open.
     changes: Option<(ChangeStat, bool)>,
+    /// The thread's folder and what it opens in (`design/open-in-editor`, topic 1A).
+    editors: Option<(Choices, PathBuf)>,
     /// Newest first, with their links.
     artifacts: Vec<(Artifact, Option<String>)>,
 }
@@ -13698,6 +13777,13 @@ impl CompactHeaderItems {
                         .into_any_element()
                 },
                 |window, cx| window.dispatch_action(Box::new(ToggleDiff), cx),
+            );
+        }
+        if let Some((choices, folder)) = &self.editors {
+            menu = choices.add_to_compact_menu(
+                menu.separator(),
+                folder.clone(),
+                open_with(view.clone()),
             );
         }
         if !self.artifacts.is_empty() {
@@ -16371,7 +16457,8 @@ mod tests {
             cx.run_until_parked();
         };
 
-        resize(720., cx);
+        // Wide enough for Open in Editor's button too.
+        resize(800., cx);
         let project_name = width_of("thread-header-project-name", cx).expect("the name is shown");
         assert!(width_of("thread-header-branch", cx).is_some_and(|width| width > px(100.)));
         assert!(cx.debug_bounds("thread-header-changes").is_some());
@@ -16439,6 +16526,219 @@ mod tests {
             assert!(project.right() < title.left());
             assert!(title.size.width >= MIN_HEADER_TITLE_WIDTH);
         }
+    }
+
+    const SHOW_FOLDER: &str = if cfg!(target_os = "macos") {
+        "MENU_ITEM-Show in Finder"
+    } else {
+        "MENU_ITEM-Show in Files"
+    };
+
+    /// A click away from the menu, which closes it.
+    fn dismiss_menu(cx: &mut VisualTestContext) {
+        cx.simulate_click(gpui::point(px(4.), px(690.)), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn click_selector(selector: &'static str, cx: &mut VisualTestContext) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is shown"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Answers what this Mac's server does for Open in Editor, recording what it's asked.
+    fn answer_editors(
+        client: &Entity<ServerClient>,
+        installed: &'static [&'static str],
+        cx: &mut VisualTestContext,
+    ) -> Rc<std::cell::RefCell<Vec<Request>>> {
+        let requests: Rc<std::cell::RefCell<Vec<Request>>> = Rc::default();
+        client.update(cx, |client, cx| {
+            client.set_editors_for_test(installed, cx);
+            let requests = requests.clone();
+            client.answer_for_test(move |request| match request {
+                Request::ListEditors => Some(Response::Editors(
+                    installed.iter().map(|id| id.to_string()).collect(),
+                )),
+                Request::OpenInEditor { .. } => {
+                    requests.borrow_mut().push(request.clone());
+                    Some(Response::Ok)
+                }
+                _ => None,
+            });
+        });
+        cx.run_until_parked();
+        requests
+    }
+
+    fn opened(editor: &str, path: &str) -> Request {
+        Request::OpenInEditor {
+            editor: editor.into(),
+            path: path.into(),
+            line: None,
+        }
+    }
+
+    /// The header's Open in Editor (`design/open-in-editor`, topic 1A and 2B): with none found
+    /// a plain Open that lists Show in Files and Copy Path; else the last used editor's icon
+    /// and Open, which opens the folder there, and a chevron with the editors, the last used
+    /// first. A chat has no folder to open.
+    #[gpui::test]
+    fn the_header_opens_the_folder_in_the_last_used_editor(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        cx.run_until_parked();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+
+        assert!(cx.debug_bounds("thread-header-open").is_some());
+        assert!(cx.debug_bounds("thread-header-open-editor").is_none());
+        click_selector("thread-header-open", cx);
+        assert!(cx.debug_bounds("MENU_ITEM-No editor found").is_some());
+        assert!(cx.debug_bounds(SHOW_FOLDER).is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Path").is_some());
+        dismiss_menu(cx);
+
+        let requests = answer_editors(&client, &["cursor", "vscode", "zed"], cx);
+        let open = cx
+            .debug_bounds("thread-header-open")
+            .expect("the split button");
+        let changes = cx
+            .debug_bounds("thread-header-changes")
+            .expect("the changes");
+        assert!(open.right() <= changes.left());
+        click_selector("thread-header-open-editor", cx);
+        assert_eq!(*requests.borrow(), [opened("cursor", "/tmp/demo")]);
+
+        // The chevron lists them with the last used first, then the folder's own.
+        click_selector("thread-header-open-menu", cx);
+        let top = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is listed"))
+                .top()
+        };
+        assert!(top("MENU_ITEM-Cursor", cx) < top("MENU_ITEM-VS Code", cx));
+        assert!(top("MENU_ITEM-VS Code", cx) < top("MENU_ITEM-Zed", cx));
+        assert!(top("MENU_ITEM-Zed", cx) < top(SHOW_FOLDER, cx));
+        assert!(top(SHOW_FOLDER, cx) < top("MENU_ITEM-Copy Path", cx));
+        click_selector("MENU_ITEM-Zed", cx);
+        assert_eq!(requests.borrow().last(), Some(&opened("zed", "/tmp/demo")));
+        assert_eq!(
+            cx.update(|_, cx| crate::app_settings::AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .last_editor
+                .clone()),
+            Some("zed".to_string())
+        );
+
+        // Zed is now first, and what the button and Cmd-Shift-O open.
+        click_selector("thread-header-open-menu", cx);
+        assert!(top("MENU_ITEM-Zed", cx) < top("MENU_ITEM-Cursor", cx));
+        dismiss_menu(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_in_editor(&OpenInEditor, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(requests.borrow().len(), 3);
+        assert_eq!(requests.borrow().last(), Some(&opened("zed", "/tmp/demo")));
+    }
+
+    #[gpui::test]
+    fn a_chat_has_no_folder_to_open(cx: &mut TestAppContext) {
+        let mut snapshot = snapshot(Some("Fix the login"));
+        snapshot.threads[1].project_id = ProjectId::CHATS;
+        let (view, cx) = open_in(snapshot, 2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requests = answer_editors(&client, &["vscode"], cx);
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thread-header-open").is_none());
+        view.update_in(cx, |view, window, cx| {
+            view.open_in_editor(&OpenInEditor, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().is_empty());
+    }
+
+    /// Narrow, "⋯" heads the editors with "Open in <editor>" and an "Open in…" submenu
+    /// (`design/open-in-editor`, topic 1A), after Terminal and the changes.
+    #[gpui::test]
+    fn a_narrow_header_opens_in_an_editor_from_its_menu(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requests = answer_editors(&client, &["vscode", "zed"], cx);
+        cx.simulate_resize(gpui::size(px(440.), px(700.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thread-header-open").is_none());
+        click_selector("thread-options", cx);
+        let changes = cx
+            .debug_bounds("thread-options-changes")
+            .expect("⋯ has the changes");
+        let open = cx
+            .debug_bounds("MENU_ITEM-Open in VS Code")
+            .expect("⋯ has the editor");
+        assert!(changes.bottom() <= open.top());
+        // "Open in…" is the next row, and opens the whole menu beside it.
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Path").is_none());
+        cx.simulate_mouse_move(
+            gpui::point(open.center().x, open.center().y + open.size.height),
+            None,
+            gpui::Modifiers::none(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Path").is_some());
+        assert!(cx.debug_bounds(SHOW_FOLDER).is_some());
+        click_selector("MENU_ITEM-Zed", cx);
+        assert_eq!(*requests.borrow(), [opened("zed", "/tmp/demo")]);
+    }
+
+    /// A thread on an SSH machine opens in an editor on this Mac, over SSH
+    /// (`design/open-in-editor`, topic 3C): only those with a link for it are listed, with a
+    /// first line about the key until one has opened, and no file manager.
+    #[gpui::test]
+    fn a_thread_on_another_machine_opens_over_ssh(cx: &mut TestAppContext) {
+        let (mac, devbox) = two_machines(cx);
+        devbox.update(cx, |client, _| {
+            client.set_transport_for_test(crate::server_client::Transport::Ssh("devbox1".into()))
+        });
+        let (_view, cx) = open_on(&devbox, 2, cx);
+        let requests = answer_editors(&mac, &["webstorm", "vscode", "zed"], cx);
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        cx.run_until_parked();
+
+        let note = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| Choices::of(MachineId::Remote(1), cx).ssh_note())
+        };
+        assert_eq!(
+            note(cx).as_deref(),
+            Some("Opens over SSH. Needs your key on Devbox 1")
+        );
+        click_selector("thread-header-open-menu", cx);
+        assert!(cx.debug_bounds("MENU_ITEM-VS Code").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Zed").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-WebStorm").is_none());
+        assert!(cx.debug_bounds(SHOW_FOLDER).is_none());
+        assert!(cx.debug_bounds("MENU_ITEM-Copy Path").is_some());
+        dismiss_menu(cx);
+
+        click_selector("thread-header-open-editor", cx);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("vscode://vscode-remote/ssh-remote+devbox1/tmp/demo")
+        );
+        // The server on this Mac isn't asked to start anything.
+        assert!(requests.borrow().is_empty());
+        let has_opened = cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .opened_over_ssh
+        });
+        assert!(has_opened);
+        assert_eq!(note(cx), None);
     }
 
     /// Under 560 px, the composer's agent and account show only their icon and avatar

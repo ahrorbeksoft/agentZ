@@ -47,8 +47,8 @@ use crate::window_background;
 use crate::window_decorations::{self, RoundedTopCorners as _, Side};
 use crate::worktree_modal::{WorktreeModal, WorktreeModalEvent, WorktreeModalMode};
 use crate::{
-    GoTo, NewChat, NewThread, OpenFolder, OpenSettings, ShowShortcuts, ToggleCommandPalette,
-    ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
+    GoTo, NewChat, NewThread, OpenFolder, OpenInEditor, OpenSettings, ShowShortcuts,
+    ToggleCommandPalette, ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
 };
 
 pub const KEY_CONTEXT: &str = "Shell";
@@ -899,6 +899,25 @@ impl Shell {
             view.update(cx, |view, cx| {
                 view.toggle_terminal_drawer(action, window, cx)
             });
+        }
+    }
+
+    /// Cmd-Shift-O with focus outside the thread view: the open thread's folder in its editor.
+    fn open_in_editor(
+        &mut self,
+        action: &OpenInEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.view != MainView::Agents || self.settings_page.is_some() {
+            return;
+        }
+        let view = self
+            .active_thread
+            .and_then(|thread_id| self.open_threads.get(&thread_id))
+            .map(|open_thread| open_thread.view.clone());
+        if let Some(ThreadView::Agent(view)) = view {
+            view.update(cx, |view, cx| view.open_in_editor(action, window, cx));
         }
     }
 
@@ -2366,6 +2385,7 @@ impl Render for Shell {
                     .on_action(cx.listener(Self::toggle_project_switcher))
                     .on_action(cx.listener(Self::toggle_diff))
                     .on_action(cx.listener(Self::toggle_terminal_drawer))
+                    .on_action(cx.listener(Self::open_in_editor))
             })
             .on_action(cx.listener(Self::toggle_shortcuts))
             .on_action(cx.listener(Self::toggle_command_palette))

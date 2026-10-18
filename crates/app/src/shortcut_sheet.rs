@@ -24,8 +24,9 @@ use crate::terminal_view::{
     SelectNextMatch, SelectPreviousMatch,
 };
 use crate::{
-    GoTo, NewThread, OpenFolder, OpenSettings, Quit, ShowShortcuts, ToggleCommandPalette,
-    ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer, shell, sidebar,
+    GoTo, NewThread, OpenFolder, OpenInEditor, OpenSettings, Quit, ShowShortcuts,
+    ToggleCommandPalette, ToggleDiff, ToggleProjectSwitcher, ToggleSidebar, ToggleTerminalDrawer,
+    shell, sidebar,
 };
 
 const KEY_CONTEXT: &str = "ShortcutSheet";
@@ -208,6 +209,7 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
             general.push(entry("Switch Project…", &ToggleProjectSwitcher));
             general.push(entry("Toggle Changes", &ToggleDiff));
             general.push(entry("Toggle Terminal", &ToggleTerminalDrawer));
+            general.push(entry("Open in Editor", &OpenInEditor));
         }
         general.extend([
             entry("Command Palette", &ToggleCommandPalette),

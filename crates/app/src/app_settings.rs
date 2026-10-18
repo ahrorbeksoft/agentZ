@@ -273,6 +273,12 @@ pub struct AppSettings {
     pub sound_volume: f32,
     /// System notifications show only while another app is in front, as t3code's do.
     pub notify_when_unfocused: bool,
+    /// The editor Open in Editor last opened something in (an id of
+    /// [`agentz_protocol::editors::EDITORS`]), which its button opens next.
+    pub last_editor: Option<String>,
+    /// A thread on another machine has been opened in an editor over SSH, so its menu stops
+    /// reminding that the SSH key is needed.
+    pub opened_over_ssh: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -312,6 +318,8 @@ impl Default for AppSettings {
             play_sound_when_input_needed: PlaySound::Always,
             sound_volume: 1.,
             notify_when_unfocused: true,
+            last_editor: None,
+            opened_over_ssh: false,
             saved_layouts: Vec::new(),
         }
     }

@@ -1048,6 +1048,18 @@ impl Server {
                 self.update_thread(connection, |thread| thread.drop_handoff(made_at))?;
                 Ok(Response::Ok)
             }
+            Request::ListEditors => Ok(Response::Editors(crate::editors::installed(
+                &crate::editors::Environment::current(),
+            ))),
+            Request::OpenInEditor { editor, path, line } => {
+                crate::editors::launch(
+                    &crate::editors::Environment::current(),
+                    &editor,
+                    &path,
+                    line,
+                )?;
+                Ok(Response::Ok)
+            }
             Request::ForkThread { thread_id, entry } => {
                 Ok(Response::ThreadCreated(self.fork_thread(thread_id, entry)?))
             }

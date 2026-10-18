@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use agentz_protocol::diff::{
     DiffFile, DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff,
 };
+use agentz_protocol::editors::Editor;
 use agentz_protocol::thread::DiffLineKind;
 use agentz_protocol::{CAPABILITY_THREAD_DIFF, Request, Response};
 use collections::{HashMap, HashSet};
@@ -24,6 +25,7 @@ use ui::{
 
 use crate::ToggleDiff;
 use crate::agent_view::TOOLBAR_HEIGHT;
+use crate::open_in_editor::{self, Choices};
 use crate::server_client::ServerClient;
 
 pub const DIFF_PANEL_WIDTH: Pixels = px(520.);
@@ -433,6 +435,25 @@ impl DiffPanel {
         cx.notify();
     }
 
+    /// Opens the file in the editor, at its first change.
+    fn open_in_editor(&mut self, file: usize, editor: &'static Editor, cx: &mut Context<Self>) {
+        let Some(file) = self.diff.as_ref().and_then(|diff| diff.files.get(file)) else {
+            return;
+        };
+        let line = file.first_changed_line();
+        let store = self.client.read(cx).projects().clone();
+        // The diff names files from the repository's root, which is the thread's folder.
+        let Some(path) = store
+            .read(cx)
+            .thread_folder(self.thread_id)
+            .map(|folder| folder.join(&file.path))
+        else {
+            return;
+        };
+        let machine = self.client.read(cx).machine();
+        open_in_editor::open_and_log(machine, &path, editor, line, cx);
+    }
+
     fn toggle_all_collapsed(&mut self, cx: &mut Context<Self>) {
         let Some(diff) = &self.diff else {
             return;
@@ -713,11 +734,13 @@ impl Render for DiffPanel {
                 let viewed = Rc::new(self.viewed.clone());
                 let collapsed = Rc::new(self.collapsed.clone());
                 let panel = cx.entity().downgrade();
+                // The editor the header's Open in Editor would open, for each file's button.
+                let editor = Choices::of(self.client.read(cx).machine(), cx).preferred();
                 list(self.list_state.clone(), move |index, _, cx| {
                     let Some(row) = rows.get(index) else {
                         return div().into_any_element();
                     };
-                    render_row(*row, &diff, &viewed, &collapsed, &panel, cx)
+                    render_row(*row, &diff, &viewed, &collapsed, editor, &panel, cx)
                 })
                 .flex_1()
                 .min_h_0()
@@ -746,6 +769,7 @@ fn render_row(
     diff: &ThreadDiff,
     viewed: &HashMap<String, u64>,
     collapsed: &HashSet<String>,
+    editor: Option<&'static Editor>,
     panel: &WeakEntity<DiffPanel>,
     cx: &App,
 ) -> AnyElement {
@@ -814,6 +838,38 @@ fn render_row(
                     )
                 })
                 .child(line_stat(file.additions, file.deletions))
+                // A deleted file is no longer there to open.
+                .when_some(
+                    editor.filter(|_| file.change != FileChange::Deleted),
+                    |this, editor| {
+                        let open_panel = panel.clone();
+                        this.child(
+                            // Opening the file must not also toggle it.
+                            div()
+                                .id(("diff-file-open-wrapper", index))
+                                .debug_selector(move || format!("diff-file-open-{index}"))
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    IconButton::new(
+                                        ("diff-file-open", index),
+                                        open_in_editor::editor_icon(editor),
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(format!("Open in {}", editor.label)))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            open_panel
+                                                .update(cx, |panel, cx| {
+                                                    panel.open_in_editor(index, editor, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    ),
+                                ),
+                        )
+                    },
+                )
                 .child(
                     // Ticking the box must not also toggle the file.
                     div()
@@ -1067,5 +1123,108 @@ diff --git a/b.txt b/b.txt
             ]
         );
         assert_eq!(build_rows(&diff, &collapsed).last(), Some(&Row::File(1)));
+    }
+
+    /// Each file's header has the editor Open in Editor would use beside Viewed
+    /// (`design/open-in-editor`, topic 4B): it opens the file at its first change without
+    /// collapsing it, and a deleted file has none.
+    #[gpui::test]
+    fn a_file_opens_in_the_editor_at_its_first_change(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+
+        let patch = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,4 +10,4 @@
+ keep
+ keep
+-old
++new
+ keep
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let diff = ThreadDiff {
+            status: DiffStatus::Ready,
+            turns: 1,
+            files: agentz_protocol::diff::parse_patch(patch),
+            truncated: false,
+            restore: RestoreAvailability::Available,
+            finished_turns: Vec::new(),
+            base_ref: None,
+        };
+        let snapshot = projects::ProjectsSnapshot {
+            projects: vec![projects::Project {
+                id: projects::ProjectId(1),
+                path: "/tmp/demo".into(),
+                custom_name: None,
+                icon: None,
+                workspaces: Vec::new(),
+                repository: None,
+            }],
+            threads: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": 2,
+                    "project_id": 1,
+                    "title": "Fix it",
+                    "agent_id": "mock",
+                    "session_id": "session",
+                }))
+                .expect("a thread"),
+            ],
+            ..Default::default()
+        };
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                crate::machines::MachineId::Local,
+                "This Mac".into(),
+                agentz_protocol::spaces::SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| {
+                client.set_online_for_test(cx);
+                client.set_editors_for_test(&["zed"], cx);
+            });
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| store.set_snapshot(snapshot, cx));
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| match request {
+                Request::ThreadDiff { .. } => Some(Response::ThreadDiff(diff.clone())),
+                Request::OpenInEditor { .. } => {
+                    requests.borrow_mut().push(request.clone());
+                    Some(Response::Ok)
+                }
+                _ => None,
+            });
+        });
+        let (panel, cx) =
+            cx.add_window_view(|_, cx| DiffPanel::new(client.clone(), ThreadId(2), cx));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("diff-file-open-0").is_some());
+        assert!(cx.debug_bounds("diff-file-open-1").is_none());
+        let button = cx.debug_bounds("diff-file-open-0").expect("the button");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.borrow(),
+            [Request::OpenInEditor {
+                editor: "zed".into(),
+                path: "/tmp/demo/src/a.rs".into(),
+                line: Some(12),
+            }]
+        );
+        assert!(panel.read_with(cx, |panel, _| panel.collapsed.is_empty()));
     }
 }

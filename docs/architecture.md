@@ -95,7 +95,7 @@ so an open tool call's output raced the conversation.
 |---|---|
 | `app` | The `agentz` binary: the window and every view. Modules are listed under each feature below. |
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
-| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
+| `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), the editors a folder opens in (`editors.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
@@ -935,12 +935,39 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   titles can be, except on a draft, Archive, Delete…), and a double-click
   renames it in place, as you type, as the sidebar does (`TitleButton`: the second click closes
   the menu the first opened; the field takes focus after the menu's delayed focus). Then the
-  branch with its worktree or pasture icon, the changes as +added −removed (the Diff icon when
-  none), Terminal, and "⋯" with the agent's options. A workspace pane keeps its own header with
+  branch with its worktree or pasture icon, Open in Editor (below), the changes as +added
+  −removed (the Diff icon when none), Terminal, and "⋯" with the agent's options. A workspace pane keeps its own header with
   the same buttons. A fork has its source's title in a pill before the changes, opening Open
   Source Thread and Merge Back (below). A Workspaces thread has its folder (icon and name, the path in its
   tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
   another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
+- **Open in Editor** (`open_in_editor.rs`, `agentz_protocol::editors`, `agentz_server::editors`;
+  t3code's OpenInPicker and `launchEditor`; design round `design/open-in-editor/`, 1 A, 2 B,
+  3 C, 4 B): an outlined split button before the changes, ⌘⇧O (⌘O is Open Folder; also File
+  ▸ Open in Editor, the shortcut sheet and the command palette). The left part is the last
+  used editor's icon and "Open", which opens the thread's folder there with one click; the
+  chevron lists, in groups, that editor with the key, the others, then Show in Finder ("Show
+  in Files" on Linux) and Copy Path. With none found the button is a plain "Open ↗" that opens
+  the menu: "No editor found" (disabled) over Show in Finder and Copy Path. A chat has none
+  (its folder is never shown). Narrow, "⋯" gets "Open in <editor> ⌘⇧O" and an "Open in…"
+  submenu with the same menu, after the changes. The server on a machine finds the editors
+  installed on it (`Request::ListEditors`: `EDITORS` is t3code's table, Cursor, VS Code and its
+  Insiders and VSCodium, Zed and the JetBrains IDEs, each by its command on `PATH` or where
+  its installer puts it: macOS app bundles, `~/.local/bin`, `/snap/bin`, JetBrains Toolbox's
+  scripts, since a GUI-started server has a short `PATH`), and starts one detached
+  (`Request::OpenInEditor`, with a line for editors that take one: `--goto path:line`, Zed's
+  `path:line`, JetBrains' `--line`). Only this Mac's server is asked
+  (`ServerClient::editors`, again as the menu opens). The last used editor and whether a
+  folder was ever opened over SSH are app settings (`last_editor`, `opened_over_ssh`). A
+  thread on an SSH machine opens in an editor on this Mac over SSH: the menu lists only
+  those installed here that open remote folders (VS Code and its forks through
+  `vscode://vscode-remote/ssh-remote+<host><path>`, Zed through `zed://ssh/<host><path>`),
+  the OS is handed the link (`Editor::remote_url`, t3code's `buildRemoteOpenUrl`) with the
+  host the app dials, and the editor connects by itself; a first line says "Opens over SSH.
+  Needs your key on <machine>" until one has been opened. No file manager is listed for it.
+  The Changes panel's file headers have the same editor's icon beside Viewed ("Open in VS
+  Code"), opening the file at its first change (`DiffFile::first_changed_line`; not for a
+  deleted file), hidden when no editor is found.
 - **Narrow threads** (`AgentView::view_width`, measured by `render_view_measure`;
   `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
   `design/thread-narrow/`, 2 C and 3 B, from t3code's compact controls): a thread can be as
@@ -950,8 +977,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   least 120 px, and the project's name shrinks only after it. At 360 px and under the
   project shows only its icon. Under 480 px the branch, the artifacts pill, the changes and
   Terminal leave the header for "⋯", which they head: the branch as a line, Toggle
-  Terminal, Show or Hide Changes with the counts, then the artifacts, then the agent's
-  options; Terminal's running dot moves onto "⋯". Under 560 px the composer's agent picker
+  Terminal, Show or Hide Changes with the counts, Open in Editor, then the artifacts, then the
+  agent's options; Terminal's running dot moves onto "⋯". Under 560 px the composer's agent picker
   shows only its icon and a sent thread's account picker only its avatar, their names in
   the tooltips, and when its controls wrap, they keep to the right, so Send stays in the
   corner.

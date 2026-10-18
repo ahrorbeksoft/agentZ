@@ -101,6 +101,22 @@ pub struct DiffFile {
     pub hunks: Vec<DiffHunk>,
 }
 
+impl DiffFile {
+    /// The line of the file as it is now where its first change is: the first line added, or
+    /// where the first lines removed were.
+    pub fn first_changed_line(&self) -> Option<u32> {
+        let hunk = self.hunks.first()?;
+        let mut line = hunk.new_start;
+        for diff_line in &hunk.lines {
+            match diff_line.kind {
+                DiffLineKind::Context => line += 1,
+                DiffLineKind::Added | DiffLineKind::Removed => return Some(line.max(1)),
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileChange {
     Added,
@@ -308,6 +324,41 @@ fn split_quoted(text: &str) -> Option<(String, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_opens_at_its_first_change() {
+        let files = parse_patch(
+            "\
+diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -10,4 +10,4 @@
+ keep
+ keep
+-old
++new
+ keep
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -3,3 +3,2 @@
+ keep
+-gone
+ keep
+diff --git a/c.rs b/c.rs
+new file mode 100644
+--- /dev/null
++++ b/c.rs
+@@ -0,0 +1 @@
++hello
+diff --git a/d.png b/d.png
+new file mode 100644
+Binary files /dev/null and b/d.png differ
+",
+        );
+        let lines: Vec<Option<u32>> = files.iter().map(DiffFile::first_changed_line).collect();
+        assert_eq!(lines, [Some(12), Some(4), Some(1), None]);
+    }
 
     #[test]
     fn patches() {

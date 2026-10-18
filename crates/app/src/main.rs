@@ -19,6 +19,7 @@ mod machines;
 mod mention_menu;
 mod new_space_picker;
 mod new_thread_modal;
+mod open_in_editor;
 mod project_copies;
 mod project_icon_picker;
 mod project_info;
@@ -85,6 +86,8 @@ actions!(
         ToggleSidebar,
         /// Opens or closes the terminal under the open thread.
         ToggleTerminalDrawer,
+        /// Opens the open thread's folder in the editor last used for it.
+        OpenInEditor,
         /// Lists the shortcuts for what's focused, and the app's.
         ShowShortcuts,
         /// Opens the command palette, to run what applies to what's focused.
@@ -195,6 +198,8 @@ fn bind_keys(cx: &mut App) {
         // Zed's key for its left dock.
         KeyBinding::new("secondary-b", ToggleSidebar, context),
         KeyBinding::new("secondary-j", ToggleTerminalDrawer, context),
+        // Not Cmd-O, which is Open Folder here (t3code's Open in Editor key).
+        KeyBinding::new("secondary-shift-o", OpenInEditor, context),
         // herdr's help is prefix-?; Cmd-? is macOS's Help menu search.
         KeyBinding::new("secondary-/", ShowShortcuts, context),
         // Zed's keys: its command palette, and its file finder for places.
@@ -216,6 +221,8 @@ fn init_actions(cx: &mut App) {
             MenuItem::action("New Thread…", NewThread),
             MenuItem::action("Open Folder…", OpenFolder),
             MenuItem::action("Switch Project…", ToggleProjectSwitcher),
+            MenuItem::separator(),
+            MenuItem::action("Open in Editor", OpenInEditor),
         ]),
         Menu::new("View").items([
             MenuItem::action("Sidebar", ToggleSidebar),
