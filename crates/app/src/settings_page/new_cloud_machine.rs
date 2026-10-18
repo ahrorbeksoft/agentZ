@@ -23,9 +23,8 @@ use ui::{
 use util::ResultExt as _;
 
 use super::SettingsPage;
-use super::cloud_providers::signed_in_account;
 use crate::app_settings::AppSettingsStore;
-use crate::cloud_machines::{charge_message, noun_title, provider_icon};
+use crate::cloud_machines::{charge_message, noun_title, provider_icon, signed_in_account};
 use crate::machines::Machines;
 
 pub(super) const KEY_CONTEXT: &str = "NewCloudMachine";

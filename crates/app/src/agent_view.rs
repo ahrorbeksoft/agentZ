@@ -21,6 +21,7 @@ use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactKind, ArtifactReply, ArtifactRequest,
 };
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
+use agentz_protocol::cloud::{Change, CloudState, Lifecycle};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
@@ -75,6 +76,9 @@ use crate::attachment_image::{
     without_image_links,
 };
 use crate::branch_picker::{BranchPicker, FetchOrigin};
+use crate::cloud_machines::{
+    MainAction, change_label, charge_question, charges, lifecycle_label, main_action, state_label,
+};
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
@@ -85,7 +89,7 @@ use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
-use crate::server_client::{MachineStatus, ServerClient};
+use crate::server_client::{MachineStatus, ServerClient, Transport};
 use crate::settings_page::{
     AccountEntry, account_entries, account_entry, account_selector, render_entry_avatar,
 };
@@ -529,6 +533,10 @@ pub struct AgentView {
     title: SharedString,
     /// The thread's machine.
     client: Entity<ServerClient>,
+    /// Whether the machine has been found running or not since the view opened: a free cloud
+    /// machine that wasn't starts by itself then (design/cloud topic 11 C), but not when it's
+    /// stopped later.
+    machine_checked: bool,
     store: Entity<ProjectStore>,
     registry: Entity<AgentRegistryStore>,
     /// The thread's agent, which follows the store's as the thread goes on with another.
@@ -710,7 +718,7 @@ impl AgentView {
         let rename_input = cx.new(|cx| TextInput::new("Thread title", cx));
         let login =
             cx.new(|cx| AgentLogin::new(thread.clone(), LoginLayout::Card, agent_id.clone(), cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&rename_input, |this, _, _: &TextInputEvent, cx| {
                 this.apply_rename(cx)
             }),
@@ -753,15 +761,19 @@ impl AgentView {
             }),
             // Whether messages can be sent follows the machine's connection.
             cx.observe(&client, |this, _, cx| {
+                this.start_stopped_machine(cx);
                 this.sync_agents_section(cx);
                 this.load_changed_files(false, cx);
                 cx.notify();
             }),
         ];
+        // A cloud machine's notice follows what this Mac's server says its provider is doing.
+        if matches!(client.read(cx).transport(), Transport::Cloud { .. }) {
+            subscriptions.push(cx.observe(&Machines::local(cx), |_, _, cx| cx.notify()));
+        }
         // What's typed is saved as the view closes, when the user leaves the thread.
         cx.on_release(|this, cx| this.save_unsent_text_now(cx))
             .detach();
-        let mut subscriptions = subscriptions;
         subscriptions.push(cx.subscribe(
             &composer,
             |this, _, event: &TextInputEvent, cx| match event {
@@ -813,6 +825,7 @@ impl AgentView {
             changed_files_asked_for: None,
             _changed_files_load: Task::ready(()),
             client,
+            machine_checked: false,
             store,
             registry,
             agent_id,
@@ -929,7 +942,65 @@ impl AgentView {
         this.sync_blocked_subthreads(cx);
         this.sync_agents_section(cx);
         this.load_changed_files(false, cx);
+        this.start_stopped_machine(cx);
         this
+    }
+
+    /// Opening a thread on a cloud machine that isn't running starts it where that's free,
+    /// and only then (design/cloud topic 11 C); one that charges waits for its notice's Start.
+    fn start_stopped_machine(&mut self, cx: &mut Context<Self>) {
+        if self.machine_checked {
+            return;
+        }
+        let client = self.client.read(cx);
+        let state = match client.status() {
+            MachineStatus::NotRunning(state) => state,
+            MachineStatus::Online => {
+                self.machine_checked = true;
+                return;
+            }
+            _ => return,
+        };
+        self.machine_checked = true;
+        let Transport::Cloud { link, .. } = client.transport() else {
+            return;
+        };
+        if let Some(MainAction::Change(change)) = main_action(link.provider, state)
+            && matches!(change, Lifecycle::Start | Lifecycle::Resume)
+            && charges(link.provider, change).is_none()
+        {
+            self.client.update(cx, |client, cx| {
+                client.start_cloud_machine(change, true, cx)
+            });
+        }
+    }
+
+    /// Start or Resume, on a machine's notice: one that charges asks first (topic 5 C), until
+    /// its account says not to.
+    fn start_machine(&mut self, change: Lifecycle, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let Transport::Cloud { link, .. } = client.read(cx).transport() else {
+            return;
+        };
+        let provider = link.provider;
+        let verb = lifecycle_label(change);
+        let on_confirm: Rc<dyn Fn(&mut Window, &mut App)> = {
+            let client = client.clone();
+            Rc::new(move |_, cx| {
+                client.update(cx, |client, cx| {
+                    client.start_cloud_machine(change, false, cx)
+                })
+            })
+        };
+        let title = format!("{verb} {}?", client.read(cx).label());
+        let question = charges(provider, change)
+            .and_then(|charge| charge_question(provider, charge, title, verb, on_confirm, cx));
+        match question {
+            Some(question) => cx.emit(AgentViewEvent::Confirm(question)),
+            None => client.update(cx, |client, cx| {
+                client.start_cloud_machine(change, false, cx)
+            }),
+        }
     }
 
     /// Follows the thread's agent as it goes on with another ([`Request::SwitchAgent`]).
@@ -9750,7 +9821,10 @@ impl AgentView {
 
     /// While the thread's machine is unreachable, in place of the message editor. The draft
     /// stays in the editor for when it's back.
-    fn render_offline_notice(&self, cx: &App) -> AnyElement {
+    fn render_offline_notice(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(notice) = self.render_stopped_machine_notice(cx) {
+            return notice;
+        }
         let label = self.client.read(cx).label().clone();
         let description = match self.client.read(cx).status() {
             MachineStatus::Attention { error, .. } | MachineStatus::Reconnecting(error) => {
@@ -9761,7 +9835,7 @@ impl AgentView {
             }
             MachineStatus::NotRunning(state) => format!(
                 "It's {}. New messages can be sent once it's running.",
-                crate::cloud_machines::state_label(state).to_lowercase()
+                state_label(state).to_lowercase()
             ),
         };
         Callout::new()
@@ -9771,6 +9845,123 @@ impl AgentView {
             .title(format!("{label} is offline"))
             .description(description)
             .into_any_element()
+    }
+
+    /// A cloud machine that's stopped or paused (design/cloud topic 11 C): "Resuming
+    /// review-box…" while it comes up, with Cancel where it started by itself, or
+    /// "proton-cloud is stopped" with Start and what it costs.
+    fn render_stopped_machine_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        enum Action {
+            Cancel,
+            Start(Lifecycle, Option<&'static str>),
+        }
+        let client = self.client.read(cx);
+        let MachineStatus::NotRunning(state) = client.status() else {
+            return None;
+        };
+        let Transport::Cloud { link, .. } = client.transport() else {
+            return None;
+        };
+        let provider = link.provider;
+        let label = client.label();
+        let start = client.cloud_start(cx);
+        let changing = Machines::local(cx)
+            .read(cx)
+            .cloud()
+            .provider(provider)
+            .and_then(|state| {
+                state
+                    .changing
+                    .iter()
+                    .find(|changing| changing.machine == link.machine)
+            })
+            .map(|changing| change_label(changing.change));
+        let under_way = start
+            .filter(|start| start.error.is_none())
+            .map(|start| change_label(Change::Lifecycle(start.change)))
+            .or(changing)
+            .or_else(|| {
+                matches!(state, CloudState::Starting | CloudState::Resuming)
+                    .then(|| state_label(state))
+            });
+        let (title, description, action) = if let Some(under_way) = under_way {
+            let cancelled = start
+                .filter(|start| start.cancelled)
+                .map(|start| match start.change {
+                    Lifecycle::Resume => "Cancelled: it pauses again once it’s resumed.",
+                    _ => "Cancelled: it stops again once it’s started.",
+                });
+            let can_cancel = start.is_some_and(|start| start.by_itself && !start.cancelled);
+            (
+                format!("{under_way} {label}…"),
+                cancelled
+                    .unwrap_or("New messages can be sent once it’s running.")
+                    .to_string(),
+                can_cancel.then_some(Action::Cancel),
+            )
+        } else {
+            let Some(MainAction::Change(change @ (Lifecycle::Start | Lifecycle::Resume))) =
+                main_action(provider, state)
+            else {
+                return None;
+            };
+            let description = match start.and_then(|start| start.error.as_ref()) {
+                Some(error) => format!(
+                    "Couldn’t {} it: {error}",
+                    lifecycle_label(change).to_lowercase()
+                ),
+                None => "New messages can be sent once it’s running.".to_string(),
+            };
+            let price = charges(provider, change).map(|_| provider.description().price);
+            (
+                format!("{label} is {}", state_label(state).to_lowercase()),
+                description,
+                Some(Action::Start(change, price)),
+            )
+        };
+        let failed = start.is_some_and(|start| start.error.is_some()) && under_way.is_none();
+        let actions = action.map(|action| match action {
+            Action::Cancel => div()
+                .debug_selector(|| "machine-start-cancel".into())
+                .child(
+                    Button::new("machine-start-cancel", "Cancel")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.client
+                                .update(cx, |client, cx| client.cancel_cloud_start(cx))
+                        })),
+                )
+                .into_any_element(),
+            Action::Start(change, price) => h_flex()
+                .gap_2()
+                .child(
+                    div().debug_selector(|| "machine-start".into()).child(
+                        Button::new("machine-start", lifecycle_label(change))
+                            .style(ButtonStyle::Filled)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.start_machine(change, cx)
+                            })),
+                    ),
+                )
+                .children(
+                    price.map(|price| Label::new(price).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .into_any_element(),
+        });
+        Some(
+            Callout::new()
+                .border_position(ui::CalloutBorderPosition::Top)
+                .severity(if failed {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                })
+                .title(title)
+                .description(description)
+                .when_some(actions, |callout, actions| callout.actions_slot(actions))
+                .into_any_element(),
+        )
     }
 
     fn render_restore_notice(&self, cx: &App) -> Option<AnyElement> {
@@ -16348,6 +16539,7 @@ fn summarize_work(entries: &[Entry]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use agentz_protocol::cloud::Provider;
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::QueuedMessage;
     use gpui::{TestAppContext, VisualTestContext};
@@ -18269,6 +18461,211 @@ mod tests {
         assert_eq!(note(cx), None);
     }
 
+    /// Devbox 1 as `provider`'s machine `machine`, in `status`, beside This Mac, whose server
+    /// lists Instabox's `m-1` paused and Proton's `c-1` stopped (signed in as
+    /// me@example.com), and does their changes unless `fails` says not to.
+    fn on_a_cloud_machine(
+        provider: Provider,
+        machine: &str,
+        status: MachineStatus,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ServerClient>,
+        Entity<ServerClient>,
+        Rc<RefCell<Vec<Request>>>,
+        Rc<Cell<bool>>,
+    ) {
+        use agentz_protocol::cloud::{CloudMachine, CloudSnapshot, ProviderState, ProviderStatus};
+
+        let (mac, devbox) = two_machines(cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let fails = Rc::new(Cell::new(false));
+        let account = |provider: Provider, id: &str, name: &str, state: CloudState| ProviderState {
+            provider,
+            status: ProviderStatus::SignedIn {
+                version: "1.0.0".into(),
+                account: "me@example.com".into(),
+                rules: Default::default(),
+            },
+            machines: vec![CloudMachine {
+                id: id.into(),
+                name: name.into(),
+                state,
+                size: Default::default(),
+                template: None,
+                ssh_address: None,
+                created_at: None,
+                error: None,
+            }],
+            usage: None,
+            listed_at: Some(SystemTime::UNIX_EPOCH),
+            error: None,
+            changing: Vec::new(),
+        };
+        cx.update(|cx| {
+            mac.update(cx, |mac, cx| {
+                let requests = requests.clone();
+                let fails = fails.clone();
+                mac.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    (matches!(request, Request::ChangeCloudMachine { .. }) && !fails.get())
+                        .then_some(Response::Ok)
+                });
+                mac.set_cloud_for_test(
+                    CloudSnapshot {
+                        providers: vec![
+                            account(Provider::Instabox, "m-1", "review-box", CloudState::Paused),
+                            account(Provider::Proton, "c-1", "proton-cloud", CloudState::Stopped),
+                        ],
+                        checking: false,
+                    },
+                    cx,
+                );
+            });
+            devbox.update(cx, |devbox, cx| {
+                devbox.set_transport_for_test(Transport::Cloud {
+                    link: crate::app_settings::CloudLink {
+                        provider,
+                        machine: machine.into(),
+                    },
+                    target: None,
+                });
+                devbox.set_status_for_test(status, cx);
+            });
+        });
+        (mac, devbox, requests, fails)
+    }
+
+    fn cloud_change(provider: Provider, machine: &str, change: Lifecycle) -> Request {
+        Request::ChangeCloudMachine {
+            provider,
+            machine: machine.into(),
+            change,
+        }
+    }
+
+    /// Opening a thread on an Instabox machine that's paused resumes it, which costs nothing
+    /// (design/cloud topic 11 C), once: "Resuming…" with Cancel, which pauses it again once
+    /// Instabox is done. Once Instabox lists it paused, its Resume resumes it again.
+    #[gpui::test]
+    fn a_free_cloud_machine_starts_as_its_thread_opens(cx: &mut TestAppContext) {
+        let (mac, devbox, requests, _) = on_a_cloud_machine(
+            Provider::Instabox,
+            "m-1",
+            MachineStatus::NotRunning(CloudState::Paused),
+            cx,
+        );
+        let (_view, cx) = open_on(&devbox, 2, cx);
+        let resume = cloud_change(Provider::Instabox, "m-1", Lifecycle::Resume);
+        assert_eq!(*requests.borrow(), std::slice::from_ref(&resume));
+        assert!(cx.debug_bounds("machine-start-cancel").is_some());
+        assert!(cx.debug_bounds("machine-start").is_none());
+
+        // It looks again, still paused: it isn't asked twice.
+        devbox.update(cx, |devbox, cx| {
+            devbox.set_status_for_test(MachineStatus::NotRunning(CloudState::Paused), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(requests.borrow().len(), 1);
+
+        click_selector("machine-start-cancel", cx);
+        assert_eq!(
+            *requests.borrow(),
+            [
+                resume.clone(),
+                cloud_change(Provider::Instabox, "m-1", Lifecycle::Pause)
+            ]
+        );
+        assert!(cx.debug_bounds("machine-start-cancel").is_none());
+
+        // Listed again, it's paused, with Resume and no price.
+        mac.update(cx, |mac, cx| {
+            let mut cloud = mac.cloud().clone();
+            cloud.providers[0].listed_at = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60));
+            mac.set_cloud_for_test(cloud, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("machine-start").is_some());
+        requests.borrow_mut().clear();
+        click_selector("machine-start", cx);
+        assert_eq!(*requests.borrow(), [resume]);
+        // Resumed by hand, it has no Cancel.
+        assert!(cx.debug_bounds("machine-start-cancel").is_none());
+        assert!(cx.debug_bounds("machine-start").is_none());
+    }
+
+    /// A free machine found running when its thread opened isn't started by itself once it
+    /// stops: that was meant.
+    #[gpui::test]
+    fn a_cloud_machine_that_stops_while_its_thread_is_open_stays_so(cx: &mut TestAppContext) {
+        let (_mac, devbox, requests, _) =
+            on_a_cloud_machine(Provider::Instabox, "m-1", MachineStatus::Online, cx);
+        let (_view, cx) = open_on(&devbox, 2, cx);
+        devbox.update(cx, |devbox, cx| {
+            devbox.set_status_for_test(MachineStatus::NotRunning(CloudState::Paused), cx)
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().is_empty());
+        assert!(cx.debug_bounds("machine-start").is_some());
+    }
+
+    /// A Proton computer that's stopped charges once it starts, so its thread says so with
+    /// Start, which asks first (topic 5 C) until the account says not to; a start that fails
+    /// says why, with Start again.
+    #[gpui::test]
+    fn a_cloud_machine_that_charges_asks_before_it_starts(cx: &mut TestAppContext) {
+        let (_mac, devbox, requests, fails) = on_a_cloud_machine(
+            Provider::Proton,
+            "c-1",
+            MachineStatus::NotRunning(CloudState::Stopped),
+            cx,
+        );
+        let (view, cx) = open_on(&devbox, 2, cx);
+        let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        cx.update(|_, cx| {
+            let confirms = confirms.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::Confirm(request) = event {
+                    confirms.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+        });
+        assert!(requests.borrow().is_empty());
+        assert!(cx.debug_bounds("machine-start-cancel").is_none());
+
+        fails.set(true);
+        click_selector("machine-start", cx);
+        assert!(requests.borrow().is_empty());
+        let confirm = confirms.borrow_mut().pop().expect("Start asks first");
+        assert_eq!(confirm.title.as_ref(), "Start Devbox 1?");
+        assert!(confirm.is_charge && confirm.checkbox.is_some());
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        let start = cloud_change(Provider::Proton, "c-1", Lifecycle::Start);
+        assert_eq!(*requests.borrow(), std::slice::from_ref(&start));
+        let error = devbox.read_with(cx, |devbox, cx| {
+            devbox.cloud_start(cx).and_then(|start| start.error.clone())
+        });
+        assert_eq!(error.as_deref(), Some("not connected to This Mac"));
+        assert!(cx.debug_bounds("machine-start").is_some());
+
+        fails.set(false);
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings.set_asks_before_charging(Provider::Proton, "me@example.com", false)
+                    },
+                    cx,
+                )
+            })
+        });
+        click_selector("machine-start", cx);
+        assert!(confirms.borrow().is_empty());
+        assert_eq!(*requests.borrow(), [start.clone(), start]);
+        assert!(cx.debug_bounds("machine-start").is_none());
+    }
     /// Under 560 px, the composer's agent and account show only their icon and avatar
     /// (`design/thread-narrow`, topic 3B), and when its controls wrap, they keep to the
     /// right, so Send stays in the corner.

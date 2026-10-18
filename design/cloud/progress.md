@@ -71,9 +71,18 @@ Notes for whoever continues:
    which open it, and the row menu's Open Desktop, Save Snapshot…, Publish Port…, SSH Keys…
    and Machine Settings…. The page reads the machine again after each listing, and closes
    once the provider doesn't list it. Its actions are tested against a test server only.
-7. **Machines that are off**: messages held for a stopped machine, which start it (topic
-   11 C). The list of every remote machine's projects and threads kept on this Mac is put off
-   for later (the user, 2026-10-19). Status: not started.8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
+7. **Machines that are off** (topic 11 C): opening a thread on a cloud machine that isn't
+   running starts it where that's free (resuming or starting an Instabox machine), with
+   "Resuming review-box…" and Cancel, which puts it back once the provider is done; one that
+   charges (a Proton computer) says "proton-cloud is stopped" with Start and its price, which
+   asks topic 5's question first. Only the first look counts: a machine found running when
+   the thread opened isn't started again once it stops. The list of every remote machine's
+   projects and threads kept on this Mac, and messages held for a stopped machine, are put
+   off for later (the user, 2026-10-19). Status: done. `ServerClient::start_cloud_machine`
+   (the start is under way until the provider lists its machines again after its CLI is
+   done), the thread's notice in `agent_view.rs`, and `cloud_machines::charge_question`,
+   shared with Settings › Machines.
+8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
    not started.
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
    not started.

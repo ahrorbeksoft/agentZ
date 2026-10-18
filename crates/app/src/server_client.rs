@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
@@ -14,7 +14,7 @@ use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
 };
-use agentz_protocol::cloud::{CloudSnapshot, CloudState};
+use agentz_protocol::cloud::{CloudSnapshot, CloudState, Lifecycle};
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -97,6 +97,21 @@ pub enum MachineStatus {
     NotRunning(CloudState),
 }
 
+/// Starting or resuming a cloud machine that isn't running, through this Mac's server.
+pub struct CloudStart {
+    pub change: Lifecycle,
+    /// It started by itself, as a free machine does when one of its threads opens, so it can
+    /// be cancelled: it's put back once its provider is done.
+    pub by_itself: bool,
+    pub cancelled: bool,
+    /// Why the provider's CLI couldn't.
+    pub error: Option<SharedString>,
+    /// When the provider had last listed its machines as its CLI was done: the listing still
+    /// has the machine as it was until the next one.
+    done_at_listing: Option<Option<SystemTime>>,
+    _request: Task<()>,
+}
+
 /// Why the wait before reconnecting was cut short.
 #[derive(Debug, PartialEq)]
 enum Retry {
@@ -174,6 +189,9 @@ pub struct ServerClient {
     artifacts: Artifacts,
     /// The cloud providers its server found, and their machines: this Mac's only.
     cloud: CloudSnapshot,
+    /// What this cloud machine's provider was asked to bring it up with (design/cloud topic
+    /// 11 C), until it lists its machines again after.
+    cloud_start: Option<CloudStart>,
     /// The ids of the editors installed on the machine
     /// ([`agentz_protocol::editors::EDITORS`]), asked for of this Mac's server only.
     editors: Vec<String>,
@@ -243,6 +261,7 @@ impl ServerClient {
                 storage: Storage::default(),
                 artifacts: Artifacts::default(),
                 cloud: CloudSnapshot::default(),
+                cloud_start: None,
                 editors: Vec::new(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
@@ -406,6 +425,124 @@ impl ServerClient {
                 response => Err(anyhow!("unexpected response: {response:?}")),
             }
         })
+    }
+
+    /// The start under way, until the provider lists its machines after it, or the one that
+    /// failed.
+    pub fn cloud_start(&self, cx: &App) -> Option<&CloudStart> {
+        let start = self.cloud_start.as_ref()?;
+        let listed_since = start
+            .done_at_listing
+            .is_some_and(|listed_at| self.cloud_listed_at(cx) != listed_at);
+        (start.error.is_some() || !listed_since).then_some(start)
+    }
+
+    /// Asks this Mac's server to start or resume this cloud machine, unless that's under way.
+    pub fn start_cloud_machine(
+        &mut self,
+        change: Lifecycle,
+        by_itself: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Transport::Cloud { link, .. } = &self.transport else {
+            return;
+        };
+        let local = Machines::local(cx);
+        let changing = local
+            .read(cx)
+            .cloud()
+            .provider(link.provider)
+            .is_some_and(|state| {
+                state
+                    .changing
+                    .iter()
+                    .any(|changing| changing.machine == link.machine)
+            });
+        if changing
+            || self
+                .cloud_start(cx)
+                .is_some_and(|start| start.error.is_none())
+        {
+            return;
+        }
+        let request = local.read(cx).request(Request::ChangeCloudMachine {
+            provider: link.provider,
+            machine: link.machine.clone(),
+            change,
+        });
+        self.cloud_start = Some(CloudStart {
+            change,
+            by_itself,
+            cancelled: false,
+            error: None,
+            done_at_listing: None,
+            _request: cx.spawn(async move |this, cx| {
+                let result = request.await;
+                this.update(cx, |this, cx| this.cloud_start_done(result, cx))
+                    .ok();
+            }),
+        });
+        cx.notify();
+    }
+
+    /// Cancel, on a machine that started by itself: it's put back once its provider is done.
+    pub fn cancel_cloud_start(&mut self, cx: &mut Context<Self>) {
+        let Some(start) = &mut self.cloud_start else {
+            return;
+        };
+        if !start.by_itself || start.cancelled || start.error.is_some() {
+            return;
+        }
+        start.cancelled = true;
+        if start.done_at_listing.is_some() {
+            self.put_cloud_machine_back(cx);
+        }
+        cx.notify();
+    }
+
+    fn cloud_start_done(&mut self, result: Result<Response>, cx: &mut Context<Self>) {
+        let listed_at = self.cloud_listed_at(cx);
+        let Some(start) = &mut self.cloud_start else {
+            return;
+        };
+        start.done_at_listing = Some(listed_at);
+        match result {
+            Ok(_) if start.cancelled => self.put_cloud_machine_back(cx),
+            Ok(_) => {}
+            Err(error) => start.error = Some(format!("{error:#}").into()),
+        }
+        cx.notify();
+    }
+
+    fn put_cloud_machine_back(&self, cx: &App) {
+        let (Transport::Cloud { link, .. }, Some(start)) = (&self.transport, &self.cloud_start)
+        else {
+            return;
+        };
+        let change = match start.change {
+            Lifecycle::Resume => Lifecycle::Pause,
+            _ => Lifecycle::Stop,
+        };
+        Machines::local(cx).read(cx).send(
+            Request::ChangeCloudMachine {
+                provider: link.provider,
+                machine: link.machine.clone(),
+                change,
+            },
+            cx,
+        );
+    }
+
+    /// When this Mac's server last listed this cloud machine's provider's machines.
+    fn cloud_listed_at(&self, cx: &App) -> Option<SystemTime> {
+        let Transport::Cloud { link, .. } = &self.transport else {
+            return None;
+        };
+        Machines::local(cx)
+            .read(cx)
+            .cloud()
+            .provider(link.provider)?
+            .listed_at
     }
 
     /// Tries again now instead of waiting out the backoff, as after fixing what needed
@@ -993,6 +1130,13 @@ impl ServerClient {
         self.answer_for_test = Some(Box::new(answer));
     }
 
+    /// Reads as the connection would leave it, though a test client has no connection.
+    #[cfg(test)]
+    pub fn set_status_for_test(&mut self, status: MachineStatus, cx: &mut Context<Self>) {
+        self.status = status;
+        cx.notify();
+    }
+
     /// Reads as connected, though a test client has no connection.
     #[cfg(test)]
     pub fn set_online_for_test(&mut self, cx: &mut Context<Self>) {
@@ -1013,6 +1157,7 @@ impl ServerClient {
         self.auto_archive_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
+        self.cloud_start = None;
         self.upload_progress = None;
         self.queued_session_events = Some(Vec::new());
         self.refresh_editors(cx);

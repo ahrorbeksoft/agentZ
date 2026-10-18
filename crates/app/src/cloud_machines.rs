@@ -1,11 +1,19 @@
-//! Words and marks for cloud providers' machines (design/cloud), wherever they show.
+//! Words and marks for cloud providers' machines (design/cloud), wherever they show, and the
+//! question asked before one starts charging.
 
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CloudState, CloudUsage, Lifecycle, MachineSize, Provider,
+    Change, CloudMachine, CloudState, CloudUsage, Lifecycle, MachineSize, Provider, ProviderState,
+    ProviderStatus,
 };
+use gpui::{App, Window};
 use ui::{Color, IconName};
+
+use crate::app_settings::AppSettingsStore;
+use crate::confirm_dialog::{ConfirmCheckbox, ConfirmRequest};
+use crate::machines::Machines;
 
 /// A state as its badge says it.
 pub fn state_label(state: &CloudState) -> &str {
@@ -126,6 +134,60 @@ pub fn charge_message(charge: &str, usage: Option<&CloudUsage>) -> String {
         .map(|left| format!(" ({left})"))
         .unwrap_or_default();
     format!("It costs {charge}{balance}. Stopping it stops the charge.")
+}
+
+/// The account the provider's CLI is signed in to.
+pub fn signed_in_account(state: Option<&ProviderState>) -> Option<String> {
+    match &state?.status {
+        ProviderStatus::SignedIn { account, .. } => Some(account.clone()),
+        _ => None,
+    }
+}
+
+/// The question asked before something starts the provider's billing (topic 5 C): what it
+/// costs, the balance left, and "Don't ask again for this account". `None` once the account
+/// said not to ask.
+pub fn charge_question(
+    provider: Provider,
+    charge: &str,
+    title: String,
+    confirm_label: &'static str,
+    on_confirm: Rc<dyn Fn(&mut Window, &mut App)>,
+    cx: &App,
+) -> Option<ConfirmRequest> {
+    let local = Machines::local(cx);
+    let state = local.read(cx).cloud().provider(provider);
+    let account = signed_in_account(state);
+    let app_settings = AppSettingsStore::global(cx);
+    if account.as_ref().is_some_and(|account| {
+        app_settings
+            .read(cx)
+            .settings()
+            .charges_without_asking(provider, account)
+    }) {
+        return None;
+    }
+    let checkbox = account.map(|account| ConfirmCheckbox {
+        label: "Don’t ask again for this account".into(),
+        type_to_confirm: None,
+        on_confirm_ticked: Rc::new(move |cx| {
+            app_settings.update(cx, |store, cx| {
+                store.update(
+                    |settings| settings.set_asks_before_charging(provider, &account, false),
+                    cx,
+                )
+            })
+        }),
+    });
+    Some(ConfirmRequest {
+        icon: IconName::Coins,
+        title: title.into(),
+        message: charge_message(charge, state.and_then(|state| state.usage.as_ref())).into(),
+        confirm_label: confirm_label.into(),
+        on_confirm,
+        checkbox,
+        is_charge: true,
+    })
 }
 
 /// What the provider calls its machines, as a title ("Computer").
@@ -270,6 +332,7 @@ pub fn memory_label(used_bytes: u64, total_bytes: u64) -> String {
     let used = used_bytes as f64 / f64::from(1u32 << 30);
     format!("{used:.1} of {} GB", gib(total_bytes >> 20))
 }
+
 /// When something happened or happens: the time today, or the day and time ("Oct 19, 14:02").
 pub fn time_label(time: SystemTime, now: SystemTime) -> String {
     let time = chrono::DateTime::<chrono::Local>::from(time);

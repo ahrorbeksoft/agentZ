@@ -28,8 +28,9 @@ use super::{
 };
 use crate::app_settings::{CloudLink, MachineProfile};
 use crate::cloud_machines::{
-    MainAction, change_label, charge_message, charges, lifecycle_label, machine_summary,
-    main_action, noun_title, other_changes, provider_icon, state_color, state_label, usage_summary,
+    MainAction, change_label, charge_question, charges, lifecycle_label, machine_summary,
+    main_action, noun_title, other_changes, provider_icon, signed_in_account, state_color,
+    state_label, usage_summary,
 };
 use crate::confirm_dialog::{ConfirmCheckbox, ConfirmRequest};
 use crate::controls::{copy_to_clipboard, icon_tile, status_badge};
@@ -928,59 +929,30 @@ impl SettingsPage {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let state = Machines::local(cx)
-            .read(cx)
-            .cloud()
-            .provider(provider)
-            .cloned();
-        let account = signed_in_account(state.as_ref());
-        let asks = account.as_ref().is_none_or(|account| {
-            !self
-                .app_settings
-                .read(cx)
-                .settings()
-                .charges_without_asking(provider, account)
-        });
-        let Some(charge) = charges(provider, change).filter(|_| asks) else {
-            self.send_cloud_change(provider, machine, change, cx);
-            return;
-        };
-        let verb = lifecycle_label(change);
-        let page = cx.weak_entity();
-        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
-            icon: IconName::Coins,
-            title: format!("{verb} {name}?").into(),
-            message: charge_message(
-                charge,
-                state.as_ref().and_then(|state| state.usage.as_ref()),
-            )
-            .into(),
-            confirm_label: verb.into(),
-            on_confirm: Rc::new(move |_, cx| {
+        let on_confirm: Rc<dyn Fn(&mut Window, &mut App)> = {
+            let page = cx.weak_entity();
+            let machine = machine.clone();
+            Rc::new(move |_, cx| {
                 page.update(cx, |page, cx| {
                     page.send_cloud_change(provider, machine.clone(), change, cx)
                 })
                 .log_err();
-            }),
-            checkbox: account.map(|account| self.dont_ask_again(provider, account)),
-            is_charge: true,
-        }));
-    }
-
-    /// "Don't ask again for this account", under a question about a charge.
-    fn dont_ask_again(&self, provider: Provider, account: String) -> ConfirmCheckbox {
-        let app_settings = self.app_settings.clone();
-        ConfirmCheckbox {
-            label: "Don’t ask again for this account".into(),
-            type_to_confirm: None,
-            on_confirm_ticked: Rc::new(move |cx| {
-                app_settings.update(cx, |store, cx| {
-                    store.update(
-                        |settings| settings.set_asks_before_charging(provider, &account, false),
-                        cx,
-                    )
-                })
-            }),
+            })
+        };
+        let verb = lifecycle_label(change);
+        let question = charges(provider, change).and_then(|charge| {
+            charge_question(
+                provider,
+                charge,
+                format!("{verb} {name}?"),
+                verb,
+                on_confirm,
+                cx,
+            )
+        });
+        match question {
+            Some(question) => cx.emit(SettingsPageEvent::Confirm(question)),
+            None => self.send_cloud_change(provider, machine, change, cx),
         }
     }
 
@@ -1168,45 +1140,37 @@ impl SettingsPage {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let state = Machines::local(cx)
-            .read(cx)
-            .cloud()
-            .provider(provider)
-            .cloned();
-        let account = signed_in_account(state.as_ref());
-        let asks = account.as_ref().is_none_or(|account| {
-            !self
-                .app_settings
-                .read(cx)
-                .settings()
-                .charges_without_asking(provider, account)
-        });
-        let Some(charge) = provider.description().charge.filter(|_| asks) else {
-            self.send_cloud_create(provider, machine, cx);
-            return true;
-        };
-        let page = cx.weak_entity();
-        let title = format!("Create {}?", machine.name);
-        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
-            icon: IconName::Coins,
-            title: title.into(),
-            message: charge_message(
-                charge,
-                state.as_ref().and_then(|state| state.usage.as_ref()),
-            )
-            .into(),
-            confirm_label: "Create".into(),
-            on_confirm: Rc::new(move |_, cx| {
+        let on_confirm: Rc<dyn Fn(&mut Window, &mut App)> = {
+            let page = cx.weak_entity();
+            let machine = machine.clone();
+            Rc::new(move |_, cx| {
                 page.update(cx, |page, cx| {
                     page.send_cloud_create(provider, machine.clone(), cx)
                 })
                 .log_err();
                 dialog.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
-            }),
-            checkbox: account.map(|account| self.dont_ask_again(provider, account)),
-            is_charge: true,
-        }));
-        false
+            })
+        };
+        let question = provider.description().charge.and_then(|charge| {
+            charge_question(
+                provider,
+                charge,
+                format!("Create {}?", machine.name),
+                "Create",
+                on_confirm,
+                cx,
+            )
+        });
+        match question {
+            Some(question) => {
+                cx.emit(SettingsPageEvent::Confirm(question));
+                false
+            }
+            None => {
+                self.send_cloud_create(provider, machine, cx);
+                true
+            }
+        }
     }
 
     /// Makes the machine through its provider's CLI, and saves it once it's made, so agentZ
@@ -1318,13 +1282,6 @@ impl SettingsPage {
                 cx,
             )
         });
-    }
-}
-
-pub(super) fn signed_in_account(state: Option<&ProviderState>) -> Option<String> {
-    match &state?.status {
-        ProviderStatus::SignedIn { account, .. } => Some(account.clone()),
-        _ => None,
     }
 }
 
