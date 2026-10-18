@@ -230,3 +230,35 @@ Follow [t3code's thread snooze](https://github.com/pingdotgg/t3code/blob/main/do
 hide a thread until a chosen time, including its quota reset when known, then return it to
 the list. Keep snooze independent of archiving and automatic resume; waking a snoozed thread
 does not itself send a prompt. Persist its wake time so snooze survives app and server restarts.
+
+## Approved GPUI features
+
+Requested October 18, 2026, after reviewing the
+[GPUI release tracker](https://github.com/gpui-archipelago/gpui-release-notes/issues/3): add
+container queries, optional reduced motion and diagnostics. These APIs are already in our
+copied GPUI crates but are not wired into the app. The review was of source; runtime behavior
+and performance gains have not been verified.
+
+### Use container queries for responsive layouts
+
+Use GPUI's `container_query`
+([#60774](https://github.com/zed-industries/zed/pull/60774)) to replace the corresponding
+custom width measurement and deferred rerenders in `crates/app/src/agent_view.rs`, including
+compact headers and composers where suitable. The parent must supply the container's size;
+its contents cannot determine that size. Preserve existing responsive behavior and retain
+measurement needed for conversation scrolling and other behavior beyond layout breakpoints.
+
+### Offer optional reduced motion
+
+Expose an optional reduced-motion preference using GPUI's `reduce_motion` support
+([#60614](https://github.com/zed-industries/zed/pull/60614)). Keep it off by default, and use
+the upstream behavior for animations and animated images when enabled. Review app-owned
+animations so they honor the preference too. Preserve the existing animation frame limits.
+
+### Enable optional local performance diagnostics
+
+Wire up GPUI's profiler feature and Zed's controls for the frame-time overlay
+([#62749](https://github.com/zed-industries/zed/pull/62749)), frame and input-latency statistics,
+and hang monitoring ([#64944](https://github.com/zed-industries/zed/pull/64944)). Keep these
+developer diagnostics opt-in and local. Follow the upstream controls and verify that enabling
+diagnostics does not itself cause continuous redraws.
