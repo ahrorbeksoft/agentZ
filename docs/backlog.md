@@ -48,6 +48,8 @@ The Account added dialog shows it the same way
 ([screenshot](backlog/account-added-dialog.png), email covered): "New account", then "Its
 settings were copied from … You can rename it from its ··· menu."
 
+Adding the same account again also shows two accounts, and then one disappears.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
