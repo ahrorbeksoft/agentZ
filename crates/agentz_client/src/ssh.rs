@@ -4,7 +4,8 @@
 //! stdin and stdout.
 //!
 //! Nothing secret is stored. Authentication stays with OpenSSH: keys, the agent and
-//! `~/.ssh/config`.
+//! `~/.ssh/config`. A cloud provider's machine is reached with the options its CLI's
+//! `ssh-config` gives, passed as `-o`, so the user's config is never edited.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -14,6 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use agentz_protocol::ClientKind;
+use agentz_protocol::cloud::SshOptions;
 use anyhow::{Context as _, Result, anyhow, bail};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{
@@ -159,8 +161,9 @@ impl std::fmt::Display for SshError {
 impl std::error::Error for SshError {}
 
 impl SshError {
-    /// herdr's `saved_ssh_failure_needs_attention` and its hints.
-    pub fn classify(target: &str, error: &anyhow::Error) -> Self {
+    /// herdr's `saved_ssh_failure_needs_attention` and its hints. `command` is what reaches the
+    /// machine from a terminal, which the hints name.
+    pub fn classify(command: &str, error: &anyhow::Error) -> Self {
         let message = format!("{error:#}");
         let lowercase = message.to_lowercase();
         let host_key = [
@@ -180,12 +183,12 @@ impl SshError {
                         || lowercase.contains("agent"))));
         let hint = if host_key {
             Some(format!(
-                "agentZ checks host keys strictly. Run `ssh {target}` in a terminal to check \
+                "agentZ checks host keys strictly. Run `{command}` in a terminal to check \
                  and accept the host key, then retry."
             ))
         } else if authentication {
             Some(format!(
-                "Check that `ssh {target}` works in a terminal. If your key has a passphrase, \
+                "Check that `{command}` works in a terminal. If your key has a passphrase, \
                  add it to ssh-agent with `ssh-add`."
             ))
         } else if lowercase.contains("unsupported remote platform")
@@ -250,35 +253,92 @@ pub fn shell_quote(value: &str) -> String {
 pub struct Ssh {
     program: PathBuf,
     target: String,
+    /// `Key=Value` for `-o`, before the target in every command: a provider's `ssh-config`.
+    options: Vec<String>,
+    /// What reaches the machine from a terminal, for hints.
+    terminal_command: String,
     control_path: Option<PathBuf>,
 }
 
 impl Ssh {
     pub fn new(target: &str) -> Result<Self> {
-        let program = std::env::var_os(SSH_PROGRAM_ENV_VAR)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("ssh"));
-        Self::with_program(program, target)
+        Self::with_program(ssh_program(), target)
     }
 
     pub fn with_program(program: PathBuf, target: &str) -> Result<Self> {
         validate_target(target)?;
-        let control_path = match control_directory() {
-            Ok(directory) => Some(directory.join("%C")),
-            Err(error) => {
-                log::warn!("connecting without a shared SSH connection: {error:#}");
-                None
-            }
-        };
         Ok(Self {
             program,
             target: target.to_string(),
-            control_path,
+            options: Vec::new(),
+            terminal_command: format!("ssh {target}"),
+            control_path: shared_control_path(),
+        })
+    }
+
+    /// A machine reached with `options` rather than a target in `~/.ssh/config`. `name` stands
+    /// for it in messages, and `terminal_command` reaches it from a terminal
+    /// (`proton ssh devbox-3`).
+    pub fn with_options(name: &str, options: &SshOptions, terminal_command: &str) -> Result<Self> {
+        Self::with_program_and_options(ssh_program(), name, options, terminal_command)
+    }
+
+    pub fn with_program_and_options(
+        program: PathBuf,
+        name: &str,
+        options: &SshOptions,
+        terminal_command: &str,
+    ) -> Result<Self> {
+        validate_target(name)?;
+        validate_target(&options.host_name)?;
+        let mut all = vec![("HostName".to_string(), options.host_name.clone())];
+        all.extend(
+            options
+                .port
+                .map(|port| ("Port".to_string(), port.to_string())),
+        );
+        all.extend(options.user.clone().map(|user| ("User".to_string(), user)));
+        all.extend(options.options.iter().cloned());
+        let options = all
+            .into_iter()
+            .map(|(key, value)| {
+                anyhow::ensure!(
+                    !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric()),
+                    "{key:?} isn't an SSH option"
+                );
+                anyhow::ensure!(
+                    !value.chars().any(|character| character.is_control()),
+                    "the SSH option {key} has a line break"
+                );
+                Ok(format!("{key}={value}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            program,
+            target: name.to_string(),
+            options,
+            terminal_command: terminal_command.to_string(),
+            control_path: shared_control_path(),
         })
     }
 
     pub fn target(&self) -> &str {
         &self.target
+    }
+
+    pub fn terminal_command(&self) -> &str {
+        &self.terminal_command
+    }
+
+    /// The machine's own options, then its target: what every command ends with.
+    fn destination(&self, command: &mut tokio::process::Command) {
+        for option in &self.options {
+            command.arg("-o").arg(option);
+        }
+        command.arg(&self.target);
     }
 
     /// `ssh` with herdr's options for background commands: never prompt, check host keys
@@ -296,9 +356,9 @@ impl Ssh {
         for option in BATCH_OPTIONS {
             command.arg("-o").arg(option);
         }
+        command.arg("-T");
+        self.destination(&mut command);
         command
-            .arg("-T")
-            .arg(&self.target)
             .arg(remote_command)
             .env("SSH_ASKPASS_REQUIRE", "never")
             .env_remove("SSH_ASKPASS")
@@ -394,7 +454,8 @@ impl Ssh {
             self.target
         );
         let mut command = self.control_command(&pinned.alias);
-        command.args(["-O", "stop"]).arg(&self.target);
+        command.args(["-O", "stop"]);
+        self.destination(&mut command);
         let output = self.output(command, CONTROL_TIMEOUT).await;
         if !pinned.is_current()? {
             return Ok(true);
@@ -418,7 +479,9 @@ impl Ssh {
         if master_only {
             command.args(["-o", "ProxyCommand=false"]);
         }
-        command.arg("-T").arg(&self.target).arg("exit");
+        command.arg("-T");
+        self.destination(&mut command);
+        command.arg("exit");
         let output = self.output(command, COMMAND_TIMEOUT).await?;
         if !output.status.success() {
             bail!("{}", failure_message(&output.status, &output.stderr));
@@ -432,8 +495,8 @@ impl Ssh {
         command
             .arg("-o")
             .arg(format!("ControlPath={}", control_path.display()))
-            .arg("-G")
-            .arg(&self.target);
+            .arg("-G");
+        self.destination(&mut command);
         let output = match self.output(command, CONTROL_TIMEOUT).await {
             Ok(output) if output.status.success() => output,
             Ok(output) => {
@@ -767,11 +830,13 @@ impl Ssh {
             .control_path
             .as_ref()
             .context("there's no shared SSH connection to forward it through")?;
-        let output = tokio::process::Command::new(&self.program)
+        let mut command = tokio::process::Command::new(&self.program);
+        command
             .arg("-o")
             .arg(format!("ControlPath={}", control_path.display()))
-            .args(["-O", operation, "-L", &forward.specification()])
-            .arg(&self.target)
+            .args(["-O", operation, "-L", &forward.specification()]);
+        self.destination(&mut command);
+        let output = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -829,7 +894,7 @@ pub async fn connect(
         &on_upload_progress,
     )
     .await
-    .map_err(|error| SshError::classify(ssh.target(), &error))
+    .map_err(|error| SshError::classify(ssh.terminal_command(), &error))
 }
 
 async fn connect_inner(
@@ -936,6 +1001,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// `/tmp/agentz-ssh-<uid>`, private to this user, for the control sockets. It's `/tmp` rather
 /// than the temp directory because macOS's is too long for a socket path (herdr's
 /// `shared_ssh_control_path`).
+fn ssh_program() -> PathBuf {
+    std::env::var_os(SSH_PROGRAM_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ssh"))
+}
+
+/// The control socket, `%C` being the hash of the host, port and user ssh ends up with, so
+/// machines behind one gateway each get their own.
+fn shared_control_path() -> Option<PathBuf> {
+    match control_directory() {
+        Ok(directory) => Some(directory.join("%C")),
+        Err(error) => {
+            log::warn!("connecting without a shared SSH connection: {error:#}");
+            None
+        }
+    }
+}
+
 fn control_directory() -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -1127,7 +1210,7 @@ mod tests {
 
     #[test]
     fn sorts_failures() {
-        let classify = |message: &str| SshError::classify("devbox1", &anyhow!("{message}"));
+        let classify = |message: &str| SshError::classify("ssh devbox1", &anyhow!("{message}"));
         let refused = classify("ssh: connect to host devbox1 port 22: Connection refused");
         assert!(!refused.needs_attention);
         assert!(refused.hint.is_none());
@@ -1140,6 +1223,72 @@ mod tests {
         assert!(host_key.needs_attention);
         assert!(host_key.hint.expect("hint").contains("ssh devbox1"));
         assert!(classify("unsupported remote platform: FreeBSD amd64").needs_attention);
+    }
+
+    #[test]
+    fn a_providers_options_come_before_the_target() {
+        let options = SshOptions {
+            host_name: "ssh.proton.computer".into(),
+            port: Some(22021),
+            user: Some("ubuntu".into()),
+            options: vec![("StrictHostKeyChecking".into(), "yes".into())],
+        };
+        let ssh = Ssh::with_program_and_options(
+            "ssh".into(),
+            "proton-devbox-3",
+            &options,
+            "proton ssh devbox-3",
+        )
+        .expect("valid options");
+        let command = ssh.command("exit");
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let target = args
+            .iter()
+            .position(|arg| arg == "proton-devbox-3")
+            .expect("has the target");
+        assert_eq!(
+            args[target - 8..target],
+            [
+                "-o",
+                "HostName=ssh.proton.computer",
+                "-o",
+                "Port=22021",
+                "-o",
+                "User=ubuntu",
+                "-o",
+                "StrictHostKeyChecking=yes",
+            ]
+        );
+        assert_eq!(args.last().map(String::as_str), Some("exit"));
+        let host_key = SshError::classify(
+            ssh.terminal_command(),
+            &anyhow!("Host key verification failed."),
+        );
+        assert!(
+            host_key
+                .hint
+                .expect("hint")
+                .contains("`proton ssh devbox-3`")
+        );
+    }
+
+    #[test]
+    fn rejects_options_that_could_inject_more() {
+        let options = SshOptions {
+            host_name: "gateway".into(),
+            options: vec![("ProxyCommand".into(), "sh\nevil".into())],
+            ..Default::default()
+        };
+        assert!(Ssh::with_program_and_options("ssh".into(), "x", &options, "x").is_err());
+        let options = SshOptions {
+            host_name: "-oProxyCommand=evil".into(),
+            ..Default::default()
+        };
+        assert!(Ssh::with_program_and_options("ssh".into(), "x", &options, "x").is_err());
     }
 
     const ANSWERS: &str = "exit 0";

@@ -23,7 +23,9 @@ Notes for whoever continues:
    Status: done in its own commit ("Add the cloud crate…"). Proton's fixtures are captured
    from its CLI on this Mac; Instabox's follow its API reference.
 2. **SSH options** in `agentz_client::ssh`: a machine reached by options from a provider's
-   `ssh-config` rather than a target in `~/.ssh/config`. Status: not started.
+   `ssh-config` rather than a target in `~/.ssh/config`. Status: done in its own commit
+   ("Reach machines with a provider's SSH options"): `Ssh::with_options`, and hints that name
+   the command that works in a terminal.
 3. **Providers in this Mac's server**: `cloud.json`, detection on demand and every few minutes
    while an app is open, the protocol (a snapshot, events, requests for lifecycle changes and
    SSH options). Status: not started.
