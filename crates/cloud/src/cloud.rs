@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use agentz_protocol::cloud::{
-    CloudMachine, CloudSources, CloudUsage, CreateMachine, Lifecycle, Provider, ProviderStatus,
-    SshOptions,
+    AccountRules, CloudMachine, CloudSources, CloudUsage, CreateMachine, Lifecycle, Provider,
+    ProviderStatus, SshOptions,
 };
 use anyhow::{Context as _, Result, anyhow};
 
@@ -69,17 +69,33 @@ impl Cli {
             }
             Ok(output) => version_of(&output.stdout, self.provider.description().program),
         };
-        match self.run(&["whoami"], READ_TIMEOUT).await {
-            Ok(stdout) => match first_line(&stdout) {
-                Some(account) => ProviderStatus::SignedIn {
+        let whoami: &[&str] = match self.provider {
+            Provider::Instabox => &["whoami", "--json"],
+            Provider::Proton => &["whoami"],
+        };
+        match self.run(whoami, READ_TIMEOUT).await {
+            Ok(stdout) => match self.account(&stdout) {
+                Some((account, rules)) => ProviderStatus::SignedIn {
                     version,
-                    account: account.to_string(),
+                    account,
+                    rules,
                 },
                 None => ProviderStatus::SignedOut { version },
             },
             Err(error) if is_not_found(&error) => ProviderStatus::NotInstalled,
             Err(_) => ProviderStatus::SignedOut { version },
         }
+    }
+
+    /// Who `whoami` names, and the account's rules where it gives them.
+    fn account(&self, stdout: &str) -> Option<(String, AccountRules)> {
+        if self.provider == Provider::Instabox {
+            match instabox::parse_whoami(stdout) {
+                Ok(account) => return Some(account),
+                Err(error) => log::warn!("reading instabox whoami --json: {error:#}"),
+            }
+        }
+        first_line(stdout).map(|account| (account.to_string(), AccountRules::default()))
     }
 
     pub async fn machines(&self) -> Result<Vec<CloudMachine>> {
@@ -294,8 +310,38 @@ mod tests {
             ProviderStatus::SignedIn {
                 version: "0.1.2".into(),
                 account: "alex@example.com".into(),
+                rules: AccountRules::default(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn instabox_names_the_account_and_its_rules() {
+        let directory = tempfile::tempdir().expect("makes a folder");
+        let program = fake_cli(
+            &directory,
+            &[
+                ("--version", "instabox cbecf34a\n", "", 0),
+                (
+                    "whoami --json",
+                    include_str!("instabox_outputs/whoami.json"),
+                    "",
+                    0,
+                ),
+            ],
+        );
+        let cli = Cli::with_program(Provider::Instabox, program);
+        let ProviderStatus::SignedIn {
+            version,
+            account,
+            rules,
+        } = cli.status().await
+        else {
+            panic!("signed in");
+        };
+        assert_eq!(version, "cbecf34a");
+        assert_eq!(account, "me@example.com");
+        assert_eq!(rules.fixed_idle_pause, Some(Duration::from_secs(1800)));
     }
 
     #[tokio::test]
@@ -445,7 +491,7 @@ mod tests {
             .sources()
             .await
             .expect("reads them");
-        assert_eq!(sources.templates.len(), 2);
+        assert_eq!(sources.templates.len(), 4);
         assert_eq!(sources.snapshots.len(), 2);
         let proton = Cli::with_program(Provider::Proton, "/nonexistent/agentz-test-proton");
         assert_eq!(
@@ -463,7 +509,7 @@ mod tests {
                 ("ssh-cert agents-1", "", "", 0),
                 (
                     "ssh-config agents-1",
-                    "Host instabox-agents-1\n  HostName ssh.instabox.sh\n  Port 2222\n  User m_q4mz7tk2bx5rn3wd6vp2hj4sye\n  CertificateFile /Users/alex/.config/instabox/ssh/m_q4mz-cert.pub\n",
+                    include_str!("instabox_outputs/ssh-config.txt"),
                     "",
                     0,
                 ),
@@ -471,8 +517,18 @@ mod tests {
         );
         let cli = Cli::with_program(Provider::Instabox, program);
         let options = cli.ssh_options("agents-1").await.expect("gives options");
-        assert_eq!(options.host_name, "ssh.instabox.sh");
+        assert_eq!(options.host_name, "api.instabox.sh");
         assert_eq!(options.port, Some(2222));
+        assert_eq!(
+            options.user.as_deref(),
+            Some("m_q4mz7tk2bx5rn3wd6vp2hj4sye")
+        );
+        assert!(
+            options
+                .options
+                .iter()
+                .any(|(key, value)| key == "CertificateFile" && value.ends_with("-cert.pub"))
+        );
         assert_eq!(
             commands_run(&directory),
             ["ssh-cert agents-1", "ssh-config agents-1"]

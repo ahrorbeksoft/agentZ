@@ -1,4 +1,4 @@
-These follow Instabox's API reference (the examples on instabox.sh's docs), not captured CLI
-output: its CLI wasn't installed when they were written. Replace them with real `instabox ls
---json`, `instabox usage --json`, `instabox templates --json` and `instabox snapshot ls --json`
-outputs, personal data replaced, once it is. The templates' descriptions are made up.
+Captured from `instabox` (version `cbecf34a`) on 2026-10-18, with the account's details
+replaced: `ls --json`, `templates --json`, `usage --json`, `whoami --json` and `ssh-config`.
+`snapshots.json` isn't captured: the account had no snapshots (`snapshot ls --json` printed
+`[]`), so it follows the API reference's snapshot objects *(unverified)*.

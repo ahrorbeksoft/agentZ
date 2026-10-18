@@ -158,7 +158,18 @@ pub enum ProviderStatus {
         version: String,
         /// Who `whoami` says is signed in.
         account: String,
+        #[serde(default)]
+        rules: AccountRules,
     },
+}
+
+/// What the provider lets the account change about its machines.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountRules {
+    /// Its machines pause after this long idle, whatever they're asked.
+    pub fixed_idle_pause: Option<Duration>,
+    /// The longest timeout a machine can have.
+    pub max_timeout: Option<Duration>,
 }
 
 impl ProviderStatus {

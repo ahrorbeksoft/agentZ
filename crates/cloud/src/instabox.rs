@@ -1,12 +1,11 @@
-//! Instabox's CLI (`instabox`, a native binary). Its `--json` outputs are taken to be its API's
-//! objects, as its API reference shows them (`instabox_outputs/README.md`): the CLI wasn't
-//! installed when this was written (*unverified*).
+//! Instabox's CLI (`instabox`, a native binary). Its `--json` outputs are its API's objects
+//! (`instabox_outputs/README.md` says which fixtures were captured from it).
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use agentz_protocol::cloud::{
-    CloudMachine, CloudState, CloudTemplate, CloudUsage, CreateMachine, Lifecycle, MachineSize,
-    MachineSnapshot, MachineSource,
+    AccountRules, CloudMachine, CloudState, CloudTemplate, CloudUsage, CreateMachine, Lifecycle,
+    MachineSize, MachineSnapshot, MachineSource,
 };
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -127,6 +126,9 @@ struct TemplateEntry {
     description: Option<String>,
     #[serde(default)]
     default_spec: Option<Spec>,
+    /// Kept for machines made from it, not offered for new ones.
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Deserialize)]
@@ -136,21 +138,55 @@ enum Templates {
     List(Vec<TemplateEntry>),
 }
 
+/// The templates new machines can start from. The listing has every version of each, oldest
+/// first, and `create --template` takes the latest, so each is kept once, as that one.
 pub(crate) fn parse_templates(json: &str) -> Result<Vec<CloudTemplate>> {
     let templates: Templates = serde_json::from_str(json).context("parsing the templates")?;
     let templates = match templates {
         Templates::Page { templates } | Templates::List(templates) => templates,
     };
-    Ok(templates
-        .into_iter()
-        .map(|template| CloudTemplate {
+    let mut kept: Vec<CloudTemplate> = Vec::new();
+    for template in templates.into_iter().filter(|template| !template.hidden) {
+        let template = CloudTemplate {
             id: template.id,
             description: template
                 .description
                 .filter(|description| !description.is_empty()),
             size: size(template.default_spec.unwrap_or_default()),
-        })
-        .collect())
+        };
+        match kept.iter_mut().find(|kept| kept.id == template.id) {
+            Some(older) => *older = template,
+            None => kept.push(template),
+        }
+    }
+    Ok(kept)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Whoami {
+    login: String,
+    #[serde(default)]
+    fixed_auto_suspend_seconds: Option<u64>,
+    #[serde(default)]
+    max_timeout_seconds: Option<u64>,
+}
+
+/// `whoami --json`: who's signed in, and what the account lets its machines change.
+pub(crate) fn parse_whoami(json: &str) -> Result<(String, AccountRules)> {
+    let whoami: Whoami = serde_json::from_str(json).context("parsing whoami")?;
+    let seconds = |seconds: Option<u64>| {
+        seconds
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+    };
+    Ok((
+        whoami.login,
+        AccountRules {
+            fixed_idle_pause: seconds(whoami.fixed_auto_suspend_seconds),
+            max_timeout: seconds(whoami.max_timeout_seconds),
+        },
+    ))
 }
 
 #[derive(Deserialize)]
@@ -278,8 +314,6 @@ pub(crate) fn parse_usage(json: &str) -> Result<CloudUsage> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use agentz_protocol::cloud::MachineTimeout;
 
     use super::*;
@@ -287,10 +321,11 @@ mod tests {
     #[test]
     fn reads_the_listing() {
         let machines = parse_machines(include_str!("instabox_outputs/ls.json")).expect("parses");
-        assert_eq!(machines.len(), 2);
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].id, "m_q4mz7tk2bx5rn3wd6vp2hj4sye");
         assert_eq!(machines[0].name, "agents-1");
-        assert_eq!(machines[0].state, CloudState::Running);
-        assert_eq!(machines[0].template.as_deref(), Some("universal"));
+        assert_eq!(machines[0].state, CloudState::Paused);
+        assert_eq!(machines[0].template.as_deref(), Some("agent-browser"));
         assert_eq!(
             machines[0].size,
             MachineSize {
@@ -301,13 +336,13 @@ mod tests {
             }
         );
         assert!(machines[0].created_at.is_some());
-        assert_eq!(machines[1].state, CloudState::Paused);
+        assert_eq!(machines[0].error, None);
     }
 
     #[test]
-    fn reads_a_plain_list_too() {
+    fn reads_a_page_and_errors_too() {
         let machines = parse_machines(
-            r#"[{"id": "m_a", "name": "a", "state": "error", "error": {"code": "no_capacity", "message": "no capacity"}}]"#,
+            r#"{"machines": [{"id": "m_a", "name": "a", "state": "error", "error": {"code": "no_capacity", "message": "no capacity"}}], "nextCursor": null}"#,
         )
         .expect("parses");
         assert_eq!(machines[0].state, CloudState::Failed);
@@ -319,31 +354,50 @@ mod tests {
         assert_eq!(
             parse_usage(include_str!("instabox_outputs/usage.json")).expect("parses"),
             CloudUsage::Limits {
-                machines: 2,
+                machines: 1,
                 max_machines: Some(5),
-                snapshots: 1,
+                snapshots: 0,
                 max_snapshots: Some(10),
-                stored_bytes: Some(6442450944),
+                stored_bytes: Some(6643454),
                 max_stored_gib: Some(200),
             }
         );
     }
 
     #[test]
-    fn reads_the_templates() {
+    fn offers_each_template_once_without_the_hidden_ones() {
         let templates =
             parse_templates(include_str!("instabox_outputs/templates.json")).expect("parses");
-        assert_eq!(templates.len(), 2);
-        assert_eq!(templates[0].id, "universal");
-        assert_eq!(
-            templates[0].description.as_deref(),
-            Some("Docker, Python (uv), Node, Go and Rust")
-        );
+        let ids: Vec<&str> = templates
+            .iter()
+            .map(|template| template.id.as_str())
+            .collect();
+        assert_eq!(ids, ["herdr", "orca", "universal", "agent-browser"]);
         assert_eq!(templates[0].size.memory_mib, Some(8192));
+        assert_eq!(templates[0].description, None);
         assert_eq!(
-            parse_templates(r#"[{"id": "orca"}]"#).expect("parses")[0].description,
-            None
+            parse_templates(r#"[{"id": "orca", "description": "Orca's runtime"}]"#)
+                .expect("parses")[0]
+                .description
+                .as_deref(),
+            Some("Orca's runtime")
         );
+    }
+
+    #[test]
+    fn reads_who_is_signed_in_and_the_accounts_rules() {
+        let (account, rules) =
+            parse_whoami(include_str!("instabox_outputs/whoami.json")).expect("parses");
+        assert_eq!(account, "me@example.com");
+        assert_eq!(
+            rules,
+            AccountRules {
+                fixed_idle_pause: Some(Duration::from_secs(1800)),
+                max_timeout: Some(Duration::from_secs(4 * 3600)),
+            }
+        );
+        let (_, rules) = parse_whoami(r#"{"login": "me@example.com"}"#).expect("parses");
+        assert_eq!(rules, AccountRules::default());
     }
 
     #[test]

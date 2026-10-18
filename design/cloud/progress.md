@@ -6,14 +6,24 @@ in the same commit as your first change, and mark it done with its commit when i
 Each item is committed on its own, so `git log` and `git status` show where work stopped.
 
 Notes for whoever continues:
-- **Don't push** this work: the user asked for commits only, for now (2026-10-18).
+- **Don't push** this work: the user asked for commits only, for now (2026-10-18). It's on the
+  branch `cloud-machines`, rebased on `origin/main`; `main` stays as upstream has it.
 - Proton's CLI is installed and signed in on this Mac (`proton`, in `~/.local/bin`), with one
   computer, `devbox-3`, running: the user's `proton-cloud` machine. Only read-only commands
   may be run against it (`whoami`, `list`, `show`, `balance`, `ssh-config`): starting,
   stopping, creating or deleting a computer costs money or loses work. Test those with a fake
   `proton` on `PATH`.
-- Instabox's CLI isn't installed here, and there's no account. Its parsers follow its docs and
-  `--help`; their fixtures are *(unverified)* until someone captures real outputs.
+- Instabox's CLI is installed and signed in on this Mac too (`instabox`, in `~/.local/bin`),
+  with one machine, `devbox5`, paused. Only read-only commands may be run against it
+  (`whoami`, `ls`, `get`, `templates`, `snapshot ls`, `usage`, `port ls`, `vault ls`,
+  `keys ls`, `ssh-config`): the account has 5 machines and 10 snapshots in all, and its
+  machines hold the user's work. Its fixtures are captured from it, except snapshots' (it has
+  none). Its account pauses machines after 30 idle minutes whatever they ask
+  (`fixedAutoSuspendSeconds` in `whoami --json`), and allows timeouts up to 4 hours.
+- Instabox's HTTP API (desktop links, CPU and memory, running time) is read from its SDK,
+  `@insforge/instabox-sdk` 0.5.3: `GET /v1/machines/{id}/metrics`, `…/usage`, `POST
+  …/desktop` (`{"action": "start"}`) and `POST …/desktop/stream` (`{"viewOnly", "ttlSeconds"}`),
+  with `X-API-Key`.
 - Never sign in or out of a provider's CLI: the user does that (topic 3's note).
 
 ## Items

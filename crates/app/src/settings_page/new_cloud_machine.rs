@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use agentz_protocol::cloud::{
-    CloudSources, CloudUsage, CreateMachine, MachineSource, MachineTimeout, Provider,
+    AccountRules, CloudSources, CloudUsage, CreateMachine, MachineSource, MachineTimeout, Provider,
+    ProviderStatus,
 };
 use agentz_protocol::{Request, Response};
 use gpui::{
@@ -89,6 +90,13 @@ impl Timeout {
                 after: Duration::from_secs(minutes * 60),
                 delete,
             }),
+        }
+    }
+
+    fn is_allowed(self, rules: &AccountRules) -> bool {
+        match (self.timeout(), rules.max_timeout) {
+            (Some(timeout), Some(max)) => timeout.after <= max,
+            _ => true,
         }
     }
 }
@@ -231,6 +239,19 @@ impl NewCloudMachine {
         cx.notify();
     }
 
+    /// What the provider lets this account's machines change.
+    fn rules(&self, cx: &App) -> AccountRules {
+        match Machines::local(cx)
+            .read(cx)
+            .cloud()
+            .provider(self.provider)
+            .map(|state| &state.status)
+        {
+            Some(ProviderStatus::SignedIn { rules, .. }) => rules.clone(),
+            _ => AccountRules::default(),
+        }
+    }
+
     /// What's being read before Create can make it.
     fn is_reading(&self) -> bool {
         self._reading_sources.is_some() && self.sources.is_none()
@@ -262,11 +283,18 @@ impl NewCloudMachine {
             )),
         };
         let has_timeouts = description.capabilities.timeouts;
+        let rules = self.rules(cx);
         Ok(CreateMachine {
             name,
             source,
-            timeout: self.timeout.timeout().filter(|_| has_timeouts),
-            auto_suspend: self.idle_pause.auto_suspend().filter(|_| has_timeouts),
+            timeout: self
+                .timeout
+                .timeout()
+                .filter(|_| has_timeouts && self.timeout.is_allowed(&rules)),
+            auto_suspend: self
+                .idle_pause
+                .auto_suspend()
+                .filter(|_| has_timeouts && rules.fixed_idle_pause.is_none()),
         })
     }
 
@@ -446,12 +474,19 @@ impl NewCloudMachine {
     }
 
     fn render_timeouts(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let rules = self.rules(cx);
         let this = cx.weak_entity();
         let current = self.timeout;
+        let allowed: Vec<Timeout> = Timeout::ALL
+            .into_iter()
+            .filter(|value| value.is_allowed(&rules))
+            .collect();
         let timeout_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for (index, value) in Timeout::ALL.into_iter().enumerate() {
+            let mut is_deleting = false;
+            for value in allowed {
                 // Pausing, then deleting.
-                if index == 4 {
+                if matches!(value, Timeout::After { delete: true, .. }) && !is_deleting {
+                    is_deleting = true;
                     menu = menu.separator();
                 }
                 let this = this.clone();
@@ -493,11 +528,18 @@ impl NewCloudMachine {
             menu
         });
         let name = self.provider.description().name;
-        let idle_hint = match self.idle_pause {
-            IdlePause::Default => {
+        let idle_hint = match (rules.fixed_idle_pause, self.idle_pause) {
+            (Some(_), _) => format!(
+                "{name} sets this for your account. Idle: no agent working, no terminal use, little CPU."
+            ),
+            (None, IdlePause::Default) => {
                 format!("{name}’s default. Idle: no agent working, no terminal use, little CPU.")
             }
-            _ => "Idle: no agent working, no terminal use, little CPU.".into(),
+            (None, _) => "Idle: no agent working, no terminal use, little CPU.".into(),
+        };
+        let idle_label = match rules.fixed_idle_pause {
+            Some(after) => format!("Pause after {}", minutes_label(after.as_secs() / 60)),
+            None => self.idle_pause.label(),
         };
         h_flex()
             .gap_3()
@@ -519,9 +561,10 @@ impl NewCloudMachine {
             .child(
                 div().flex_1().min_w_0().child(render_field(
                     "When idle",
-                    DropdownMenu::new("new-cloud-machine-idle", self.idle_pause.label(), idle_menu)
+                    DropdownMenu::new("new-cloud-machine-idle", idle_label, idle_menu)
                         .style(DropdownStyle::Outlined)
                         .full_width(true)
+                        .disabled(rules.fixed_idle_pause.is_some())
                         .into_any_element(),
                     Some(idle_hint),
                 )),
@@ -820,6 +863,7 @@ mod tests {
                 let signed_in = || ProviderStatus::SignedIn {
                     version: "1.0.0".into(),
                     account: "me@example.com".into(),
+                    rules: AccountRules::default(),
                 };
                 let mut instabox = provider_state(Provider::Instabox, signed_in());
                 instabox.machines = vec![cloud_machine("m-1", "agents-1", CloudState::Running)];
@@ -967,6 +1011,52 @@ mod tests {
         let saved = saved.expect("the machine made is saved");
         assert_eq!(saved.label, "agents-2");
         assert!(saved.enabled);
+    }
+
+    /// An account whose idle pause Instabox fixes isn't asked for one, and a timeout longer
+    /// than the account allows isn't sent.
+    #[gpui::test]
+    fn keeps_to_the_accounts_rules(cx: &mut TestAppContext) {
+        let Opened { page, requests, .. } = open(cx);
+        cx.update(|cx| {
+            Machines::local(cx).update(cx, |client, cx| {
+                let mut cloud = client.cloud().clone();
+                for state in &mut cloud.providers {
+                    if let ProviderStatus::SignedIn { rules, .. } = &mut state.status {
+                        *rules = AccountRules {
+                            fixed_idle_pause: Some(Duration::from_secs(1800)),
+                            max_timeout: Some(Duration::from_secs(3600)),
+                        };
+                    }
+                }
+                client.set_cloud_for_test(cloud, cx);
+            })
+        });
+        let (dialog, cx) = cx.add_window_view(|window, cx| {
+            NewCloudMachine::new(Provider::Instabox, page.downgrade(), window, cx)
+        });
+        cx.run_until_parked();
+        dialog.update(cx, |dialog, cx| {
+            dialog.timeout = Timeout::After {
+                minutes: 240,
+                delete: false,
+            };
+            dialog.idle_pause = IdlePause::Never;
+            cx.notify();
+        });
+        let create = cx
+            .debug_bounds("new-cloud-machine-create")
+            .expect("Create is shown");
+        cx.simulate_click(create.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let made = creates(&requests);
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].1.timeout, None);
+        assert_eq!(made[0].1.auto_suspend, None);
+        assert!(!Timeout::ALL[3].is_allowed(&AccountRules {
+            fixed_idle_pause: None,
+            max_timeout: Some(Duration::from_secs(3600)),
+        }));
     }
 
     /// Making a Proton computer charges, so it asks first, with the price and the balance;

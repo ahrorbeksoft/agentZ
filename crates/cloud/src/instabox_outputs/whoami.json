@@ -1,0 +1,19 @@
+{
+  "userId": -1500,
+  "login": "me@example.com",
+  "name": "Alex Example",
+  "avatarUrl": "https://example.com/avatar.png",
+  "admin": false,
+  "allowedSpecs": [
+    {
+      "vcpus": 4,
+      "memMiB": 8192,
+      "persistentDiskGiB": 20
+    }
+  ],
+  "inviteRequired": true,
+  "activated": true,
+  "manualLifecycle": false,
+  "fixedAutoSuspendSeconds": 1800,
+  "maxTimeoutSeconds": 14400
+}

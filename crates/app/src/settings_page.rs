@@ -12298,6 +12298,7 @@ mod tests {
                     ProviderStatus::SignedIn {
                         version: "0.4.0".into(),
                         account: account.into(),
+                        rules: Default::default(),
                     },
                 );
                 proton.machines = vec![

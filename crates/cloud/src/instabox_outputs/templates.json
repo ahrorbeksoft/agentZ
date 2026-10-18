@@ -1,18 +1,513 @@
 {
   "templates": [
     {
+      "id": "base",
+      "version": "2026-10-07.1",
+      "digest": "sha256:4fba6c82715a623065754d97a176c1faabf36e15ec87e9193d560ae8c65734fc",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ],
+      "hidden": true
+    },
+    {
+      "id": "dev",
+      "version": "2026-10-07.1",
+      "digest": "sha256:b16ab416e668443b1afd6f516bd8f4051f4dbc080154a863600b9de94ab126f4",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ],
+      "hidden": true
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-07.1",
+      "digest": "sha256:d792a449e6ad8940c98e84dc872f0bbdfcdf5ed8efd547bc53956da1e3b84ab1",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-07.4",
+      "digest": "sha256:a5a11ec167f72dbc08f4b6ec2d2783ea64b3bac2e73df017451f7ccc6144ca02",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-08.2",
+      "digest": "sha256:7b20cf11fcfbe4ff501dd37d7b6911da8ee0957ed6883f7434066bb7185ec1ad",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-09.1",
+      "digest": "sha256:2916bc0ef1499294e8560d6ea8c218c3e459d5d298779acb26ecd38d6052c5a0",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "activity"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-09.2",
+      "digest": "sha256:381fd533ff84e832071418d7ad1e0e40cb144815620449d49c306d5154328099",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "activity"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-13.10",
+      "digest": "sha256:ee46c3cc75e774a868fcdb27b6dc271d8beb802b2c8c7da7e3c442537ce3b986",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "activity"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-14.1",
+      "digest": "sha256:6f810fccbc357b4e089c59ea9a78a84f528dc77704a6274bc2c35f19773f5992",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "activity"
+      ]
+    },
+    {
+      "id": "herdr",
+      "version": "2026-10-15.4",
+      "digest": "sha256:071390dc0f3d1d23669ebf3d92ef849747b47b13ae694b955b358b7cc8b6087e",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "activity",
+        "guest-user"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-07.1",
+      "digest": "sha256:41c70067159576056b15119fdd0072dfe03136ebfd6fcb73e2e7bc78f9b5ab40",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-07.4",
+      "digest": "sha256:2e052e2f8f367675af32e69df7a057951dac85160520c3c3d4812d6d490ee0ab",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-08.2",
+      "digest": "sha256:60e62ff42176d800c31cefd8a40fd6285bbb5f965ece1b14bbf5fb944d43c86d",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 6
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-09.1",
+      "digest": "sha256:1485e3f975b69120e1c39da2b71c518f95fbac22bbc452850baf2744be22b66a",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 6
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-09.2",
+      "digest": "sha256:41ac5c35085cacc75de16201948776465844408555f6945e70eb36df577b8c40",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-13.10",
+      "digest": "sha256:bd210b55dd18488035fd3e530d5ad5c9f2c0e8c4deee91b73bceca990ceb6983",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-14.1",
+      "digest": "sha256:f660317ef5e82271c45bc15b14597bd501c6f3ef128061edbc021010aa264971",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca"
+      ]
+    },
+    {
+      "id": "orca",
+      "version": "2026-10-15.4",
+      "digest": "sha256:8b3448c00dfcfe8a57e09fa5aa4da8573126a8ec7b927f7abd8af4821be3726c",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 8
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "orca",
+        "guest-user"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-08.2",
+      "digest": "sha256:7269aca9ab49ee143ee7da13defe75d57c6ca7a81a534b0a46796c8ab346517f",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-09.2",
+      "digest": "sha256:b1a32bcbe84ced5996bb351e4ff3f273d5fa2f3e101666fd32707019fa9d39ed",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-12.1",
+      "digest": "sha256:0834ea3728f1e088185ab91a7739f407f85a8f2fd71c7dfd4a41f32c8328cabd",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-13.2",
+      "digest": "sha256:f697afdeeebbdf704ca7520b5cd514305bcf27c37d4474dbe579e0a5238605c0",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
       "id": "universal",
       "version": "2026-10-13.10",
-      "description": "Docker, Python (uv), Node, Go and Rust",
+      "digest": "sha256:9a961612b78c183adf5136b603f9c2971962c9ffe201695bcab7c175f1ff7768",
       "arch": "x86_64",
-      "defaultSpec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 }
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-14.1",
+      "digest": "sha256:1cb284afb35630430f354246a7ece186ae49e709000b110954cb259f6b6a7781",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "universal",
+      "version": "2026-10-15.4",
+      "digest": "sha256:a37c5b145431119bfad61f5190a2f4ba69e6abb0fd8641fb73a772e440fa470d",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "guest-user"
+      ],
+      "preboot": true,
+      "prebootSpecs": [
+        {
+          "vcpus": 4,
+          "memMiB": 8192,
+          "persistentDiskGiB": 20
+        }
+      ]
+    },
+    {
+      "id": "agent-browser",
+      "version": "2026-10-12.1",
+      "digest": "sha256:0ea606d693dc8f570c3b3c3a2a4a981d5eb6415fdcbc34517812fa19dfce4bd1",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "agent-browser",
+      "version": "2026-10-13.2",
+      "digest": "sha256:ca6d102d5ee37b52729320ab54e1f300da67f73150e53ba9bb9c4347a5c5eb05",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
     },
     {
       "id": "agent-browser",
       "version": "2026-10-13.10",
-      "description": "universal plus Chromium and a desktop for browser agents",
+      "digest": "sha256:b870cdb7a83c3935b3732e6b90f3a2e1a6bdfa12c39917c7bf48a7792a66252a",
       "arch": "x86_64",
-      "defaultSpec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 }
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "agent-browser",
+      "version": "2026-10-14.1",
+      "digest": "sha256:0f18b53c2d230a7d8d9da6e8e7454a2d416ab0c5ebcf0b156dc13308c72deb66",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow"
+      ]
+    },
+    {
+      "id": "agent-browser",
+      "version": "2026-10-15.4",
+      "digest": "sha256:dcd05703722b04dc1ccea03264ce13ec96cb431423c9419d7394bec97f0cf52f",
+      "arch": "x86_64",
+      "defaultSpec": {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20,
+        "rootDiskGiB": 16
+      },
+      "capabilities": [
+        "identity-reset",
+        "root-grow",
+        "guest-user"
+      ],
+      "preboot": true,
+      "prebootSpecs": [
+        {
+          "vcpus": 4,
+          "memMiB": 8192,
+          "persistentDiskGiB": 20
+        }
+      ]
     }
   ]
 }

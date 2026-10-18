@@ -11391,6 +11391,7 @@ async fn finds_cloud_providers_and_changes_their_machines() {
         ProviderStatus::SignedIn {
             version: "0.1.2".into(),
             account: "alex@example.com".into(),
+            rules: Default::default(),
         }
     );
     assert_eq!(proton.machines.len(), 1);

@@ -1,7 +1,47 @@
 {
-  "machines": 2,
-  "snapshots": 1,
-  "storedBytes": 6442450944,
-  "computedAt": "2026-10-13T10:00:00Z",
-  "limits": { "maxMachines": 5, "maxSnapshots": 10, "maxStoredGiB": 200 }
+  "computedAt": "2026-10-18T18:05:16.265972Z",
+  "logicalBytes": 38654705664,
+  "storedBytes": 6643454,
+  "exclusiveBytes": 1359089,
+  "machines": 1,
+  "snapshots": 0,
+  "images": 0,
+  "limits": {
+    "maxMachines": 5,
+    "machineSpec": {
+      "vcpus": 4,
+      "memMiB": 8192,
+      "persistentDiskGiB": 20
+    },
+    "machineSpecs": [
+      {
+        "vcpus": 4,
+        "memMiB": 8192,
+        "persistentDiskGiB": 20
+      }
+    ],
+    "maxSnapshots": 10,
+    "maxStoredGiB": 200,
+    "maxImages": 10,
+    "liveSnapshots": true,
+    "vault": {
+      "maxItems": 100,
+      "maxBytes": 262144
+    }
+  },
+  "storage": {
+    "machines": [
+      {
+        "id": "m_q4mz7tk2bx5rn3wd6vp2hj4sye",
+        "name": "agents-1",
+        "state": "suspended",
+        "sizeBytes": 21474836480,
+        "diskBytes": 6643454,
+        "snapshots": 0,
+        "snapshotBytes": 0
+      }
+    ],
+    "deletedMachineSnapshots": 0,
+    "deletedMachineSnapshotBytes": 0
+  }
 }
