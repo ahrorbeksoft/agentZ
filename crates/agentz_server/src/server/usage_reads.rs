@@ -117,7 +117,8 @@ impl Server {
     }
 
     /// Reads the account now, unless a read of it is under way. A read that fails leaves the
-    /// last one; a logged-out account keeps what it had too.
+    /// last one, and says why until one works (Add Account's dialog shows it); a logged-out
+    /// account keeps what it had too.
     pub(super) fn read_account(
         &mut self,
         agent_id: &AgentId,
@@ -127,6 +128,9 @@ impl Server {
         if !self.reading_accounts.insert((agent_id.clone(), account)) {
             return;
         }
+        self.accounts.update(agent_id, |accounts| {
+            accounts.set_read_error(account, None);
+        });
         let started = Instant::now();
         let command = self.agent_command(agent_id, account, true);
         let http = self.http_client.clone();
@@ -137,13 +141,16 @@ impl Server {
             reader.read(command.await?, http, &folder?).await
         };
         let agent_id = agent_id.clone();
-        self.spawn_then(read, move |server, read| {
+        self.spawn_then(read, move |server, read: Result<Read>| {
             server.reading_accounts.remove(&(agent_id.clone(), account));
-            if let Some(read) = read
-                .with_context(|| format!("reading {agent_id}'s usage"))
-                .log_err()
-            {
-                server.keep_read(&agent_id, account, read);
+            match read {
+                Ok(read) => server.keep_read(&agent_id, account, read),
+                Err(error) => {
+                    log::error!("reading {agent_id}'s usage: {error:#}");
+                    server.accounts.update(&agent_id, |accounts| {
+                        accounts.set_read_error(account, Some(format!("{error:#}")));
+                    });
+                }
             }
             server.wait_for_limits_found(&agent_id, account, started);
         });
@@ -306,6 +313,7 @@ impl Server {
             }
         }
         self.accounts.update(agent_id, |accounts| {
+            accounts.set_read_error(account, None);
             if let Some(logged_in) = read.logged_in {
                 accounts.set_logged_in(account, logged_in);
             }

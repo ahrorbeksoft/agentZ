@@ -15,17 +15,6 @@ binding (`secondary-,` in the `Shell` context) reaching `OpenSettings` with a te
 so the cause is likely in what a real Linux keyboard sends (xkb's key and `key_char` for the
 comma while Ctrl is down). Needs a run under a real X or Wayland session.
 
-### A newly added account shows as "New account"
-
-After an account is added, the agent's Accounts list shows it as "New account", with no name
-or usage ([screenshot](backlog/new-account-row.png), Factory Droid on proton-cloud, the
-existing account's name covered). At least add a refresh button or something like it.
-
-The Account added dialog shows it the same way
-([screenshot](backlog/account-added-dialog.png), email covered): "New account", then "Its
-settings were copied from … You can rename it from its ··· menu."
-
-Adding the same account again also shows two accounts, and then one disappears.
 
 ## Features
 

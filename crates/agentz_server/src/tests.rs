@@ -3765,6 +3765,72 @@ async fn an_account_logged_in_twice_is_not_added() {
     );
 }
 
+/// A read that fails says why on the account until one works, which Refresh Usage starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_read_says_why_until_one_works() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let description = crate::AgentDescription {
+        reader: Some(mock_usage_reader(&command)),
+        ..mock_accounts()
+    };
+    let Some(server) = TestServer::start_with_description(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        description,
+    ) else {
+        return;
+    };
+    let mock = AgentId::new("mock");
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let Response::AccountAdded(account) = client.ok(Request::AddAccount(mock.clone())).await else {
+        panic!("expected an account");
+    };
+    let home = server
+        .data_dir
+        .path()
+        .join("accounts/mock")
+        .join(account.to_string());
+    std::fs::write(home.join("email"), "work@example.com").expect("give it its own login");
+    std::fs::write(home.join("usage_fails"), "").expect("make its reads fail");
+    client
+        .ok(Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(account),
+        })
+        .await;
+    let read_error = |client: &TestClient| {
+        client
+            .accounts("mock")
+            .account(account)
+            .and_then(|account| account.read_error.clone())
+    };
+    client
+        .wait_until(|client| read_error(client).is_some())
+        .await;
+    assert!(
+        read_error(&client).is_some_and(|error| error.contains("exited")),
+        "{:?}",
+        read_error(&client)
+    );
+    assert_eq!(client.accounts("mock").status(Some(account)), None);
+
+    std::fs::remove_file(home.join("usage_fails")).expect("let its reads work");
+    client
+        .ok(Request::RefreshUsage {
+            agent_id: mock,
+            account: Some(account),
+        })
+        .await;
+    client
+        .wait_until(|client| client.accounts("mock").status(Some(account)).is_some())
+        .await;
+    assert_eq!(read_error(&client), None);
+}
+
 /// Only an account Add Account made is taken for a duplicate: one listed before, whose read
 /// finds the External account's login, stays with its folder.
 #[tokio::test(flavor = "multi_thread")]

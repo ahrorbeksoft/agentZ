@@ -85,7 +85,8 @@ once that has passed, none of it is used. While all of it is, prompts fail with 
 reached", as agents' turns end at their limits. A `windows` file in MOCK_HOME (a JSON array of
 {"label", "used_percent", "resets_in", "length"}, the last two in seconds) replaces that window
 in `--usage` with those, to show several windows at different paces. An `email` file there
-gives the login that email in place of mock@example.com. A `.mock/settings.json`
+gives the login that email in place of mock@example.com, and while a `usage_fails` file is
+there, `--usage` fails (it exits with 1). A `.mock/settings.json`
 in MOCK_HOME with a list of `models` offers only those, as an organization's plan offers fewer.
 
 An `overage` file in MOCK_HOME makes it Droid-like at its limit: `--usage` then reports its
@@ -187,6 +188,9 @@ LIMIT_RESET_ATTEMPT_FILE = (os.path.join(os.environ["MOCK_HOME"], "limit_reset_a
                             if os.environ.get("MOCK_HOME") else None)
 # The email the home's login has, in place of mock@example.com.
 EMAIL_FILE = os.path.join(os.environ["MOCK_HOME"], "email") if os.environ.get("MOCK_HOME") else None
+# While it's there, `--usage` fails, as a read does when the vendor doesn't answer.
+USAGE_FAILS_FILE = (os.path.join(os.environ["MOCK_HOME"], "usage_fails")
+                    if os.environ.get("MOCK_HOME") else None)
 
 
 def stored_login():
@@ -288,6 +292,8 @@ if sys.argv[-1] == "--usage":
     if not stored_login():
         print(json.dumps({"logged_in": False}), flush=True)
         sys.exit(0)
+    if USAGE_FAILS_FILE and os.path.exists(USAGE_FAILS_FILE):
+        sys.exit(1)
     if os.environ.get("AGENTZ_LIMIT_RESET_ATTEMPT"):
         outcome = use_limit_reset(os.environ["AGENTZ_LIMIT_RESET_ATTEMPT"])
         print(json.dumps({"outcome": outcome}), flush=True)

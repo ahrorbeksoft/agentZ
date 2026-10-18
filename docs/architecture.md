@@ -525,7 +525,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   other accounts, the default one first, or Nothing), which starts the session again with
   them; then the picked method's progress in the dialog (the browser page or code, the
   terminal, the key's fields with Log In), with Back (`AgentLogin::back`) and Cancel; a failed
-  login says why with Try Again (`LoginStep::Failed`). Logged in, it's "Account added": a
+  login says why with Try Again (`LoginStep::Failed`). Logged in, an agent whose usage is read
+  waits for the account's first read ("Reading the account…"), which names it and finds a
+  login already listed; a read that fails says why (`Account::read_error`) with Try Again
+  (`Request::RefreshUsage`), and Done keeps the account. Then it's "Account added": a
   small card with the account's email, plan and limits, where its settings were copied from,
   and Done. Cancel, Escape or the backdrop remove an account that isn't logged in
   (`SettingsPage::account_dialog_closed`). The server refuses a login that's an account
@@ -1452,7 +1455,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   account that a read naming another reset moves; an app that opens later reads an account
   with a window reset since its read), so no row shows what was used before a reset; after
   each turn on the account; and on demand (`Request::RefreshUsage`). A read that fails, or finds the
-  account logged out, keeps the last numbers. Droid's reader (`Reader::DroidTerminal`,
+  account logged out, keeps the last numbers; one that fails also says why on an agentZ
+  account (`Account::read_error`), cleared as the next read starts. Droid's reader (`Reader::DroidTerminal`,
   `accounts/droid.rs`) runs its terminal UI in a terminal nobody sees
   (`accounts/hidden_terminal.rs`), in `accounts/<agent id>/reader/`, and runs `/status` and
   `/limits` there. Droid is translated, so only its symbols, numbers, emails and ids are read

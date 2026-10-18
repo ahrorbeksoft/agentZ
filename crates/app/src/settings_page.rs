@@ -5928,8 +5928,8 @@ impl SettingsPage {
     }
 
     /// Add Account's dialog by its step: the agent starting, how to log in with Copy settings
-    /// from, the login in progress or why it failed, then the account added, or the account it
-    /// turned out to be already.
+    /// from, the login in progress or why it failed, the account's first read or why it failed,
+    /// then the account added, or the account it turned out to be already.
     fn render_adding_account(
         &self,
         adding: &AddingAccount,
@@ -6006,6 +6006,51 @@ impl SettingsPage {
         let session = panel.session(Some(id));
         let state = session.map(|session| AccountState::of(session.connection.read(cx)));
         match state {
+            // It's added once its first read names it: the read also finds a login that's an
+            // account already listed.
+            Some(AccountState::LoggedIn)
+                if support.reads_usage
+                    && accounts
+                        .account(id)
+                        .is_some_and(|account| account.status.is_none()) =>
+            {
+                let read_error = accounts
+                    .account(id)
+                    .and_then(|account| account.read_error.clone());
+                let body = match read_error {
+                    Some(error) => div()
+                        .debug_selector(|| "add-account-read-failed".into())
+                        .child(centered(vec![
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::Medium)
+                                .color(Color::Error)
+                                .into_any_element(),
+                            Label::new("Couldn't read the account").into_any_element(),
+                            Label::new(error)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                            wrap(
+                                "add-account-read-retry",
+                                button("add-account-read-retry", "Try Again", ActionStyle::Outline)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.refresh_usage(Some(id), cx)
+                                    })),
+                            ),
+                        ]))
+                        .into_any_element(),
+                    None => div()
+                        .debug_selector(|| "add-account-reading".into())
+                        .child(centered(vec![
+                            spinner(Color::Muted),
+                            Label::new("Reading the account…")
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        ]))
+                        .into_any_element(),
+                };
+                return (adding_title, body, vec![done(cx)]);
+            }
             Some(AccountState::LoggedIn) => {
                 let body = self.render_account_added(id, accounts, cx);
                 return ("Account added".into(), body, vec![done(cx)]);
@@ -10490,7 +10535,7 @@ mod tests {
         assert!(cx.debug_bounds("login-method-login").is_some());
         assert!(cx.debug_bounds("login-try-again").is_none());
 
-        // 3: logged in, the account added, with its limits, and Done.
+        // 3: logged in, its first read; then why that failed, with Try Again.
         click("login-method-login", cx);
         thread.update(cx, |thread, cx| {
             thread.update_state_for_test(
@@ -10502,6 +10547,20 @@ mod tests {
                 cx,
             )
         });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("add-account-reading").is_some());
+        assert!(cx.debug_bounds("add-account-added").is_none());
+        accounts.accounts[0].read_error = Some("Factory didn't answer".into());
+        publish(&accounts, cx);
+        assert!(cx.debug_bounds("add-account-reading").is_none());
+        assert!(cx.debug_bounds("add-account-read-failed").is_some());
+        click("add-account-read-retry", cx);
+        assert!(sent(&Request::RefreshUsage {
+            agent_id: mock.clone(),
+            account: Some(AccountId(3)),
+        }));
+
+        // 4: read, the account added, with its limits, and Done.
         accounts.accounts[0] = Account {
             settings_from: SettingsSource::External,
             ..account(
@@ -10580,6 +10639,7 @@ mod tests {
                 status,
                 read_at: SystemTime::now() - Duration::from_secs(180),
             }),
+            read_error: None,
         }
     }
 

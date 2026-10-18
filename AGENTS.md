@@ -178,7 +178,8 @@ From Zed's guidelines, which this code follows:
   prompts fail with "Usage limit reached" until it resets (`resets_at` in the home sets
   when, in seconds since the epoch), and a `windows` file there (a JSON array of `label`,
   `used_percent`, `resets_in` and `length`, in seconds) replaces that window with those, for
-  several windows at different paces. An `email` file there gives its login that email in place
+  several windows at different paces. A `usage_fails` file there makes `--usage` fail, as a
+  read does when the vendor doesn't answer. An `email` file there gives its login that email in place
   of mock@example.com, and a session recorded with a history path (its argument) then loads
   only for the login that prompted it, as agents keep sessions per account. An `overage` file
   in the home (empty, `DroidCore` or

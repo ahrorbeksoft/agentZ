@@ -71,6 +71,9 @@ pub struct Account {
     pub logs_in_with_key: bool,
     #[serde(default)]
     pub status: Option<StatusRead>,
+    /// Why the last read of it failed, until a read works. Cleared while one is under way.
+    #[serde(default)]
+    pub read_error: Option<String>,
     /// The account "Copy settings from" last copied, which its card shows until it logs in.
     #[serde(default)]
     pub settings_from: SettingsSource,
@@ -409,6 +412,7 @@ impl AgentAccounts {
             logged_in: None,
             logs_in_with_key: false,
             status: None,
+            read_error: None,
             settings_from: SettingsSource::Nothing,
         });
         id
@@ -491,6 +495,14 @@ impl AgentAccounts {
                     account.status = Some(read);
                 }
             }
+        }
+    }
+
+    /// Keeps why a read of `account` failed, or `None` once one is under way or worked. The
+    /// External account keeps none, and a removed account is left removed.
+    pub fn set_read_error(&mut self, account: Option<AccountId>, error: Option<String>) {
+        if let Some(account) = account.and_then(|id| self.account_mut(id)) {
+            account.read_error = error;
         }
     }
 
