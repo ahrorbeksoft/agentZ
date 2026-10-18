@@ -4,7 +4,7 @@
 //! What it shows is read from the provider as it opens and after each listing; what it does
 //! goes through the provider's CLI on this Mac's server.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -32,18 +32,6 @@ use crate::machines::Machines;
 
 /// "When idle"'s choices, in minutes; zero never stops.
 const IDLE_STOPS: [u64; 4] = [30, 60, 240, 0];
-
-/// The keys `ssh` offers by itself. A Proton computer's `ssh-config` names none, so these are
-/// what agentZ reaches it with.
-const DEFAULT_KEYS: [&str; 7] = [
-    "id_rsa",
-    "id_ecdsa",
-    "id_ecdsa_sk",
-    "id_ed25519",
-    "id_ed25519_sk",
-    "id_xmss",
-    "id_dsa",
-];
 
 /// The machine whose page is open, and what its provider said of it.
 pub(super) struct MachinePage {
@@ -338,8 +326,8 @@ impl SettingsPage {
         .detach();
     }
 
-    /// Asks before replacing the machine's keys, and warns when agentZ's own wouldn't be
-    /// among them.
+    /// Asks before replacing the machine's keys. This Mac's server keeps agentZ's own key among
+    /// them, which agentZ reaches the machine with.
     fn confirm_replace_ssh_keys(
         &mut self,
         provider: Provider,
@@ -368,17 +356,7 @@ impl SettingsPage {
             .map(|name| name.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(", ");
-        let ssh_folder = dirs::home_dir().map(|home| home.join(".ssh"));
-        let keeps_own = keys
-            .iter()
-            .any(|key| is_own_key(key, ssh_folder.as_deref()));
-        let mut message = format!("From now on, only these keys reach it: {names}.");
-        if !keeps_own {
-            message.push_str(
-                " None of them is one of this Mac's own keys in ~/.ssh, which agentZ reaches it \
-                 with, so agentZ won't reach it anymore.",
-            );
-        }
+        let message = format!("From now on, only these keys and agentZ's own reach it: {names}.");
         let page = cx.weak_entity();
         cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
             icon: IconName::Lock,
@@ -940,8 +918,8 @@ impl SettingsPage {
             vec![render_row(
                 "SSH Keys",
                 format!(
-                    "{} lets in only the public keys it's given. agentZ reaches it with this \
-                     Mac's own keys in ~/.ssh, so keep one of them.",
+                    "{} lets in only the public keys it's given. agentZ's own key, which it \
+                     reaches the computer with, always stays among them.",
                     provider.description().name
                 ),
                 replace,
@@ -992,15 +970,6 @@ fn action_failure(action: &MachineAction) -> String {
         MachineAction::ReplaceSshKeys(_) => "Couldn't replace its SSH keys".into(),
         MachineAction::StopWhenIdle(_) => "Couldn't change when it stops".into(),
     }
-}
-
-/// One of the keys `ssh` offers by itself, in `ssh_folder`.
-fn is_own_key(key: &Path, ssh_folder: Option<&Path>) -> bool {
-    ssh_folder.is_some_and(|folder| key.parent() == Some(folder))
-        && key
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| DEFAULT_KEYS.contains(&stem))
 }
 
 #[cfg(test)]
@@ -1239,10 +1208,9 @@ mod tests {
         assert!(cx.debug_bounds("machine-page-errors").is_some());
     }
 
-    /// Replace Keys… takes public keys only, and warns when none is one of this Mac's own,
-    /// which agentZ reaches the computer with.
+    /// Replace Keys… takes public keys only, and says agentZ's own stays.
     #[gpui::test]
-    fn replacing_ssh_keys_takes_public_keys_and_warns_without_this_macs(cx: &mut TestAppContext) {
+    fn replacing_ssh_keys_takes_public_keys_and_keeps_agentzs(cx: &mut TestAppContext) {
         let Served { requests, .. } = serve(cx);
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         let confirms = confirms(&page, cx);
@@ -1266,10 +1234,9 @@ mod tests {
         replace(vec![deploy.clone()], cx);
         let confirm = confirms.borrow_mut().pop().expect("it asks first");
         assert_eq!(confirm.title.as_ref(), "Replace the SSH keys of devbox-3?");
-        assert!(
-            confirm.message.contains("agentZ won't reach it anymore"),
-            "{}",
-            confirm.message
+        assert_eq!(
+            confirm.message.as_ref(),
+            "From now on, only these keys and agentZ's own reach it: deploy.pub."
         );
         cx.update(|window, cx| (confirm.on_confirm)(window, cx));
         cx.run_until_parked();
@@ -1277,41 +1244,10 @@ mod tests {
             actions(&requests),
             [MachineAction::ReplaceSshKeys(vec![deploy])]
         );
-
-        if let Some(home) = dirs::home_dir() {
-            replace(vec![home.join(".ssh").join("id_ed25519.pub")], cx);
-            let confirm = confirms.borrow_mut().pop().expect("it asks first");
-            assert!(
-                !confirm.message.contains("won't reach it"),
-                "{}",
-                confirm.message
-            );
-        }
     }
 
     #[test]
-    fn own_keys_are_the_ones_ssh_offers_from_its_folder() {
-        let folder = Path::new("/Users/me/.ssh");
-        assert!(is_own_key(
-            Path::new("/Users/me/.ssh/id_ed25519.pub"),
-            Some(folder)
-        ));
-        assert!(is_own_key(
-            Path::new("/Users/me/.ssh/id_rsa.pub"),
-            Some(folder)
-        ));
-        assert!(!is_own_key(
-            Path::new("/Users/me/.ssh/deploy.pub"),
-            Some(folder)
-        ));
-        assert!(!is_own_key(
-            Path::new("/Users/me/keys/id_ed25519.pub"),
-            Some(folder)
-        ));
-        assert!(!is_own_key(
-            Path::new("/Users/me/.ssh/id_ed25519.pub"),
-            None
-        ));
+    fn proton_computers_have_overview_and_ssh_keys() {
         assert_eq!(
             MachineTab::of(Provider::Proton),
             [MachineTab::Overview, MachineTab::SshKeys]

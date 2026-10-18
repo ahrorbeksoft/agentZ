@@ -235,6 +235,26 @@ pub fn validate_target(target: &str) -> Result<()> {
     Ok(())
 }
 
+/// An option's value as `ssh -o` reads it: it splits the value at spaces and takes quotes and
+/// backslashes as its own, so a value with any of them is put in double quotes, escaped.
+fn option_value(value: &str) -> String {
+    let is_plain = !value
+        .chars()
+        .any(|character| character.is_whitespace() || "\"'\\#".contains(character));
+    if is_plain {
+        return value.to_string();
+    }
+    let mut quoted = String::from('"');
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Quotes a word for a POSIX shell (herdr's `shell_quote`).
 pub fn shell_quote(value: &str) -> String {
     let is_plain = !value.is_empty()
@@ -313,7 +333,7 @@ impl Ssh {
                     !value.chars().any(|character| character.is_control()),
                     "the SSH option {key} has a line break"
                 );
-                Ok(format!("{key}={value}"))
+                Ok(format!("{key}={}", option_value(&value)))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -1303,6 +1323,34 @@ mod tests {
                 .hint
                 .expect("hint")
                 .contains("`proton ssh devbox-3`")
+        );
+    }
+
+    /// `ssh` splits an option's value at spaces, and agentZ's own key is in "Application
+    /// Support".
+    #[test]
+    fn an_option_with_spaces_is_quoted() {
+        let options = SshOptions {
+            host_name: "ssh.proton.computer".into(),
+            options: vec![
+                (
+                    "IdentityFile".into(),
+                    "/Users/me/Library/Application Support/agentZ/cloud/id_ed25519".into(),
+                ),
+                ("IdentityFile".into(), "~/.ssh/id_ed25519".into()),
+                ("CertificateFile".into(), r#"/tmp/a "b\c"#.into()),
+            ],
+            ..Default::default()
+        };
+        let ssh = Ssh::with_program_and_options("ssh".into(), "x", &options, "x").expect("valid");
+        assert_eq!(
+            ssh.options,
+            [
+                "HostName=ssh.proton.computer",
+                r#"IdentityFile="/Users/me/Library/Application Support/agentZ/cloud/id_ed25519""#,
+                "IdentityFile=~/.ssh/id_ed25519",
+                r#"CertificateFile="/tmp/a \"b\\c""#,
+            ]
         );
     }
 

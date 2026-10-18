@@ -16,7 +16,7 @@ use agentz_protocol::cloud::{
     ProviderStatus, hours_of_balance,
 };
 use anyhow::{Context as _, Result, anyhow};
-use cloud::Cli;
+use cloud::{Cli, OwnKey};
 use util::ResultExt as _;
 
 use super::{ClientId, Input, Server};
@@ -46,6 +46,8 @@ pub(super) struct CloudStore {
     revision: u64,
     /// The `PATH` the CLIs are looked for on; `None` is the server's own.
     cli_path: Option<OsString>,
+    /// The key the machines are made and reached with.
+    own_key: OwnKey,
     /// An app asked, so the providers are refreshed every minute while one is open.
     watching: bool,
     status_checked_at: Option<Instant>,
@@ -73,7 +75,7 @@ struct MachineUse {
 }
 
 impl CloudStore {
-    pub(super) fn load(path: Option<PathBuf>, cli_path: Option<OsString>) -> Self {
+    pub(super) fn load(path: Option<PathBuf>, cli_path: Option<OsString>, own_key: OwnKey) -> Self {
         let mut snapshot: CloudSnapshot = path
             .as_deref()
             .and_then(|path| read_json(path).log_err().flatten())
@@ -88,6 +90,7 @@ impl CloudStore {
             path,
             revision: 0,
             cli_path,
+            own_key,
             watching: false,
             status_checked_at: None,
             reading: BTreeSet::new(),
@@ -108,7 +111,7 @@ impl CloudStore {
     }
 
     fn cli(&self, provider: Provider) -> Cli {
-        Cli::on_path(provider, self.cli_path.clone())
+        Cli::on_path(provider, self.cli_path.clone()).with_own_key(self.own_key.clone())
     }
 
     fn update<T>(&mut self, change: impl FnOnce(&mut CloudSnapshot) -> T) -> T {

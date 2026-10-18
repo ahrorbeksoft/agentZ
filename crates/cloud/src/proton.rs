@@ -2,6 +2,7 @@
 //! they are, `balance` prints text, and `start`, `restart`, `create` and `delete` ask before
 //! charging unless given `--yes`: agentZ asks in its own UI first (topic 5).
 
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use agentz_protocol::cloud::{
@@ -158,10 +159,17 @@ fn state(state: &str) -> CloudState {
     }
 }
 
-/// `create` takes the user's own key (`~/.ssh/id_ed25519.pub` by default), which the computer
-/// is reached with.
-pub(crate) fn create_args(machine: &CreateMachine) -> Vec<String> {
-    vec!["create".into(), machine.name.clone(), "--yes".into()]
+/// `create` takes one public key, the one the computer is reached with: agentZ's own, or with
+/// none the CLI's default, `~/.ssh/id_ed25519.pub` (or `id_ecdsa` or `id_rsa`).
+pub(crate) fn create_args(machine: &CreateMachine, key: Option<&Path>) -> Result<Vec<String>> {
+    let mut args = vec!["create".into(), machine.name.clone(), "--yes".into()];
+    if let Some(key) = key {
+        let key = key
+            .to_str()
+            .with_context(|| format!("{} isn't a path Proton's CLI can take", key.display()))?;
+        args.extend(["--key".to_string(), key.to_string()]);
+    }
+    Ok(args)
 }
 
 pub(crate) fn change_args(machine: &str, change: Lifecycle) -> Vec<String> {
@@ -356,10 +364,23 @@ mod tests {
     }
 
     #[test]
-    fn creating_takes_only_a_name() {
+    fn creating_gives_the_key_it_has() {
         let machine = CreateMachine {
             name: "scratch".into(),
         };
-        assert_eq!(create_args(&machine), ["create", "scratch", "--yes"]);
+        assert_eq!(
+            create_args(&machine, None).expect("has args"),
+            ["create", "scratch", "--yes"]
+        );
+        assert_eq!(
+            create_args(&machine, Some(Path::new("/data/cloud/id_ed25519.pub"))).expect("has args"),
+            [
+                "create",
+                "scratch",
+                "--yes",
+                "--key",
+                "/data/cloud/id_ed25519.pub"
+            ]
+        );
     }
 }

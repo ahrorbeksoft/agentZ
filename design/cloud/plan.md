@@ -68,9 +68,12 @@ its output. agentZ runs those commands; it never reads the CLI's login.
 - **SSH options from the CLI**: `instabox ssh-config <machine>` and `proton ssh-config <name>`
   print a Host block; agentZ passes its options to `ssh` (`-o HostName=…` and so on) and never
   edits `~/.ssh/config`. Instabox's certificate lasts a short time, so agentZ runs `instabox
-  ssh-cert <machine>` before each connection and before it runs out. Proton's computers take the
-  user's own key, given when the computer is made (`~/.ssh/id_ed25519.pub` by default), and its
-  CLI pins the host key it reports in `~/.config/proton/known_hosts`.
+  ssh-cert <machine>` before each connection and before it runs out. Proton's computers take one
+  public key when they're made (its CLI's default is `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` or
+  `id_rsa.pub`, which many Macs don't have): agentZ gives each its own key, made in the data
+  folder (`cloud/id_ed25519`) when first needed, keeps it when the keys are replaced, and adds
+  it to the SSH options (`IdentityFile`, then `ssh`'s defaults, which the option replaces).
+  Its CLI pins the host key it reports in `~/.config/proton/known_hosts`.
 - **Where it runs.** This Mac's server runs the CLIs and keeps what it learned in
   `cloud.json` (the providers' last state and the machines' last listing), so a certificate is
   renewed and an idle machine handled with the app closed. A saved machine (`MachineProfile`)

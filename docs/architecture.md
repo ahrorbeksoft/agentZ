@@ -198,6 +198,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `cloud.json` | server | The cloud providers found, their machines and usage as last listed, each machine's Stop when idle, and the notices not yet shown |
+| `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
@@ -2280,7 +2281,12 @@ parsers in the `cloud` crate; another provider follows the same two steps.
   after each.
 - **Reaching one** (`MachineProfile::cloud`, `Transport::Cloud`, `Ssh::with_options`): a saved
   machine linked to a provider's machine connects with the options the provider's
-  `ssh-config` gives (`CloudSshOptions`). An SSH machine whose address matches a provider's
+  `ssh-config` gives (`CloudSshOptions`), with agentZ's own key (`cloud::OwnKey`, in
+  `cloud/id_ed25519`) first and then the ones `ssh` offers by itself, for a machine made
+  outside agentZ. That key is made the first time a machine needs it: `create` is given it,
+  since Proton's CLI looks only for `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` and `id_rsa.pub`,
+  and replacing a machine's keys keeps it. Option values with spaces are quoted, as `ssh -o`
+  splits them. An SSH machine whose address matches a provider's
   machine is linked to it (`Machines::link_cloud_machines`). One that isn't running isn't
   dialed and shows its provider's state (`MachineStatus::NotRunning`); a thread on it says so
   in its offline notice, and it's started from Settings › Machines.
@@ -2294,7 +2300,8 @@ parsers in the `cloud` crate; another provider follows the same two steps.
   `cloud_machines::charge_question`).
 - **A machine's page** (`settings_page/cloud_machine_page.rs`; `Request::CloudMachineDetails`):
   the tabs its provider has. A Proton computer's are Overview (size, running time and what it
-  cost, last activity, and Stop when idle) and SSH Keys.
+  cost, last activity, and Stop when idle) and SSH Keys (Replace Keys…, from public key files
+  on this Mac, with agentZ's own kept).
 - **Idle machines and costs** (topic 12): the app tells this Mac's server what works on each
   provider machine (its threads that work or wait on the user, and the agents in its
   workspaces) and whether a thread, terminal or workspace of it is open

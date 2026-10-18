@@ -368,8 +368,11 @@ impl Server {
         );
         registry.refresh_if_stale();
         let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
-        let cloud =
-            cloud_requests::CloudStore::load(Some(data_dir.join("cloud.json")), config.cloud_path);
+        let cloud = cloud_requests::CloudStore::load(
+            Some(data_dir.join("cloud.json")),
+            config.cloud_path,
+            cloud::OwnKey::new(data_dir.join("cloud").join("id_ed25519")),
+        );
         let mut queues = queue_requests::Queues::load(data_dir.join("queues.json"));
         queues.retain(|thread_id| projects.thread(thread_id).is_some());
         let machine_icon = MachineIcon {

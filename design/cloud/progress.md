@@ -6,13 +6,11 @@ in the same commit as your first change, and mark it done with its commit when i
 Each item is committed on its own, so `git log` and `git status` show where work stopped.
 
 Notes for whoever continues:
-- **Don't push** this work: the user asked for commits only, for now (2026-10-18). It's on the
-  branch `cloud-machines`, rebased on `origin/main`; `main` stays as upstream has it.
-- Proton's CLI is installed and signed in on this Mac (`proton`, in `~/.local/bin`), with one
-  computer, `devbox-3`, running: the user's `proton-cloud` machine. Only read-only commands
-  may be run against it (`whoami`, `list`, `show`, `balance`, `ssh-config`): starting,
-  stopping, creating or deleting a computer costs money or loses work. Test those with a fake
-  `proton` on `PATH`.
+- Items 1–10 are merged into `main` and pushed (the user, 2026-10-19).
+- Proton's CLI is installed and signed in on this Mac (`proton`, in `~/.local/bin`); the
+  account has no computers now (2026-10-19). Only read-only commands may be run against it
+  (`whoami`, `list`, `show`, `balance`, `ssh-config`): starting, stopping, creating or
+  deleting a computer costs money or loses work. Test those with a fake `proton` on `PATH`.
 - **Instabox was dropped** (the user, 2026-10-19; item 10): its account pauses machines after
   30 idle minutes whatever they ask (`fixedAutoSuspendSeconds` in `whoami --json`, and
   `auto-suspend <machine> 0` doesn't change it), and allows timeouts up to 4 hours. On three
@@ -115,3 +113,10 @@ so the Instabox parts they name are gone.
     reachable while the app stays open: a thread on a stopped computer has the usual offline
     notice, which says it's stopped, and a stopped computer's notification has no button.
     Status: done in its own commit ("Drop Instabox…").
+11. **agentZ's own SSH key** (the user, 2026-10-19): making a computer failed with "no SSH key
+    found" on this Mac, whose keys in `~/.ssh` have other names than the three Proton's CLI
+    looks for, and agentZ reached computers only with `ssh`'s defaults. The user chose a key
+    of agentZ's own over picking one in New Computer: `cloud::OwnKey`, in `cloud/id_ed25519`,
+    made when first needed, given to `create`, kept by Replace Keys, and the first
+    `IdentityFile` of a computer's SSH options. Status: done in its own commit ("Make cloud
+    computers with agentZ's own SSH key").

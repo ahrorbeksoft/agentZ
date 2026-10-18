@@ -3,8 +3,11 @@
 //! with it; agentZ only runs it, with the login shell's environment the server already has, and
 //! never reads its login.
 
+mod own_key;
 mod proton;
 mod ssh_config;
+
+pub use own_key::OwnKey;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -30,6 +33,9 @@ pub struct Cli {
     program: PathBuf,
     /// The `PATH` it's looked for on and runs with; `None` is the server's own.
     path: Option<OsString>,
+    /// agentZ's own key, which machines are made and reached with; `None` leaves the key to
+    /// the CLI.
+    own_key: Option<OwnKey>,
 }
 
 impl Cli {
@@ -43,6 +49,7 @@ impl Cli {
             provider,
             program: program.into(),
             path: None,
+            own_key: None,
         }
     }
 
@@ -51,6 +58,13 @@ impl Cli {
         Self {
             path,
             ..Self::new(provider)
+        }
+    }
+
+    pub fn with_own_key(self, own_key: OwnKey) -> Self {
+        Self {
+            own_key: Some(own_key),
+            ..self
         }
     }
 
@@ -92,8 +106,12 @@ impl Cli {
     /// Makes a machine and waits until it's made, then gives it as the CLI lists it: its
     /// `create` doesn't print it.
     pub async fn create(&self, machine: &CreateMachine) -> Result<CloudMachine> {
+        let key = match &self.own_key {
+            Some(own_key) => Some(own_key.public_key().await?),
+            None => None,
+        };
         let args = match self.provider {
-            Provider::Proton => proton::create_args(machine),
+            Provider::Proton => proton::create_args(machine, key.as_deref())?,
         };
         self.run(&args, CHANGE_TIMEOUT).await?;
         self.machines()
@@ -111,10 +129,14 @@ impl Cli {
         self.run(&args, CHANGE_TIMEOUT).await.map(|_| ())
     }
 
-    /// How SSH reaches a running machine, from the CLI's `ssh-config`.
+    /// How SSH reaches a running machine, from the CLI's `ssh-config`, with agentZ's own key.
     pub async fn ssh_options(&self, machine: &str) -> Result<SshOptions> {
         let stdout = self.run(&["ssh-config", machine], READ_TIMEOUT).await?;
-        ssh_config::parse(&stdout)
+        let mut options = ssh_config::parse(&stdout)?;
+        if let Some(own_key) = &self.own_key {
+            options.options.extend(own_key.identity_options().await?);
+        }
+        Ok(options)
     }
 
     /// What a machine's page shows beyond its listing (topic 7 A), by the machine's id.
@@ -126,10 +148,22 @@ impl Cli {
         parse(&stdout)
     }
 
-    /// Does a page's action to a machine, by its id, and waits until it's done.
+    /// Does a page's action to a machine, by its id, and waits until it's done. Replacing its
+    /// keys keeps agentZ's own among them.
     pub async fn act(&self, machine: &str, action: &MachineAction) -> Result<()> {
+        let action = match (action, &self.own_key) {
+            (MachineAction::ReplaceSshKeys(keys), Some(own_key)) => {
+                let own = own_key.public_key().await?;
+                let mut keys = keys.clone();
+                if !keys.contains(&own) {
+                    keys.push(own);
+                }
+                MachineAction::ReplaceSshKeys(keys)
+            }
+            (action, _) => action.clone(),
+        };
         let args = match self.provider {
-            Provider::Proton => proton::action_args(machine, action)?,
+            Provider::Proton => proton::action_args(machine, &action)?,
         };
         self.run(&args, CHANGE_TIMEOUT).await.map(|_| ())
     }
@@ -399,6 +433,67 @@ mod tests {
         assert_eq!(
             commands_run(&directory),
             ["create scratch --yes", "list --json"]
+        );
+    }
+
+    /// With agentZ's own key, a machine is made with it, reached with it, and keeps it when its
+    /// keys are replaced.
+    #[tokio::test]
+    async fn machines_are_made_and_reached_with_agentzs_own_key() {
+        let directory = tempfile::tempdir().expect("makes a folder");
+        let data = tempfile::tempdir().expect("makes a folder");
+        let own_key = OwnKey::new(data.path().join("cloud").join("id_ed25519"));
+        let public = data.path().join("cloud").join("id_ed25519.pub");
+        let create = format!("create scratch --yes --key {}", public.display());
+        let keys = format!("keys c2 --key /tmp/a.pub --key {}", public.display());
+        let program = fake_cli(
+            &directory,
+            &[
+                (&create, "Creating scratch…\n", "", 0),
+                (
+                    "list --json",
+                    r#"[{"id": "c2", "name": "scratch", "state": "running"}]"#,
+                    "",
+                    0,
+                ),
+                (
+                    "ssh-config c2",
+                    include_str!("proton_outputs/ssh-config.txt"),
+                    "",
+                    0,
+                ),
+                (&keys, "", "", 0),
+            ],
+        );
+        let cli = Cli::with_program(Provider::Proton, program).with_own_key(own_key.clone());
+        cli.create(&CreateMachine {
+            name: "scratch".into(),
+        })
+        .await
+        .expect("creates");
+        assert!(public.is_file(), "the key was made");
+        let options = cli.ssh_options("c2").await.expect("has options");
+        assert!(
+            options.options.contains(&(
+                "IdentityFile".to_string(),
+                own_key.path().display().to_string()
+            )),
+            "{options:?}"
+        );
+        cli.act(
+            "c2",
+            &MachineAction::ReplaceSshKeys(vec!["/tmp/a.pub".into()]),
+        )
+        .await
+        .expect("replaces");
+        assert_eq!(
+            commands_run(&directory),
+            [
+                create.as_str(),
+                "list --json",
+                "ssh-config c2",
+                keys.as_str()
+            ]
         );
     }
 

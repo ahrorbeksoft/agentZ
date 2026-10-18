@@ -11309,7 +11309,8 @@ async fn artifacts_are_published_served_and_sent_back() {
 
 /// A fake `proton` CLI in a folder of its own: signed in as `alex@example.com`, with one
 /// computer whose state is kept in a file, so `start` and `stop` change what `list` says, and
-/// `create scratch` adds a second. A `balance` file there replaces what `balance` prints.
+/// `create scratch` with a key adds a second. A `balance` file there replaces what `balance`
+/// prints.
 #[cfg(unix)]
 fn fake_proton_cli() -> (tempfile::TempDir, std::ffi::OsString) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -11324,7 +11325,7 @@ case "$*" in
   "--version") echo "proton 0.1.2" ;;
   "whoami") echo "alex@example.com" ;;
   "list --json") printf '[{{"id": "c-1", "name": "devbox-3", "state": "%s", "vcpus": 8, "error": "", "public_ssh": {{"hostname": "ssh.proton.computer", "port": 22021, "enabled": 1}}}}%s]' "$(cat '{state}')" "$(cat '{created}' 2>/dev/null)" ;;
-  "create scratch --yes") printf ', {{"id": "c-2", "name": "scratch", "state": "running"}}' > '{created}' ;;
+  "create scratch --yes --key "*) printf ', {{"id": "c-2", "name": "scratch", "state": "running"}}' > '{created}' ;;
   "balance") cat '{balance}' 2>/dev/null || printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
   "start c-1 --yes") echo running > '{state}'; echo "  start: succeeded" >&2 ;;
   "stop c-1") echo stopped > '{state}' ;;
@@ -11359,8 +11360,9 @@ fn cloud_snapshot(client: &TestClient) -> Option<agentz_protocol::cloud::CloudSn
 /// Once an app asks, this Mac's server looks for the providers' CLIs and runs them: Proton
 /// signed in, with its computer and balance. It starts a computer through the CLI, skipping the
 /// CLI's own price question, lists it again after, and gives the computer's SSH options. It
-/// makes a computer and answers with it. A computer's page reads when it started, and replaces
-/// its SSH keys.
+/// makes a computer with agentZ's own key, made then, and answers with it. A computer's page
+/// reads when it started, and replaces its SSH keys, keeping agentZ's. Once the key is made, it
+/// reaches computers with it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn finds_cloud_providers_and_changes_their_machines() {
@@ -11478,13 +11480,31 @@ async fn finds_cloud_providers_and_changes_their_machines() {
             })
         })
         .await;
+    let own_key = server.data_dir.path().join("cloud").join("id_ed25519");
+    let own_public = server.data_dir.path().join("cloud").join("id_ed25519.pub");
+    assert!(own_public.is_file(), "agentZ's key was made");
+    let Response::SshOptions(options) = client
+        .ok(Request::CloudSshOptions {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+        })
+        .await
+    else {
+        panic!("not SSH options");
+    };
+    assert_eq!(
+        options.options.first(),
+        Some(&("IdentityFile".to_string(), own_key.display().to_string()))
+    );
     let log = std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
     assert!(log.lines().any(|line| line == "start c-1 --yes"), "{log}");
-    assert!(
-        log.lines().any(|line| line == "create scratch --yes"),
-        "{log}"
+    let made = format!("create scratch --yes --key {}", own_public.display());
+    assert!(log.lines().any(|line| line == made), "{log}");
+    let replaced = format!(
+        "keys c-1 --key {} --key {}",
+        key.display(),
+        own_public.display()
     );
-    let replaced = format!("keys c-1 --key {}", key.display());
     assert!(log.lines().any(|line| line == replaced), "{log}");
     // Kept for after a restart.
     let saved = std::fs::read_to_string(server.data_dir.path().join("cloud.json"))
