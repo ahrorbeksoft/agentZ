@@ -45,14 +45,6 @@ Requested October 18, 2026: add all five groups from the upstream review. The re
 our October 1 Zed reference (`57bfce2945`) with upstream through October 17 (`56934ec056`),
 245 newer commits. These are source findings; the failures have not been reproduced in agentZ.
 
-### Update rustls for the TLS handshake security fix
-
-Update rustls to at least 0.23.45, as Zed did in
-[#65221](https://github.com/zed-industries/zed/pull/65221). Our lockfile has 0.23.40, within the
-affected range for a moderate TLS 1.3 handshake vulnerability
-([advisory](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)). Prioritize
-this before the other upstream work.
-
 ### Update ACP and support session notices, compaction and v2 sessions
 
 Upstream uses SDK 3.4.0
