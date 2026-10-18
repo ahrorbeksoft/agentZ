@@ -27,8 +27,8 @@ Object.assign(ICONS, {
 // Proton account with two computers. proton-cloud is the SSH machine already saved today,
 // linked to the Proton computer devbox-3.
 const PROVIDERS = {
-  ib: { name: 'Instabox', account: 'alex@hey.com', via: 'API key', usage: '2 of 5 machines · 1 of 10 snapshots · 14 of 200 GB', price: 'Free during the beta', short: 'Free' },
-  pr: { name: 'Proton', account: 'alex@hey.com', via: 'Proton login', usage: '$14.20 left · 31 h running this month', price: '$20 a month while running, billed by the second', short: '$20/mo while running' },
+  ib: { name: 'Instabox', account: 'alex@hey.com', via: 'the instabox CLI', usage: '2 of 5 machines · 1 of 10 snapshots · 14 of 200 GB', price: 'Free during the beta', short: 'Free' },
+  pr: { name: 'Proton', account: 'alex@hey.com', via: 'the proton CLI', usage: '$14.20 left · 31 h running this month', price: '$20 a month while running, billed by the second', short: '$20/mo while running' },
 };
 const MACHINES = {
   agents: { name: 'agents-1', p: 'ib', state: 'running', what: 'universal · 4 vCPUs · 8 GB · 20 GB' },
@@ -169,67 +169,99 @@ TOPICS.push({
       good: 'Accounts and money get their own page.', cost: 'Two pages show the same machines; a new section in the nav.',
       mock: () => settingsWindow(page('Cloud', [
         `<div class="col" style="gap:10px">${sectionHead('Accounts', headAction('Add Account'))}${['ib', 'pr'].map((p) => card([
-          machineRow({ name: PROVIDERS[p].name, lead: mark(p), sub: `${PROVIDERS[p].account} · signed in with ${PROVIDERS[p].via === 'API key' ? 'an API key' : 'Proton'}`, right: `${link(p === 'pr' ? 'Add Credit' : 'Dashboard')}${ibtn('more')}` }),
+          machineRow({ name: PROVIDERS[p].name, lead: mark(p), sub: `${PROVIDERS[p].account} · signed in with ${PROVIDERS[p].via}`, right: `${link(p === 'pr' ? 'Add Credit' : 'Dashboard')}${ibtn('more')}` }),
           `<div class="row sm" style="padding:10px 16px;gap:24px"><span class="mu">${PROVIDERS[p].usage}</span><span class="grow"></span><span class="mu">${PROVIDERS[p].price}</span></div>`,
           ...Object.values(MACHINES).filter((m) => m.p === p).map((m) => `<div class="row g3" style="padding:9px 16px 9px 56px"><span class="grow trunc">${m.name}</span>${stateText(m.state)}<span class="sm mu" style="width:70px;text-align:right">${m.p === 'pr' ? (m.state === 'running' ? '$0.09 today' : '—') : ''}</span></div>`),
           `<div class="row g1 sm mu" style="padding:9px 16px 9px 56px">${ic('plus', 'xs')}${p === 'pr' ? 'New Computer' : 'New Machine'}</div>`,
         ])).join('')}</div>`,
       ].join('')), { selected: 'Cloud', extraNav: [['Cloud', 'cloud']] }) },
     { key: 'C', name: 'Machines grouped by provider', from: 'new',
-      desc: 'Machines keeps This Mac and SSH machines as today, then one group per provider account. A group’s header has the provider’s mark and name, the account, its usage (Proton’s balance and hours, Instabox’s counts against its limits), the provider’s page (Add Credit, Dashboard) and New Machine; the account’s menu has Sign Out. Its machines are its rows.',
+      desc: 'Machines keeps This Mac and SSH machines as today, then one group per provider account. A group’s header has the provider’s mark and name, the account, its usage (Proton’s balance and hours, Instabox’s counts against its limits), the provider’s page (Add Credit, Dashboard) and New Machine. Its machines are its rows; providers not set up are listed under the groups (topic 2).',
       good: 'Each machine sits under the account it uses and bills to; nothing new in the nav.', cost: 'A longer page with three accounts or more.',
       mock: () => settingsWindow(page('Machines', groupedMachines())) },
     { key: 'D', name: 'Accounts behind the rows only', from: 'new',
-      desc: 'No account list at all. Signing in happens the first time a cloud machine is added, and a row’s menu holds its account: “Instabox account: alex@hey.com”, Sign Out. Usage shows on each machine’s own page.',
+      desc: 'No account list at all. Providers show only in Add Machine, and a row’s menu names the account its provider’s CLI is signed in as. Usage shows on each machine’s own page.',
       good: 'The least UI.', cost: 'No place to see what an account costs or how close it is to its limits; signing out is hidden in a machine’s menu.',
-      mock: () => settingsWindow(page('Machines', section('Machines', [macRow(), devboxRow(), ...[MACHINES.agents, MACHINES.review].map((m) => cloudRow(m)), cloudRow(MACHINES.proton, { menu: menuList([['lbl', 'Proton account: alex@hey.com'], ['external', 'Add Credit'], ['logout', 'Sign Out'], 'hr', ['stop', 'Stop'], ['restart', 'Restart'], ['copy', 'Copy SSH Command'], 'hr', ['trash', 'Delete Computer…', { danger: true }]], 'top:44px;right:40px', 230) }), cloudRow(MACHINES.scratch)], headAction('Add Machine')))) },
+      mock: () => settingsWindow(page('Machines', section('Machines', [macRow(), devboxRow(), ...[MACHINES.agents, MACHINES.review].map((m) => cloudRow(m)), cloudRow(MACHINES.proton, { menu: menuList([['lbl', 'proton CLI: alex@hey.com'], ['external', 'Add Credit'], 'hr', ['stop', 'Stop'], ['restart', 'Restart'], ['copy', 'Copy SSH Command'], 'hr', ['trash', 'Delete Computer…', { danger: true }]], 'top:44px;right:40px', 230) }), cloudRow(MACHINES.scratch)], headAction('Add Machine')))) },
   ],
 });
 
-// 2. Signing in -----------------------------------------------------------------------------------
-const instaboxKey = (key = 'ibk_••••••••••••••••7Q2m') => dialog('Sign In to Instabox', [
-  field('API key', input(key, { focus: true }), `Make one on Instabox’s API Keys page, or with <code>instabox keys create</code>. A full-access key, or one with <code>machines:write</code>, <code>machines:delete</code> and the <code>images</code> scopes.`),
-  `<div class="row">${link('Open API Keys')}</div>`,
-].join(''), `${gbtn('Cancel')}${pbtn('Sign In')}`, { sub: 'agentZ keeps the key on this Mac and uses it for your machines there.', foot: '' });
-const protonCode = () => dialog('Sign In to Proton', [
-  `<div class="col" style="gap:10px;align-items:center;padding:6px 0 2px"><span class="sm mu">Continue in your browser. Check that it shows this code:</span><span style="font:600 22px/1 'IBM Plex Mono';letter-spacing:3px">KQ7M-4XRD</span><span class="row g2 sm mu">${spinner}Waiting for you to approve it…</span></div>`,
-  `<div class="row g2" style="justify-content:center">${obtn(`${ic('copy', 'xs')}Copy Link`)}${obtn(`${ic('external', 'xs')}Open Again`)}</div>`,
-].join(''), `${gbtn('Cancel')}`, { sub: 'Proton signs agentZ in as its CLI does, with a code. Your Proton password stays in your browser.', foot: 'The code expires in 10 minutes.' });
+// 2. Providers that aren't set up -----------------------------------------------------------------
+// The user's real state for these two topics: Proton's CLI signed in, Instabox's not installed.
+const DESCRIBED = {
+  ib: { pitch: 'Linux machines for agents: pause and resume, snapshots, public ports, a desktop.', price: 'Free during the beta', install: 'curl -fsSL https://api.instabox.sh/install.sh | sh', code: 'Invite code 482913', codeNote: 'New Instabox accounts need an invite code. Example: neither provider gives agentZ a code yet.' },
+  pr: { pitch: 'One persistent Linux computer, with Claude Code, Codex and Docker installed.', price: '$20 a month while running', install: 'curl -fsSL https://app.proton.computer/install.sh | sh' },
+};
+const codeChip = (text) => `<span class="row g1 xs none" style="height:20px;padding:0 7px;border-radius:5px;border:1px dashed var(--ok);color:var(--ok)">${ic('ticket', 'xs')}${text}</span>`;
+Object.assign(ICONS, { ticket: '<path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2"/><path d="M13 17v2"/><path d="M13 11v2"/>' });
+const installBox = (command) => `<span class="row g2" style="height:28px;padding:0 6px 0 10px;border-radius:6px;background:var(--term);border:1px solid var(--bv);font:12px 'IBM Plex Mono';color:#c8ccd4;min-width:0"><span class="grow trunc">${command}</span>${ibtn('copy', 'sm')}</span>`;
+const notInstalledRow = (p, { code = true } = {}) => `<div class="row g3" style="padding:12px 16px;align-items:flex-start">${mark(p)}<div class="col grow" style="gap:3px;min-width:0"><span class="row g2"><span>${PROVIDERS[p].name}</span>${tag('Not installed')}${code && DESCRIBED[p].code ? codeChip(DESCRIBED[p].code) : ''}</span><span class="sm mu">${DESCRIBED[p].pitch} ${DESCRIBED[p].price}.</span></div><span class="row g2 none">${obtn(`${ic('copy', 'xs')}Copy Install Command`)}${link('Learn More')}</span></div>`;
+const signedOutRow = (p) => `<div class="row g3" style="padding:12px 16px">${mark(p)}<div class="col grow" style="gap:3px;min-width:0"><span class="row g2"><span>${PROVIDERS[p].name}</span>${tag('Signed out', 'warn')}</span><span class="sm mu">The <code>${p === 'ib' ? 'instabox' : 'proton'}</code> CLI is installed, but not signed in.</span></div><span class="row g2 none">${obtn('Sign In…')}${link('Learn More')}</span></div>`;
+const realMachines = (more) => settingsWindow(page('Machines', [
+  section('This Mac and SSH', [macRow(), devboxRow()], headAction('Add Machine')),
+  `<div class="col" style="gap:10px">${providerHead('pr')}${card([cloudRow(MACHINES.proton, { showProvider: false })])}</div>`,
+  more,
+].join('')));
 
 TOPICS.push({
-  id: 'sign-in', section: 'Settings', title: 'Signing in to a provider', size: 'wide', rec: 'A',
-  now: 'There’s nothing to sign in to: agentZ reaches a cloud computer as an SSH target, with the key in <code>~/.ssh</code>. Instabox signs programs in with an API key (<code>ibk_…</code>); its CLI signs people in through the browser. Proton has no API keys: its CLI signs in with a code it shows, approved in the browser (<code>proton login</code>), and keeps the token in <code>~/.config/proton/credentials.json</code>. You’re signed in there already.',
+  id: 'providers', section: 'Settings', title: 'Providers that aren’t set up', size: 'wide', rec: 'A',
+  now: 'agentZ knows no providers. On this Mac, Proton’s CLI (<code>proton</code>, in <code>~/.local/bin</code>) is installed and signed in as your account, and Instabox’s isn’t installed. Neither provider has a referral program today; Instabox needs an invite code for a new account (6 digits, from its admins; <code>instabox login --invite-code</code>), so a code they give agentZ would show here. Settings › Agents lists the registry’s agents that aren’t installed, each with Install.',
   options: [
-    { key: 'A', name: 'agentZ’s own sign-in, each the provider’s way', from: 'Instabox docs, Proton CLI',
-      desc: 'Add Account (or the first New Machine) asks which provider. <b>Instabox</b> asks for an API key, with a link to its API Keys page and the scopes it needs. <b>Proton</b> opens its sign-in page in the browser and shows the code to compare, with Copy Link and Open Again, as <code>proton login</code> does; it closes by itself once approved. agentZ keeps each credential in its data directory (mode 0600), as API-key accounts keep theirs.',
-      good: 'Works without the vendors’ CLIs; signing out in agentZ doesn’t sign the CLI out.', cost: 'You sign in to Proton a second time, beside the CLI.',
-      mock: () => frame(`<div class="row" style="height:100%;gap:0">${['ib', 'pr'].map((p) => `<div style="position:relative;flex:1;height:100%;border-right:1px solid var(--b)">${p === 'ib' ? instaboxKey() : protonCode()}</div>`).join('')}</div>`, { w: 1100, h: 460 }) },
-    { key: 'B', name: 'A, but use the CLI’s login when there is one', from: 'new',
-      desc: 'As A, but when the provider’s CLI is signed in on this Mac (<code>~/.config/proton/credentials.json</code>), agentZ offers it first: “Your Proton CLI is signed in as alex@hey.com. Use It, or Sign In Separately.” Using it means agentZ reads the CLI’s token and stays signed in as long as the CLI is; <code>proton logout</code> signs agentZ out too.',
-      good: 'One click when the CLI is set up already.', cost: 'agentZ reads another program’s login, which it doesn’t do for agents; the CLI and agentZ come and go together.',
-      mock: () => frame(dialog('Sign In to Proton', [
-        `<div class="card row g3" style="padding:12px 14px;background:none">${mark('pr', 28)}<div class="col grow" style="gap:2px"><span>Your Proton CLI is signed in</span><span class="sm mu">alex@hey.com · ~/.config/proton/credentials.json</span></div></div>`,
-        `<span class="sm mu" style="line-height:1.5">agentZ would use the CLI’s login, and sign out when it does.</span>`,
-      ].join(''), `${gbtn('Cancel')}${obtn('Sign In Separately')}${pbtn('Use It')}`), { w: 620, h: 360 }) },
-    { key: 'C', name: 'Inline on the page', from: 'new',
-      desc: 'With no account yet, Machines shows a tile per provider (its mark, one line on what it is and costs) with Connect. Connect opens the tile in place: Instabox’s key field, or Proton’s code with “Waiting…”. No dialog.',
-      good: 'The providers are visible before you sign in to any.', cost: 'Tiles for providers you may never use stay on the page until you dismiss them.',
-      mock: () => settingsWindow(page('Machines', [
-        section('Machines', [macRow(), devboxRow()], headAction('Add Machine')),
-        `<div class="col" style="gap:10px">${sectionHead('Cloud')}<div class="row g3" style="align-items:stretch">${[
-          `<div class="card col" style="flex:1;padding:14px;gap:10px"><div class="row g2">${mark('ib', 22)}<span class="b5">Instabox</span><span class="grow"></span>${tag('Free')}</div><span class="sm mu" style="line-height:1.5">Linux machines for agents: 4 vCPUs, 8 GB, 20 GB. Pause and resume, snapshots, a desktop.</span>${field('API key', input('ibk_…', { ph: true, focus: true }))}<div class="row g2">${link('Make a key')}<span class="grow"></span>${gbtn('Cancel')}${pbtn('Connect')}</div></div>`,
-          `<div class="card col" style="flex:1;padding:14px;gap:10px"><div class="row g2">${mark('pr', 22)}<span class="b5">Proton</span><span class="grow"></span>${tag('$20/mo while running')}</div><span class="sm mu" style="line-height:1.5">One persistent Linux computer: 4 vCPUs, 2–64 GB, 50 GB, Ubuntu 24.04 with Claude Code and Codex.</span><span class="grow"></span><div class="row g2"><span class="grow"></span>${obtn('Connect')}</div></div>`,
-        ].join('')}</div></div>`,
-      ].join(''))) },
+    { key: 'A', name: 'Rows under the providers, as agents to install', from: 'Settings › Agents',
+      desc: 'Under the provider groups, <b>More Providers</b> lists each provider whose CLI agentZ didn’t find: its mark, name and “Not installed”, one line on what it is and its price, agentZ’s code when there is one, then Copy Install Command and Learn More. A provider whose CLI is installed but signed out shows “Signed out” with Sign In… (topic 3). Once signed in, it becomes a group with its machines.',
+      good: 'Every provider is one place, in one of three clear states.', cost: 'A provider you’ll never use stays listed (its menu has Hide).',
+      mock: () => `<div class="col" style="gap:14px">${realMachines(section('More Providers', [notInstalledRow('ib')]))}${piece(`<div style="padding:0 16px 16px">${caption('The same row once its CLI is installed, before signing in')}${card([signedOutRow('ib')])}</div>`, 1100)}</div>` },
+    { key: 'B', name: 'Tiles, with the install command', from: 'new',
+      desc: 'Each provider not set up is a tile at the bottom of Machines: its mark and name, what it is, its price, agentZ’s code, the install command in a box with Copy, and Learn More. A signed-out one’s tile has Sign In… instead of the command.',
+      good: 'The command is right there to copy; a code stands out.', cost: 'Tiles take more room than rows, and grow with every provider added.',
+      mock: () => realMachines(`<div class="col" style="gap:10px">${sectionHead('More Providers')}<div class="row g3" style="align-items:stretch">${[
+        `<div class="card col" style="flex:1;padding:14px;gap:10px;min-width:0"><div class="row g2">${mark('ib', 22)}<span class="b5">Instabox</span><span class="grow"></span>${tag(DESCRIBED.ib.price)}</div><span class="sm mu" style="line-height:1.5">${DESCRIBED.ib.pitch}</span>${codeChip(DESCRIBED.ib.code)}${installBox(DESCRIBED.ib.install)}<div class="row">${link('Learn More')}</div></div>`,
+        `<div class="card col" style="flex:1;padding:14px;gap:10px;border-style:dashed;background:none;align-items:center;justify-content:center"><span class="sm ph" style="text-align:center;line-height:1.5">Providers added later show here.</span></div>`,
+      ].join('')}</div></div>`) },
+    { key: 'C', name: 'Only in Add Machine', from: 'new',
+      desc: 'Machines shows only the providers that are signed in. Add Machine’s list of kinds (topic 4) shows every provider with its state: signed in (its account), signed out (Sign In…), or not installed (Learn More, Copy Install Command, agentZ’s code).',
+      good: 'Machines stays about your machines.', cost: 'A provider you haven’t set up is found only by starting to add a machine.',
+      mock: () => frame(dialog('Add Machine', [
+        ['server', null, 'SSH machine', 'A machine you already reach with ssh.', ''],
+        [null, 'pr', 'Proton', 'alex@hey.com · $20/mo while running', ''],
+        [null, 'ib', 'Instabox', DESCRIBED.ib.pitch, 'install'],
+      ].map(([icon, p, name, line, state]) => `<div class="card row g3" style="padding:10px 12px;background:none;align-items:flex-start">${p ? mark(p, 26) : `<span style="width:26px;display:inline-grid;place-items:center" class="mu">${ic(icon, 'lg')}</span>`}<div class="col grow" style="gap:4px;min-width:0"><span class="row g2">${name}${state ? tag('Not installed') : ''}</span><span class="sm mu">${line}</span>${state ? `<span class="row g2" style="margin-top:4px">${codeChip(DESCRIBED.ib.code)}<span class="grow"></span>${obtn(`${ic('copy', 'xs')}Copy Install Command`)}${link('Learn More')}</span>` : ''}</div></div>`).join(''), gbtn('Cancel'), { w: 560 }), { w: 700, h: 470 }) },
   ],
 });
 
-// 3. Adding a machine -------------------------------------------------------------------------------
+// 3. Signing in with the CLI --------------------------------------------------------------------------
+const loginTerminal = (lines) => `<div class="term" style="border-radius:6px;border:1px solid var(--bv);flex:none;height:auto;padding:8px 10px">${lines.join('\n')}</div>`;
+const LOGIN_LINES = [
+  `${C('tg', '$')} instabox login`,
+  'Opening your browser to sign in to Instabox…',
+  `If it didn’t open: ${C('tc', 'https://api.instabox.sh/auth/cli/start?…')}`,
+  `${C('faint', 'Waiting for you to confirm in the browser…')}`,
+];
+TOPICS.push({
+  id: 'sign-in', section: 'Settings', title: 'Signing in with the provider’s CLI', size: 'wide', rec: 'A',
+  now: 'An agent that logs in from a terminal (Settings › Agents) runs its login command in a terminal shown under its login buttons, and agentZ checks the login when it ends. Instabox’s CLI signs in with <code>instabox login</code> (the browser, GitHub or Google; <code>--device</code> without a browser; <code>--invite-code</code> for a new account), Proton’s with <code>proton login</code> (a code to approve in the browser). The mock’s output is illustrative.',
+  options: [
+    { key: 'A', name: 'Its login runs under the row', from: 'agents’ terminal logins',
+      desc: 'Sign In… opens a terminal under the provider’s row running its login command (with agentZ’s invite code where the provider takes one), as an agent’s terminal login does under its buttons. When it ends, agentZ runs <code>whoami</code>: signed in, the row becomes the provider’s group; otherwise it says what the CLI said. Cancel ends it.',
+      good: 'The CLI does its own login, in full view, with no window to find.', cost: 'A terminal in Settings.',
+      mock: () => piece(`<div style="padding:16px">${card([signedOutRow('ib').replace(obtn('Sign In…'), gbtn('Cancel')), `<div style="padding:0 16px 14px 56px">${loginTerminal(LOGIN_LINES)}</div>`])}</div>`, 720) },
+    { key: 'B', name: 'Copy the command', from: 'new',
+      desc: 'Sign In… shows the command (<code>instabox login</code>) with Copy, to run in any terminal. agentZ checks <code>whoami</code> every few seconds while the row shows it, and moves on once it answers.',
+      good: 'Nothing new in agentZ; works with any terminal.', cost: 'You leave agentZ to sign in.',
+      mock: () => piece(`<div style="padding:16px">${card([signedOutRow('ib').replace(obtn('Sign In…'), gbtn('Cancel')), `<div class="col" style="padding:0 16px 14px 56px;gap:8px"><span class="sm mu">Run this in a terminal, then come back:</span>${installBox('instabox login')}<span class="row g2 xs ph">${spinner}Waiting for the CLI to be signed in…</span></div>`])}</div>`, 720) },
+    { key: 'C', name: 'A pane in Workspaces', from: 'new',
+      desc: 'Sign In… opens a new tab in the Workspaces view running the login command, and switches to it. Settings says “Signing in, in Workspaces” until <code>whoami</code> answers.',
+      good: 'A full terminal, where agentZ’s terminals live.', cost: 'You leave Settings, and the tab stays after.',
+      mock: () => win(main(tabBar([['instabox login', 'working']], { active: 0 }), pane({ title: 'instabox login', detail: '~', focus: true, body: LOGIN_LINES.slice(1).map((line) => line) })), { w: 900, h: 300 }) },
+  ],
+});
+
+// 4. Adding a machine -------------------------------------------------------------------------------
 const instaboxForm = () => [
   field('Account', dd(`${mark('ib', 16)}&nbsp;Instabox · alex@hey.com`)),
   `<div class="row g3"><div style="flex:1">${field('Start from', `<div class="row g2">${seg(['Template', 'Snapshot'], 'Template')}<span class="grow">${dd('universal — Docker, Python, Go, Rust')}</span></div>`)}</div></div>`,
   field('Name', input('agents-2'), 'Lowercase letters, digits and -.'),
-  `<div class="row g3"><div style="flex:1">${field('Pause or delete it after', dd('Never'))}</div><div style="flex:1">${field('When idle', dd('Pause after 30 min'), 'Instabox’s default; changing it needs manual lifecycle on the account.')}</div></div>`,
+  `<div class="row g3"><div style="flex:1">${field('Pause or delete it after', dd('Never'))}</div><div style="flex:1">${field('When idle', dd('Pause after 30 min'), 'Instabox’s default. Idle: no agent working, no terminal use, little CPU.')}</div></div>`,
 ].join('');
 const protonForm = () => [
   field('Account', dd(`${mark('pr', 16)}&nbsp;Proton · alex@hey.com`)),
@@ -247,7 +279,7 @@ TOPICS.push({
       good: 'Today’s dialog, extended.', cost: 'A busy dialog; the switch hides what each provider is until you click it.',
       mock: () => settingsWindow(page('Machines', groupedMachines()), { overlay: dialog('Add Machine', `${seg(['SSH', 'Instabox', 'Proton'], 'Instabox')}${instaboxForm()}`, `${gbtn('Cancel')}${pbtn('Create Machine')}`, { w: 540, foot: 'Free: 2 of 5 machines used.' }) }) },
     { key: 'B', name: 'Pick the kind, then its form', from: 'new',
-      desc: 'Add Machine first lists the kinds, each with one line and its price: <b>SSH machine</b> (“A machine you already reach with ssh”), <b>Instabox</b> (“Free during the beta · 4 vCPUs · 8 GB · pauses when idle”), <b>Proton</b> (“$20 a month while running · 4 vCPUs · 2–64 GB · 50 GB”), and <b>Add Existing…</b> for machines an account already has. Picking one shows its form, as in A, with Back.',
+      desc: 'Add Machine first lists the kinds, each with one line and its price: <b>SSH machine</b> (“A machine you already reach with ssh”), <b>Instabox</b> (“Free during the beta · 4 vCPUs · 8 GB · pauses when idle”), <b>Proton</b> (“$20 a month while running · 4 vCPUs · 2–64 GB · 50 GB”), and <b>Add Existing…</b> for machines an account already has. A provider that isn’t set up shows there as in topic 2, with Learn More. Picking one shows its form, as in A, with Back.',
       good: 'What each provider is and costs shows before choosing; each form stays short.', cost: 'One more click.',
       mock: () => frame(`<div class="row" style="height:100%">${[
         `<div style="position:relative;flex:1;height:100%;border-right:1px solid var(--b)">${dialog('Add Machine', [
@@ -265,7 +297,7 @@ TOPICS.push({
   ],
 });
 
-// 4. What starting costs ----------------------------------------------------------------------------
+// 5. What starting costs ----------------------------------------------------------------------------
 TOPICS.push({
   id: 'cost', section: 'Machines', title: 'Starting something that costs money', size: 'wide', rec: 'B',
   now: 'Nothing in agentZ costs money by itself. Proton bills $20 per 730 running hours from the moment a computer is created or started; its CLI asks first: “This computer costs $20 per 730 running hours (about one month), billed per running second from your shared Cube balance. Stopping it stops the charge. Continue?” (skipped with <code>--yes</code>). Instabox is free during its beta.',
@@ -285,7 +317,7 @@ TOPICS.push({
   ],
 });
 
-// 5. A cloud machine's row ---------------------------------------------------------------------------
+// 6. A cloud machine's row ---------------------------------------------------------------------------
 TOPICS.push({
   id: 'row', section: 'Machines', title: 'A cloud machine’s row', size: 'wide', rec: 'B',
   now: 'A row is the machine’s icon, its name over “SSH proton · Connected” (or Connecting, Uploading agentz-server · 40%, Reconnecting: the error), then Update Server when there’s one, Retry Now while it’s offline, Edit, Remove and its switch. A stopped Proton computer reads “Reconnecting” with an SSH error.',
@@ -301,12 +333,12 @@ TOPICS.push({
       mock: () => piece(`<div style="padding:16px 16px 230px">${card([cloudRow(MACHINES.agents, { menu: rowMenu(MACHINES.agents) }), cloudRow(MACHINES.review), cloudRow(MACHINES.proton), cloudRow(MACHINES.scratch)])}</div>`, 720) },
     { key: 'C', name: 'B, with live numbers', from: 'Instabox dashboard',
       desc: 'B’s row with a third line while it runs: how long it’s been running, CPU and memory (Instabox’s samples every 30 s), and for Proton what it has cost today.',
-      good: 'You see what each machine is doing and costing without opening it.', cost: 'Taller rows; a read every 30 s per machine while Settings is open (Proton has no metrics, so only time and cost).',
+      good: 'You see what each machine is doing and costing without opening it.', cost: 'Taller rows; a read every 30 s per machine while Settings is open. CPU and memory come only from Instabox’s API, not its CLI (the plan’s open question); Proton has neither.',
       mock: () => piece(`<div style="padding:16px">${card([cloudRow(MACHINES.agents, { form: 'metrics' }), cloudRow(MACHINES.review, { form: 'metrics' }), cloudRow(MACHINES.proton, { form: 'metrics' }), cloudRow(MACHINES.scratch, { form: 'metrics' })])}</div>`, 720) },
   ],
 });
 
-// 6. A machine's page --------------------------------------------------------------------------------
+// 7. A machine's page --------------------------------------------------------------------------------
 const kv = (label, value, right = '') => `<div class="row g3" style="padding:11px 16px"><span class="sm mu" style="width:150px;flex:none">${label}</span><span class="grow sm">${value}</span>${right}</div>`;
 const spark = (points, color = 'var(--ac)') => `<svg viewBox="0 0 120 28" style="width:120px;height:28px;flex:none"><polyline points="${points}" fill="none" stroke="${color}" stroke-width="1.5"/></svg>`;
 function machinePage(tab, body, { m = MACHINES.agents, tabs = ['Overview', 'Snapshots', 'Ports', 'Desktop', 'Vault', 'SSH'] } = {}) {
@@ -341,7 +373,7 @@ TOPICS.push({
   now: 'A saved machine has only Edit (its target and name) and Remove. Instabox also has snapshots, public ports, a desktop with share links, a Vault of secrets, SSH tokens for other terminals, CPU and memory samples, running time, timeouts, idle pause and labels. Proton has its SSH keys and billing. Today they’re all on the vendors’ dashboards and CLIs.',
   options: [
     { key: 'A', name: 'A page per machine, with tabs', from: 'the agent page (render_agent_page)',
-      desc: 'Clicking a cloud machine opens its page, as an agent’s does: back to Machines, its mark, name and state badge, its id, Pause and Open Desktop, and tabs for what its provider has. <b>Overview</b>: size, CPU and memory, running time, timeout, idle pause, Vault and labels. <b>Snapshots</b>: those saved from it, Save Snapshot. <b>Ports</b>: published URLs, Publish Port. <b>Desktop</b>: Open Desktop (a control link) and Copy View Link (view only, for an hour). <b>Vault</b>: what it gets, Push Now. <b>SSH</b>: Copy SSH Command (a 7-day token for any terminal), Revoke All. A Proton computer’s page has Overview (size, running time, cost) and SSH Keys.',
+      desc: 'Clicking a cloud machine opens its page, as an agent’s does: back to Machines, its mark, name and state badge, its id, Pause and Open Desktop, and tabs for what its provider has. <b>Overview</b>: size, CPU and memory, running time, timeout, idle pause, Vault and labels. <b>Snapshots</b>: those saved from it, Save Snapshot. <b>Ports</b>: published URLs, Publish Port. <b>Desktop</b>: Open Desktop (a control link) and Copy View Link (view only, for an hour). <b>Vault</b>: what it gets, Push Now. <b>SSH</b>: Copy SSH Command (a 7-day token for any terminal), Revoke All. A Proton computer’s page has Overview (size, running time, cost) and SSH Keys. Desktop links and CPU and memory come only from Instabox’s API, not its CLI, so they’re in only if the plan’s open question says so.',
       good: 'Room for everything, and only what the provider has.', cost: 'The most to build; another level in Settings.',
       mock: () => settingsWindow(machinePage('Overview', overviewIb()), { h: 820 }) },
     { key: 'B', name: 'All in the row’s menu, as small dialogs', from: 'new',
@@ -367,7 +399,7 @@ TOPICS.push({
   ],
 });
 
-// 7. Snapshots ----------------------------------------------------------------------------------------
+// 8. Snapshots ----------------------------------------------------------------------------------------
 const snapshotsList = () => card([
   `<div class="row g3" style="padding:11px 16px">${ic('camera', 'sm mu')}<div class="col grow" style="gap:2px"><span>dev-base</span><span class="sm mu">From agents-1 · software, home and workspace · 3.1 GB · Oct 12</span></div>${obtn('New Machine')}${ibtn('more')}</div>`,
   `<div class="row g3" style="padding:11px 16px">${ic('camera', 'sm mu')}<div class="col grow" style="gap:2px"><span class="row g2">claude-logged-in ${tag('Saving…', 'ac')}</span><span class="sm mu">From review-box · software only</span></div>${obtn('New Machine')}${ibtn('more')}</div>`,
@@ -398,7 +430,7 @@ TOPICS.push({
   ],
 });
 
-// 8. Removing and deleting -----------------------------------------------------------------------------
+// 9. Removing and deleting -----------------------------------------------------------------------------
 TOPICS.push({
   id: 'delete', section: 'Machines', title: 'Removing or deleting a cloud machine', size: 'wide', rec: 'A',
   now: 'Remove… takes a machine out of agentZ; the machine itself and agentZ’s server there stay. Proton’s own Delete asks you to type the computer’s name (“This permanently deletes this computer and its disk. Its files cannot be recovered.”).',
@@ -414,7 +446,7 @@ TOPICS.push({
   ],
 });
 
-// 9. Machines an account already has ---------------------------------------------------------------------
+// 10. Machines an account already has ---------------------------------------------------------------------
 TOPICS.push({
   id: 'existing', section: 'Machines', title: 'Machines an account already has', size: 'wide', rec: 'B',
   now: 'proton-cloud is saved as the SSH target <code>proton</code>, an alias in <code>~/.ssh/config</code> for <code>ssh.proton.computer:22021</code>: that’s the Proton computer devbox-3. Machines made on a vendor’s site or CLI aren’t in agentZ until they’re added by hand.',
@@ -437,7 +469,7 @@ TOPICS.push({
   ],
 });
 
-// 10. A stopped or paused machine elsewhere ------------------------------------------------------------
+// 11. A stopped or paused machine elsewhere ------------------------------------------------------------
 const threadFrame = (banner, { toast = '', input = 'proton-cloud is stopped' } = {}) => frame(`<div class="col" style="height:100%"><div class="row g2 sm mu" style="height:36px;padding:0 16px;border-bottom:1px solid var(--b)"><span class="glyph">✻</span><span style="color:var(--t)">Fix the flaky login test</span><span class="grow"></span>${mark('pr', 16)}<span>proton-cloud</span></div>${banner}<div style="padding:16px 60px;display:flex;flex-direction:column;gap:12px;opacity:.6"><div style="align-self:flex-end;background:var(--hov);padding:8px 12px;border-radius:8px">Find why login.spec.ts fails one run in five.</div><div style="line-height:22px">The test waits on a fixed 200 ms timeout before the session cookie is set…</div></div><div class="grow"></div><div style="border-top:1px solid var(--b);padding:12px 60px" class="ph">${input}</div></div>${toast}`, { w: 760, h: 420 });
 const bannerRow = (html, buttons) => `<div class="row g3" style="margin:12px 16px 0;padding:10px 14px;border:1px solid var(--b);border-radius:8px;background:var(--panel)">${ic('power', 'sm mu')}<span class="grow sm" style="line-height:1.45">${html}</span>${buttons}</div>`;
 TOPICS.push({
@@ -462,14 +494,14 @@ TOPICS.push({
   ],
 });
 
-// 11. Idle machines ------------------------------------------------------------------------------------
+// 12. Idle machines ------------------------------------------------------------------------------------
 const toastBox = (title, body, buttons = '') => `<div class="toast" style="position:relative;width:360px"><div class="row g2"><span class="b5 grow">${title}</span>${ic('x', 'xs mu')}</div><div class="sm mu" style="margin-top:4px;line-height:1.45">${body}</div>${buttons ? `<div class="row g2" style="margin-top:8px;justify-content:flex-end">${buttons}</div>` : ''}</div>`;
 TOPICS.push({
   id: 'idle', section: 'Everywhere', title: 'Idle machines and running costs', size: 'medium', type: 'multi', rec: 'ACD',
-  now: 'agentZ keeps a machine awake while its agents work (<code>caffeinate</code>, <code>systemd-inhibit</code>), and stops idle agents after 30 minutes. Cloud providers have their own rules: an Instabox machine pauses after 30 idle minutes (what counts as idle isn’t documented), and changing that needs “manual lifecycle” on the account; a Proton computer runs, and bills, until it’s stopped, and is suspended when the balance runs out.',
+  now: 'agentZ keeps a machine awake while its agents work (<code>caffeinate</code>, <code>systemd-inhibit</code>), and stops idle agents after 30 minutes. Cloud providers have their own rules: an Instabox machine pauses after 30 idle minutes (“no agent working, no terminal use, little CPU”), and turning that off may need “manual lifecycle” on the account; a Proton computer runs, and bills, until it’s stopped, and is suspended when the balance runs out.',
   options: [
     { key: 'A', name: 'Keep Instabox awake while agents work', from: 'agentZ’s keep-awake',
-      desc: 'While an agent on an Instabox machine works, its server holds off the idle pause, as it holds off sleep: through the provider, by turning the idle pause off and back on when the work ends. On an account without manual lifecycle that’s refused; agentZ then says on the machine’s page that turns may stop when Instabox pauses it.',
+      desc: 'While an agent on an Instabox machine works, this Mac’s server holds off the idle pause, as it holds off sleep: it runs <code>instabox auto-suspend &lt;machine&gt; 0</code>, and sets it back when the work ends. If the account refuses that (it may need manual lifecycle), agentZ says on the machine’s page that turns may stop when Instabox pauses it.',
       good: 'A long turn isn’t frozen halfway.', cost: 'Only works where the account allows it, and Instabox’s idle rule isn’t documented.',
       mock: () => piece(`<div style="padding:16px">${card([kv('When idle', 'Pause after 30 minutes, <span class="okc">but not while agents work</span>', dd('30 min'))])}</div>`, 560) },
     { key: 'B', name: 'Stop or pause machines left idle', from: 'new',
@@ -487,7 +519,7 @@ TOPICS.push({
   ],
 });
 
-// 12. Where cost and limits show -----------------------------------------------------------------------
+// 13. Where cost and limits show -----------------------------------------------------------------------
 TOPICS.push({
   id: 'usage', section: 'Everywhere', title: 'Cost, usage and limits', size: 'wide', rec: 'A',
   now: 'Settings › Usage shows each agent account’s limits (5-hour, weekly…). Nothing shows a cloud account: Proton’s balance, hours and charges, or how many of Instabox’s 5 machines, 10 snapshots and 200 GB are used.',
