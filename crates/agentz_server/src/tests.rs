@@ -9152,6 +9152,11 @@ if args[:2] == ["debug", "models"]:
         {{"slug": "gpt-test", "display_name": "GPT-Test", "visibility": "list",
           "supported_reasoning_levels": [{{"effort": "low"}}, {{"effort": "high"}}]}}]}}))
     sys.exit(0)
+if args[-3:] == ["mcp", "list", "--json"]:
+    print(json.dumps([{{"name": "augmenter", "enabled": True}},
+                      {{"name": "my.server", "enabled": True}},
+                      {{"name": "already-off", "enabled": False}}]))
+    sys.exit(0)
 prompt = sys.stdin.read()
 with open({calls:?}, "a") as calls:
     calls.write(json.dumps({{"program": os.path.basename(sys.argv[0]), "args": args,
@@ -9366,7 +9371,19 @@ async fn titles_threads_their_agent_does_not_name() {
         .filter_map(Value::as_str)
         .collect();
     assert_eq!(call["program"], "codex");
-    assert_eq!(args[..2], ["exec", "--ephemeral"]);
+    assert_eq!(
+        args[..7],
+        [
+            "exec",
+            "--config",
+            "features.plugins=false",
+            "--config",
+            "features.apps=false",
+            "--config",
+            r#"mcp_servers={"augmenter"={enabled=false},"my.server"={enabled=false}}"#,
+        ]
+    );
+    assert_eq!(args[7], "--ephemeral");
     assert!(
         args.windows(2)
             .any(|pair| pair == ["--model", "gpt-6-luna"])

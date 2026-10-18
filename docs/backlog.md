@@ -76,13 +76,6 @@ saved snapshots, t3code had 715 newer commits, herdr 68 and OpenUsage 17. Cow ha
 since our v0.1.10 snapshot. These are source findings; the failures have not been reproduced
 in agentZ.
 
-### Isolate Codex automatic title generation from MCP servers, plugins and apps
-
-Follow t3code's [#17058](https://github.com/pingdotgg/t3code/pull/17058). Our Codex title runner
-in `crates/agentz_server/src/title_generation.rs` lacks the overrides that disable the user's
-MCP servers, plugins and apps. Titles need only their prompt; starting them in an empty folder
-with a read-only sandbox does not disable the user's MCP configuration.
-
 ### Clean up archived threads' workspaces automatically
 
 Use t3code's new archived-thread retention rules

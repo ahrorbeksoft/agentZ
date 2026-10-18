@@ -21,6 +21,16 @@ use crate::agent_settings::{read_json, write_json};
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long `codex debug models` may take to list its models.
 const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
+/// t3code's timeout for `codex mcp list`.
+const MCP_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Plugins and apps bring MCP servers of their own, so t3code turns them off for a title; the
+/// user's own servers are listed and turned off by name.
+const CODEX_NO_PLUGINS: [&str; 4] = [
+    "--config",
+    "features.plugins=false",
+    "--config",
+    "features.apps=false",
+];
 /// t3code's budget for the user's message in the prompt.
 const MESSAGE_BUDGET: usize = 8_000;
 const TRUNCATED: &str = "\n[Content truncated]\n";
@@ -203,6 +213,73 @@ async fn codex_models(program: &Path, search_path: Option<&OsString>) -> Vec<Tit
         models.insert(0, default_codex_model());
     }
     models
+}
+
+/// The MCP servers the user's Codex would start, by name, as t3code lists them. None if Codex
+/// can't list them: the title is still written, with them.
+async fn codex_mcp_servers(
+    program: &Path,
+    directory: &Path,
+    search_path: Option<&OsString>,
+) -> Vec<String> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(CODEX_NO_PLUGINS)
+        .args(["mcp", "list", "--json"])
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(search_path) = search_path {
+        command.env("PATH", search_path);
+    }
+    let failure = match tokio::time::timeout(MCP_LIST_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            match parse_codex_mcp_servers(&output.stdout) {
+                Some(servers) => return servers,
+                None => "its list didn't parse".to_string(),
+            }
+        }
+        Ok(Ok(output)) => format!(
+            "{}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Ok(Err(error)) => error.to_string(),
+        Err(_) => "it timed out".to_string(),
+    };
+    log::warn!("codex mcp list failed, so titles keep its MCP servers: {failure}");
+    Vec::new()
+}
+
+fn parse_codex_mcp_servers(output: &[u8]) -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Server {
+        name: String,
+        enabled: bool,
+    }
+    let servers: Vec<Server> = serde_json::from_slice(output).ok()?;
+    Some(
+        servers
+            .into_iter()
+            .filter(|server| server.enabled)
+            .map(|server| server.name)
+            .collect(),
+    )
+}
+
+/// The `--config` value that turns off each of these MCP servers. `mcp_servers={}` would merge
+/// into the user's servers rather than replace them, so each is named, quoted so that a name
+/// with a dot stays one key.
+fn codex_mcp_servers_off(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let servers = names
+        .iter()
+        .map(|name| format!("{}={{enabled=false}}", Value::from(name.as_str())))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("mcp_servers={{{servers}}}"))
 }
 
 fn parse_codex_models(output: &[u8]) -> Option<Vec<TitleModel>> {
@@ -490,6 +567,12 @@ async fn run(
     search_path: Option<OsString>,
 ) -> Result<String> {
     let schema = output_schema().to_string();
+    let mcp_servers_off = match &settings.provider {
+        TitleProvider::Codex => codex_mcp_servers_off(
+            &codex_mcp_servers(program, directory, search_path.as_ref()).await,
+        ),
+        _ => None,
+    };
     let mut command = tokio::process::Command::new(program);
     command.current_dir(directory);
     if let Some(search_path) = search_path {
@@ -501,14 +584,14 @@ async fn run(
             let schema_path = directory.join("schema.json");
             std::fs::write(&schema_path, &schema)
                 .with_context(|| format!("writing {}", schema_path.display()))?;
+            // A title needs only its prompt. The user's MCP servers would otherwise start
+            // and could act on it, as Claude's `--strict-mcp-config` prevents for Claude.
+            command.arg("exec").args(CODEX_NO_PLUGINS);
+            if let Some(mcp_servers_off) = &mcp_servers_off {
+                command.arg("--config").arg(mcp_servers_off);
+            }
             command
-                .args([
-                    "exec",
-                    "--ephemeral",
-                    "--skip-git-repo-check",
-                    "-s",
-                    "read-only",
-                ])
+                .args(["--ephemeral", "--skip-git-repo-check", "-s", "read-only"])
                 .args(["--model", settings.model()])
                 .arg("--config")
                 .arg(format!(
@@ -715,6 +798,23 @@ mod tests {
                 efforts: vec!["low".into(), "high".into()],
             }]
         );
+    }
+
+    #[test]
+    fn turns_off_the_mcp_servers_codex_starts() {
+        let output = json!([
+            {"name": "augmenter", "enabled": true},
+            {"name": "my.server", "enabled": true},
+            {"name": "already-off", "enabled": false},
+        ]);
+        let servers = parse_codex_mcp_servers(output.to_string().as_bytes()).unwrap_or_default();
+        assert_eq!(servers, ["augmenter", "my.server"]);
+        assert_eq!(
+            codex_mcp_servers_off(&servers).as_deref(),
+            Some(r#"mcp_servers={"augmenter"={enabled=false},"my.server"={enabled=false}}"#)
+        );
+        assert_eq!(codex_mcp_servers_off(&[]), None);
+        assert_eq!(parse_codex_mcp_servers(br#"[{"name": "x"}]"#), None);
     }
 
     #[test]
