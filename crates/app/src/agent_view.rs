@@ -3883,6 +3883,29 @@ impl AgentView {
         self.is_narrower_than(COMPACT_COMPOSER_WIDTH)
     }
 
+    /// Whether this is a fork with no message of its own yet: its entries are still only the
+    /// ones copied from its source. It opens on the new thread screen, the copied conversation
+    /// a chip in the composer, until its first message.
+    fn is_fresh_fork(&self, cx: &App) -> bool {
+        let Some(fork_point) = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.forked_from)
+        else {
+            return false;
+        };
+        let thread = self.thread.read(cx);
+        // Fewer entries than were copied means they're still loading.
+        thread.entries().len() == fork_point.entries
+            && thread.state.queued_messages.is_empty()
+            && !thread.is_working()
+            && !self.is_subthread(cx)
+            && !self.is_archived
+            && !self.needs_login(cx)
+            && self.client.read(cx).is_online()
+    }
+
     /// t3code's timeline minimap, in the gutter left of the conversation's text: a strip for
     /// each of the user's messages, bright while it's in view, a preview of the turn under the
     /// mouse, and Previous and Next turn buttons. Shown once there are two turns, all the time
@@ -10769,8 +10792,9 @@ impl AgentView {
         account_fill_color(hex)
     }
 
-    /// Forks merged back, which wait to go with the next message, as attachments in the
-    /// composer. A click shows exactly what goes to the agent, × goes on without it.
+    /// Forks merged back, and the conversation a fork starts with, which wait to go with the
+    /// next message, as attachments in the composer. A click shows exactly what goes to the
+    /// agent, × goes on without it.
     fn render_handoff_chips(
         &self,
         window: &mut Window,
@@ -10783,7 +10807,12 @@ impl AgentView {
             .read(cx)
             .pending_handoffs()
             .iter()
-            .filter(|handoff| matches!(handoff.source, HandoffSource::Merge { .. }))
+            .filter(|handoff| {
+                matches!(
+                    handoff.source,
+                    HandoffSource::Merge { .. } | HandoffSource::Fork { .. }
+                )
+            })
             .cloned()
             .collect();
         if handoffs.is_empty() {
@@ -10842,23 +10871,39 @@ impl AgentView {
             1 => "1 message".to_string(),
             count => format!("{count} messages"),
         };
-        let HandoffSource::Merge { fork, title } = &handoff.source else {
-            return div().into_any_element();
+        // The thread as it's called now.
+        let (icon, title, selector, drop_tooltip): (_, SharedString, _, _) = match &handoff.source {
+            HandoffSource::Merge { fork, title } => (
+                IconName::GitMerge,
+                self.store
+                    .read(cx)
+                    .thread(*fork)
+                    .map_or_else(|| title.clone(), |fork| fork.title.clone())
+                    .into(),
+                format!("merge-chip-{}", fork.0),
+                "Don’t Merge It Back",
+            ),
+            HandoffSource::Fork { source } => (
+                IconName::GitFork,
+                self.store
+                    .read(cx)
+                    .thread(*source)
+                    .map_or_else(
+                        || "Forked conversation".into(),
+                        |source| source.title.clone(),
+                    )
+                    .into(),
+                format!("fork-chip-{}", source.0),
+                "Don’t Carry It Over",
+            ),
+            _ => return div().into_any_element(),
         };
-        let fork = *fork;
-        // The fork as it's called now.
-        let title: SharedString = self
-            .store
-            .read(cx)
-            .thread(fork)
-            .map_or_else(|| title.clone(), |fork| fork.title.clone())
-            .into();
         let made_at = handoff.made_at;
         let is_expanded = self.expanded_handoff == Some(made_at);
         let colors = cx.theme().colors();
         h_flex()
             .id(("handoff-chip", index))
-            .debug_selector(move || format!("merge-chip-{}", fork.0))
+            .debug_selector(move || selector)
             .max_w_full()
             .min_w_0()
             .gap_1p5()
@@ -10872,11 +10917,7 @@ impl AgentView {
             .cursor_pointer()
             .hover(|style| style.bg(colors.element_hover))
             .when(is_expanded, |chip| chip.bg(colors.element_selected))
-            .child(
-                Icon::new(IconName::GitMerge)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
             .child(
                 div()
                     .min_w_0()
@@ -10895,7 +10936,7 @@ impl AgentView {
                         IconButton::new(("drop-handoff", index), IconName::Close)
                             .icon_size(IconSize::XSmall)
                             .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Don’t Merge It Back"))
+                            .tooltip(Tooltip::text(drop_tooltip))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.expanded_handoff = None;
                                 this.thread
@@ -10920,6 +10961,9 @@ impl AgentView {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
         let agent_name = self.agent_name(cx);
+        // A draft's card picks the agent it starts with. A fresh fork's card, like the bar,
+        // changes the agent of a thread that exists.
+        let is_sent_thread = style == ComposerStyle::Bar || self.is_fresh_fork(cx);
         let is_generating = thread.is_working();
         let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
         let has_failed = matches!(thread.status(), ConnectionStatus::Failed(_));
@@ -11061,8 +11105,8 @@ impl AgentView {
                                     .flex_wrap()
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
-                                    .child(match (style, self.agent_switch(cx)) {
-                                        (ComposerStyle::Bar, Some(can_switch)) => h_flex()
+                                    .child(match (is_sent_thread, self.agent_switch(cx)) {
+                                        (true, Some(can_switch)) => h_flex()
                                             .min_w_0()
                                             .gap_0p5()
                                             .child(self.render_agent_picker(
@@ -11075,7 +11119,7 @@ impl AgentView {
                                             ))
                                             .children(self.render_usage_gauge(cx))
                                             .into_any_element(),
-                                        (ComposerStyle::Bar, None) => h_flex()
+                                        (true, None) => h_flex()
                                             .id("thread-agent-name")
                                             .gap_1()
                                             .px_1()
@@ -11095,7 +11139,7 @@ impl AgentView {
                                             })
                                             .children(self.render_usage_gauge(cx))
                                             .into_any_element(),
-                                        (ComposerStyle::Card, _) => {
+                                        (false, _) => {
                                             self.render_agent_picker(PickerFor::NewThread, cx)
                                         }
                                     }),
@@ -11154,7 +11198,11 @@ impl AgentView {
                         v_flex()
                             .gap_2()
                             .child(self.render_message_editor(ComposerStyle::Card, window, cx))
-                            .child(self.render_new_thread_strip(cx))
+                            .child(if self.is_fresh_fork(cx) {
+                                self.render_fork_strip(cx)
+                            } else {
+                                self.render_new_thread_strip(cx)
+                            })
                             .children(self.render_errors(cx)),
                     ),
             );
@@ -11186,6 +11234,10 @@ impl AgentView {
                 }
             })
             .text_color(cx.theme().colors().text);
+        // A fork stays in its source's project, so the headline names none to change.
+        if self.is_fresh_fork(cx) {
+            return headline.child("What should we work on?").into_any_element();
+        }
         if self.is_chat(cx) {
             return headline
                 .child("What do you want to talk about?")
@@ -11557,6 +11609,16 @@ impl AgentView {
             .gap_y_1()
             .child(left)
             .children(branch)
+            .into_any_element()
+    }
+
+    /// Under a fresh fork's composer: only the branch, for it works where its source did and
+    /// can't move its checkout or machine.
+    fn render_fork_strip(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .justify_end()
+            .children(self.render_new_thread_branch(cx))
             .into_any_element()
     }
 
@@ -13136,6 +13198,7 @@ impl Render for AgentView {
         if is_new_thread {
             self.load_new_thread_git(cx);
         }
+        let shows_new_thread_screen = is_new_thread || self.is_fresh_fork(cx);
         if needs_login && !has_rows {
             let account = self.login_account(cx);
             self.login
@@ -13183,11 +13246,11 @@ impl Render for AgentView {
             .when(is_subthread, |this| {
                 this.child(self.render_subthread_title_bar(parent, cx))
             })
-            .when(!is_drawer_full_screen && is_new_thread, |this| {
+            .when(!is_drawer_full_screen && shows_new_thread_screen, |this| {
                 this.child(self.render_new_thread(window, cx))
             })
             // A full-screen terminal hides the conversation and the composer.
-            .when(!is_drawer_full_screen && !is_new_thread, |this| {
+            .when(!is_drawer_full_screen && !shows_new_thread_screen, |this| {
                 this.children(self.render_restore_notice(cx))
                     .child(
                         // Only the rows in view are drawn, so long threads stay quick (Zed's list).
@@ -16698,6 +16761,99 @@ mod tests {
                 .any(|request| matches!(request, Request::MergeBack(ThreadId(6))))
         );
         assert_eq!(*opened.borrow(), vec![ThreadId(2), ThreadId(2)]);
+    }
+
+    /// A fork with no message of its own opens on the new thread screen, the conversation it
+    /// carries a chip in the composer that previews what goes to the agent and can be dropped;
+    /// its first message brings the long conversation back.
+    #[gpui::test]
+    fn a_fresh_fork_opens_on_the_new_thread_screen_with_its_context_chip(cx: &mut TestAppContext) {
+        use agentz_protocol::thread::PendingHandoff;
+        use std::cell::RefCell;
+
+        let (view, cx) = open_in(snapshot_with_fork(), 6, false, cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                matches!(request, Request::DropHandoff { .. }).then_some(Response::Ok)
+            });
+        });
+        let made_at = SystemTime::now();
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let (mut entries, turns) = two_turns();
+        entries.truncate(2);
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.finished_turns = turns[..1].to_vec();
+                    state.pending_handoffs.push(PendingHandoff {
+                        source: HandoffSource::Fork {
+                            source: ThreadId(2),
+                        },
+                        text: "Context handoff: the fork's conversation".into(),
+                        messages: 2,
+                        made_at,
+                    });
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("new-thread").is_some());
+        assert!(cx.debug_bounds("new-thread-project").is_none());
+        assert!(cx.debug_bounds("forked-from").is_none());
+        // The header still names the source.
+        assert!(cx.debug_bounds("thread-header-fork-source").is_some());
+        let composer = cx.debug_bounds("composer").expect("the composer");
+        let chip = cx
+            .debug_bounds("fork-chip-2")
+            .expect("the carried conversation");
+        assert!(chip.bottom() <= composer.top());
+        assert!(cx.debug_bounds("handoff-preview").is_none());
+        // The agent can change here as in any thread that exists.
+        assert!(cx.debug_bounds("thread-agent").is_some());
+        assert!(cx.debug_bounds("new-thread-agent").is_none());
+
+        cx.simulate_click(
+            gpui::point(chip.left() + px(12.), chip.center().y),
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("handoff-preview").is_some());
+
+        let drop = cx
+            .debug_bounds("drop-handoff-0")
+            .expect("the conversation can be left behind");
+        cx.simulate_click(drop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::DropHandoff { made_at: dropped, .. } if *dropped == made_at
+        )));
+
+        // Without the chip it's still a thread of its own to start.
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.pending_handoffs.clear(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread").is_some());
+        assert!(cx.debug_bounds("fork-chip-2").is_none());
+        assert!(cx.debug_bounds("thread-header-fork-source").is_some());
+
+        // Its first message makes it the long conversation, ending at the source's divider.
+        let (entries, turns) = two_turns();
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.update_state_for_test(|state| state.finished_turns = turns, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("new-thread").is_none());
+        assert!(cx.debug_bounds("forked-from").is_some());
     }
 
     #[test]

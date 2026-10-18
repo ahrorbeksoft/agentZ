@@ -39,11 +39,6 @@ thread to another machine yet (Continue with Another Agent, workspace handoff an
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
 
-### A forked thread looks like a new thread
-
-When a thread is forked, show the fork in something like the new thread view's style. The
-user doesn't like the current design.
-
 ### An Open in Editor button
 
 Add an Open in Editor button, as t3code has.

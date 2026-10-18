@@ -982,6 +982,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   agent and account, named "<title> fork". It begins with the source's conversation up to the
   end of that reply's turn, its turns and marks included, and its first message brings that
   conversation (`HandoffSource::Fork`), since its agent has no session yet; then it opens.
+  Until its first message (`AgentView::is_fresh_fork`: its entries are still only the copied
+  ones, nothing queued or running) it opens on the new thread screen
+  (`design/forked-thread/`, 1 C), not the copied conversation: the carried conversation is a
+  chip in the composer card like a merge's, "<source title> · 6 messages", which previews
+  exactly what goes to the agent, and × sends the first message without it (the thread's
+  entries keep the copied messages, and its header pill still names the source). The card's
+  agent picker changes the agent of a thread that exists, and the strip under it shows only the
+  branch: its checkout and machine are its source's. Once it has a message of its own the
+  copied conversation shows in full, as in any thread.
   t3code's pill dividers link the two where they part: Forked from conversation in the fork,
   Conversation fork in the source (one for each fork from there), each opening the other.
   The fork's header pill (above) has Merge Back, between the fork's turns: what happened in
