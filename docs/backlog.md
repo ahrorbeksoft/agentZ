@@ -47,10 +47,11 @@ our October 1 Zed reference (`57bfce2945`) with upstream through October 17 (`56
 
 ### Update ACP and support session notices, compaction and v2 sessions
 
-Upstream uses SDK 3.4.0
-([#65706](https://github.com/zed-industries/zed/pull/65706)); agentZ uses 2.2.0 and initializes
-with protocol v1. Port stable session notices and context compaction, which agentZ doesn't
-handle yet, following [#65414](https://github.com/zed-industries/zed/pull/65414).
+agentZ is on SDK 3.4.0, as upstream is
+([#65706](https://github.com/zed-industries/zed/pull/65706)); the update needed no code
+changes, and agentZ still initializes with protocol v1. Port stable session notices and
+context compaction, which agentZ doesn't handle yet, following
+[#65414](https://github.com/zed-industries/zed/pull/65414).
 
 Follow Zed's developing v2 session lifecycle, including resume/replay and metadata handling:
 [#65698](https://github.com/zed-industries/zed/pull/65698) and
