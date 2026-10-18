@@ -5,7 +5,10 @@ It answers initialize and session/new, and replies to every prompt by streaming
 "permission" first asks the client for permission and reports the chosen option.
 A prompt of "mcp" starts the first stdio MCP server given in session/new (or
 session/load), calls its first tool, and replies "MCP: <tool result>"; "mcp <tool>
-<json arguments>" calls that tool instead. A prompt of "background" ends its turn at
+<json arguments>" calls that tool instead. With MOCK_MCP_ACP set, it announces that it takes
+MCP servers on the ACP connection (MCP-over-ACP), and calls the first of those it's given with
+`mcp/message` requests instead; "mcp-cancel <tool> <json arguments>" then cancels the call
+(`$/cancel_request`) as soon as it's sent, and replies "MCP: error <code>" with the answer. A prompt of "background" ends its turn at
 once, then goes on streaming a "." every half second for six seconds, as Claude Agent's
 background tasks report after the turn, and ends that with a usage update with its cost, as
 Claude Agent ends each result. "background-task [seconds]" runs a command in the background
@@ -116,7 +119,7 @@ It supports `session/close`, and with MOCK_CLOSED_FILE set, notes each closed se
 With MOCK_REJECT_MCP set, `session/new` and `session/load` fail when given any MCP server, as
 Factory Droid 0.233.0's do. With MOCK_MCP_HTTP set, it announces that it takes HTTP MCP
 servers. A prompt of "mcp-servers" replies "MCP servers: <names>", with "(http)" after the
-HTTP ones, or "MCP servers: none".
+HTTP ones and "(acp)" after those on the ACP connection, or "MCP servers: none".
 
 With MOCK_STEERING set, it takes messages into a running turn (`_session/steering`), as Claude
 Agent and Codex do: one sent while a "permission" turn waits for its answer joins that turn,
@@ -946,8 +949,43 @@ def run_in_terminal(session_id, command):
     return f"Terminal {exited.get('exitCode')}: {output['output'].strip()}"
 
 
-def call_mcp_tool(name=None, arguments=None):
-    """Speaks MCP's stdio transport (newline-delimited JSON-RPC) to the first stdio server."""
+MCP_OVER_ACP_META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                     "io.modelcontextprotocol/clientCapabilities": {}}
+
+
+def mcp_message(server, method, params, cancel=False):
+    """An MCP request to a server on the ACP connection, as an `mcp/message` to the client, and
+    the client's whole answer."""
+    global next_request_id
+    next_request_id += 1
+    request_id = next_request_id
+    send({"jsonrpc": "2.0", "id": request_id, "method": "mcp/message",
+          "params": {"serverId": server["serverId"], "requestId": f"mcp-{request_id}",
+                     "method": method, "params": {**params, "_meta": MCP_OVER_ACP_META}}})
+    if cancel:
+        send({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": request_id}})
+    while True:
+        reply = json.loads(sys.stdin.readline())
+        if reply.get("id") == request_id and "method" not in reply:
+            return reply
+
+
+def call_mcp_tool_over_acp(server, name, arguments, cancel):
+    tools = mcp_message(server, "tools/list", {})["result"]["result"]["tools"]
+    reply = mcp_message(server, "tools/call", {"name": name or tools[0]["name"],
+                                               "arguments": arguments or {}}, cancel)
+    if "error" in reply:
+        return f"error {reply['error']['code']}"
+    result = reply["result"]["result"]
+    return "".join(block.get("text", "") for block in result["content"])
+
+
+def call_mcp_tool(name=None, arguments=None, cancel=False):
+    """Speaks MCP's stdio transport (newline-delimited JSON-RPC) to the first stdio server, or
+    MCP-over-ACP to the first server on the ACP connection."""
+    server = next((s for s in mcp_servers if s.get("type") == "acp"), None)
+    if server is not None:
+        return call_mcp_tool_over_acp(server, name, arguments, cancel)
     server = next((s for s in mcp_servers if "command" in s), None)
     if server is None:
         return "no stdio MCP server"
@@ -1025,7 +1063,8 @@ for line in sys.stdin:
                              "sessionCapabilities": session_capabilities,
                              "promptCapabilities": {"embeddedContext": True,
                                                     "image": bool(os.environ.get("MOCK_IMAGES"))},
-                             "mcpCapabilities": {"http": bool(os.environ.get("MOCK_MCP_HTTP"))},
+                             "mcpCapabilities": {"http": bool(os.environ.get("MOCK_MCP_HTTP")),
+                                                 "acp": bool(os.environ.get("MOCK_MCP_ACP"))},
                              "auth": {"logout": {}}},
                          "authMethods": auth_methods}})
         send_auth_status()
@@ -1180,17 +1219,19 @@ for line in sys.stdin:
                 "Remembered: " + (", ".join(forked_messages) or "nothing")))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "mcp-servers":
-            names = [server["name"] + (" (http)" if server.get("type") == "http" else "")
+            names = [server["name"] + (f" ({server['type']})"
+                                       if server.get("type") in ("http", "acp") else "")
                      for server in mcp_servers]
             update(params["sessionId"], text_chunk("agent_message_chunk",
                                                    "MCP servers: " + (", ".join(names) or "none")))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
-        elif prompt_text == "mcp" or prompt_text.startswith("mcp "):
+        elif prompt_text in ("mcp", "mcp-cancel") or prompt_text.startswith(("mcp ", "mcp-cancel ")):
             parts = prompt_text.split(" ", 2)
             name = parts[1] if len(parts) > 1 else None
             arguments = json.loads(parts[2]) if len(parts) > 2 else None
-            update(params["sessionId"], text_chunk("agent_message_chunk",
-                                                   "MCP: " + call_mcp_tool(name, arguments)))
+            update(params["sessionId"], text_chunk(
+                "agent_message_chunk",
+                "MCP: " + call_mcp_tool(name, arguments, cancel=parts[0] == "mcp-cancel")))
             send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "lost-turn":
             # As Factory Droid loses a turn once it has put a session that waited on the user

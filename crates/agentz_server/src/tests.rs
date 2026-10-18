@@ -3058,6 +3058,93 @@ async fn agentz_server_is_switched_off_in_its_list() {
     assert!(saved.contains("\"enabled\": false") || saved.contains("\"enabled\":false"));
 }
 
+/// An agent that takes MCP servers on its ACP connection gets agentZ's tools there, in place of
+/// the bridge: its calls are the thread's, failures come back as tool errors, and a call it
+/// cancels is answered as cancelled.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_call_tools_on_their_acp_connection() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_MCP_ACP".into(), "1".into());
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let control = crate::AgentControl {
+        // Never run: the agent takes the tools on its ACP connection.
+        executable: PathBuf::from("/bin/false"),
+        socket: data_dir.path().join("server.sock"),
+    };
+    let Some(server) = TestServer::start_with_control(
+        data_dir,
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        Some(control),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+
+    assert_eq!(
+        prompt_for_answer(&mut client, connection, "mcp-servers").await,
+        "MCP servers: agentz (acp)"
+    );
+    let capabilities = prompt_for_answer(&mut client, connection, "mcp").await;
+    let capabilities: Value =
+        serde_json::from_str(capabilities.strip_prefix("MCP: ").expect("a tool result"))
+            .expect("JSON");
+    assert_eq!(capabilities["currentThreadId"], json!(thread_id.0));
+    let failure = prompt_for_answer(
+        &mut client,
+        connection,
+        r#"mcp agentz_thread_read {"threadId": 999}"#,
+    )
+    .await;
+    let failure: Value =
+        serde_json::from_str(failure.strip_prefix("MCP: ").expect("a tool result")).expect("JSON");
+    assert_eq!(failure["code"], json!("thread_not_found"));
+    assert_eq!(
+        prompt_for_answer(
+            &mut client,
+            connection,
+            r#"mcp-cancel agentz_command_run {"command": "sleep 5"}"#,
+        )
+        .await,
+        "MCP: error -32800"
+    );
+}
+
+/// Sends the prompt and waits for the agent's answer to it.
+async fn prompt_for_answer(
+    client: &mut TestClient,
+    connection: ConnectionId,
+    prompt: &str,
+) -> String {
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text(prompt),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working()
+                && matches!(
+                    thread.entries(),
+                    [.., Entry::UserMessage(sent), Entry::AgentMessage(_)] if sent == prompt
+                )
+        })
+        .await;
+    match client.thread(connection).entries() {
+        [.., Entry::AgentMessage(answer)] => answer.to_string(),
+        entries => panic!("no answer: {entries:?}"),
+    }
+}
+
 /// Starts a thread and has the mock agent name the MCP servers its session got.
 async fn expect_mcp_servers(client: &mut TestClient, server: &TestServer, expected: &str) {
     let thread_id = client.create_thread(server).await;

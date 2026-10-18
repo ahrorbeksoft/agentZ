@@ -5,6 +5,7 @@
 //! others.
 
 use agentz_protocol::{ClientKind, Request, Response, ToolCaller};
+use agentz_server::mcp_tools;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -16,18 +17,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
-const INSTRUCTIONS: &str = "Tools for managing the threads of this agentZ project: list and read \
-threads, start new ones, message, wait for, interrupt, rename and archive them, read the changes \
-each thread made (agentz_thread_diff), work in git worktrees and copy-on-write pastures \
-(agentz_workspace_*, and workspaceStrategy when launching or delegating), and delegate tasks to \
-child agents. A delegated task is \
-child work owned by this thread: use delegate_task (see orchestrator_capabilities for agents and \
-models), keep each taskId, and use task_status or task_cancel to manage it. An async task's end is \
-announced to this thread, so end the turn instead of polling. agentz_thread_launch and \
-create_threads make ordinary top-level threads: use them only when the user asks for separate or \
-new threads, never merely because they said subagent. When this project is also on other machines (orchestrator_capabilities' otherMachines), the thread tools take machine to work there; thread ids are per machine. agentz_document_publish publishes a Markdown document for the user to read in their browser, and agentz_design_publish a design of variants to pick from, each with a version per publish; agentz_artifact_list and agentz_artifact_read find them again on any machine, a design with the user's picks and comments.";
-
-pub(crate) async fn run(version: &str) -> Result<()> {
+pub(crate) async fn run() -> Result<()> {
     let token = std::env::var("AGENTZ_MCP_TOKEN").context("AGENTZ_MCP_TOKEN isn't set")?;
     let mut connection = crate::connect_for_tools(ClientKind::Mcp).await?;
 
@@ -81,9 +71,9 @@ pub(crate) async fn run(version: &str) -> Result<()> {
                         id,
                         json!({
                             "protocolVersion": protocol_version,
-                            "capabilities": {"tools": {"listChanged": false}},
-                            "serverInfo": {"name": "agentz", "title": "agentZ", "version": version},
-                            "instructions": INSTRUCTIONS,
+                            "capabilities": mcp_tools::capabilities(),
+                            "serverInfo": mcp_tools::server_info(),
+                            "instructions": mcp_tools::INSTRUCTIONS,
                         }),
                     ),
                 );
@@ -156,29 +146,14 @@ fn handle(
             tokio::spawn(async move {
                 let message = match response.await {
                     Ok(Response::ToolResult(result)) => {
-                        let text = serde_json::to_string_pretty(&result.value)
-                            .unwrap_or_else(|_| result.value.to_string());
-                        let mut tool_result = json!({
-                            "content": [{"type": "text", "text": text}],
-                            "isError": result.is_error,
-                        });
-                        if result.value.is_object() {
-                            tool_result["structuredContent"] = result.value;
-                        }
-                        result_response(id, tool_result)
+                        result_response(id, mcp_tools::call_result(result))
                     }
                     Ok(response) => {
                         error_response(id, -32603, &format!("unexpected response: {response:?}"))
                     }
-                    // MCP reports failures to run the tool as tool errors, so the agent
-                    // sees them.
-                    Err(error) => result_response(
-                        id,
-                        json!({
-                            "content": [{"type": "text", "text": format!("agentZ: {error:#}")}],
-                            "isError": true,
-                        }),
-                    ),
+                    Err(error) => {
+                        result_response(id, mcp_tools::call_failure(format!("{error:#}")))
+                    }
                 };
                 send(&outgoing, message);
             });

@@ -105,7 +105,7 @@ fn main() {
         Command::Start => start(),
         Command::Proxy => start().and_then(|()| run_proxy()),
         Command::Stop => block_on(stop()),
-        Command::McpBridge => block_on(mcp_bridge::run(VERSION)),
+        Command::McpBridge => block_on(mcp_bridge::run()),
         Command::Tools => block_on(tools()),
         Command::Call {
             tool,

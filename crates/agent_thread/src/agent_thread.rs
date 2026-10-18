@@ -187,6 +187,12 @@ pub enum TerminalRequest {
 /// capability. It must answer without blocking: waiting for an exit answers later.
 pub type TerminalHost = Arc<dyn Fn(TerminalRequest) + Send + Sync>;
 
+/// Answers the agent's `mcp/message` requests to the MCP servers declared on the ACP connection
+/// itself (MCP-over-ACP's `acp` servers), routed by the server id. It must answer without
+/// blocking: a tool call answers later.
+pub type McpHost =
+    Arc<dyn Fn(acp::MessageMcpRequest, Responder<acp::MessageMcpResponse>) + Send + Sync>;
+
 /// The result of background work, for [`AgentThread::handle`].
 pub struct ThreadMessage {
     /// Which connection the message belongs to. Messages from before a reload are dropped.
@@ -415,6 +421,7 @@ pub struct AgentThread {
     /// Where images the agent shows or replays are kept, for messages to link to.
     attachments: Option<Attachments>,
     terminal_host: Option<TerminalHost>,
+    mcp_host: Option<McpHost>,
     turn_hook: Option<TurnHook>,
     /// Set by [`Self::cancel`] for the turn in flight, in case its prompt hasn't gone out yet.
     turn_cancelled: Option<Arc<AtomicBool>>,
@@ -674,11 +681,13 @@ impl AgentThread {
         cwd: PathBuf,
         previous_session: Option<acp::SessionId>,
         terminal_host: Option<TerminalHost>,
+        mcp_host: Option<McpHost>,
     ) -> (Self, ThreadInbox) {
         let (mut this, inbox) =
             Self::new(Some(runtime), agent_name, ConnectionStatus::Connecting, cwd);
         this.previous_session = previous_session;
         this.terminal_host = terminal_host;
+        this.mcp_host = mcp_host;
         this.connect_agent(command);
         (this, inbox)
     }
@@ -830,6 +839,7 @@ impl AgentThread {
             mcp_servers: Vec::new(),
             attachments: None,
             terminal_host: None,
+            mcp_host: None,
             turn_hook: None,
             turn_cancelled: None,
             prompts_sent: 0,
@@ -1016,6 +1026,7 @@ impl AgentThread {
         let cwd = self.view.state.cwd.clone();
         let sender = self.sender();
         let terminal_host = self.terminal_host.clone();
+        let mcp_host = self.mcp_host.clone();
         self.spawn_task(async move {
             // The agent's own tasks, which stop the agent when dropped.
             let mut agent_tasks = JoinSet::new();
@@ -1026,6 +1037,7 @@ impl AgentThread {
                     cwd,
                     sender.clone(),
                     terminal_host,
+                    mcp_host,
                     &mut agent_tasks,
                 )
                 .await?;
@@ -1702,6 +1714,7 @@ impl AgentThread {
         stdout: OwnedFd,
         stderr: OwnedFd,
         terminal_host: Option<TerminalHost>,
+        mcp_host: Option<McpHost>,
     ) -> Result<(Self, ThreadInbox)> {
         let process = AgentProcess {
             pid: snapshot.pid,
@@ -1732,6 +1745,7 @@ impl AgentThread {
         this.subagent_sessions = snapshot.subagent_sessions;
         this.stoppable_subagents = snapshot.stoppable_subagents;
         this.terminal_host = terminal_host.clone();
+        this.mcp_host = mcp_host.clone();
         if is_working {
             this.emit(AgentThreadEvent::WorkingChanged(true));
         }
@@ -1773,7 +1787,8 @@ impl AgentThread {
 
         let session_id = snapshot.session_id;
         let transport = transport(outgoing_lines, incoming_lines);
-        let (connection_future, connection) = client_connection(transport, sender, terminal_host);
+        let (connection_future, connection) =
+            client_connection(transport, sender, terminal_host, mcp_host);
         let sender = this.sender();
         this.spawn_task(async move {
             let mut connection_tasks = JoinSet::new();
@@ -4395,6 +4410,7 @@ async fn connect(
     cwd: PathBuf,
     sender: MessageSender,
     terminal_host: Option<TerminalHost>,
+    mcp_host: Option<McpHost>,
     agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
     // Stopped by `ProcessGuard` rather than on drop, so a handed-off agent can outlive this
@@ -4452,7 +4468,8 @@ async fn connect(
 
     let supports_terminals = terminal_host.is_some();
     let transport = transport(outgoing_lines, incoming_lines);
-    let (connection_future, connection) = client_connection(transport, sender, terminal_host);
+    let (connection_future, connection) =
+        client_connection(transport, sender, terminal_host, mcp_host);
     agent_tasks.spawn(connection_future);
     let connection = connection
         .await
@@ -4556,6 +4573,7 @@ fn client_connection(
     transport: Transport,
     sender: MessageSender,
     terminal_host: Option<TerminalHost>,
+    mcp_host: Option<McpHost>,
 ) -> (
     BoxFuture<'static, ()>,
     oneshot::Receiver<ConnectionTo<Agent>>,
@@ -4706,6 +4724,21 @@ fn client_connection(
         .on_receive_request(
             async move |request: acp::ReleaseTerminalRequest, responder, _connection| {
                 release_host(TerminalRequest::Release(request, responder));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::MessageMcpRequest,
+                        responder: Responder<acp::MessageMcpResponse>,
+                        _connection| {
+                match &mcp_host {
+                    Some(host) => host(request, responder),
+                    None => responder.respond_with_error(agent_client_protocol::Error::new(
+                        agent_client_protocol::mcp_server::MCP_SERVER_UNAVAILABLE,
+                        "agentZ declared no MCP servers on this connection",
+                    ))?,
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -4875,16 +4908,26 @@ async fn open_session(
 }
 
 /// Every agent takes stdio servers; HTTP and SSE ones only go to agents that announce them, as
-/// ACP asks.
+/// ACP asks. So do servers on the ACP connection itself, each in place of the stdio server of
+/// its name (the `mcp-bridge` to the same tools), which goes to the agents that don't take them.
 fn servers_the_agent_takes(
     capabilities: &acp::McpCapabilities,
     mcp_servers: Vec<acp::McpServer>,
 ) -> Vec<acp::McpServer> {
+    let over_acp: HashSet<String> = mcp_servers
+        .iter()
+        .filter_map(|server| match server {
+            acp::McpServer::Acp(server) if capabilities.acp => Some(server.name.clone()),
+            _ => None,
+        })
+        .collect();
     mcp_servers
         .into_iter()
         .filter(|server| match server {
             acp::McpServer::Http(_) => capabilities.http,
             acp::McpServer::Sse(_) => capabilities.sse,
+            acp::McpServer::Acp(_) => capabilities.acp,
+            acp::McpServer::Stdio(server) => !over_acp.contains(&server.name),
             _ => true,
         })
         .collect()
@@ -5032,6 +5075,7 @@ pub async fn agent_info(command: AgentCommand) -> Result<Option<acp::Implementat
         std::env::temp_dir(),
         sender,
         None,
+        None,
         &mut agent_tasks,
     );
     let deadline = tokio::time::sleep(AGENT_INFO_TIMEOUT);
@@ -5091,6 +5135,7 @@ pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
             command,
             std::env::temp_dir(),
             sender,
+            None,
             None,
             &mut agent_tasks,
         )
@@ -5321,6 +5366,7 @@ mod tests {
             std::env::temp_dir(),
             previous_session,
             None,
+            None,
         ))
     }
 
@@ -5435,6 +5481,32 @@ mod tests {
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;
         assert!(thread.thread.session.is_some());
+    }
+
+    /// agentZ's tools go on the ACP connection to agents that take MCP servers there, and
+    /// through the stdio bridge to the others; the user's servers go to either.
+    #[test]
+    fn servers_on_the_acp_connection_replace_their_stdio_bridge() {
+        let servers = vec![
+            acp::McpServer::Acp(acp::McpServerAcp::new("agentz", "token")),
+            acp::McpServer::Stdio(acp::McpServerStdio::new("agentz", "/bin/agentz-server")),
+            acp::McpServer::Stdio(acp::McpServerStdio::new("github", "/bin/gh")),
+        ];
+        let names = |capabilities: acp::McpCapabilities| {
+            servers_the_agent_takes(&capabilities, servers.clone())
+                .iter()
+                .map(|server| match server {
+                    acp::McpServer::Acp(server) => format!("{} (acp)", server.name),
+                    acp::McpServer::Stdio(server) => server.name.clone(),
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(acp::McpCapabilities::new().acp(true)),
+            ["agentz (acp)", "github"]
+        );
+        assert_eq!(names(acp::McpCapabilities::new()), ["agentz", "github"]);
     }
 
     fn user_messages(thread: &AgentThread) -> Vec<String> {
@@ -7282,6 +7354,7 @@ mod tests {
                 handed_off.stdin,
                 handed_off.stdout,
                 handed_off.stderr,
+                None,
                 None,
             )
             .expect("the agent is adopted"),

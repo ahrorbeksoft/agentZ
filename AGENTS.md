@@ -160,7 +160,10 @@ From Zed's guidelines, which this code follows:
   With `MOCK_FORK` it forks sessions (`session/fork`; `fail` fails them), and `recall` names
   the messages the fork's source had ("Remembered: hello"), from the history path. Its
   `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
-  linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones.
+  linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones. With
+  `MOCK_MCP_ACP` it takes MCP servers on its ACP connection (MCP-over-ACP), and its `mcp`
+  prompts call agentZ's tools there with `mcp/message`; `mcp-cancel <tool> <json>` cancels
+  the call as soon as it's sent ("MCP: error -32800").
   For accounts, `MOCK_HOME` is its home (the login is then `login` there) and `MOCK_API_KEY`
   logs it in (unless it's `refused`), as does its `mock-env-key` login in a home, which reads
   that variable as Droid's "Factory API Key" does; the server tests' mock is described with
@@ -185,8 +188,10 @@ From Zed's guidelines, which this code follows:
   directory. `agentz_client` tests reattach to a turn in progress.
 - **Agent control:** `agentz_server` tests call the tools as a thread (`Request::CallTool`) for
   their behavior and policy; `tests/agent_control.rs` has the mock agent call them through the
-  real `mcp-bridge`, and runs `call` as a thread's shell would. Delegated tasks run the mock
-  agent too, so a task's prompt is a mock script (`hello`, `slow`, `permission`).
+  real `mcp-bridge`, and runs `call` as a thread's shell would, and
+  `agents_call_tools_on_their_acp_connection` has it call them on its ACP connection.
+  Delegated tasks run the mock agent too, so a task's prompt is a mock script (`hello`,
+  `slow`, `permission`).
 - **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a short temporary directory
   (`mktemp -d /tmp/az.XXXX`: `server.sock`'s path must fit in `SUN_LEN`, which the scratchpad's
   doesn't) and put

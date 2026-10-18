@@ -13,6 +13,7 @@ mod hand_off;
 mod key_logins;
 mod limit_waits;
 mod login_checks;
+mod mcp_over_acp;
 mod mcp_server_requests;
 mod prompt_requests;
 mod queue_requests;
@@ -32,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::schema::v1 as acp;
@@ -110,6 +111,11 @@ pub(crate) enum Input {
     ToolDeadline,
     /// A thread's agent asked for one of its terminals.
     AgentTerminal(ThreadId, agent_thread::TerminalRequest),
+    /// A thread's agent sent agentZ's MCP server a request on its ACP connection.
+    AgentMcp(
+        acp::MessageMcpRequest,
+        agent_client_protocol::Responder<acp::MessageMcpResponse>,
+    ),
     /// An event from a terminal's run (`serial`).
     Terminal {
         key: TerminalKey,
@@ -162,6 +168,9 @@ struct LoginSession {
 pub(crate) struct Server {
     runtime: tokio::runtime::Handle,
     inputs: mpsc::UnboundedSender<Input>,
+    /// Shared with the listener: the server makes clients of its own for its agents' tool
+    /// calls on their ACP connections.
+    next_client_id: Arc<AtomicU64>,
     machine: MachineInfo,
     data_dir: PathBuf,
     custom_agents: BTreeMap<AgentId, CustomAgent>,
@@ -185,7 +194,8 @@ pub(crate) struct Server {
     pausing_threads: HashSet<ThreadId>,
     /// Set once it's done, as the server stops.
     handed_off: Arc<AtomicBool>,
-    /// The MCP bridges' credentials, each given to one thread's agent. Dropped with the agent.
+    /// The tool credentials, each given to one thread's agent for its MCP server (the bridge's,
+    /// or the server id on its ACP connection). Dropped with the agent.
     tool_sessions: HashMap<String, ThreadId>,
     follow_ups: HashMap<ThreadId, VecDeque<FollowUp>>,
     /// Threads handed off to a new workspace, with their continuation prompts, whose agents
@@ -328,6 +338,7 @@ impl Server {
         config: ServerConfig,
         machine: MachineInfo,
         inputs: mpsc::UnboundedSender<Input>,
+        next_client_id: Arc<AtomicU64>,
         handed_off: Arc<AtomicBool>,
     ) -> Self {
         let data_dir = config.data_dir;
@@ -374,6 +385,7 @@ impl Server {
         let mut server = Self {
             runtime,
             inputs,
+            next_client_id,
             machine,
             data_dir,
             custom_agents: config.custom_agents,
@@ -871,6 +883,7 @@ impl Server {
             Input::AgentTerminal(thread_id, request) => {
                 self.agent_terminal_request(thread_id, request)
             }
+            Input::AgentMcp(request, responder) => self.answer_mcp_message(request, responder),
             Input::Thread(connection, message) => {
                 let thread = match connection {
                     ConnectionId::Thread(id) => self.threads.get_mut(&id),
@@ -1708,6 +1721,12 @@ impl Server {
             if mcp_servers::gives_agentz(&self.mcp_servers, &session_account) {
                 let token = uuid::Uuid::new_v4().to_string();
                 self.tool_sessions.insert(token.clone(), thread_id);
+                // Agents that take MCP servers on their ACP connection get this one in place
+                // of the bridge.
+                mcp_servers.push(acp::McpServer::Acp(acp::McpServerAcp::new(
+                    AGENTZ_SERVER_NAME,
+                    token.clone(),
+                )));
                 mcp_servers.push(acp::McpServer::Stdio(
                     acp::McpServerStdio::new(AGENTZ_SERVER_NAME, &control.executable)
                         .args(vec!["mcp-bridge".into()])
@@ -1747,6 +1766,7 @@ impl Server {
             cwd.clone(),
             previous_session,
             Some(self.agent_terminal_host(thread_id)),
+            Some(self.agent_mcp_host()),
         );
         agent_thread.set_session_login(session_login);
         agent_thread.set_agent(ThreadAgent {

@@ -267,6 +267,7 @@ impl Server {
                 pipes.stdout,
                 pipes.stderr,
                 Some(terminal_host),
+                Some(self.agent_mcp_host()),
             );
             let (mut thread, inbox) = match adopted {
                 Ok(adopted) => adopted,

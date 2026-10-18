@@ -22,6 +22,7 @@ pub mod handoff;
 mod keep_awake;
 mod machine_kind;
 mod mcp_servers;
+pub mod mcp_tools;
 mod pages;
 mod repositories;
 mod server;
@@ -209,6 +210,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
     let (inputs, inbox) = mpsc::unbounded();
     let (stopped_sender, stopped) = tokio::sync::watch::channel(false);
     let handed_off = Arc::new(AtomicBool::new(false));
+    let next_client_id = Arc::new(AtomicU64::new(1));
     let server = {
         // The stores spawn their background work onto the runtime as they're created.
         let _guard = runtime.enter();
@@ -217,6 +219,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             config,
             welcome.machine.clone(),
             inputs.clone(),
+            next_client_id.clone(),
             handed_off.clone(),
         )
     };
@@ -228,7 +231,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
         runtime,
         inputs,
         welcome: Arc::new(welcome),
-        next_client_id: Arc::new(AtomicU64::new(1)),
+        next_client_id,
         stopped,
         handed_off,
     })

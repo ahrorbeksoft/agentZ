@@ -25,7 +25,8 @@ agentz (GPUI app, a client)
   └─ ssh <host> ~/.agentz/server/agentz-server proxy
                     └─ stdio ⇄ unix socket ───────────► agentz-server  (remote Mac/Linux)
 
-agent (ACP) ─stdio MCP─► agentz-server mcp-bridge ─unix socket─► agentz-server  (same machine)
+agent (ACP) ─mcp/message on its ACP connection─► agentz-server  (agents that take MCP-over-ACP)
+agent (ACP) ─stdio MCP─► agentz-server mcp-bridge ─unix socket─► agentz-server  (the others)
 script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─► agentz-server
 ```
 
@@ -1736,10 +1737,19 @@ Designed in `design/sounds/` and `design/notifications/`.
 t3code's orchestrator MCP (`docs/orchestration-v2/`, `apps/server/src/mcp/`), with `agentz_`
 for `t3_`.
 
-- **Delivery** (`mcp_bridge.rs`): every ACP session gets `agentz-server mcp-bridge` as a stdio MCP
-  server, with a per-session credential in its environment, so the server knows the calling
-  thread. Agents and terminals also get `AGENTZ_SOCKET`, `AGENTZ_THREAD_ID` and `AGENTZ_BIN_PATH`,
-  for `agentz-server call <tool> [json]` (t3code's `acp-mcp-call`).
+- **Delivery** (`server/mcp_over_acp.rs`, `mcp_bridge.rs`, `mcp_tools.rs`): every ACP session
+  gets agentZ's `agentz` MCP server with a per-session credential, so the server knows the
+  calling thread. Agents that take MCP servers on their ACP connection (`mcpCapabilities.acp`,
+  ACP's [MCP-over-ACP](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/mcp-over-acp.md))
+  get it there, with the credential as its server id: they send each request of MCP's stateless
+  revision (2026-07-28, no `initialize`) as an `mcp/message`, which the server answers itself,
+  each tool call for a client of its own that ends with the call, so a call the agent cancels
+  (`$/cancel_request`) stops waiting, as one whose bridge went away does. The others get
+  `agentz-server mcp-bridge` as a stdio MCP server, with the credential in its environment
+  (`agent_thread::servers_the_agent_takes` gives each agent one of the two). Both answer as
+  `mcp_tools.rs` says, and run the same calls. Agents and terminals also get `AGENTZ_SOCKET`,
+  `AGENTZ_THREAD_ID` and `AGENTZ_BIN_PATH`, for `agentz-server call <tool> [json]` (t3code's
+  `acp-mcp-call`).
 - **Tools** (`server/tools.rs`): `orchestrator_capabilities`, `agentz_thread_list`/`_read`/
   `_launch`/`_send`/`_wait`/`_interrupt`/`_update`/`_organize`/`_diff`, `create_threads`,
   `delegate_task`, `task_status`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal

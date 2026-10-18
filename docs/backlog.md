@@ -96,14 +96,6 @@ app and its machine servers still update together. Coordinate the ACP work with 
 protocol update above. Verify behavior with the mock agent; installed adapters' support has
 not been verified.
 
-### Use MCP-over-ACP with the stdio bridge as a fallback
-
-Attach agentZ's tools to the existing ACP connection where supported, replacing the
-per-thread `mcp-bridge` subprocess and its extra socket connection
-([native MCP-over-ACP](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/mcp-over-acp.md)).
-Keep the stdio bridge for agents without that transport, and keep the standalone CLI tool
-path. Preserve caller identity, account scope, cancellation and tool policy across transports.
-
 ### Use SDK session builders for session setup and restoration
 
 Replace the corresponding handwritten new/load/resume and routing plumbing with the SDK's
