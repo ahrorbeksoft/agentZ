@@ -124,6 +124,7 @@ impl TestServer {
             hands_pages_to_clients: false,
             terminal_shell: Some("/bin/sh".into()),
             title_generation_path: None,
+            cloud_path: None,
             keep_awake: Vec::new(),
             listener: None,
             handed_over: None,
@@ -11304,4 +11305,142 @@ async fn artifacts_are_published_served_and_sent_back() {
         })
         .await;
     assert_eq!(page_request(address, "GET", &content, "").await.0, 404);
+}
+
+/// A fake `proton` CLI in a folder of its own: signed in as `alex@example.com`, with one
+/// computer whose state is kept in a file, so `start` changes what `list` says.
+#[cfg(unix)]
+fn fake_proton_cli() -> (tempfile::TempDir, std::ffi::OsString) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let folder = tempfile::tempdir().expect("temp dir");
+    let state = folder.path().join("state");
+    std::fs::write(&state, "stopped").expect("writes the state");
+    let script = format!(
+        r#"#!/bin/sh
+echo "$*" >> '{log}'
+case "$*" in
+  "--version") echo "proton 0.1.2" ;;
+  "whoami") echo "alex@example.com" ;;
+  "list --json") printf '[{{"id": "c-1", "name": "devbox-3", "state": "%s", "vcpus": 8, "error": "", "public_ssh": {{"hostname": "ssh.proton.computer", "port": 22021, "enabled": 1}}}}]' "$(cat '{state}')" ;;
+  "balance") printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
+  "start c-1 --yes") echo running > '{state}'; echo "  start: succeeded" >&2 ;;
+  "ssh-config c-1") printf 'Host proton-devbox-3\n  HostName ssh.proton.computer\n  User ubuntu\n  Port 22021\n' ;;
+  *) echo "proton: unknown command: $*" >&2; exit 1 ;;
+esac
+"#,
+        log = folder.path().join("log").display(),
+        state = state.display(),
+    );
+    let program = folder.path().join("proton");
+    std::fs::write(&program, script).expect("writes the CLI");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("makes it runnable");
+    // `sh`, `cat` and `printf` from the system, and no `instabox` anywhere.
+    let path = std::ffi::OsString::from(format!("{}:/bin:/usr/bin", folder.path().display()));
+    (folder, path)
+}
+
+#[cfg(unix)]
+fn cloud_snapshot(client: &TestClient) -> Option<agentz_protocol::cloud::CloudSnapshot> {
+    client.events.iter().rev().find_map(|event| match event {
+        Event::Cloud(snapshot) => Some(snapshot.clone()),
+        _ => None,
+    })
+}
+
+/// Once an app asks, this Mac's server looks for the providers' CLIs and runs them: Proton
+/// signed in, with its computer and balance, and Instabox not installed. It starts a computer
+/// through the CLI, skipping the CLI's own price question, lists it again after, and gives the
+/// computer's SSH options; a change the provider doesn't have is refused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn finds_cloud_providers_and_changes_their_machines() {
+    use agentz_protocol::cloud::{
+        CloudState, CloudUsage, Lifecycle, Provider, ProviderStatus, SshOptions,
+    };
+
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let (cli, path) = fake_proton_cli();
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        move |config| config.cloud_path = Some(path),
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    client.ok(Request::CheckCloud).await;
+    let cloud = cloud_snapshot(&client).expect("the providers were sent");
+    assert!(!cloud.checking);
+    let instabox = cloud.provider(Provider::Instabox).expect("Instabox");
+    assert_eq!(instabox.status, ProviderStatus::NotInstalled);
+    let proton = cloud.provider(Provider::Proton).expect("Proton");
+    assert_eq!(
+        proton.status,
+        ProviderStatus::SignedIn {
+            version: "0.1.2".into(),
+            account: "alex@example.com".into(),
+        }
+    );
+    assert_eq!(proton.machines.len(), 1);
+    assert_eq!(proton.machines[0].state, CloudState::Stopped);
+    assert!(matches!(
+        proton.usage,
+        Some(CloudUsage::Balance {
+            balance_micro_usd: Some(24_270_000),
+            ..
+        })
+    ));
+
+    client
+        .ok(Request::ChangeCloudMachine {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+            change: Lifecycle::Start,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            cloud_snapshot(client)
+                .and_then(|cloud| cloud.machine(Provider::Proton, "c-1").cloned())
+                .is_some_and(|machine| machine.state == CloudState::Running)
+        })
+        .await;
+    let error = client
+        .request(Request::ChangeCloudMachine {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+            change: Lifecycle::Pause,
+        })
+        .await
+        .expect_err("Proton can't pause");
+    assert!(error.message.contains("can't do that"), "{}", error.message);
+    let options = client
+        .ok(Request::CloudSshOptions {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+        })
+        .await;
+    assert_eq!(
+        options,
+        Response::SshOptions(SshOptions {
+            host_name: "ssh.proton.computer".into(),
+            port: Some(22021),
+            user: Some("ubuntu".into()),
+            options: Vec::new(),
+        })
+    );
+    let log = std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
+    assert!(log.lines().any(|line| line == "start c-1 --yes"), "{log}");
+    // Kept for after a restart.
+    let saved = std::fs::read_to_string(server.data_dir.path().join("cloud.json"))
+        .expect("cloud.json was written");
+    assert!(saved.contains("devbox-3"));
 }

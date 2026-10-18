@@ -76,6 +76,9 @@ pub struct ServerConfig {
     /// The `PATH` the CLIs that write thread titles are looked for on and run with. `None` is
     /// the server's own.
     pub title_generation_path: Option<std::ffi::OsString>,
+    /// The `PATH` the cloud providers' CLIs are looked for on and run with. `None` is the
+    /// server's own.
+    pub cloud_path: Option<std::ffi::OsString>,
     /// The commands that keep the machine awake while agents work, tried in order
     /// ([`KeepAwakeCommand::system`]). Empty lets it sleep.
     pub keep_awake: Vec<KeepAwakeCommand>,

@@ -7,6 +7,7 @@ mod instabox;
 mod proton;
 mod ssh_config;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,6 +28,8 @@ const CHANGE_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 pub struct Cli {
     provider: Provider,
     program: PathBuf,
+    /// The `PATH` it's looked for on and runs with; `None` is the server's own.
+    path: Option<OsString>,
 }
 
 impl Cli {
@@ -39,6 +42,15 @@ impl Cli {
         Self {
             provider,
             program: program.into(),
+            path: None,
+        }
+    }
+
+    /// The provider's CLI, found on `path` rather than the server's own `PATH`.
+    pub fn on_path(provider: Provider, path: Option<OsString>) -> Self {
+        Self {
+            path,
+            ..Self::new(provider)
         }
     }
 
@@ -148,6 +160,9 @@ impl Cli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(path) = &self.path {
+            command.env("PATH", path);
+        }
         let command_line = args
             .first()
             .map(|arg| format!("{} {}", self.program.display(), arg.as_ref()))

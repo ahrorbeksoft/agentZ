@@ -228,6 +228,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "cloud",
  "collections",
  "env_logger",
  "futures",

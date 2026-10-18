@@ -791,6 +791,29 @@ pub enum Request {
     /// [`Storage::cleanup`]. Refused while no rule is on.
     CleanUpNow,
 
+    /// Looks for the cloud providers' CLIs and lists their machines now, answered once it's
+    /// done (Check Again), and every minute after while an app is open. Only this Mac's
+    /// server is asked: the providers' CLIs are installed here.
+    CheckCloud,
+    /// Starts, stops, pauses or deletes a provider's machine, by its id, answered once its CLI
+    /// is done.
+    ChangeCloudMachine {
+        provider: cloud::Provider,
+        machine: String,
+        change: cloud::Lifecycle,
+    },
+    /// Makes a machine with the provider's CLI, answered once it's made.
+    CreateCloudMachine {
+        provider: cloud::Provider,
+        machine: cloud::CreateMachine,
+    },
+    /// How SSH reaches a running provider machine, answered with [`Response::SshOptions`].
+    /// Instabox's certificate is renewed first.
+    CloudSshOptions {
+        provider: cloud::Provider,
+        machine: String,
+    },
+
     /// Answers [`Response::Ok`] at once, to show the connection still carries messages, as
     /// herdr's heartbeat does after the Mac wakes.
     Ping,
@@ -1056,6 +1079,7 @@ pub enum Response {
     Message(String),
     /// The ids of the editors installed on the machine ([`Request::ListEditors`]).
     Editors(Vec<String>),
+    SshOptions(cloud::SshOptions),
     Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]
@@ -1086,6 +1110,9 @@ pub struct SessionSnapshot {
     pub storage: Storage,
     #[serde(default)]
     pub artifacts: Artifacts,
+    /// The cloud providers this machine's server found, and their machines.
+    #[serde(default)]
+    pub cloud: cloud::CloudSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1101,6 +1128,7 @@ pub enum Event {
     TitleGeneration(title_generation::TitleGenerationState),
     Storage(Storage),
     Artifacts(Artifacts),
+    Cloud(cloud::CloudSnapshot),
     Thread {
         connection: ConnectionId,
         update: ThreadUpdate,

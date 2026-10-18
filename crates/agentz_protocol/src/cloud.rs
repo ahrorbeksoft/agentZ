@@ -282,3 +282,56 @@ pub enum CloudUsage {
     /// Billing isn't on for the account.
     NotBilled,
 }
+
+/// What this Mac's server knows of the providers, kept in its `cloud.json` and sent to apps.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CloudSnapshot {
+    /// One per provider, in [`Provider::ALL`]'s order, once looked for.
+    pub providers: Vec<ProviderState>,
+    /// Looking for the CLIs now (Check Again).
+    #[serde(default)]
+    pub checking: bool,
+}
+
+impl CloudSnapshot {
+    pub fn provider(&self, provider: Provider) -> Option<&ProviderState> {
+        self.providers
+            .iter()
+            .find(|state| state.provider == provider)
+    }
+
+    pub fn machine(&self, provider: Provider, machine: &str) -> Option<&CloudMachine> {
+        self.provider(provider)?
+            .machines
+            .iter()
+            .find(|candidate| candidate.id == machine)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderState {
+    pub provider: Provider,
+    pub status: ProviderStatus,
+    /// As last listed; kept while it's signed out or failing, so they're still shown.
+    pub machines: Vec<CloudMachine>,
+    pub usage: Option<CloudUsage>,
+    pub listed_at: Option<SystemTime>,
+    /// Why the last listing failed, while it does.
+    pub error: Option<String>,
+    /// What the CLI is doing to its machines now.
+    #[serde(default)]
+    pub changing: Vec<MachineChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MachineChange {
+    /// The machine's id, or the name of one being made.
+    pub machine: String,
+    pub change: Change,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Change {
+    Create,
+    Lifecycle(Lifecycle),
+}

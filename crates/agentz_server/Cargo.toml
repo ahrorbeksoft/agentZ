@@ -25,6 +25,7 @@ alacritty_terminal.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
+cloud.workspace = true
 clap.workspace = true
 collections.workspace = true
 env_logger.workspace = true

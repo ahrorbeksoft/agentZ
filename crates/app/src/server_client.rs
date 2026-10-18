@@ -14,6 +14,7 @@ use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
 };
+use agentz_protocol::cloud::CloudSnapshot;
 use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
@@ -156,6 +157,8 @@ pub struct ServerClient {
     storage: Storage,
     /// The machine's published artifacts, and where its pages server is.
     artifacts: Artifacts,
+    /// The cloud providers its server found, and their machines: this Mac's only.
+    cloud: CloudSnapshot,
     /// The ids of the editors installed on the machine
     /// ([`agentz_protocol::editors::EDITORS`]), asked for of this Mac's server only.
     editors: Vec<String>,
@@ -222,6 +225,7 @@ impl ServerClient {
                 regenerating_titles: HashSet::default(),
                 storage: Storage::default(),
                 artifacts: Artifacts::default(),
+                cloud: CloudSnapshot::default(),
                 editors: Vec::new(),
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
@@ -737,6 +741,13 @@ impl ServerClient {
         &self.artifacts
     }
 
+    fn set_cloud(&mut self, cloud: CloudSnapshot, cx: &mut Context<Self>) {
+        if cloud != self.cloud {
+            self.cloud = cloud;
+            cx.notify();
+        }
+    }
+
     fn set_artifacts(&mut self, artifacts: Artifacts, cx: &mut Context<Self>) {
         if artifacts != self.artifacts {
             self.artifacts = artifacts;
@@ -1020,6 +1031,7 @@ impl ServerClient {
         self.set_title_generation(session.title_generation, cx);
         self.set_storage(session.storage, cx);
         self.set_artifacts(session.artifacts, cx);
+        self.set_cloud(session.cloud, cx);
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
@@ -1048,6 +1060,7 @@ impl ServerClient {
                     | Event::TitleGeneration(_)
                     | Event::Storage(_)
                     | Event::Artifacts(_)
+                    | Event::Cloud(_)
             )
         {
             queued.push(event);
@@ -1066,6 +1079,7 @@ impl ServerClient {
             Event::MachineIcon(icon) => self.set_machine_icon_state(icon, cx),
             Event::TitleGeneration(state) => self.set_title_generation(state, cx),
             Event::Storage(storage) => self.set_storage(storage, cx),
+            Event::Cloud(cloud) => self.set_cloud(cloud, cx),
             Event::Artifacts(artifacts) => {
                 // Only a change is a publish: the session's list is what was there before.
                 let published: Vec<Artifact> = artifacts

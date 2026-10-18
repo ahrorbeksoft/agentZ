@@ -231,6 +231,7 @@ async fn serve(
             hands_pages_to_clients: agentz_server::browser::hands_pages_to_clients(),
             terminal_shell: None,
             title_generation_path: None,
+            cloud_path: None,
             keep_awake: agentz_server::KeepAwakeCommand::system(),
             listener: Some(listener.as_raw_fd()),
             handed_over,

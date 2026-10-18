@@ -112,6 +112,7 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
             hands_pages_to_clients: false,
             terminal_shell: Some("/bin/sh".into()),
             title_generation_path: None,
+            cloud_path: None,
             keep_awake: Vec::new(),
             listener: None,
             handed_over: None,

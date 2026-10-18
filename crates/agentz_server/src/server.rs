@@ -5,6 +5,7 @@ mod artifact_requests;
 mod attachment_requests;
 mod auto_archive;
 mod chats;
+mod cloud_requests;
 mod copy_reads;
 mod custom_agents;
 mod favicon_reads;
@@ -232,6 +233,7 @@ pub(crate) struct Server {
     /// What agentZ keeps on the machine, as last measured, for Settings › Storage.
     storage: Storage,
     storage_reads: storage_reads::StorageReads,
+    cloud: cloud_requests::CloudStore,
     /// What Settings › Storage's cleanup rules noted and are doing, besides the rules and the
     /// last run's report in `storage`.
     cleanups: workspace_cleanup::Cleanups,
@@ -300,6 +302,7 @@ pub(crate) struct Server {
     machine_icon_sent: MachineIcon,
     title_generation_sent: TitleGenerationState,
     storage_sent: Storage,
+    cloud_revision_sent: u64,
     registry_changed: bool,
     changed_connections: HashSet<ConnectionId>,
     /// When each draft no client has open is removed, unless something is typed in it (see
@@ -365,6 +368,8 @@ impl Server {
         );
         registry.refresh_if_stale();
         let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
+        let cloud =
+            cloud_requests::CloudStore::load(Some(data_dir.join("cloud.json")), config.cloud_path);
         let mut queues = queue_requests::Queues::load(data_dir.join("queues.json"));
         queues.retain(|thread_id| projects.thread(thread_id).is_some());
         let machine_icon = MachineIcon {
@@ -442,6 +447,7 @@ impl Server {
                 ..Storage::default()
             },
             storage_reads: storage_reads::StorageReads::default(),
+            cloud,
             cleanups: workspace_cleanup::Cleanups::new(&cleanup_file),
             artifacts,
             pages: artifact_pages,
@@ -472,6 +478,7 @@ impl Server {
             title_generation_sent: title_generation.clone(),
             title_generation,
             storage_sent: Storage::default(),
+            cloud_revision_sent: 0,
             title_generation_path: config.title_generation_path,
             agent_titled_threads: HashSet::default(),
             generated_titles: HashSet::default(),
@@ -838,6 +845,31 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::CheckCloud,
+            } => self.check_cloud(client, id),
+            Input::Request {
+                client,
+                id,
+                request:
+                    Request::ChangeCloudMachine {
+                        provider,
+                        machine,
+                        change,
+                    },
+            } => self.change_cloud_machine(client, id, provider, machine, change),
+            Input::Request {
+                client,
+                id,
+                request: Request::CreateCloudMachine { provider, machine },
+            } => self.create_cloud_machine(client, id, provider, machine),
+            Input::Request {
+                client,
+                id,
+                request: Request::CloudSshOptions { provider, machine },
+            } => self.cloud_ssh_options(client, id, provider, machine),
+            Input::Request {
+                client,
+                id,
                 request:
                     request @ (Request::AddAttachment { .. }
                     | Request::Attachment { .. }
@@ -961,6 +993,7 @@ impl Server {
                     title_generation: self.title_generation.clone(),
                     storage: self.storage.clone(),
                     artifacts: self.artifacts_snapshot(),
+                    cloud: self.cloud.snapshot().clone(),
                 }))
             }
             Request::SubscribeThread(connection) => {
@@ -1393,6 +1426,12 @@ impl Server {
             }
             Request::ClearStorage(_) => Err(anyhow!("clearing storage is handled separately")),
             Request::CleanUpNow => Err(anyhow!("cleaning up is handled separately")),
+            Request::CheckCloud
+            | Request::ChangeCloudMachine { .. }
+            | Request::CreateCloudMachine { .. }
+            | Request::CloudSshOptions { .. } => {
+                Err(anyhow!("cloud providers are handled separately"))
+            }
             Request::SetCleanupRules(rules) => {
                 self.set_cleanup_rules(rules)?;
                 Ok(Response::Ok)
@@ -2674,6 +2713,10 @@ impl Server {
         if self.artifacts.revision() != self.artifacts_revision_sent {
             self.artifacts_revision_sent = self.artifacts.revision();
             self.broadcast(Event::Artifacts(self.artifacts_snapshot()));
+        }
+        if self.cloud.revision() != self.cloud_revision_sent {
+            self.cloud_revision_sent = self.cloud.revision();
+            self.broadcast(Event::Cloud(self.cloud.snapshot().clone()));
         }
 
         for connection in std::mem::take(&mut self.changed_connections) {

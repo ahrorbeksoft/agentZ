@@ -28,7 +28,9 @@ Notes for whoever continues:
    the command that works in a terminal.
 3. **Providers in this Mac's server**: `cloud.json`, detection on demand and every few minutes
    while an app is open, the protocol (a snapshot, events, requests for lifecycle changes and
-   SSH options). Status: not started.
+   SSH options). Status: done in its own commit ("Find the cloud providers…"):
+   `server/cloud_requests.rs`, `Request::CheckCloud` and friends, `ServerConfig::cloud_path`
+   for tests. Only this Mac's app asks, so other machines never run the CLIs.
 4. **Cloud machines in the app**: `MachineProfile`'s source, connecting with the provider's SSH
    options (Instabox's certificate renewed first), the provider's states (a stopped machine
    isn't dialed), and Settings › Machines grouped by provider with More Providers and Check
