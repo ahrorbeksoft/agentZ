@@ -61,7 +61,10 @@ Notes for whoever continues:
    `proton` only.
 6. **A machine's page** with its provider's tabs (topic 7 A), snapshots on it (topic 8 A),
    ports, Vault, SSH tokens and Proton's keys; Instabox's API key through its CLI, for desktop
-   links and CPU and memory. Status: not started.
+   links and CPU and memory. Status: in progress. The server's part is committed ("Read a
+   cloud machine's details…"): `Request::CloudMachineDetails` and `CloudMachineAction`,
+   `cloud::InstaboxApi` (its key in `cloud/instabox/api-key`, made with `instabox keys
+   create`), Instabox's `get`, `vault show` and `port ls` fixtures. The app's page is next.
 7. **Machines that are off**: the list of every remote machine's projects and threads kept on
    this Mac, and messages held for a stopped machine, which start it (topic 11 C). Status: not
    started.

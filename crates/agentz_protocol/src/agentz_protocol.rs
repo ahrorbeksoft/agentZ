@@ -817,6 +817,17 @@ pub enum Request {
         provider: cloud::Provider,
         machine: String,
     },
+    /// What a provider machine's page shows, answered with [`Response::CloudMachineDetails`].
+    CloudMachineDetails {
+        provider: cloud::Provider,
+        machine: String,
+    },
+    /// Does something with a provider machine's extras, answered once it's done.
+    CloudMachineAction {
+        provider: cloud::Provider,
+        machine: String,
+        action: cloud::MachineAction,
+    },
 
     /// Answers [`Response::Ok`] at once, to show the connection still carries messages, as
     /// herdr's heartbeat does after the Mac wakes.
@@ -1086,6 +1097,9 @@ pub enum Response {
     SshOptions(cloud::SshOptions),
     CloudSources(cloud::CloudSources),
     CloudMachineCreated(cloud::CloudMachine),
+    CloudMachineDetails(cloud::MachineDetails),
+    /// What a provider's action gave: an SSH command, or a desktop's link.
+    CloudOutput(String),
     Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]

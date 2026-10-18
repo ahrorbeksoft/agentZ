@@ -847,6 +847,8 @@ mod tests {
                                     is_ready: true,
                                     source_machine: None,
                                     created_at: None,
+                                    software_only: false,
+                                    size_bytes: None,
                                 }],
                             }))
                         }

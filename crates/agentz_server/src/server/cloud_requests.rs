@@ -7,15 +7,16 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::Response;
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CloudSnapshot, CloudUsage, CreateMachine, Lifecycle, MachineChange,
-    Provider, ProviderState, ProviderStatus,
+    Change, CloudMachine, CloudSnapshot, CloudUsage, CreateMachine, Lifecycle, MachineAction,
+    MachineChange, Provider, ProviderState, ProviderStatus,
 };
 use anyhow::{Context as _, Result, anyhow};
-use cloud::Cli;
+use cloud::{Cli, InstaboxApi};
 use util::ResultExt as _;
 
 use super::{ClientId, Input, Server};
@@ -37,10 +38,16 @@ pub(super) struct CloudStore {
     status_checked_at: Option<Instant>,
     /// Providers being looked at now, so a refresh doesn't run beside another.
     reading: BTreeSet<Provider>,
+    /// For what Instabox's CLI doesn't do, with agentZ's key.
+    api: Arc<InstaboxApi>,
 }
 
 impl CloudStore {
-    pub(super) fn load(path: Option<PathBuf>, cli_path: Option<OsString>) -> Self {
+    pub(super) fn load(
+        path: Option<PathBuf>,
+        cli_path: Option<OsString>,
+        api: InstaboxApi,
+    ) -> Self {
         let mut snapshot: CloudSnapshot = path
             .as_deref()
             .and_then(|path| read_json(path).log_err().flatten())
@@ -58,6 +65,7 @@ impl CloudStore {
             watching: false,
             status_checked_at: None,
             reading: BTreeSet::new(),
+            api: Arc::new(api),
         }
     }
 
@@ -393,6 +401,60 @@ impl Server {
                 .retain(|changing| changing.machine != machine);
         });
         self.list_cloud_machines(provider);
+    }
+
+    /// What a machine's page shows beyond its listing (topic 7 A).
+    pub(super) fn cloud_machine_details(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        provider: Provider,
+        machine: String,
+    ) {
+        let cli = self.cloud.cli(provider);
+        let api = self.cloud.api.clone();
+        let ready = self.shell_environment_ready.clone();
+        let work = async move {
+            ready.await;
+            cli.details(&machine, &api)
+                .await
+                .map_err(|error| anyhow!("{error:#}"))
+        };
+        self.spawn_then(work, move |server, details| {
+            server.respond(client, id, details.map(Response::CloudMachineDetails));
+        });
+    }
+
+    /// Does a page's action to a machine, answered once its CLI is done with what it gave for
+    /// the user. The machines and usage are listed again after one that changes something.
+    pub(super) fn cloud_machine_action(
+        &mut self,
+        client: ClientId,
+        id: u64,
+        provider: Provider,
+        machine: String,
+        action: MachineAction,
+    ) {
+        let cli = self.cloud.cli(provider);
+        let api = self.cloud.api.clone();
+        let ready = self.shell_environment_ready.clone();
+        let changes = !matches!(
+            action,
+            MachineAction::SshCommand | MachineAction::DesktopLink { .. }
+        );
+        let work = async move {
+            ready.await;
+            cli.act(&machine, &action, &api)
+                .await
+                .map_err(|error| anyhow!("{error:#}"))
+        };
+        self.spawn_then(work, move |server, output| {
+            if changes {
+                server.list_cloud_machines(provider);
+            }
+            let response = output.map(|output| output.map_or(Response::Ok, Response::CloudOutput));
+            server.respond(client, id, response);
+        });
     }
 
     /// How SSH reaches the machine, from its CLI.

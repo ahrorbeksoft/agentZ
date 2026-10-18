@@ -5,9 +5,10 @@ use std::time::{Duration, SystemTime};
 
 use agentz_protocol::cloud::{
     AccountRules, CloudMachine, CloudState, CloudTemplate, CloudUsage, CreateMachine, Lifecycle,
-    MachineSize, MachineSnapshot, MachineSource,
+    MachineAction, MachineDetails, MachineSize, MachineSnapshot, MachineSource, MachineVault,
+    PublishedPort, TimeoutAt, VaultItem, VaultWrite,
 };
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -29,6 +30,8 @@ struct Machine {
 #[derive(Deserialize)]
 struct Template {
     id: String,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -96,7 +99,7 @@ fn size(spec: Spec) -> MachineSize {
     }
 }
 
-fn time(at: Option<String>) -> Option<SystemTime> {
+pub(crate) fn time(at: Option<String>) -> Option<SystemTime> {
     at.and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
         .map(SystemTime::from)
 }
@@ -200,6 +203,11 @@ struct Snapshot {
     source_machine_id: Option<String>,
     #[serde(default)]
     created_at: Option<String>,
+    #[serde(default)]
+    root_size_bytes: Option<f64>,
+    /// Its `/data` disk's, which a snapshot saved with `--root-only` doesn't have.
+    #[serde(default)]
+    data_size_bytes: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -222,8 +230,243 @@ pub(crate) fn parse_snapshots(json: &str) -> Result<Vec<MachineSnapshot>> {
             is_ready: snapshot.status.as_deref() == Some("ready"),
             source_machine: snapshot.source_machine_id,
             created_at: time(snapshot.created_at),
+            software_only: snapshot.data_size_bytes.is_none_or(|bytes| bytes <= 0.),
+            size_bytes: snapshot
+                .root_size_bytes
+                .map(|root| (root + snapshot.data_size_bytes.unwrap_or(0.)) as u64),
         })
         .collect())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MachineInfo {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    template: Option<Template>,
+    #[serde(default)]
+    timeout_at: Option<String>,
+    #[serde(default)]
+    on_timeout: Option<String>,
+    #[serde(default)]
+    auto_suspend_after_seconds: Option<u64>,
+    #[serde(default)]
+    auto_suspended_at: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `get <machine> --json`: what its listing doesn't have, and whether it runs.
+pub(crate) fn parse_details(json: &str) -> Result<(MachineDetails, bool)> {
+    let info: MachineInfo = serde_json::from_str(json).context("parsing the machine")?;
+    let template = info.template.map(|template| match template.version {
+        Some(version) if !version.is_empty() => format!("{} {version}", template.id),
+        _ => template.id,
+    });
+    let delete = info.on_timeout.as_deref() == Some("kill");
+    let labels = info
+        .metadata
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| match value {
+            serde_json::Value::String(value) => (key, value),
+            value => (key, value.to_string()),
+        })
+        .collect();
+    let details = MachineDetails {
+        template,
+        timeout: time(info.timeout_at).map(|at| TimeoutAt { at, delete }),
+        idle_pause: info
+            .auto_suspend_after_seconds
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs),
+        idle_paused_at: time(info.auto_suspended_at),
+        labels,
+        ..MachineDetails::default()
+    };
+    Ok((details, info.state.as_deref() == Some("running")))
+}
+
+#[derive(Deserialize)]
+struct Vault {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    items: Vec<VaultEntry>,
+    #[serde(default)]
+    applied: Option<VaultApplied>,
+}
+
+#[derive(Deserialize)]
+struct VaultEntry {
+    name: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VaultApplied {
+    #[serde(default)]
+    at: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// `vault show <machine> --json`: what it gets, and its last write.
+pub(crate) fn parse_vault(json: &str) -> Result<MachineVault> {
+    let vault: Vault = serde_json::from_str(json).context("parsing the Vault")?;
+    Ok(MachineVault {
+        enabled: vault.enabled,
+        items: vault
+            .items
+            .into_iter()
+            .map(|item| VaultItem {
+                path: item.path.filter(|_| item.kind.as_deref() != Some("env")),
+                name: item.name,
+            })
+            .collect(),
+        last_write: vault.applied.map(|applied| VaultWrite {
+            at: time(applied.at),
+            error: applied.error.filter(|error| !error.is_empty()),
+        }),
+    })
+}
+
+#[derive(Deserialize)]
+struct Port {
+    port: u16,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Ports {
+    Page { ports: Vec<Port> },
+    List(Vec<Port>),
+}
+
+/// `port ls <machine> --json` (`{"enabled": true, "ports": []}` captured; its ports'
+/// fields are *unverified*).
+pub(crate) fn parse_ports(json: &str) -> Result<Vec<PublishedPort>> {
+    let ports: Ports = serde_json::from_str(json).context("parsing the ports")?;
+    let (Ports::Page { ports } | Ports::List(ports)) = ports;
+    let mut ports: Vec<PublishedPort> = ports
+        .into_iter()
+        .map(|port| PublishedPort {
+            port: port.port,
+            name: port.name.filter(|name| !name.is_empty()),
+            url: port.url.filter(|url| !url.is_empty()),
+        })
+        .collect();
+    ports.sort_by_key(|port| port.port);
+    Ok(ports)
+}
+
+/// The URL `port publish --json` gives the port, where it's found.
+pub(crate) fn published_url(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    find_string(&value, &|text| text.starts_with("https://")).map(str::to_string)
+}
+
+/// `ssh-token <machine> --json`'s command, for any terminal.
+pub(crate) fn parse_ssh_command(stdout: &str) -> Result<String> {
+    let command = match serde_json::from_str::<serde_json::Value>(stdout) {
+        Ok(value) => value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        Err(_) => stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("ssh "))
+            .map(str::to_string),
+    };
+    command
+        .filter(|command| !command.is_empty())
+        .context("Instabox gave no SSH command")
+}
+
+/// The first string in `value` that `matches`, depth first.
+pub(crate) fn find_string<'a>(
+    value: &'a serde_json::Value,
+    matches: &dyn Fn(&str) -> bool,
+) -> Option<&'a str> {
+    match value {
+        serde_json::Value::String(text) => Some(text.as_str()).filter(|text| matches(text)),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| find_string(value, matches))
+        }
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .find_map(|value| find_string(value, matches)),
+        _ => None,
+    }
+}
+
+/// What the CLI runs for a page's action, all but the desktop link, which only its API makes.
+pub(crate) fn action_args(machine: &str, action: &MachineAction) -> Result<Vec<String>> {
+    let mut args: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| args.extend(items.iter().map(|item| item.to_string()));
+    match action {
+        MachineAction::SaveSnapshot {
+            name,
+            software_only,
+        } => {
+            push(&["snapshot", "save", machine, "--name", name]);
+            if *software_only {
+                push(&["--root-only"]);
+            }
+            push(&["--json"]);
+        }
+        MachineAction::DeleteSnapshot(snapshot) => push(&["snapshot", "rm", snapshot]),
+        MachineAction::PublishPort { port, name } => {
+            push(&["port", "publish", machine, &port.to_string()]);
+            if let Some(name) = name.as_deref().filter(|name| !name.is_empty()) {
+                push(&["--name", name]);
+            }
+            push(&["--json"]);
+        }
+        MachineAction::UnpublishPort(port) => {
+            push(&["port", "unpublish", machine, &port.to_string()]);
+        }
+        MachineAction::PushVault => push(&["vault", "push", machine, "--json"]),
+        MachineAction::SetTimeout(Some(timeout)) => push(&[
+            "timeout",
+            machine,
+            &duration_arg(timeout.after),
+            "--on-timeout",
+            if timeout.delete { "kill" } else { "pause" },
+        ]),
+        MachineAction::SetTimeout(None) => push(&["timeout", machine, "0"]),
+        MachineAction::SetIdlePause(after) => {
+            push(&["auto-suspend", machine, &duration_arg(*after)])
+        }
+        MachineAction::SshCommand => push(&["ssh-token", machine, "--json"]),
+        MachineAction::RevokeSshCommands => push(&["ssh-token", "--revoke", machine]),
+        MachineAction::DesktopLink { .. } => {
+            return Err(anyhow!("Instabox's CLI makes no desktop links"));
+        }
+        MachineAction::ReplaceSshKeys(_) => {
+            return Err(anyhow!(
+                "Instabox machines are reached with its certificates, not keys"
+            ));
+        }
+    }
+    Ok(args)
+}
+
+/// A duration as the CLI takes it, where zero turns the setting off.
+fn duration_arg(after: Duration) -> String {
+    match after.as_secs() {
+        0 => "0".to_string(),
+        seconds => format!("{seconds}s"),
+    }
 }
 
 pub(crate) fn create_args(machine: &CreateMachine) -> Vec<String> {
@@ -246,15 +489,7 @@ pub(crate) fn create_args(machine: &CreateMachine) -> Vec<String> {
         ]);
     }
     if let Some(after) = machine.auto_suspend {
-        let after = after.as_secs();
-        args.extend([
-            "--auto-suspend".into(),
-            if after == 0 {
-                "0".into()
-            } else {
-                format!("{after}s")
-            },
-        ]);
+        args.extend(["--auto-suspend".into(), duration_arg(after)]);
     }
     args
 }
@@ -412,7 +647,157 @@ mod tests {
             Some("m_q4mz7tk2bx5rn3wd6vp2hj4sye")
         );
         assert!(snapshots[0].created_at.is_some());
+        assert!(!snapshots[0].software_only);
+        assert_eq!(snapshots[0].size_bytes, Some(38654705664));
         assert!(!snapshots[1].is_ready);
+        assert!(snapshots[1].software_only);
+        assert_eq!(parse_snapshots("[]").expect("parses"), []);
+    }
+
+    #[test]
+    fn reads_what_get_has_beyond_the_listing() {
+        let (details, running) =
+            parse_details(include_str!("instabox_outputs/get.json")).expect("parses");
+        assert!(!running);
+        assert_eq!(
+            details.template.as_deref(),
+            Some("agent-browser 2026-10-15.4")
+        );
+        assert_eq!(details.timeout, None);
+        assert_eq!(details.idle_pause, Some(Duration::from_secs(1800)));
+        assert!(details.idle_paused_at.is_some());
+        assert_eq!(details.labels, []);
+
+        let (details, running) = parse_details(
+            r#"{"state": "running", "timeoutAt": "2026-10-18T12:00:00Z", "onTimeout": "kill",
+                "autoSuspendAfterSeconds": 0, "metadata": {"team": "web", "tier": 2}}"#,
+        )
+        .expect("parses");
+        assert!(running);
+        assert!(details.timeout.is_some_and(|timeout| timeout.delete));
+        assert_eq!(details.idle_pause, None);
+        assert_eq!(
+            details.labels,
+            [("team".into(), "web".into()), ("tier".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn reads_the_vault_and_ports() {
+        assert_eq!(
+            parse_vault(include_str!("instabox_outputs/vault-show.json")).expect("parses"),
+            MachineVault {
+                enabled: true,
+                items: Vec::new(),
+                last_write: None,
+            }
+        );
+        let vault = parse_vault(
+            r#"{"enabled": true, "items": [{"name": "GITHUB_TOKEN", "kind": "env"},
+                {"name": "npmrc", "kind": "file", "path": ".npmrc"}],
+                "applied": {"at": "2026-10-18T09:00:00Z", "env": ["GITHUB_TOKEN"], "files": []}}"#,
+        )
+        .expect("parses");
+        assert_eq!(vault.items[0].path, None);
+        assert_eq!(vault.items[1].path.as_deref(), Some(".npmrc"));
+        assert!(
+            vault
+                .last_write
+                .is_some_and(|write| write.at.is_some() && write.error.is_none())
+        );
+
+        assert_eq!(
+            parse_ports(include_str!("instabox_outputs/port-ls.json")).expect("parses"),
+            []
+        );
+        let ports = parse_ports(
+            r#"{"enabled": true, "ports": [{"port": 8080, "name": "", "url": "https://p-8080.instabox.app"},
+                {"port": 3000, "name": "web"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            ports,
+            [
+                PublishedPort {
+                    port: 3000,
+                    name: Some("web".into()),
+                    url: None,
+                },
+                PublishedPort {
+                    port: 8080,
+                    name: None,
+                    url: Some("https://p-8080.instabox.app".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            published_url(r#"{"port": {"port": 3000, "url": "https://web.instabox.app"}}"#)
+                .as_deref(),
+            Some("https://web.instabox.app")
+        );
+    }
+
+    #[test]
+    fn reads_the_ssh_command() {
+        assert_eq!(
+            parse_ssh_command(
+                r#"{"command": "ssh -p 2222 t_abc@api.instabox.sh", "expiresAt": "2026-10-25T00:00:00Z"}"#
+            )
+            .expect("parses"),
+            "ssh -p 2222 t_abc@api.instabox.sh"
+        );
+        assert_eq!(
+            parse_ssh_command("Works for 7 days:\n  ssh -p 2222 t_abc@api.instabox.sh\n")
+                .expect("parses"),
+            "ssh -p 2222 t_abc@api.instabox.sh"
+        );
+        assert!(parse_ssh_command("{}").is_err());
+    }
+
+    #[test]
+    fn the_pages_actions_run_the_cli() {
+        let args = |action| action_args("m_1", &action).expect("has args").join(" ");
+        assert_eq!(
+            args(MachineAction::SaveSnapshot {
+                name: "base".into(),
+                software_only: true,
+            }),
+            "snapshot save m_1 --name base --root-only --json"
+        );
+        assert_eq!(
+            args(MachineAction::DeleteSnapshot("s_1".into())),
+            "snapshot rm s_1"
+        );
+        assert_eq!(
+            args(MachineAction::PublishPort {
+                port: 3000,
+                name: Some("web".into()),
+            }),
+            "port publish m_1 3000 --name web --json"
+        );
+        assert_eq!(
+            args(MachineAction::UnpublishPort(3000)),
+            "port unpublish m_1 3000"
+        );
+        assert_eq!(args(MachineAction::PushVault), "vault push m_1 --json");
+        assert_eq!(
+            args(MachineAction::SetTimeout(Some(MachineTimeout {
+                after: Duration::from_secs(3600),
+                delete: false,
+            }))),
+            "timeout m_1 3600s --on-timeout pause"
+        );
+        assert_eq!(args(MachineAction::SetTimeout(None)), "timeout m_1 0");
+        assert_eq!(
+            args(MachineAction::SetIdlePause(Duration::ZERO)),
+            "auto-suspend m_1 0"
+        );
+        assert_eq!(args(MachineAction::SshCommand), "ssh-token m_1 --json");
+        assert_eq!(
+            args(MachineAction::RevokeSshCommands),
+            "ssh-token --revoke m_1"
+        );
+        assert!(action_args("m_1", &MachineAction::DesktopLink { view_only: true }).is_err());
     }
 
     #[test]

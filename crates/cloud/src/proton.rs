@@ -5,7 +5,8 @@
 use std::time::{Duration, SystemTime};
 
 use agentz_protocol::cloud::{
-    CloudMachine, CloudState, CloudUsage, CreateMachine, Lifecycle, MachineSize, SshAddress,
+    CloudMachine, CloudState, CloudUsage, CreateMachine, Lifecycle, MachineAction, MachineDetails,
+    MachineSize, SshAddress,
 };
 use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
@@ -45,6 +46,73 @@ pub(crate) fn parse_machines(json: &str) -> Result<Vec<CloudMachine>> {
     Ok(computers.into_iter().map(machine).collect())
 }
 
+fn seconds_since_epoch(seconds: f64) -> Option<SystemTime> {
+    (seconds.is_finite() && seconds >= 0.)
+        .then(|| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(seconds))
+}
+
+#[derive(Deserialize)]
+struct Show {
+    machine: ShownComputer,
+    #[serde(default)]
+    operations: Vec<Operation>,
+}
+
+#[derive(Deserialize)]
+struct ShownComputer {
+    state: String,
+    #[serde(default)]
+    last_activity: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct Operation {
+    action: String,
+    status: String,
+    #[serde(default)]
+    finished: Option<f64>,
+}
+
+/// `show <computer> --json`: when a running computer last started, which its operations say,
+/// and its last activity.
+pub(crate) fn parse_details(json: &str) -> Result<MachineDetails> {
+    let show: Show = serde_json::from_str(json).context("parsing the computer")?;
+    let started_at = (show.machine.state == "running")
+        .then(|| {
+            show.operations
+                .iter()
+                .filter(|operation| {
+                    operation.status == "succeeded"
+                        && matches!(operation.action.as_str(), "start" | "restart" | "create")
+                })
+                .filter_map(|operation| operation.finished)
+                .max_by(f64::total_cmp)
+        })
+        .flatten()
+        .and_then(seconds_since_epoch);
+    Ok(MachineDetails {
+        started_at,
+        last_activity: show.machine.last_activity.and_then(seconds_since_epoch),
+        ..MachineDetails::default()
+    })
+}
+
+/// A page's action: only its SSH keys, which `keys` replaces on a running computer.
+pub(crate) fn action_args(machine: &str, action: &MachineAction) -> Result<Vec<String>> {
+    let MachineAction::ReplaceSshKeys(keys) = action else {
+        return Err(anyhow!("Proton computers can't do that"));
+    };
+    anyhow::ensure!(!keys.is_empty(), "a computer needs at least one SSH key");
+    let mut args = vec!["keys".to_string(), machine.to_string()];
+    for key in keys {
+        let key = key
+            .to_str()
+            .with_context(|| format!("{} isn't a path Proton's CLI can take", key.display()))?;
+        args.extend(["--key".to_string(), key.to_string()]);
+    }
+    Ok(args)
+}
+
 fn machine(computer: Computer) -> CloudMachine {
     let ssh_address = computer
         .public_ssh
@@ -69,10 +137,7 @@ fn machine(computer: Computer) -> CloudMachine {
         },
         template: None,
         ssh_address,
-        created_at: computer
-            .created
-            .filter(|seconds| seconds.is_finite() && *seconds >= 0.)
-            .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs_f64(seconds)),
+        created_at: computer.created.and_then(seconds_since_epoch),
         error: computer.error.filter(|error| !error.is_empty()),
     }
 }
@@ -212,6 +277,46 @@ mod tests {
         let show: Show =
             serde_json::from_str(include_str!("proton_outputs/show.json")).expect("parses");
         assert_eq!(machine(show.machine).name, "devbox-3");
+    }
+
+    #[test]
+    fn show_says_when_it_started() {
+        let details = parse_details(include_str!("proton_outputs/show.json")).expect("parses");
+        assert_eq!(
+            details.started_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(1792244584.507196))
+        );
+        assert_eq!(
+            details.last_activity,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(1792244584.5072565))
+        );
+        let stopped = include_str!("proton_outputs/show.json").replacen(
+            r#""state": "running""#,
+            r#""state": "stopped""#,
+            1,
+        );
+        assert_eq!(parse_details(&stopped).expect("parses").started_at, None);
+    }
+
+    #[test]
+    fn replaces_the_ssh_keys_with_the_files_picked() {
+        let keys = MachineAction::ReplaceSshKeys(vec![
+            "/Users/me/.ssh/id_ed25519.pub".into(),
+            "/Users/me/.ssh/work.pub".into(),
+        ]);
+        assert_eq!(
+            action_args("devbox-3", &keys).expect("has args"),
+            [
+                "keys",
+                "devbox-3",
+                "--key",
+                "/Users/me/.ssh/id_ed25519.pub",
+                "--key",
+                "/Users/me/.ssh/work.pub",
+            ]
+        );
+        assert!(action_args("devbox-3", &MachineAction::ReplaceSshKeys(Vec::new())).is_err());
+        assert!(action_args("devbox-3", &MachineAction::PushVault).is_err());
     }
 
     #[test]

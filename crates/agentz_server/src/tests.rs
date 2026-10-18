@@ -11328,6 +11328,8 @@ case "$*" in
   "balance") printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
   "start c-1 --yes") echo running > '{state}'; echo "  start: succeeded" >&2 ;;
   "ssh-config c-1") printf 'Host proton-devbox-3\n  HostName ssh.proton.computer\n  User ubuntu\n  Port 22021\n' ;;
+  "show c-1 --json") printf '{{"machine": {{"id": "c-1", "name": "devbox-3", "state": "%s", "last_activity": 1792244584.5}}, "operations": [{{"action": "start", "status": "succeeded", "finished": 1792244584.5}}]}}' "$(cat '{state}')" ;;
+  "keys c-1 --key "*) echo "  replaced 1 key" ;;
   *) echo "proton: unknown command: $*" >&2; exit 1 ;;
 esac
 "#,
@@ -11356,12 +11358,14 @@ fn cloud_snapshot(client: &TestClient) -> Option<agentz_protocol::cloud::CloudSn
 /// signed in, with its computer and balance, and Instabox not installed. It starts a computer
 /// through the CLI, skipping the CLI's own price question, lists it again after, and gives the
 /// computer's SSH options; a change the provider doesn't have is refused. It makes a computer
-/// and answers with it, and Proton has nothing to start one from.
+/// and answers with it, and Proton has nothing to start one from. A computer's page reads when
+/// it started, and replaces its SSH keys.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn finds_cloud_providers_and_changes_their_machines() {
     use agentz_protocol::cloud::{
-        CloudState, CloudUsage, CreateMachine, Lifecycle, Provider, ProviderStatus, SshOptions,
+        CloudState, CloudUsage, CreateMachine, Lifecycle, MachineAction, Provider, ProviderStatus,
+        SshOptions,
     };
 
     let Some(command) = mock_agent() else {
@@ -11446,6 +11450,37 @@ async fn finds_cloud_providers_and_changes_their_machines() {
         client.ok(Request::CloudSources(Provider::Proton)).await,
         Response::CloudSources(Default::default())
     );
+    let Response::CloudMachineDetails(details) = client
+        .ok(Request::CloudMachineDetails {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+        })
+        .await
+    else {
+        panic!("not its details");
+    };
+    assert!(details.started_at.is_some());
+    assert_eq!(details.errors, Vec::<String>::new());
+    let key = cli.path().join("id_ed25519.pub");
+    assert_eq!(
+        client
+            .ok(Request::CloudMachineAction {
+                provider: Provider::Proton,
+                machine: "c-1".into(),
+                action: MachineAction::ReplaceSshKeys(vec![key.clone()]),
+            })
+            .await,
+        Response::Ok
+    );
+    let error = client
+        .request(Request::CloudMachineAction {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+            action: MachineAction::PushVault,
+        })
+        .await
+        .expect_err("Proton has no Vault");
+    assert!(error.message.contains("can't do that"), "{}", error.message);
     let Response::CloudMachineCreated(created) = client
         .ok(Request::CreateCloudMachine {
             provider: Provider::Proton,
@@ -11475,6 +11510,8 @@ async fn finds_cloud_providers_and_changes_their_machines() {
         log.lines().any(|line| line == "create scratch --yes"),
         "{log}"
     );
+    let replaced = format!("keys c-1 --key {}", key.display());
+    assert!(log.lines().any(|line| line == replaced), "{log}");
     // Kept for after a restart.
     let saved = std::fs::read_to_string(server.data_dir.path().join("cloud.json"))
         .expect("cloud.json was written");

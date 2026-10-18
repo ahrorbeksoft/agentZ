@@ -368,8 +368,11 @@ impl Server {
         );
         registry.refresh_if_stale();
         let spaces = SpaceStore::load(Some(data_dir.join("spaces.json")));
-        let cloud =
-            cloud_requests::CloudStore::load(Some(data_dir.join("cloud.json")), config.cloud_path);
+        let cloud = cloud_requests::CloudStore::load(
+            Some(data_dir.join("cloud.json")),
+            config.cloud_path,
+            cloud::InstaboxApi::new(http_client.clone(), &data_dir),
+        );
         let mut queues = queue_requests::Queues::load(data_dir.join("queues.json"));
         queues.retain(|thread_id| projects.thread(thread_id).is_some());
         let machine_icon = MachineIcon {
@@ -872,6 +875,21 @@ impl Server {
                 id,
                 request: Request::CloudSshOptions { provider, machine },
             } => self.cloud_ssh_options(client, id, provider, machine),
+            Input::Request {
+                client,
+                id,
+                request: Request::CloudMachineDetails { provider, machine },
+            } => self.cloud_machine_details(client, id, provider, machine),
+            Input::Request {
+                client,
+                id,
+                request:
+                    Request::CloudMachineAction {
+                        provider,
+                        machine,
+                        action,
+                    },
+            } => self.cloud_machine_action(client, id, provider, machine, action),
             Input::Request {
                 client,
                 id,
@@ -1435,7 +1453,9 @@ impl Server {
             | Request::ChangeCloudMachine { .. }
             | Request::CloudSources(_)
             | Request::CreateCloudMachine { .. }
-            | Request::CloudSshOptions { .. } => {
+            | Request::CloudSshOptions { .. }
+            | Request::CloudMachineDetails { .. }
+            | Request::CloudMachineAction { .. } => {
                 Err(anyhow!("cloud providers are handled separately"))
             }
             Request::SetCleanupRules(rules) => {

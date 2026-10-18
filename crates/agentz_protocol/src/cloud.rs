@@ -52,6 +52,8 @@ pub struct ProviderDescription {
     /// What a running machine costs, for a provider whose machines bill from when they're
     /// created or started; starting one is asked about first (topic 5).
     pub charge: Option<&'static str>,
+    /// The same, an hour, in millionths of a dollar, for what a run has cost so far.
+    pub hourly_micro_usd: Option<u64>,
     /// The lifecycle changes it has.
     pub lifecycle: &'static [Lifecycle],
     pub capabilities: Capabilities,
@@ -94,6 +96,7 @@ static INSTABOX: ProviderDescription = ProviderDescription {
     new_machine: None,
     code: None,
     charge: None,
+    hourly_micro_usd: None,
     lifecycle: &[
         Lifecycle::Start,
         Lifecycle::Stop,
@@ -128,6 +131,8 @@ static PROTON: ProviderDescription = ProviderDescription {
     new_machine: Some("8 shared vCPUs · 2–64 GB memory · 50 GB disk · Ubuntu 24.04"),
     code: None,
     charge: Some("$20 per 730 running hours, billed by the second from your Cube balance"),
+    // $20 / 730 hours.
+    hourly_micro_usd: Some(27_397),
     lifecycle: &[
         Lifecycle::Start,
         Lifecycle::Stop,
@@ -272,6 +277,133 @@ pub struct MachineSnapshot {
     /// The machine it was saved from, by its id.
     pub source_machine: Option<String>,
     pub created_at: Option<SystemTime>,
+    /// It has the machine's software only, without its home and workspace.
+    #[serde(default)]
+    pub software_only: bool,
+    /// The saved disks' full size, not the storage they use.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+}
+
+/// What a machine's page shows (topic 7 A) beyond its listing, as its provider tells it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MachineDetails {
+    /// The template it started from, with its version ("universal 2026-10-13").
+    pub template: Option<String>,
+    /// When it's paused or deleted (Instabox's timeout).
+    pub timeout: Option<TimeoutAt>,
+    /// It pauses once it's been idle this long; `None` never does.
+    pub idle_pause: Option<Duration>,
+    /// When it paused itself for being idle, until it's next changed.
+    pub idle_paused_at: Option<SystemTime>,
+    /// Its labels (Instabox's metadata).
+    pub labels: Vec<(String, String)>,
+    /// What it gets from the account's Vault, where the provider has one.
+    pub vault: Option<MachineVault>,
+    /// The account's snapshots saved from it, newest first.
+    pub snapshots: Vec<MachineSnapshot>,
+    pub ports: Vec<PublishedPort>,
+    /// CPU and memory, oldest first: Instabox samples them every 30 s, and gives the last 5
+    /// minutes.
+    pub metrics: Vec<MetricSample>,
+    /// How long it ran this month.
+    pub running: Option<RunningTime>,
+    /// When it last started, while it runs (Proton's).
+    pub started_at: Option<SystemTime>,
+    pub last_activity: Option<SystemTime>,
+    /// What couldn't be read ("Its ports: …"); the rest still is.
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TimeoutAt {
+    pub at: SystemTime,
+    /// It's deleted then, rather than paused.
+    pub delete: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MachineVault {
+    /// It takes the Vault; turned off, it is for good.
+    pub enabled: bool,
+    /// The items it gets with its labels.
+    pub items: Vec<VaultItem>,
+    /// The last write into it.
+    pub last_write: Option<VaultWrite>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VaultItem {
+    pub name: String,
+    /// Where a file is written under its home; `None` for an environment variable.
+    pub path: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VaultWrite {
+    pub at: Option<SystemTime>,
+    /// Why it failed, when it did.
+    pub error: Option<String>,
+}
+
+/// A port with a public HTTPS URL (Instabox's).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PublishedPort {
+    pub port: u16,
+    pub name: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetricSample {
+    pub at: SystemTime,
+    /// CPU time used over its vCPUs, 0 to 100.
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunningTime {
+    /// Since when it's counted.
+    pub since: SystemTime,
+    pub seconds: u64,
+    pub vcpu_seconds: Option<u64>,
+}
+
+/// What a machine's page does with its provider's extras.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MachineAction {
+    /// Saves a snapshot of it; `software_only` leaves out its home and workspace.
+    SaveSnapshot {
+        name: String,
+        software_only: bool,
+    },
+    /// Deletes one of the account's snapshots, by its id.
+    DeleteSnapshot(String),
+    PublishPort {
+        port: u16,
+        name: Option<String>,
+    },
+    UnpublishPort(u16),
+    /// Writes the Vault's items into it now.
+    PushVault,
+    /// Pauses or deletes it this long from now; `None` clears its timeout.
+    SetTimeout(Option<MachineTimeout>),
+    /// Pauses it once it's been idle this long; zero never does.
+    SetIdlePause(Duration),
+    /// A plain `ssh` command for any terminal, which works for 7 days, answered with
+    /// [`crate::Response::CloudOutput`].
+    SshCommand,
+    /// Stops every SSH command made for it, and closes their sessions.
+    RevokeSshCommands,
+    /// A link to its desktop, installed and started first, answered with
+    /// [`crate::Response::CloudOutput`]: one to use it, or to watch it for an hour.
+    DesktopLink {
+        view_only: bool,
+    },
+    /// Replaces the SSH keys that reach it with these public key files on this Mac (Proton's).
+    ReplaceSshKeys(Vec<std::path::PathBuf>),
 }
 
 /// What a new machine is made with.
