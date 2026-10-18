@@ -16,6 +16,9 @@ pub struct Environment {
     path: Vec<PathBuf>,
     home: Option<PathBuf>,
     data_home: Option<PathBuf>,
+    /// The machine's own folders that installers put editors in: `/Applications` on macOS,
+    /// `/usr/bin` and the like elsewhere.
+    system: Vec<PathBuf>,
 }
 
 impl Environment {
@@ -30,6 +33,14 @@ impl Environment {
                 .unwrap_or_default(),
             home,
             data_home,
+            system: if cfg!(target_os = "macos") {
+                vec![PathBuf::from("/Applications")]
+            } else {
+                ["/usr/local/bin", "/usr/bin", "/snap/bin"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect()
+            },
         }
     }
 }
@@ -101,7 +112,7 @@ fn installed_commands(editor: &Editor, env: &Environment) -> Vec<PathBuf> {
             .home
             .iter()
             .map(|home| home.join("Applications"))
-            .chain([PathBuf::from("/Applications")]);
+            .chain(env.system.iter().cloned());
         for root in roots {
             let entries: Vec<String> = std::fs::read_dir(&root)
                 .map(|entries| {
@@ -141,11 +152,7 @@ fn installed_commands(editor: &Editor, env: &Environment) -> Vec<PathBuf> {
             .home
             .iter()
             .map(|home| home.join(".local/bin"))
-            .chain(
-                ["/usr/local/bin", "/usr/bin", "/snap/bin"]
-                    .into_iter()
-                    .map(PathBuf::from),
-            )
+            .chain(env.system.iter().cloned())
             .collect();
         if is_jetbrains && let Some(data_home) = &env.data_home {
             directories.push(data_home.join("JetBrains/Toolbox/scripts"));
@@ -192,12 +199,14 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 impl Environment {
-    /// Only these directories, as `PATH`.
+    /// Only these directories, as `PATH`, and none of the machine's own: a test that finds
+    /// the user's real editor starts it.
     fn only(path: Vec<PathBuf>) -> Self {
         Self {
             path,
             home: None,
             data_home: None,
+            system: Vec::new(),
         }
     }
 }
