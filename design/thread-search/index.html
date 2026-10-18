@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search in a Thread Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-thread-search.css">
+</head>
+<body data-area="thread-search" data-title="Search in a Thread">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Search in a Thread <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>The backlog says: “Add in-thread message and plan search, beyond title search, following t3code’s chat find. Search the retained conversation, navigate between matches and reveal the matching message in the virtualized conversation with its match highlighted.”</p>
+<p>t3code’s find (⌘F) floats over the chat, searches your messages, the agent’s messages and proposed plans across the whole thread (the server searches older pages too), ignores case, opens folded messages and plans to show a match, and closes when you switch threads. Zed has a thread search too: a strip under the header with case, whole-word and regex options, searching messages, open thoughts, tool calls’ titles and whatever tool output is shown. agentZ has neither; its terminal has a find bar, and its Markdown can already paint search matches.</p>
+<p>Today’s pictures are recreated from the code in HTML, not captured from the running app (this machine has no display). The mocks use One Dark and the board’s demo: storefront’s “Add a promo code field” with Claude Agent, searched for “promo”.</p>`;
+</script>
+<script src="mock-thread-search.js"></script>
+<script src="topics-thread-search.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

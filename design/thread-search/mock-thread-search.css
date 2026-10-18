@@ -1,0 +1,47 @@
+/* Search in a thread: an open thread (agent_view.rs) with find bars from t3code
+   (ThreadFindBar.tsx), Zed (thread_search_bar.rs) and agentZ's terminal (terminal_view.rs). */
+.m .ts-head { height: 36px; flex: none; padding: 0 8px; gap: 4px; border-bottom: 1px solid var(--b); background: var(--panel); }
+.m .ts-conv { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; position: relative; }
+.m .ts-col { width: 100%; max-width: 640px; display: flex; flex-direction: column; font-size: 13px; line-height: 21px; }
+.m .ts-user { display: flex; justify-content: flex-end; padding: 12px 20px 4px; }
+.m .ts-user > div { max-width: 80%; padding: 8px 12px; border-radius: 12px; background: #3d424c; }
+.m .ts-agent { padding: 6px 20px; }
+.m .ts-work { margin: 0 20px; padding: 4px 0; }
+.m .ts-work > div { min-height: 24px; display: flex; align-items: center; gap: 6px; padding: 0 2px; border-radius: 6px; color: #8b909d; font-size: 13px; }
+.m .ts-work .chev { width: 24px; display: inline-grid; place-items: center; flex: none; }
+.m .ts-row { display: flex; align-items: center; gap: 8px; margin: 0 20px 0 50px; height: 24px; font-size: 13px; color: #8b909d; }
+.m .ts-plan { margin: 4px 20px 4px 50px; border: 1px solid var(--b); border-radius: 6px; background: var(--ed); }
+.m .ts-plan .ph2 { height: 26px; display: flex; align-items: center; padding: 0 10px; font-size: 12px; color: var(--ph); border-bottom: 1px solid var(--bv); gap: 6px; }
+.m .ts-plan .pb { padding: 8px 12px; }
+.m .ts-plan ol { margin: 0; padding-left: 18px; }
+.m mark.ts-m { background: rgba(116,173,232,.4); color: inherit; border-radius: 2px; padding: 0 1px; }
+.m mark.ts-m.on { background: rgba(232,175,116,.4); }
+.m.t3 mark.ts-m { background: #8a7a3d; color: #fff; }
+.m.t3 mark.ts-m.on { background: #e9b54a; color: #2a2210; }
+.m.under mark.ts-m { background: none; text-decoration: underline 2px rgba(116,173,232,.8); text-underline-offset: 3px; }
+.m.under mark.ts-m.on { background: rgba(232,175,116,.4); text-decoration: none; }
+.m mark.ts-m.flash { box-shadow: 0 0 0 2px rgba(232,175,116,.8); }
+.m .ts-comp { flex: none; border-top: 1px solid var(--b); padding: 8px 0 10px; background: var(--panel); }
+.m .ts-comp-in { max-width: 640px; margin: 0 auto; padding: 0 20px; }
+/* t3code's floating bar */
+.m .ts-float { position: absolute; z-index: 24; top: 48px; right: 12px; width: 280px; height: 36px; display: flex; align-items: center; gap: 4px; padding: 0 6px 0 12px; border-radius: 16px; background: rgba(54,59,69,.92); border: 1px solid rgba(220,224,229,.18); box-shadow: 0 10px 28px rgba(0,0,0,.45); font-size: 13px; }
+.m .ts-float .q { flex: 1; min-width: 0; }
+.m .ts-count { font-size: 11px; color: var(--mu); min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; flex: none; }
+.m .ts-count.none { color: var(--del); }
+.m .ts-ib { width: 22px; height: 22px; border-radius: 11px; display: inline-grid; place-items: center; color: var(--mu); flex: none; }
+.m .ts-ib.sq { border-radius: 4px; }
+.m .ts-ib.on { background: var(--sel); color: var(--t); }
+.m .ts-ib.dis { opacity: .4; }
+/* Zed's strip and agentZ's terminal find bar */
+.m .ts-strip { flex: none; display: flex; align-items: center; gap: 6px; padding: 6px; background: var(--panel); border-bottom: 1px solid rgba(70,75,87,.6); font-size: 13px; }
+.m .ts-input { flex: 1; min-width: 128px; height: 30px; display: flex; align-items: center; gap: 2px; padding: 0 6px; border: 1px solid var(--b); border-radius: 6px; background: var(--ed); }
+.m .ts-input .q { flex: 1; min-width: 0; }
+.m .ts-tog { width: 22px; height: 20px; border-radius: 4px; display: inline-grid; place-items: center; font-size: 11px; color: var(--mu); flex: none; font-family: "IBM Plex Mono", monospace; }
+.m .ts-tog.on { background: var(--sel); color: var(--t); }
+.m .caret { display: inline-block; width: 1.5px; height: 15px; background: var(--ac); vertical-align: -3px; margin-left: 1px; }
+.m .ts-sb { position: absolute; right: 2px; top: 4px; bottom: 4px; width: 8px; }
+.m .ts-sb i { position: absolute; left: 1px; right: 1px; height: 3px; border-radius: 1px; background: rgba(116,173,232,.8); }
+.m .ts-sb i.on { background: #e8af74; }
+.m .ts-sb b { position: absolute; left: 2px; right: 2px; border-radius: 3px; background: rgba(169,175,188,.25); }
+.ts-pair { display: flex; gap: 22px; align-items: flex-start; }
+.ts-cap { font: 11px/1.3 -apple-system, "IBM Plex Sans", sans-serif; color: #8d93a0; margin-top: 6px; max-width: 700px; }

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session Notices and Compaction Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+<link rel="stylesheet" href="mock-session-notices.css">
+</head>
+<body data-area="session-notices" data-title="Session Notices and Compaction">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Session Notices and Compaction <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>The backlog says: “Port stable session notices and context compaction, which agentZ doesn’t handle yet, following zed#65414.” With ACP SDK 3.3, Zed shows both for every ACP agent. agentZ is on SDK 3.4.0, where both are stable, but it doesn’t tell agents it takes them, so they don’t send them.</p>
+<p>A <b>notice</b> is a live message from the agent about the session, outside the conversation: a severity (info, warning, error, or another word such as “maintenance”), a plain-text title and an optional description. It isn’t saved, doesn’t come back when the thread loads again, has no buttons of its own, and dismissing it tells the agent nothing. <b>Compaction</b> is the agent shortening its own context: it sends an update with a status (in progress, completed, failed, canceled), then a summary or an error. Its first update fixes where it sits in the conversation. Neither carries token counts; the context ring under the composer comes from the agent’s usage reports. The agent decides when to compact; you can ask only through its own slash command, such as Claude Agent’s /compact.</p>
+<p>The v2 session lifecycle in the same backlog entry has no UI of its own and isn’t part of this round. Today’s pictures are recreated from the code in HTML, not captured from the running app (this machine has no display). The mocks use One Dark and the board’s demo: storefront’s “Add the checkout page” with Claude Agent. The notice texts are Zed’s own preview examples.</p>`;
+</script>
+<script src="mock-session-notices.js"></script>
+<script src="topics-session-notices.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
