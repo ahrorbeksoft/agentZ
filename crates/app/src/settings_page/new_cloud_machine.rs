@@ -38,13 +38,13 @@ enum StartFrom {
 
 /// "Pause or delete it after".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Timeout {
+pub(super) enum Timeout {
     Never,
     After { minutes: u64, delete: bool },
 }
 
 impl Timeout {
-    const ALL: [Timeout; 7] = [
+    pub(super) const ALL: [Timeout; 7] = [
         Timeout::Never,
         Timeout::After {
             minutes: 30,
@@ -72,7 +72,7 @@ impl Timeout {
         },
     ];
 
-    fn label(self) -> String {
+    pub(super) fn label(self) -> String {
         match self {
             Timeout::Never => "Never".into(),
             Timeout::After { minutes, delete } => format!(
@@ -83,7 +83,7 @@ impl Timeout {
         }
     }
 
-    fn timeout(self) -> Option<MachineTimeout> {
+    pub(super) fn timeout(self) -> Option<MachineTimeout> {
         match self {
             Timeout::Never => None,
             Timeout::After { minutes, delete } => Some(MachineTimeout {
@@ -93,7 +93,7 @@ impl Timeout {
         }
     }
 
-    fn is_allowed(self, rules: &AccountRules) -> bool {
+    pub(super) fn is_allowed(self, rules: &AccountRules) -> bool {
         match (self.timeout(), rules.max_timeout) {
             (Some(timeout), Some(max)) => timeout.after <= max,
             _ => true,
@@ -137,7 +137,7 @@ impl IdlePause {
     }
 }
 
-fn minutes_label(minutes: u64) -> String {
+pub(super) fn minutes_label(minutes: u64) -> String {
     match minutes {
         60 => "1 hour".into(),
         minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
@@ -154,6 +154,8 @@ pub struct NewCloudMachine {
     start_from: StartFrom,
     template: Option<String>,
     snapshot: Option<String>,
+    /// The snapshot it was opened to start from, from that snapshot's New Machine.
+    preferred_snapshot: Option<String>,
     timeout: Timeout,
     idle_pause: IdlePause,
     error: Option<SharedString>,
@@ -211,12 +213,21 @@ impl NewCloudMachine {
             start_from: StartFrom::Template,
             template: None,
             snapshot: None,
+            preferred_snapshot: None,
             timeout: Timeout::Never,
             idle_pause: IdlePause::Default,
             error: None,
             _reading_sources: reading_sources,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Starts from the account's snapshot, as a snapshot's New Machine opens it.
+    pub(super) fn from_snapshot(mut self, snapshot: String) -> Self {
+        self.start_from = StartFrom::Snapshot;
+        self.snapshot = Some(snapshot.clone());
+        self.preferred_snapshot = Some(snapshot);
+        self
     }
 
     /// The templates and snapshots read, with the usual template picked: Instabox's
@@ -229,10 +240,15 @@ impl NewCloudMachine {
                 .find(|template| template.id == "universal")
                 .or(sources.templates.first())
                 .map(|template| template.id.clone());
-            self.snapshot = sources
-                .snapshots
-                .iter()
-                .find(|snapshot| snapshot.is_ready)
+            let ready = || {
+                sources
+                    .snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.is_ready)
+            };
+            self.snapshot = ready()
+                .find(|snapshot| self.preferred_snapshot.as_ref() == Some(&snapshot.id))
+                .or_else(|| ready().next())
                 .map(|snapshot| snapshot.id.clone());
         }
         self.sources = Some(sources);
@@ -739,7 +755,11 @@ impl Render for NewCloudMachine {
     }
 }
 
-fn render_field(title: &'static str, field: AnyElement, hint: Option<String>) -> AnyElement {
+pub(super) fn render_field(
+    title: &'static str,
+    field: AnyElement,
+    hint: Option<String>,
+) -> AnyElement {
     v_flex()
         .gap_1()
         .child(Label::new(title).size(LabelSize::Small))

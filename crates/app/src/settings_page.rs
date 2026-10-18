@@ -3,6 +3,8 @@
 //! entry per project) and the chosen section's rows on the right.
 
 mod accounts_menu;
+mod cloud_machine_dialog;
+mod cloud_machine_page;
 mod cloud_providers;
 mod mcp_servers;
 mod new_cloud_machine;
@@ -28,7 +30,7 @@ use agentz_protocol::agents::{
     InstallState,
 };
 use agentz_protocol::artifacts::{DesignDefaults, DesignSizes, VariantsAs};
-use agentz_protocol::cloud::Provider;
+use agentz_protocol::cloud::{MachineAction, Provider};
 use agentz_protocol::title_generation::{TitleGeneration, TitleProvider, effort_label};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
@@ -117,6 +119,7 @@ actions!(
     ]
 );
 
+pub use cloud_machine_dialog::CloudMachineDialog;
 pub use new_cloud_machine::NewCloudMachine;
 
 pub fn init(cx: &mut App) {
@@ -124,6 +127,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(new_cloud_machine::KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(new_cloud_machine::KEY_CONTEXT)),
+        KeyBinding::new(
+            "enter",
+            menu::Confirm,
+            Some(cloud_machine_dialog::KEY_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            menu::Cancel,
+            Some(cloud_machine_dialog::KEY_CONTEXT),
+        ),
         KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_DIALOG_KEY_CONTEXT)),
@@ -137,6 +150,8 @@ pub enum SettingsPageEvent {
     EditMachine(Option<MachineProfile>),
     /// Show a provider's New Machine dialog, in the shell's modal layer.
     NewCloudMachine(Entity<NewCloudMachine>),
+    /// Show a cloud machine's Save Snapshot… or Publish Port…, in the shell's modal layer.
+    CloudMachineDialog(Entity<CloudMachineDialog>),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
     /// Leave settings for the thread, as an agent's Threads tab opens one.
@@ -262,6 +277,13 @@ pub struct SettingsPage {
     /// A command just copied from Machines, whose button says so for a moment.
     copied_command: Option<&'static str>,
     copied_reset: Option<Task<()>>,
+    /// The cloud machine whose page Machines shows in place of its list.
+    machine_page: Option<cloud_machine_page::MachinePage>,
+    /// What's being done to cloud machines' extras, each once at a time.
+    cloud_actions: Vec<(Provider, String, MachineAction)>,
+    /// An action whose output was just copied, whose button says so for a moment.
+    copied_action: Option<(Provider, String, MachineAction)>,
+    copied_action_reset: Option<Task<()>>,
     nav_scroll: ScrollHandle,
     /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
     /// made each frame of a scroll slow (taffy measures every row again at each level of
@@ -320,6 +342,7 @@ impl SettingsPage {
                 {
                     this.titles_machine = MachineId::Local;
                 }
+                this.sync_machine_page(cx);
                 cx.notify();
             }),
             cx.observe(&app_settings, |_, _, cx| cx.notify()),
@@ -375,6 +398,10 @@ impl SettingsPage {
             cloud_errors: HashMap::new(),
             copied_command: None,
             copied_reset: None,
+            machine_page: None,
+            cloud_actions: Vec::new(),
+            copied_action: None,
+            copied_action_reset: None,
             nav_scroll: ScrollHandle::new(),
             content_list: ListState::new(0, ListAlignment::Top, px(0.)).measure_all(),
             content_scroll_top: ListOffset::default(),
@@ -550,6 +577,7 @@ impl SettingsPage {
         self.mcp_servers_page = mcp_servers::McpServersPage::List;
         self.mcp_server_error = None;
         self.storage_page.error = None;
+        self.machine_page = None;
         if section == Section::Agents {
             self.registry(cx)
                 .update(cx, |registry, cx| registry.refresh_if_stale(cx));
@@ -9469,6 +9497,10 @@ impl SettingsPage {
             Section::McpServers => (
                 self.render_mcp_servers_header(window, cx),
                 self.render_mcp_servers(window, cx),
+            ),
+            Section::Machines if self.machine_page.is_some() => (
+                self.render_machine_page_header(cx),
+                self.render_machine_page(window, cx),
             ),
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Storage => (

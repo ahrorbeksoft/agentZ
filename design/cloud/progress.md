@@ -61,14 +61,19 @@ Notes for whoever continues:
    `proton` only.
 6. **A machine's page** with its provider's tabs (topic 7 A), snapshots on it (topic 8 A),
    ports, Vault, SSH tokens and Proton's keys; Instabox's API key through its CLI, for desktop
-   links and CPU and memory. Status: in progress. The server's part is committed ("Read a
-   cloud machine's details…"): `Request::CloudMachineDetails` and `CloudMachineAction`,
+   links and CPU and memory. Status: done in two commits. The server's ("Read a cloud
+   machine's details…"): `Request::CloudMachineDetails` and `CloudMachineAction`,
    `cloud::InstaboxApi` (its key in `cloud/instabox/api-key`, made with `instabox keys
-   create`), Instabox's `get`, `vault show` and `port ls` fixtures. The app's page is next.
-7. **Machines that are off**: the list of every remote machine's projects and threads kept on
-   this Mac, and messages held for a stopped machine, which start it (topic 11 C). Status: not
-   started.
-8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
+   create`), Instabox's `get`, `vault show` and `port ls` fixtures. The app's ("Open a cloud
+   machine's page…"): `settings_page/cloud_machine_page.rs` for the page and its tabs,
+   `settings_page/cloud_machine_dialog.rs` for Save Snapshot… and Publish Port… (in the
+   shell's modal layer), and in `settings_page/cloud_providers.rs` the row's mark and name,
+   which open it, and the row menu's Open Desktop, Save Snapshot…, Publish Port…, SSH Keys…
+   and Machine Settings…. The page reads the machine again after each listing, and closes
+   once the provider doesn't list it. Its actions are tested against a test server only.
+7. **Machines that are off**: messages held for a stopped machine, which start it (topic
+   11 C). The list of every remote machine's projects and threads kept on this Mac is put off
+   for later (the user, 2026-10-19). Status: not started.8. **Idle machines** (topic 12 A–D) and the Usage page's Cloud section (topic 13 C). Status:
    not started.
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
    not started.

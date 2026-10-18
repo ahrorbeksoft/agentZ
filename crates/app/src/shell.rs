@@ -171,6 +171,8 @@ enum OverlayKind {
     ProjectIconFile,
     /// Custom… in a snooze menu, which asks for how long.
     CustomSnooze,
+    /// A cloud machine's Save Snapshot… or Publish Port…, from its settings.
+    CloudMachineAction,
 }
 
 struct Overlay {
@@ -1056,6 +1058,13 @@ impl Shell {
                         SettingsPageEvent::NewCloudMachine(dialog) => {
                             this.open_cloud_machine_dialog(dialog.clone(), window, cx)
                         }
+                        SettingsPageEvent::CloudMachineDialog(dialog) => this
+                            .open_settings_overlay(
+                                OverlayKind::CloudMachineAction,
+                                dialog.clone(),
+                                window,
+                                cx,
+                            ),
                         SettingsPageEvent::Confirm(request) => {
                             this.open_confirm_dialog(request.clone(), window, cx)
                         }
@@ -2418,7 +2427,10 @@ impl Render for Shell {
             || matches!(
                 self.overlay_kind(),
                 Some(
-                    OverlayKind::SaveLayout | OverlayKind::ProjectIcon | OverlayKind::CustomSnooze
+                    OverlayKind::SaveLayout
+                        | OverlayKind::ProjectIcon
+                        | OverlayKind::CustomSnooze
+                        | OverlayKind::CloudMachineAction
                 )
             );
         // Beside the thread, or filling its area when full screen.

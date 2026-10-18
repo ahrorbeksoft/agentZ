@@ -7,7 +7,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CreateMachine, Lifecycle, Provider, ProviderState, ProviderStatus,
+    Change, CloudMachine, CreateMachine, Lifecycle, MachineAction, Provider, ProviderState,
+    ProviderStatus,
 };
 use agentz_protocol::{Request, Response};
 use anyhow::anyhow;
@@ -18,6 +19,8 @@ use ui::{
 };
 use util::ResultExt as _;
 
+use super::cloud_machine_dialog::DialogKind;
+use super::cloud_machine_page::MachineTab;
 use super::new_cloud_machine::NewCloudMachine;
 use super::{
     SettingsPage, SettingsPageEvent, connection_line, on_page, render_rows,
@@ -33,7 +36,7 @@ use crate::controls::{copy_to_clipboard, icon_tile, status_badge};
 use crate::machines::{MachineId, Machines};
 
 /// How long a copy button says it copied.
-const COPIED_FOR: Duration = Duration::from_secs(2);
+pub(super) const COPIED_FOR: Duration = Duration::from_secs(2);
 /// A machine's and a provider's mark, as a machine's icon is drawn.
 const MARK_SIZE: Pixels = px(28.);
 
@@ -459,6 +462,12 @@ impl SettingsPage {
             });
             let machine_id = machine_id.clone();
             let label = label.clone();
+            let capabilities = &description.capabilities;
+            let is_listed = machine.is_some();
+            // Whether it's running, once it can be acted on.
+            let extras = machine
+                .filter(|_| can_change)
+                .map(|machine| machine.state.is_running());
             PopoverMenu::new(element_id("menu"))
                 .menu(move |window, cx| {
                     let page = page.clone();
@@ -491,14 +500,104 @@ impl SettingsPage {
                         if has_changes {
                             menu = menu.separator();
                         }
+                        if capabilities.desktop && extras == Some(true) {
+                            let machine_id = machine_id.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new("Open Desktop")
+                                    .icon(IconName::Screen)
+                                    .icon_color(Color::Muted)
+                                    .handler(on_page(&page, move |page, _, cx| {
+                                        page.send_machine_action(
+                                            provider,
+                                            machine_id.clone(),
+                                            MachineAction::DesktopLink { view_only: false },
+                                            cx,
+                                        )
+                                    })),
+                            );
+                        }
                         menu = menu.item(
                             ContextMenuEntry::new("Copy SSH Command")
                                 .icon(IconName::Copy)
                                 .icon_color(Color::Muted)
                                 .handler(move |_, cx| copy_to_clipboard(&ssh_command, cx)),
                         );
+                        let dialogs = [
+                            (
+                                capabilities.snapshots,
+                                "Save Snapshot…",
+                                IconName::Archive,
+                                DialogKind::SaveSnapshot,
+                            ),
+                            (
+                                capabilities.public_ports,
+                                "Publish Port…",
+                                IconName::Public,
+                                DialogKind::PublishPort,
+                            ),
+                        ];
+                        for (has, title, icon, kind) in dialogs {
+                            if !has || extras.is_none() {
+                                continue;
+                            }
+                            let machine_id = machine_id.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new(title)
+                                    .icon(icon)
+                                    .icon_color(Color::Muted)
+                                    .handler(on_page(&page, move |page, window, cx| {
+                                        page.open_machine_dialog(
+                                            provider,
+                                            machine_id.clone(),
+                                            kind,
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            );
+                        }
+                        let pages = [
+                            (
+                                capabilities.ssh_keys,
+                                "SSH Keys…",
+                                IconName::Lock,
+                                MachineTab::SshKeys,
+                            ),
+                            (
+                                true,
+                                "Machine Settings…",
+                                IconName::Settings,
+                                MachineTab::Overview,
+                            ),
+                        ];
+                        for (has, title, icon, tab) in pages {
+                            if !has || !is_listed {
+                                continue;
+                            }
+                            // Its settings go with Remove….
+                            if tab == MachineTab::Overview {
+                                menu = menu.separator();
+                            }
+                            let machine_id = machine_id.clone();
+                            menu = menu.item(
+                                ContextMenuEntry::new(title)
+                                    .icon(icon)
+                                    .icon_color(Color::Muted)
+                                    .handler(on_page(&page, move |page, _, cx| {
+                                        page.open_machine_page(
+                                            provider,
+                                            machine_id.clone(),
+                                            tab,
+                                            cx,
+                                        )
+                                    })),
+                            );
+                        }
                         if let Some((id, name, deletable)) = removable {
-                            menu = menu.separator().item(
+                            if !is_listed {
+                                menu = menu.separator();
+                            }
+                            menu = menu.item(
                                 ContextMenuEntry::new("Remove…")
                                     .icon(IconName::Trash)
                                     .icon_color(Color::Muted)
@@ -526,6 +625,12 @@ impl SettingsPage {
                 .offset(gpui::point(px(0.), px(4.)))
         };
 
+        let open_page = machine.map(|_| {
+            let machine_id = machine_id.clone();
+            cx.listener(move |this, _, _, cx| {
+                this.open_machine_page(provider, machine_id.clone(), MachineTab::Overview, cx)
+            })
+        });
         let is_enabled = profile.is_some_and(|profile| profile.enabled);
         let switch = match profile {
             Some(profile) => {
@@ -564,33 +669,41 @@ impl SettingsPage {
             .py_2p5()
             .gap_3()
             .when(!is_enabled, |row| row.opacity(0.6))
-            .child(icon_tile(
-                Icon::new(provider_icon(provider)).color(Color::Muted),
-                MARK_SIZE,
-                cx,
-            ))
             .child(
-                v_flex()
+                // Its mark and name open its page (topic 7 A); its buttons stay theirs.
+                h_flex()
+                    .id(element_id("open"))
+                    .debug_selector(|| format!("cloud-open-{id_suffix}"))
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(label).truncate())
-                    .when(!subtitle.is_empty(), |column| {
-                        column.child(
-                            Label::new(subtitle)
-                                .size(LabelSize::Small)
-                                .color(if is_error { Color::Error } else { Color::Muted })
-                                .truncate(),
-                        )
+                    .gap_3()
+                    .when_some(open_page, |area, open_page| {
+                        area.cursor_pointer().on_click(open_page)
                     })
-                    .children(
-                        machine_error.map(|error| {
-                            Label::new(error).size(LabelSize::Small).color(Color::Error)
-                        }),
-                    )
-                    .children(
-                        hint.map(|hint| {
-                            Label::new(hint).size(LabelSize::Small).color(Color::Muted)
-                        }),
+                    .child(icon_tile(
+                        Icon::new(provider_icon(provider)).color(Color::Muted),
+                        MARK_SIZE,
+                        cx,
+                    ))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(label).truncate())
+                            .when(!subtitle.is_empty(), |column| {
+                                column.child(
+                                    Label::new(subtitle)
+                                        .size(LabelSize::Small)
+                                        .color(if is_error { Color::Error } else { Color::Muted })
+                                        .truncate(),
+                                )
+                            })
+                            .children(machine_error.map(|error| {
+                                Label::new(error).size(LabelSize::Small).color(Color::Error)
+                            }))
+                            .children(hint.map(|hint| {
+                                Label::new(hint).size(LabelSize::Small).color(Color::Muted)
+                            })),
                     ),
             )
             .child(
@@ -806,7 +919,7 @@ impl SettingsPage {
 
     /// Changes the machine through its provider's CLI, asking first when that starts a charge,
     /// until "Don't ask again" for its account (topic 5 C).
-    fn change_cloud_machine(
+    pub(super) fn change_cloud_machine(
         &mut self,
         provider: Provider,
         machine: String,
@@ -1251,7 +1364,7 @@ fn render_creating_row(provider: Provider, name: &str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn lifecycle_icon(change: Lifecycle) -> IconName {
+pub(super) fn lifecycle_icon(change: Lifecycle) -> IconName {
     match change {
         Lifecycle::Start | Lifecycle::Resume => IconName::PlayFilled,
         Lifecycle::Stop => IconName::Stop,

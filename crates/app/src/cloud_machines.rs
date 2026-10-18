@@ -1,6 +1,10 @@
 //! Words and marks for cloud providers' machines (design/cloud), wherever they show.
 
-use agentz_protocol::cloud::{Change, CloudMachine, CloudState, CloudUsage, Lifecycle, Provider};
+use std::time::SystemTime;
+
+use agentz_protocol::cloud::{
+    Change, CloudMachine, CloudState, CloudUsage, Lifecycle, MachineSize, Provider,
+};
 use ui::{Color, IconName};
 
 /// A state as its badge says it.
@@ -151,9 +155,18 @@ pub fn provider_icon(provider: Provider) -> IconName {
     }
 }
 
-/// What a machine is: its template and size ("universal · 4 vCPUs · 8 GB · 20 GB").
+/// What a machine is: its template and size ("universal · 4 vCPUs · 8 GB · 20 GB disk").
 pub fn machine_summary(machine: &CloudMachine) -> String {
-    let size = &machine.size;
+    [machine.template.clone(), Some(size_summary(&machine.size))]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A machine's size ("4 vCPUs · 8 GB · 20 GB disk").
+pub fn size_summary(size: &MachineSize) -> String {
     let memory = match (size.memory_mib, size.memory_ceiling_mib) {
         (Some(floor), Some(ceiling)) if ceiling > floor => {
             Some(format!("{}–{} GB", gib(floor), gib(ceiling)))
@@ -163,7 +176,6 @@ pub fn machine_summary(machine: &CloudMachine) -> String {
         (None, None) => None,
     };
     [
-        machine.template.clone(),
         size.vcpus.map(|vcpus| {
             if vcpus == 1 {
                 "1 vCPU".to_string()
@@ -237,7 +249,39 @@ pub fn usage_summary(usage: &CloudUsage) -> String {
     }
 }
 
-fn dollars(micro_usd: i64) -> String {
+/// How long something ran ("31 h 12 min", "4 min").
+pub fn duration_label(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    match hours {
+        0 => format!("{minutes} min"),
+        hours => format!("{hours} h {minutes} min"),
+    }
+}
+
+/// A size in Instabox's gigabytes, of 10⁹ bytes ("3.1 GB").
+pub fn gigabytes(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+/// Memory used of a machine's, in the gigabytes of 2³⁰ bytes its size is given in ("2.1 of
+/// 8 GB").
+pub fn memory_label(used_bytes: u64, total_bytes: u64) -> String {
+    let used = used_bytes as f64 / f64::from(1u32 << 30);
+    format!("{used:.1} of {} GB", gib(total_bytes >> 20))
+}
+/// When something happened or happens: the time today, or the day and time ("Oct 19, 14:02").
+pub fn time_label(time: SystemTime, now: SystemTime) -> String {
+    let time = chrono::DateTime::<chrono::Local>::from(time);
+    let now = chrono::DateTime::<chrono::Local>::from(now);
+    if time.date_naive() == now.date_naive() {
+        time.format("%H:%M").to_string()
+    } else {
+        time.format("%b %-d, %H:%M").to_string()
+    }
+}
+
+pub fn dollars(micro_usd: i64) -> String {
     let cents = (micro_usd as f64 / 10_000.).round() as i64;
     let sign = if cents < 0 { "-" } else { "" };
     let cents = cents.abs();
@@ -246,8 +290,6 @@ fn dollars(micro_usd: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agentz_protocol::cloud::MachineSize;
-
     use super::*;
 
     #[test]
@@ -268,6 +310,10 @@ mod tests {
             error: None,
         };
         assert_eq!(machine_summary(&machine), "8 vCPUs · 2–64 GB · 50 GB disk");
+        assert_eq!(duration_label(31 * 3600 + 12 * 60 + 5), "31 h 12 min");
+        assert_eq!(duration_label(240), "4 min");
+        assert_eq!(gigabytes(3_140_000_000), "3.1 GB");
+        assert_eq!(memory_label(2_254_857_830, 8 << 30), "2.1 of 8 GB");
         assert_eq!(
             usage_summary(&CloudUsage::Balance {
                 balance_micro_usd: Some(24_270_000),
