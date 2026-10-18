@@ -15,21 +15,6 @@ binding (`secondary-,` in the `Shell` context) reaching `OpenSettings` with a te
 so the cause is likely in what a real Linux keyboard sends (xkb's key and `key_char` for the
 comma while Ctrl is down). Needs a run under a real X or Wayland session.
 
-### A turn often starts without a message
-
-Often a turn's response starts straight with the tool group, with no message from the agent
-before it (Factory Droid here, [screenshot](backlog/turn-starts-with-tool-group.png): "Ran 26
-commands, changed 1 file, and performed 8 other actions" right under the user's message). The
-user sees this a lot and asks whether agentZ is missing a first message in agent responses.
-
-Looked into: agentZ shows every message chunk it gets. In a Factory Droid thread's transcript
-here, Droid opens its turns with thoughts and tool calls and no message: its first message came
-after 1, 4 and 157 entries in the thread's three turns, with 334 thoughts among 709 tool calls
-in the last. So Droid sends no first message, and its thoughts are what sit folded in the "Ran
-N commands…" header. Open question: show something in that place (say the latest thought's
-first line) or leave it as it is.
-
-
 ### A newly added account shows as "New account"
 
 After an account is added, the agent's Accounts list shows it as "New account", with no name
@@ -65,6 +50,9 @@ agentZ is on SDK 3.4.0, as upstream is
 changes, and agentZ still initializes with protocol v1. Session notices and context compaction
 are built.
 
+Waits until Zed enables ACP v2: the user's rule is not to enable it before Zed does. As of
+these PRs, Zed's v2 backend is built but inactive ("an unselected v2 backend").
+
 Follow Zed's developing v2 session lifecycle, including resume/replay and metadata handling:
 [#65698](https://github.com/zed-industries/zed/pull/65698) and
 [#65709](https://github.com/zed-industries/zed/pull/65709). Treat this as a deliberate protocol
@@ -84,6 +72,8 @@ protocol update above. Verify behavior with the mock agent; installed adapters' 
 not been verified.
 
 ### Use reported ACP v2 state with a fallback for inferred activity
+
+Waits until Zed enables ACP v2, as the v2 session lifecycle above does.
 
 Use explicit state updates for foreground activity when available, replacing the matching
 inference about autonomous work starting and ending
