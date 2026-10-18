@@ -2755,7 +2755,7 @@ impl Sidebar {
                             self.render_thread_card(&store, thread, project, None, cx)
                         }
                     };
-                    let offset = drag.slide.offset(*item, now);
+                    let offset = drag.slide.offset(*item, now, cx);
                     is_sliding |= offset != px(0.);
                     rows.push(div().relative().top(offset).child(row).into_any_element());
                 }

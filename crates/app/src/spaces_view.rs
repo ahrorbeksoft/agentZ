@@ -2012,7 +2012,7 @@ impl SpacesView {
                         .child(row)
                         .into_any_element();
                 }
-                let offset = drag.slide.offset(*lead, now);
+                let offset = drag.slide.offset(*lead, now, cx);
                 is_sliding |= offset != px(0.);
                 div().relative().top(offset).child(row).into_any_element()
             })
@@ -4005,7 +4005,7 @@ impl SpacesView {
                         .child(element)
                         .into_any_element(),
                     Some(drag) => {
-                        let offset = drag.slide.offset(tab.id, now);
+                        let offset = drag.slide.offset(tab.id, now, cx);
                         is_sliding |= offset != px(0.);
                         div()
                             .relative()

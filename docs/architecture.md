@@ -97,6 +97,12 @@ redraw renders every view again, and at 60 a second a running turn kept the main
 35-45% of a core. Caching the sidebar wouldn't help while a turn runs: a view that animates
 marks its ancestors dirty, and the spinners sit in the sidebar and the thread both. Any new
 looping animation needs `with_max_fps(LOOPING_ANIMATION_FPS)`.
+Settings › Appearance › Motion's Reduce motion (`AppSettings::reduce_motion`, off by default;
+Zed's `reduce_motion`, zed-industries/zed#60614) sets GPUI's `App::set_reduce_motion`:
+animations then draw one still frame (a looping one its first, a one-shot its last) and ask
+for no more, animated images hold the frame they show, and the rows and tabs that slide aside
+for a dragged one (`SlideDrag::offset`) are in their places at once. Any new motion the app
+draws itself should check `App::reduce_motion` too.
 `markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way,
 and `MarkdownStyle::link_chip` draws chosen links as chips (see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
@@ -390,8 +396,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   lead. The row menu is Pin, Rename and Delete…: chats aren't archived. Search lists chats
   among the threads, by last activity, with the chat icon.
 - **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  chats, combining repositories), Appearance (Zed's theme modes, and a picture behind the
-  window), Notifications (sounds and system
+  chats, combining repositories), Appearance (Zed's theme modes, a picture behind the
+  window, and Zed's Reduce motion), Notifications (sounds and system
   notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, Storage,
   and a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines

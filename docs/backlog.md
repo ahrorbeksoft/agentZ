@@ -128,13 +128,6 @@ container queries, optional reduced motion and diagnostics. These APIs are alrea
 copied GPUI crates but are not wired into the app. The review was of source; runtime behavior
 and performance gains have not been verified.
 
-### Offer optional reduced motion
-
-Expose an optional reduced-motion preference using GPUI's `reduce_motion` support
-([#60614](https://github.com/zed-industries/zed/pull/60614)). Keep it off by default, and use
-the upstream behavior for animations and animated images when enabled. Review app-owned
-animations so they honor the preference too. Preserve the existing animation frame limits.
-
 ### Enable optional local performance diagnostics
 
 Wire up GPUI's profiler feature and Zed's controls for the frame-time overlay

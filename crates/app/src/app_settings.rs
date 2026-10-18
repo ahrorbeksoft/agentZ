@@ -274,6 +274,8 @@ pub struct AppSettings {
     pub sound_volume: f32,
     /// System notifications show only while another app is in front, as t3code's do.
     pub notify_when_unfocused: bool,
+    /// Zed's `reduce_motion`: spinners, pulsing labels and sliding rows hold still.
+    pub reduce_motion: bool,
     /// The editor Open in Editor last opened something in (an id of
     /// [`agentz_protocol::editors::EDITORS`]), which its button opens next.
     pub last_editor: Option<String>,
@@ -319,6 +321,7 @@ impl Default for AppSettings {
             play_sound_when_input_needed: PlaySound::Always,
             sound_volume: 1.,
             notify_when_unfocused: true,
+            reduce_motion: false,
             last_editor: None,
             opened_over_ssh: false,
             saved_layouts: Vec::new(),
@@ -372,6 +375,7 @@ pub fn init(cx: &mut App) {
     let path = paths::settings_file();
     let settings = read_settings(&path).log_err().flatten().unwrap_or_default();
     apply_theme(&settings, cx);
+    cx.set_reduce_motion(settings.reduce_motion);
     let store = cx.new(|_| AppSettingsStore {
         settings,
         path,
@@ -409,6 +413,7 @@ impl AppSettingsStore {
             return;
         }
         apply_theme(&self.settings, cx);
+        cx.set_reduce_motion(self.settings.reduce_motion);
         let path = self.path.clone();
         let settings = self.settings.clone();
         self._save = Some(cx.background_spawn(async move {

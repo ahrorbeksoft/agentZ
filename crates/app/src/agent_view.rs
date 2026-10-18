@@ -15163,6 +15163,30 @@ mod tests {
         );
     }
 
+    /// With Reduce motion on, the shimmer is plain text and asks for no more frames.
+    #[gpui::test]
+    fn the_shimmer_holds_still_with_reduced_motion(cx: &mut TestAppContext) {
+        cx.update(crate::init_for_test);
+        cx.update(|cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.reduce_motion = true, cx)
+            })
+        });
+        assert!(cx.update(|cx| cx.reduce_motion()));
+        let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.open_window(gpui::size(px(200.), px(40.)), {
+            let renders = renders.clone();
+            move |_, _| Shimmer { renders }
+        });
+        cx.run_until_parked();
+        let before = renders.get();
+        for _ in 0..100 {
+            cx.executor().advance_clock(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        assert_eq!(renders.get(), before);
+    }
+
     #[test]
     fn a_settings_choices_are_listed_with_their_groups_and_found_by_value() {
         let ungrouped: acp::SessionConfigSelectOptions = serde_json::from_value(

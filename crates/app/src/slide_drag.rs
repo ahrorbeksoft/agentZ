@@ -131,12 +131,20 @@ impl<T: Copy + Eq + Hash> SlideDrag<T> {
     /// where it is.
     fn slide(&mut self, item: T, by: Pixels) {
         let now = Instant::now();
-        let from = self.offset(item, now);
+        let from = self.offset_at(item, now);
         self.slides.insert(item, (from + by, now));
     }
 
-    /// How far `item` is from its place at `now`.
-    pub(crate) fn offset(&self, item: T, now: Instant) -> Pixels {
+    /// How far `item` is from its place at `now`. With reduced motion it's in its place at
+    /// once.
+    pub(crate) fn offset(&self, item: T, now: Instant, cx: &App) -> Pixels {
+        if cx.reduce_motion() {
+            return px(0.);
+        }
+        self.offset_at(item, now)
+    }
+
+    fn offset_at(&self, item: T, now: Instant) -> Pixels {
         self.slides
             .get(&item)
             .map_or(px(0.), |(from, started)| slide_offset(*from, *started, now))
@@ -224,4 +232,30 @@ pub(crate) fn render_raised_rows(
                 ),
         )
         .child(v_flex().gap_0p5().children(rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use collections::HashMap;
+    use gpui::{Pixels, TestAppContext, px};
+
+    use super::SlideDrag;
+
+    /// An item the dragged one passes slides over to its new place, or with reduced motion is
+    /// there at once.
+    #[gpui::test]
+    fn a_passed_item_slides_unless_motion_is_reduced(cx: &mut TestAppContext) {
+        let lengths: HashMap<u8, Pixels> = [(1, px(20.)), (2, px(20.))].into_iter().collect();
+        let mut drag = SlideDrag::new(1, vec![1, 2], lengths, px(0.), px(0.));
+        drag.move_to(1);
+        assert_eq!(drag.order, vec![2, 1]);
+        let now = Instant::now();
+        cx.update(|cx| {
+            assert!(drag.offset(2, now, cx) > px(0.));
+            cx.set_reduce_motion(true);
+            assert_eq!(drag.offset(2, now, cx), px(0.));
+        });
+    }
 }

@@ -2199,7 +2199,32 @@ impl SettingsPage {
                 .clone()
                 .map(|error| skills::render_error(error, "picture-error")),
         );
+        sections.push(render_section(
+            "Motion",
+            vec![self.render_reduce_motion_row(cx)],
+            cx,
+        ));
         sections
+    }
+
+    /// Zed's "Reduce Motion", in its words, as a switch.
+    fn render_reduce_motion_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().reduce_motion;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "Reduce motion",
+            "Whether to reduce non-essential motion, such as loading spinners, by rendering \
+             them in a static state.",
+            Switch::new("reduce-motion", enabled.into())
+                .on_click(move |state, _, cx| {
+                    let enabled = *state == ToggleState::Selected;
+                    app_settings.update(cx, |store, cx| {
+                        store.update(|settings| settings.reduce_motion = enabled, cx)
+                    })
+                })
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// What's behind the window (`design/appearance`, topic 4): solid, or a picture of the
