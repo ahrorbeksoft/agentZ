@@ -139,3 +139,94 @@ OpenUsage's [#1364](https://github.com/robinebers/openusage/pull/1364).
 
 Within this group, prioritize delegated-task questions, title isolation, terminal detection
 and handshake deadlines.
+
+## Approved upstream features and replacements
+
+Requested October 18, 2026: support all of the following, with fallbacks where necessary.
+Choose native capabilities when the agent supports them, and retain the existing path for
+agents that do not. This explicitly authorizes agent and platform capability fallbacks; the
+app and its machine servers still update together. Coordinate the ACP work with the SDK and
+protocol update above. Verify behavior with the mock agent; installed adapters' support has
+not been verified.
+
+### Support standard ACP subagent sessions
+
+Use typed subagent announcements, state and cancellation in place of AIR-specific
+`subagent_spawned` and `subagent_state_update` parsing where supported. Standard subagents
+can be adopted on v1 as well as v2; the current Claude adapter implements them
+([subagent sessions](https://github.com/agentclientprotocol/claude-agent-acp#subagent-sessions)).
+Keep the AIR path for agents that need it, preserve its async-task support, and avoid showing
+the same child twice. Keep agentZ-owned delegated tasks and their parent relationships.
+
+### Fork native sessions when supported
+
+Use `session/fork` for a fork of the current session with the same agent, preserving the
+agent's context instead of sending a text handoff
+([SDK lifecycle](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/protocol-v2.md)).
+Verify that the returned session is usable. Keep the existing handoff for unsupported agents,
+cross-agent forks and earlier-turn forks the native operation cannot express. Preserve the
+fork's local conversation and its link to the parent.
+
+### Use MCP-over-ACP with the stdio bridge as a fallback
+
+Attach agentZ's tools to the existing ACP connection where supported, replacing the
+per-thread `mcp-bridge` subprocess and its extra socket connection
+([native MCP-over-ACP](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/mcp-over-acp.md)).
+Keep the stdio bridge for agents without that transport, and keep the standalone CLI tool
+path. Preserve caller identity, account scope, cancellation and tool policy across transports.
+
+### Use SDK session builders for session setup and restoration
+
+Replace the corresponding handwritten new/load/resume and routing plumbing with the SDK's
+session builders. Stable v1 load/resume helpers are already available
+([API](https://docs.rs/agent-client-protocol/3.4.0/agent_client_protocol/struct.ConnectionTo.html#method.load_session)).
+Keep agentZ's application policy for login, defaults, retained transcripts and server handoff.
+Select load/resume operations according to the agent's capabilities and preserve replay order.
+
+### Use reported ACP v2 state with a fallback for inferred activity
+
+Use explicit state updates for foreground activity when available, replacing the matching
+inference about autonomous work starting and ending
+([state contract](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/protocol-v2.md)).
+Keep the existing inference for agents without those reports and keep background work tracked
+separately: v2 idle describes foreground state and does not mean all work ended. Preserve
+steering and AIR functionality where agents still provide them only on v1.
+
+### Replace custom question controls with Zed's ChoiceCard
+
+Port Zed's reusable `ChoiceCard` for radio and checkbox choices
+([#63885](https://github.com/zed-industries/zed/pull/63885)), replacing the hand-drawn controls
+in `crates/app/src/elicitation_card.rs` with its focus and accessibility handling. Preserve
+validation, Recommended tags, Other answers and multi-question navigation.
+
+The user explicitly approved implementing Zed's ChoiceCard without a design round. Implement
+the upstream component directly; no additional design-board approval is needed for this item.
+
+### Keep each machine awake while agents work
+
+Follow Zed's idle-sleep prevention
+([#53130](https://github.com/zed-industries/zed/pull/53130)). Hold the machine's sleep inhibition
+while its agents have active work, including background work, and release it when that work
+ends. Own it in the machine's background server so closing the app does not end it, and a
+remote machine inhibits its own sleep. Support macOS and Linux, with a graceful fallback
+where sleep inhibition is unavailable.
+
+### Step reasoning effort with keyboard shortcuts
+
+Follow t3code's [#19928](https://github.com/pingdotgg/t3code/pull/19928): shortcuts step through
+the current agent/model's advertised reasoning-effort choices. Use the existing configuration
+path and keep the picker in sync; do not assume every model has the same effort levels.
+
+### Search the conversation in a thread
+
+Add in-thread message and plan search, beyond title search, following
+[t3code's chat find](https://github.com/pingdotgg/t3code/blob/main/docs/user/keybindings.md).
+Search the retained conversation, navigate between matches and reveal the matching message
+in the virtualized conversation with its match highlighted.
+
+### Snooze threads until later
+
+Follow [t3code's thread snooze](https://github.com/pingdotgg/t3code/blob/main/docs/user/thread-sidebar.md):
+hide a thread until a chosen time, including its quota reset when known, then return it to
+the list. Keep snooze independent of archiving and automatic resume; waking a snoozed thread
+does not itself send a prompt. Persist its wake time so snooze survives app and server restarts.
