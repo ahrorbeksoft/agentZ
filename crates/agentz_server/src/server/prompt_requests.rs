@@ -61,6 +61,8 @@ impl Server {
         }
         if let ConnectionId::Thread(thread_id) = connection {
             self.refuse_during_setup(thread_id)?;
+            // As t3code's turn start does: a message to a snoozed thread brings it back.
+            self.projects.wake_thread(thread_id);
             self.give_chat_its_folder(thread_id, &prompt)?;
             let plan = self
                 .projects

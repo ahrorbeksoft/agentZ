@@ -357,6 +357,19 @@ pub struct Thread {
     /// the limit resets, at this time. A turn that starts by then cancels it.
     #[serde(default)]
     pub continues_at: Option<SystemTime>,
+    /// Set while the thread is snoozed (t3code's `snoozedUntil`): it leaves the thread list
+    /// until then, unless it needs the user or finishes a turn first
+    /// ([`ProjectStore::is_thread_snoozed`]). It stays once the thread wakes, which clients
+    /// mark until the user opens it and wakes it for good ([`ProjectStore::wake_thread`]).
+    #[serde(default)]
+    pub snoozed_until: Option<SystemTime>,
+    /// When the thread was snoozed: a turn it finishes after this wakes it.
+    #[serde(default)]
+    pub snoozed_at: Option<SystemTime>,
+    /// When the user last woke the thread (t3code's `lastSnoozeWakeAt`). Auto-archive counts
+    /// its inactivity from then, without moving it in the list as activity would.
+    #[serde(default)]
+    pub woke_at: Option<SystemTime>,
     /// Who started the thread, when it wasn't the user.
     #[serde(default)]
     pub created_by: Option<ThreadCreator>,
@@ -520,6 +533,11 @@ impl Thread {
     pub fn can_pin(&self) -> bool {
         let is_listed_chat = self.is_chat() && self.task.is_none() && !self.is_draft;
         (self.can_arrange() || is_listed_chat) && self.terminal.is_none()
+    }
+
+    /// An agent thread among the threads, which the user can snooze as they can archive it.
+    pub fn can_snooze(&self) -> bool {
+        self.can_arrange() && self.terminal.is_none() && self.archived_at.is_none()
     }
 
     /// For a Workspaces thread, the folder it was started in, which may differ from the
@@ -1180,6 +1198,9 @@ impl ProjectStore {
             model: None,
             completed_at: None,
             continues_at: None,
+            snoozed_until: None,
+            snoozed_at: None,
+            woke_at: None,
             created_by: None,
             task: None,
             workspace: None,
@@ -1379,10 +1400,13 @@ impl ProjectStore {
             && !thread.is_chat()
         {
             thread.archived_at = Some(SystemTime::now());
-            // As t3code's settling does, so a thread brought back starts over among the rest.
+            // As t3code's settling does, so a thread brought back starts over among the rest,
+            // neither pinned nor snoozed.
             thread.pinned_at = None;
             thread.pin_order_key = None;
             thread.active_order_key = None;
+            thread.snoozed_until = None;
+            thread.snoozed_at = None;
             self.working_threads.remove(&id);
             self.blocked_threads.remove(&id);
             self.awaiting_input_threads.remove(&id);
@@ -1392,8 +1416,9 @@ impl ProjectStore {
     }
 
     /// The agent threads in the thread list, neither pinned nor busy, whose last activity was
-    /// before `cutoff`: the ones auto-archive archives. A thread with no recorded activity
-    /// or creation time is never stale.
+    /// before `cutoff`: the ones auto-archive archives. A snooze counts as activity until it
+    /// ends, as waking a thread does. A thread with no recorded activity or creation time is
+    /// never stale.
     pub fn stale_threads(&self, cutoff: SystemTime) -> Vec<ThreadId> {
         self.threads
             .iter()
@@ -1409,7 +1434,13 @@ impl ProjectStore {
                     && thread
                         .last_activity_at
                         .or(thread.created_at)
-                        .is_some_and(|last| last < cutoff)
+                        .is_some_and(|last| {
+                            [thread.snoozed_until, thread.woke_at]
+                                .into_iter()
+                                .flatten()
+                                .fold(last, SystemTime::max)
+                                < cutoff
+                        })
             })
             .map(|thread| thread.id)
             .collect()
@@ -1426,7 +1457,7 @@ impl ProjectStore {
 
     /// Pins the thread, at `order_key` among the pinned ones, or without one after those the
     /// user arranged. An archived thread comes back to be pinned, as a settled one does in
-    /// t3code. Pinning a pinned thread moves it to `order_key`.
+    /// t3code, and a snoozed one wakes. Pinning a pinned thread moves it to `order_key`.
     pub fn pin_thread(&mut self, id: ThreadId, order_key: Option<String>) -> Result<()> {
         if order_key
             .as_deref()
@@ -1447,6 +1478,7 @@ impl ProjectStore {
         if thread.pinned_at == pinned_at
             && thread.pin_order_key == pin_order_key
             && thread.archived_at.is_none()
+            && thread.snoozed_until.is_none()
         {
             return Ok(());
         }
@@ -1454,7 +1486,80 @@ impl ProjectStore {
         thread.pin_order_key = pin_order_key;
         thread.archived_at = None;
         self.changed();
+        self.wake_thread(id);
         Ok(())
+    }
+
+    /// Snoozes the thread until `until` (t3code's `thread.snooze`). A thread waiting on the
+    /// user can't be: that would hide what it asks. Snoozing again until the same time keeps
+    /// when it was snoozed, so a turn it finished since still wakes it.
+    pub fn snooze_thread(&mut self, id: ThreadId, until: SystemTime) -> Result<()> {
+        let now = SystemTime::now();
+        if until <= now {
+            anyhow::bail!("the wake time has passed");
+        }
+        if self.is_thread_or_subthread_blocked(id) || self.is_thread_awaiting_input(id) {
+            anyhow::bail!("the thread is waiting for your answer, so it can't be snoozed");
+        }
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .context("no such thread")?;
+        if !thread.can_snooze() {
+            anyhow::bail!("only an agent thread in the thread list can be snoozed");
+        }
+        if thread.snoozed_until == Some(until) {
+            return Ok(());
+        }
+        thread.snoozed_until = Some(until);
+        thread.snoozed_at = Some(now);
+        self.changed();
+        Ok(())
+    }
+
+    /// Wakes the thread (t3code's `thread.unsnooze`): a snoozed one comes back now, and one
+    /// that woke is no longer marked.
+    pub fn wake_thread(&mut self, id: ThreadId) {
+        if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
+            && thread.snoozed_until.is_some()
+        {
+            thread.snoozed_until = None;
+            thread.snoozed_at = None;
+            thread.woke_at = Some(SystemTime::now());
+            self.changed();
+        }
+    }
+
+    /// The thread is snoozed (t3code's `effectiveSnoozed`): its wake time is after `now`,
+    /// and since it was snoozed it hasn't asked the user anything or finished a turn.
+    pub fn is_thread_snoozed(&self, id: ThreadId, now: SystemTime) -> bool {
+        self.thread(id)
+            .and_then(|thread| thread.snoozed_until)
+            .is_some_and(|until| until > now)
+            && !self.raised_hand_while_snoozed(id)
+    }
+
+    /// The snoozed thread woke, on time or early, and the user hasn't woken it since: clients
+    /// mark it Woke (t3code's `threadWokeAt`).
+    pub fn has_thread_woken(&self, id: ThreadId, now: SystemTime) -> bool {
+        self.thread(id)
+            .is_some_and(|thread| thread.snoozed_until.is_some())
+            && !self.is_thread_snoozed(id, now)
+    }
+
+    /// Something outranks the snooze (t3code's `threadRaisedHandWhileSnoozed`): the thread
+    /// waits on the user, or finished a turn after it was snoozed, failed ones included.
+    fn raised_hand_while_snoozed(&self, id: ThreadId) -> bool {
+        let finished_since = self.thread(id).is_some_and(|thread| {
+            thread
+                .completed_at
+                .zip(thread.snoozed_at)
+                .is_some_and(|(completed_at, snoozed_at)| completed_at > snoozed_at)
+        });
+        finished_since
+            || self.is_thread_or_subthread_blocked(id)
+            || self.is_thread_awaiting_input(id)
     }
 
     /// Unpins the thread, which goes back to where it was among the rest.
@@ -3033,6 +3138,9 @@ mod tests {
         store.set_thread_working(working, true);
         let archived = old_thread(&mut store, "Archived");
         store.archive_thread(archived);
+        let snoozed = old_thread(&mut store, "Snoozed");
+        let in_an_hour = SystemTime::now() + Duration::from_secs(3600);
+        store.snooze_thread(snoozed, in_an_hour).expect("snooze");
         let chat = store
             .add_thread(ProjectId::CHATS, "Trip ideas", None)
             .expect("chat");
@@ -3048,6 +3156,76 @@ mod tests {
         assert!(store.thread(recent).is_some());
         store.set_thread_working(working, false);
         assert_eq!(store.stale_threads(cutoff), vec![stale], "just worked");
+        assert!(
+            store.snooze_thread(chat, in_an_hour).is_err(),
+            "chats aren't snoozed"
+        );
+        store.wake_thread(snoozed);
+        assert_eq!(store.stale_threads(cutoff), vec![stale], "just woken");
+    }
+
+    #[test]
+    fn snoozed_threads_wake_on_time_or_once_they_need_the_user() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let project = store.add_project(dir.path().join("storefront"));
+        let thread = store
+            .add_thread(project, "Fix the cart", None)
+            .expect("thread");
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        assert!(
+            store.snooze_thread(thread, now - hour).is_err(),
+            "in the past"
+        );
+        store.snooze_thread(thread, now + hour).expect("snooze");
+        assert!(store.is_thread_snoozed(thread, now));
+        assert!(!store.has_thread_woken(thread, now));
+        assert!(!store.is_thread_snoozed(thread, now + 2 * hour), "on time");
+        assert!(store.has_thread_woken(thread, now + 2 * hour));
+
+        store.set_thread_blocked(thread, true);
+        assert!(!store.is_thread_snoozed(thread, now), "asks for permission");
+        assert!(store.snooze_thread(thread, now + 2 * hour).is_err());
+        store.set_thread_blocked(thread, false);
+        store.set_thread_awaiting_input(thread, true);
+        assert!(!store.is_thread_snoozed(thread, now), "asks for input");
+        store.set_thread_awaiting_input(thread, false);
+        store.set_thread_working(thread, true);
+        assert!(
+            store.is_thread_snoozed(thread, now),
+            "works on while snoozed"
+        );
+        store.set_thread_working(thread, false);
+        assert!(!store.is_thread_snoozed(thread, now), "finished its turn");
+        assert!(store.has_thread_woken(thread, now));
+        store.wake_thread(thread);
+        assert!(!store.has_thread_woken(thread, now));
+        assert!(store.thread(thread).expect("thread").woke_at.is_some());
+
+        store
+            .snooze_thread(thread, now + hour)
+            .expect("snooze again");
+        assert!(
+            store.is_thread_snoozed(thread, now),
+            "an earlier turn doesn't wake it"
+        );
+        drop(store);
+        let mut store = ProjectStore::load(Some(state_path));
+        assert!(store.is_thread_snoozed(thread, now), "kept");
+        store.pin_thread(thread, None).expect("pin");
+        assert!(!store.has_thread_woken(thread, now), "pinning wakes it");
+
+        store
+            .snooze_thread(thread, now + hour)
+            .expect("snooze once more");
+        store.archive_thread(thread);
+        assert_eq!(store.thread(thread).expect("thread").snoozed_until, None);
+        assert!(
+            store.snooze_thread(thread, now + hour).is_err(),
+            "archived threads aren't snoozed"
+        );
     }
 
     #[test]

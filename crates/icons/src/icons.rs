@@ -30,6 +30,8 @@ pub enum IconName {
     AiVercel,
     AiXAi,
     AiZed,
+    AlarmClock,
+    AlarmClockOff,
     Archive,
     ArrowCircle,
     ArrowDown,

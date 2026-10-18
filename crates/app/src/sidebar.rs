@@ -9,7 +9,8 @@ use crate::agent_view::TOOLBAR_HEIGHT;
 use crate::app_settings::AppSettingsStore;
 use crate::controls::{AgentIcon, account_fill_color};
 use crate::machines::{
-    MachineId, Machines, ProjectKey, Scope, ThreadKey, by_latest_activity, project_at,
+    MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey, by_latest_activity,
+    project_at,
 };
 use crate::project_store::{ProjectStore, ThreadStatus};
 use crate::server_client::ServerClient;
@@ -17,12 +18,13 @@ use crate::settings_page::{AccountEntry, account_entry, render_entry_avatar};
 use crate::slide_drag::{
     DRAG_SCROLL_STEP, SlideDrag, drag_scroll_direction, render_raised_rows, scroll_while_held,
 };
+use crate::snooze;
 use agentz_protocol::agents::AgentId;
 use collections::HashMap;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, DragMoveEvent, ElementId, Entity, EventEmitter,
-    Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, PromptLevel, ScrollHandle, Stateful,
-    Subscription, Task, Window, anchored, canvas, deferred, svg,
+    Anchor, AnyElement, App, ClickEvent, Context, DismissEvent, DragMoveEvent, ElementId, Entity,
+    EventEmitter, Focusable as _, FontWeight, Hsla, KeyBinding, MouseButton, Point, PromptLevel,
+    ScrollHandle, Stateful, Subscription, Task, Window, anchored, canvas, deferred, svg,
 };
 use projects::{
     GitHead, Project, Thread, ThreadId, ThreadOrder, ThreadSection, Workspace, WorkspaceKind,
@@ -53,6 +55,8 @@ const ARCHIVED_INITIAL_COUNT: usize = 10;
 const ARCHIVED_PAGE_COUNT: usize = 25;
 /// Chats open with the latest few, and page the rest as Archived does.
 const CHATS_INITIAL_COUNT: usize = 5;
+/// How long t3code's undo notice stays after the last thread snoozed.
+const UNDO_DURATION: Duration = Duration::from_secs(5);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -68,6 +72,8 @@ pub fn init(cx: &mut App) {
 pub enum SidebarEvent {
     OpenThread(ThreadKey),
     OpenProjectSettings(ProjectKey),
+    /// The snooze menu's Custom…, which asks for how long.
+    CustomSnooze(ThreadKey),
 }
 
 /// An element id for a thread's row, unique across machines.
@@ -94,10 +100,34 @@ impl ThreadCheckout {
 /// The shelves of one-line rows under the thread cards.
 #[derive(Clone, Copy, PartialEq)]
 enum Shelf {
+    Snoozed,
     Chats,
     Shells,
     Workspaces,
     Archived,
+}
+
+/// What the thread menu offers for snoozing: the snooze menu, with the time the thread's
+/// account's used-up limit resets, or Wake Now for a snoozed thread.
+#[derive(Clone, Copy)]
+enum SnoozeItem {
+    Snooze(Option<SystemTime>),
+    WakeNow,
+}
+
+/// The snooze menu a card's clock opened, where it was clicked.
+struct SnoozeMenu {
+    thread: ThreadKey,
+    menu: Entity<ContextMenu>,
+    position: Point<Pixels>,
+    _subscription: Subscription,
+}
+
+/// t3code's undo notice at the bottom of the sidebar: the threads just snoozed from this app,
+/// until a while after the last.
+struct UndoNotice {
+    threads: Vec<ThreadKey>,
+    _expiry: Task<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -340,6 +370,10 @@ pub struct Sidebar {
     shells_expanded: bool,
     /// Whether the Working group is open. This window's alone.
     working_expanded: bool,
+    /// Whether the Snoozed shelf is open. This window's alone.
+    snoozed_expanded: bool,
+    snooze_menu: Option<SnoozeMenu>,
+    undo_notice: Option<UndoNotice>,
     /// The thread whose details popover is showing, after hovering it for a moment.
     details_thread: Option<ThreadKey>,
     /// A popover waiting out the hover delay, and the thread it's for.
@@ -369,6 +403,11 @@ impl Sidebar {
                 this.apply_rename(cx)
             }),
             cx.observe(&machines, |_, _, cx| cx.notify()),
+            cx.subscribe(&machines, |this, _, event: &MachinesEvent, cx| {
+                if let MachinesEvent::Snoozing(thread) = event {
+                    this.offer_undo(*thread, cx);
+                }
+            }),
             // Turning chats on or off in Settings › General.
             cx.observe(&AppSettingsStore::global(cx), |_, _, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
@@ -398,6 +437,9 @@ impl Sidebar {
             chats_shown: CHATS_INITIAL_COUNT,
             shells_expanded: true,
             working_expanded: true,
+            snoozed_expanded: false,
+            snooze_menu: None,
+            undo_notice: None,
             details_thread: None,
             details_delay: None,
             hovered_thread: None,
@@ -767,6 +809,10 @@ impl Sidebar {
             .as_ref()
             .and_then(|checkout| checkout.workspace.as_ref())
             .is_some_and(|workspace| workspace.kind == WorkspaceKind::Pasture);
+        // Snooze ▸ after Archive (t3code puts it after Settle), or Wake Now once snoozed.
+        let snooze_item = (!is_archived && !is_terminal)
+            .then(|| self.snooze_item(thread_id, cx))
+            .flatten();
         // Where a terminal is, when that's in no project yet.
         let new_project = is_terminal
             .then(|| {
@@ -944,6 +990,42 @@ impl Sidebar {
                         .icon_color(Color::Muted)
                         .handler(toggle_archived),
                 )
+                .map(|menu| match snooze_item {
+                    Some(SnoozeItem::Snooze(limit_reset)) => {
+                        let sidebar = sidebar.clone();
+                        menu.submenu_with_colored_icon(
+                            "Snooze",
+                            IconName::Clock,
+                            Color::Muted,
+                            move |menu, _, _| {
+                                let sidebar = sidebar.clone();
+                                snooze::snooze_menu(menu, thread_id, limit_reset, move |_, cx| {
+                                    sidebar
+                                        .update(cx, |_, cx| {
+                                            cx.emit(SidebarEvent::CustomSnooze(thread_id))
+                                        })
+                                        .ok();
+                                })
+                            },
+                        )
+                    }
+                    Some(SnoozeItem::WakeNow) => {
+                        let sidebar = sidebar.clone();
+                        menu.item(
+                            ContextMenuEntry::new("Wake Now")
+                                .icon(IconName::AlarmClockOff)
+                                .icon_color(Color::Muted)
+                                .handler(move |_, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.wake_thread(thread_id, cx)
+                                        })
+                                        .ok();
+                                }),
+                        )
+                    }
+                    None => menu,
+                })
                 .when(is_pasture, |menu| {
                     menu.separator()
                         .item(
@@ -984,6 +1066,174 @@ impl Sidebar {
         } else if let Some(store) = self.store(key.machine, cx) {
             store.update(cx, |store, cx| store.unpin_thread(key.thread, cx));
         }
+    }
+
+    fn wake_thread(&mut self, key: ThreadKey, cx: &mut Context<Self>) {
+        if let Some(store) = self.store(key.machine, cx) {
+            store.update(cx, |store, cx| store.wake_thread(key.thread, cx));
+        }
+    }
+
+    /// When the thread's account's used-up limit resets, which the snooze menu offers first.
+    fn limit_reset(&self, key: ThreadKey, cx: &App) -> Option<SystemTime> {
+        let client = self.machines.read(cx).client(key.machine, cx)?;
+        let store = self.store(key.machine, cx)?;
+        let store = store.read(cx);
+        let thread = store.thread(key.thread)?;
+        snooze::limit_reset(thread, client.read(cx), SystemTime::now())
+    }
+
+    /// The thread menu's snooze item, when the thread has one.
+    fn snooze_item(&self, key: ThreadKey, cx: &App) -> Option<SnoozeItem> {
+        let store = self.store(key.machine, cx)?;
+        let store = store.read(cx);
+        if store.is_thread_snoozed(key.thread, SystemTime::now()) {
+            Some(SnoozeItem::WakeNow)
+        } else if store.can_snooze_thread(key.thread) {
+            Some(SnoozeItem::Snooze(self.limit_reset(key, cx)))
+        } else {
+            None
+        }
+    }
+
+    /// Opens the snooze menu from a card's clock, where it was clicked (t3code's
+    /// `SnoozeMenuButton`).
+    fn deploy_snooze_menu(
+        &mut self,
+        thread: ThreadKey,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let limit_reset = self.limit_reset(thread, cx);
+        let sidebar = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let sidebar = sidebar.clone();
+            snooze::snooze_menu(menu, thread, limit_reset, move |_, cx| {
+                sidebar
+                    .update(cx, |_, cx| cx.emit(SidebarEvent::CustomSnooze(thread)))
+                    .ok();
+            })
+        });
+        let previous_focus = window.focused(cx);
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            move |this, menu, _: &DismissEvent, window, cx| {
+                // Custom…'s dialog takes the focus from the menu, and keeps it.
+                if menu.focus_handle(cx).contains_focused(window, cx)
+                    && let Some(previous_focus) = &previous_focus
+                {
+                    window.focus(previous_focus, cx);
+                }
+                this.snooze_menu = None;
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.hide_details(cx);
+        self.snooze_menu = Some(SnoozeMenu {
+            thread,
+            menu,
+            position,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn render_snooze_menu(&self) -> Option<AnyElement> {
+        let snooze_menu = self.snooze_menu.as_ref()?;
+        Some(
+            deferred(
+                anchored()
+                    .position(snooze_menu.position)
+                    .anchor(Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(snooze_menu.menu.clone()),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// A thread snoozed from this app joins the undo notice, which stays a while longer, as
+    /// t3code's groups the same action done in a row.
+    fn offer_undo(&mut self, thread: ThreadKey, cx: &mut Context<Self>) {
+        let mut threads = self
+            .undo_notice
+            .take()
+            .map(|notice| notice.threads)
+            .unwrap_or_default();
+        if !threads.contains(&thread) {
+            threads.push(thread);
+        }
+        let expiry = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(UNDO_DURATION).await;
+            this.update(cx, |this, cx| {
+                this.undo_notice = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.undo_notice = Some(UndoNotice {
+            threads,
+            _expiry: expiry,
+        });
+        cx.notify();
+    }
+
+    /// The undo notice's Undo: every thread it counts wakes.
+    fn undo_snoozes(&mut self, cx: &mut Context<Self>) {
+        let Some(notice) = self.undo_notice.take() else {
+            return;
+        };
+        for thread in notice.threads {
+            if let Some(store) = self.store(thread.machine, cx) {
+                store.update(cx, |store, cx| store.wake_thread(thread.thread, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// t3code's notice: "Snoozed 2 threads, Undo", over the sidebar's footer.
+    fn render_undo_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let count = self.undo_notice.as_ref()?.threads.len();
+        let colors = cx.theme().colors();
+        Some(
+            div()
+                .flex_none()
+                .px_2()
+                .pb_2()
+                .child(
+                    h_flex()
+                        .debug_selector(|| "snooze-undo-notice".into())
+                        .pl_2()
+                        .pr_1()
+                        .py_0p5()
+                        .gap_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.elevated_surface_background)
+                        .child(
+                            Label::new(format!(
+                                "Snoozed {count} {},",
+                                if count == 1 { "thread" } else { "threads" }
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            div().debug_selector(|| "undo-snooze".into()).child(
+                                Button::new("undo-snooze", "Undo")
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Accent)
+                                    .on_click(cx.listener(|this, _, _, cx| this.undo_snoozes(cx))),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Makes a Workspaces thread one of the project its folder is in. Outside every project,
@@ -1114,13 +1364,15 @@ impl Sidebar {
         drafts
     }
 
-    /// The thread cards, the pinned ones first.
+    /// The thread cards, the pinned ones first. Snoozed threads wait on their shelf.
     fn shown_cards(&self, cx: &App) -> Vec<(Entity<ProjectStore>, Thread)> {
+        let now = SystemTime::now();
         self.machines
             .read(cx)
             .active_threads(cx)
             .into_iter()
             .filter_map(|(machine, thread)| Some((self.store(machine, cx)?, thread)))
+            .filter(|(store, thread)| !store.read(cx).is_thread_snoozed(thread.id, now))
             .collect()
     }
 
@@ -1492,6 +1744,16 @@ impl Sidebar {
         // The open thread's composer shows its text already.
         let has_unsent_text = thread.unsent_text.is_some() && !is_active;
         let thread_status = store.read(cx).thread_status(thread.id);
+        let has_woken = store
+            .read(cx)
+            .has_thread_woken(thread.id, SystemTime::now());
+        let can_snooze = store.read(cx).can_snooze_thread(thread.id);
+        // Its hover buttons stay while the clock's menu is open, as t3code's do.
+        let is_snooze_menu_open = raised.is_none()
+            && self
+                .snooze_menu
+                .as_ref()
+                .is_some_and(|menu| menu.thread == thread_id);
         let faint_icon = Color::Custom(colors.text_muted.opacity(0.6));
         let icon = thread_agent_icon(machine, &thread, faint_icon, cx);
         // A terminal thread is described by where it is now, which may not be where it
@@ -1564,6 +1826,10 @@ impl Sidebar {
                         .color(Color::Accent),
                 )
                 .into_any_element(),
+            // Below what needs the user, above a finished turn, as in t3code.
+            (None, None | Some(ThreadStatus::Completed)) if has_woken => {
+                render_woke_mark(thread_id, "woke-mark", store.clone())
+            }
             (None, Some(status)) => render_status_pill(status, cx).into_any_element(),
             (None, None) => Label::new(time.unwrap_or_default())
                 .size(LabelSize::Small)
@@ -1627,6 +1893,56 @@ impl Sidebar {
         // Terminals aren't archived: a shell or an agent CLI is deleted when done with.
         let is_archivable = thread.terminal.is_none();
         let has_hover_buttons = !is_renaming && !is_dragging && (is_archivable || has_unsent_text);
+        // t3code's clock, before Archive. A thread waiting for the user isn't snoozed.
+        let snooze_button = (can_snooze && has_hover_buttons).then(|| {
+            let button_group =
+                SharedString::from(format!("snooze-button-{}-{}", machine.slug(), thread.id.0));
+            div()
+                .id(thread_element_id("snooze-thread", thread_id))
+                .debug_selector(|| format!("snooze-thread-{}", thread_id.thread.0))
+                .group(button_group.clone())
+                .flex()
+                .items_center()
+                .h_full()
+                .px_1()
+                .cursor_pointer()
+                .tooltip(Tooltip::text("Snooze Thread"))
+                .child(
+                    svg()
+                        .path(IconName::Clock.path())
+                        .size(IconSize::XSmall.rems())
+                        .flex_none()
+                        .text_color(if is_snooze_menu_open {
+                            bright_text
+                        } else {
+                            muted_text
+                        })
+                        .group_hover(button_group, |this| this.text_color(bright_text)),
+                )
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    if *hovered {
+                        this.hide_details(cx);
+                    } else if this.hovered_thread == Some(thread_id) {
+                        this.thread_hovered(thread_id, true, cx);
+                    }
+                }))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_snooze_menu(thread_id, event.position(), window, cx);
+                }))
+        });
+        // The Woke mark is a button too, so it stays among the hover buttons.
+        let woke_button = (has_woken
+            && has_hover_buttons
+            && thread_status.is_none_or(|status| status == ThreadStatus::Completed))
+        .then(|| {
+            div()
+                .h_full()
+                .px_1()
+                .flex()
+                .items_center()
+                .child(render_woke_mark(thread_id, "woke-button", store.clone()))
+        });
         // t3code's pin, before the status: it unpins from the hover buttons, where it moves
         // over with them. A dragged card shows its badge instead, over another section.
         let pin = (thread.is_pinned() && drop_verb.is_none()).then(|| {
@@ -1636,6 +1952,7 @@ impl Sidebar {
                 .when(has_hover_buttons, |this| {
                     this.group_hover(group_name.clone(), |this| this.invisible())
                 })
+                .when(is_snooze_menu_open, |this| this.invisible())
                 .child(
                     Icon::new(IconName::Pin)
                         .size(IconSize::XSmall)
@@ -1684,6 +2001,7 @@ impl Sidebar {
             .when(has_hover_buttons, |this| {
                 this.group_hover(group_name.clone(), |this| this.invisible())
             })
+            .when(is_snooze_menu_open, |this| this.invisible())
             .child(status);
         // The buttons cover the end of the title in the card's own color, fading in from it,
         // so a long title doesn't show through them, even over a picture.
@@ -1701,7 +2019,9 @@ impl Sidebar {
                 .top_0()
                 .bottom_0()
                 .right_0()
-                .visible_on_hover(group_name.clone())
+                .when(!is_snooze_menu_open, |this| {
+                    this.visible_on_hover(group_name.clone())
+                })
                 .child(div().w_6().h_full().bg(gpui::linear_gradient(
                     90.,
                     gpui::linear_color_stop(cover, 1.),
@@ -1711,8 +2031,10 @@ impl Sidebar {
                     h_flex()
                         .h_full()
                         .bg(cover)
+                        .children(woke_button)
                         .children(discard_button)
                         .children(unpin_button)
+                        .children(snooze_button)
                         .when(is_archivable, |this| this.child(archive_button)),
                 )
         });
@@ -1724,6 +2046,7 @@ impl Sidebar {
                 .when(has_hover_buttons, |this| {
                     this.group_hover(group_name.clone(), |this| this.invisible())
                 })
+                .when(is_snooze_menu_open, |this| this.invisible())
         });
         let title_element = if is_renaming {
             self.render_rename_input(cx)
@@ -1800,6 +2123,9 @@ impl Sidebar {
             .py_2()
             .rounded_md()
             .when(is_active, |card| card.bg(selected_background))
+            .when(is_snooze_menu_open && !is_active, |card| {
+                card.bg(hover_background)
+            })
             .when(!is_renaming && raised.is_none(), |card| {
                 card.cursor_pointer()
                     .when(!is_dragging, |card| {
@@ -2084,6 +2410,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_archived = shelf == Shelf::Archived;
+        let is_snoozed = shelf == Shelf::Snoozed;
         let is_shell = shelf == Shelf::Shells;
         let is_chat = shelf == Shelf::Chats;
         let colors = cx.theme().colors();
@@ -2113,13 +2440,25 @@ impl Sidebar {
             None => self.render_row_icon(machine, &thread, project.as_ref(), cx),
         };
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
-        let time = if is_archived {
-            thread.archived_at
+        let now = SystemTime::now();
+        // A snoozed row says when it comes back rather than when it was last active.
+        let time = if is_snoozed {
+            thread
+                .snoozed_until
+                .map(|until| snooze::time_left(until, now))
+        } else if is_archived {
+            thread
+                .archived_at
+                .map(|time| format_relative_time(time, now))
         } else {
-            thread.last_activity_at.or(thread.created_at)
-        }
-        .map(|time| format_relative_time(time, SystemTime::now()));
+            thread
+                .last_activity_at
+                .or(thread.created_at)
+                .map(|time| format_relative_time(time, now))
+        };
+        let has_hover_action = is_archived || is_snoozed;
         let prefix = match shelf {
+            Shelf::Snoozed => "snoozed",
             Shelf::Chats => "chat",
             Shelf::Shells => "shell",
             Shelf::Workspaces => "workspaces",
@@ -2191,6 +2530,41 @@ impl Sidebar {
         let is_quiet = !is_active && busy_status.is_none();
         let store = store.clone();
 
+        let time_color = if is_snoozed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
+        // An archived row's way back, or a snoozed one's Wake Now, in place of its time.
+        let hover_action = (has_hover_action && !is_renaming && !is_dragging).then(|| {
+            let (name, icon, tooltip) = if is_snoozed {
+                ("wake-thread", IconName::AlarmClockOff, "Wake Now")
+            } else {
+                ("unarchive-thread", IconName::Undo, "Unarchive Thread")
+            };
+            div()
+                .absolute()
+                .right_1()
+                .debug_selector(move || format!("{name}-{}", thread_id.thread.0))
+                .visible_on_hover(group_name.clone())
+                .child(
+                    IconButton::new(thread_element_id(name, thread_id), icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(tooltip))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            store.update(cx, |store, cx| {
+                                if is_snoozed {
+                                    store.wake_thread(thread_id.thread, cx)
+                                } else {
+                                    store.unarchive_thread(thread_id.thread, cx)
+                                }
+                            });
+                        }),
+                )
+        });
+
         let main_line = h_flex()
             .relative()
             .when(!is_shell, |line| line.h_full())
@@ -2246,37 +2620,15 @@ impl Sidebar {
                     row.child(
                         div()
                             .flex_none()
-                            .when(is_archived && !is_dragging, |this| {
+                            .when(has_hover_action && !is_dragging, |this| {
                                 this.group_hover(group_name.clone(), |this| this.invisible())
                             })
-                            .child(Label::new(time).size(LabelSize::Small).color(Color::Muted)),
+                            .child(Label::new(time).size(LabelSize::Small).color(time_color)),
                     )
                 },
             )
             .children(drop_verb.map(|verb| render_drop_badge(verb, cx)))
-            .when(is_archived && !is_renaming && !is_dragging, |row| {
-                row.child(
-                    div()
-                        .absolute()
-                        .right_1()
-                        .visible_on_hover(group_name.clone())
-                        .child(
-                            IconButton::new(
-                                thread_element_id("unarchive-thread", thread_id),
-                                IconName::Undo,
-                            )
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Unarchive Thread"))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                store.update(cx, |store, cx| {
-                                    store.unarchive_thread(thread_id.thread, cx)
-                                });
-                            }),
-                        ),
-                )
-            });
+            .children(hover_action);
         let row = v_flex()
             .id(thread_element_id(&format!("{prefix}-thread"), thread_id))
             .debug_selector(|| format!("{prefix}-row-{}", thread_id.thread.0))
@@ -2341,6 +2693,41 @@ impl Sidebar {
         })
         .menu(menu)
         .into_any_element()
+    }
+
+    /// t3code's Snoozed shelf, first at the bottom: the snoozed threads, the soonest to wake
+    /// first, folded at first. The open thread's row stays while it's folded.
+    fn render_snoozed_shelf(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let snoozed = self.machines.read(cx).snoozed_threads(cx);
+        if snoozed.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = vec![Self::render_shelf_header(
+            "snoozed-shelf-toggle",
+            "Snoozed",
+            snoozed.len(),
+            self.snoozed_expanded,
+            HeaderTone::Accent,
+            None,
+            |this, cx| {
+                this.snoozed_expanded = !this.snoozed_expanded;
+                cx.notify();
+            },
+            cx,
+        )];
+        for (machine, thread) in snoozed {
+            let is_active = self.active_thread
+                == Some(ThreadKey {
+                    machine,
+                    thread: thread.id,
+                });
+            if (self.snoozed_expanded || is_active)
+                && let Some(store) = self.store(machine, cx)
+            {
+                rows.push(self.render_slim_row(&store, thread, Shelf::Snoozed, None, cx));
+            }
+        }
+        rows
     }
 
     /// The Chats shelf, first at the bottom while chats are on: its header with New Chat,
@@ -2653,6 +3040,7 @@ impl Sidebar {
             );
         }
 
+        let snoozed_shelf = self.render_snoozed_shelf(cx);
         let mut cards = self.shown_cards(cx);
         // t3code's Working shelf: threads whose agents work and need nothing from the user
         // fold out of the list into a group of their own. Pinned ones stay where they were
@@ -2699,7 +3087,7 @@ impl Sidebar {
                             rows.push(self.render_thread_card(&store, thread, project, None, cx));
                         }
                     }
-                } else if rows.is_empty() {
+                } else if rows.is_empty() && snoozed_shelf.is_empty() {
                     rows.push(
                         h_flex()
                             .h_8()
@@ -2765,7 +3153,8 @@ impl Sidebar {
             }
         }
 
-        let mut shelf = self.render_chats_shelf(cx);
+        let mut shelf = snoozed_shelf;
+        shelf.extend(self.render_chats_shelf(cx));
         // Terminal threads running no agent CLI. One that starts an agent becomes a thread
         // card, and comes back here when it ends.
         let shells = self.machines.read(cx).shell_threads(cx);
@@ -2994,6 +3383,8 @@ impl Render for Sidebar {
                 self.render_empty_state().into_any_element()
             })
             .children(self.render_raised_thread(cx))
+            .children(self.render_snooze_menu())
+            .children(self.render_undo_notice(cx))
             .child(render_footer_item(
                 "open-settings",
                 IconName::Settings,
@@ -3265,6 +3656,39 @@ fn render_draft_badge(cx: &App) -> Div {
                 .weight(FontWeight::MEDIUM)
                 .color(Color::Muted),
         )
+}
+
+/// t3code's Woke mark: an alarm clock and "Woke" in the warning color, until the thread is
+/// opened. It's a button too, which ends the mark.
+fn render_woke_mark(
+    thread_id: ThreadKey,
+    prefix: &'static str,
+    store: Entity<ProjectStore>,
+) -> AnyElement {
+    let color = Color::Warning;
+    h_flex()
+        .id(thread_element_id(prefix, thread_id))
+        .debug_selector(move || format!("{prefix}-{}", thread_id.thread.0))
+        .flex_none()
+        .gap_1()
+        .cursor_pointer()
+        .tooltip(Tooltip::text("Dismiss Woke notification"))
+        .child(
+            Icon::new(IconName::AlarmClock)
+                .size(IconSize::Small)
+                .color(color),
+        )
+        .child(
+            Label::new("Woke")
+                .size(LabelSize::Small)
+                .weight(FontWeight::MEDIUM)
+                .color(color),
+        )
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            store.update(cx, |store, cx| store.wake_thread(thread_id.thread, cx));
+        })
+        .into_any_element()
 }
 
 /// t3code's Discard draft button: a muted × that brightens under the mouse. Clearing the
@@ -3580,7 +4004,7 @@ mod view_tests {
             .unwrap_or_else(|| panic!("{name} is drawn"))
     }
 
-    /// The requests that pin, unpin, arrange, archive or unarchive threads.
+    /// The requests that pin, unpin, arrange, archive, unarchive, snooze or wake threads.
     fn organizing_requests(cx: &mut VisualTestContext) -> Vec<Request> {
         cx.update(|_, cx| {
             let Some(client) = Machines::global(cx).read(cx).client(MachineId::Local, cx) else {
@@ -3598,6 +4022,8 @@ mod view_tests {
                             | Request::ReorderThreads { .. }
                             | Request::ArchiveThread(_)
                             | Request::UnarchiveThread(_)
+                            | Request::SnoozeThread { .. }
+                            | Request::WakeThread(_)
                     )
                 })
                 .collect()
@@ -4454,6 +4880,141 @@ mod view_tests {
         assert!(cx.debug_bounds("drop-badge-Pin").is_none());
         let_go(held, cx);
         assert_eq!(organizing_requests(cx), []);
+    }
+
+    fn click_on(name: &'static str, cx: &mut VisualTestContext) {
+        let target = bounds(cx, name);
+        cx.simulate_click(target.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn hover_on(name: &'static str, cx: &mut VisualTestContext) {
+        let target = bounds(cx, name);
+        cx.simulate_mouse_move(target.center(), None, Modifiers::none());
+    }
+
+    fn snoozed(mut thread: Thread, until: SystemTime) -> Thread {
+        thread.snoozed_until = Some(until);
+        thread.snoozed_at = Some(SystemTime::now());
+        thread
+    }
+
+    /// t3code's clock on a card opens the snooze menu. A preset sends the card to the folded
+    /// Snoozed shelf, and the notice's Undo brings it back; the notice goes on its own a while
+    /// after.
+    #[gpui::test]
+    fn a_cards_clock_snoozes_it_and_undo_brings_it_back(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        show(
+            &store,
+            vec![thread(1, false, None), thread(2, false, None)],
+            cx,
+        );
+        assert!(cx.debug_bounds("snoozed-shelf-toggle").is_none());
+
+        let before = SystemTime::now();
+        hover_on("thread-card-1", cx);
+        click_on("snooze-thread-1", cx);
+        let after = SystemTime::now();
+        click_on("snooze-hour", cx);
+        let requests = organizing_requests(cx);
+        let [Request::SnoozeThread { thread_id, until }] = requests.as_slice() else {
+            panic!("one snooze: {requests:?}");
+        };
+        assert_eq!(*thread_id, ThreadId(1));
+        let hour = Duration::from_secs(60 * 60);
+        assert!(before + hour <= *until && *until <= after + hour);
+        assert!(cx.debug_bounds("thread-card-1").is_none());
+        assert!(cx.debug_bounds("snoozed-shelf-toggle").is_some());
+        assert!(cx.debug_bounds("snoozed-row-1").is_none());
+        assert!(cx.debug_bounds("snooze-undo-notice").is_some());
+
+        click_on("undo-snooze", cx);
+        assert_eq!(
+            &organizing_requests(cx)[1..],
+            [Request::WakeThread(ThreadId(1))]
+        );
+        assert!(cx.debug_bounds("thread-card-1").is_some());
+        assert!(cx.debug_bounds("snoozed-shelf-toggle").is_none());
+        assert!(cx.debug_bounds("snooze-undo-notice").is_none());
+        // Woken by hand, it isn't marked Woke.
+        assert!(cx.debug_bounds("woke-mark-1").is_none());
+
+        hover_on("thread-card-2", cx);
+        click_on("snooze-thread-2", cx);
+        click_on("snooze-tomorrow", cx);
+        assert!(cx.debug_bounds("thread-card-2").is_none());
+        assert!(cx.debug_bounds("snooze-undo-notice").is_some());
+        cx.executor().advance_clock(super::UNDO_DURATION);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("snooze-undo-notice").is_none());
+        assert!(cx.debug_bounds("thread-card-2").is_none());
+    }
+
+    /// t3code's Snoozed shelf: folded at first, keeping the open thread's row; open, the
+    /// soonest to wake first, and a row's Wake Now brings its thread back to the cards.
+    #[gpui::test]
+    fn snoozed_threads_wait_on_their_shelf_until_woken(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        show(
+            &store,
+            vec![
+                snoozed(thread(1, false, None), now + 3 * hour),
+                snoozed(thread(2, false, None), now + hour),
+                thread(3, false, None),
+            ],
+            cx,
+        );
+        assert!(cx.debug_bounds("thread-card-1").is_none());
+        assert!(cx.debug_bounds("thread-card-2").is_none());
+        let card = bounds(cx, "thread-card-3");
+        let header = bounds(cx, "snoozed-shelf-toggle");
+        assert!(card.bottom() <= header.top());
+        assert!(cx.debug_bounds("snoozed-row-1").is_none());
+
+        open(&sidebar, 1, cx);
+        assert!(cx.debug_bounds("snoozed-row-1").is_some());
+        assert!(cx.debug_bounds("snoozed-row-2").is_none());
+
+        // The shelf rests at the bottom, so the row moved its header up.
+        click_on("snoozed-shelf-toggle", cx);
+        let row = bounds(cx, "snoozed-row-2");
+        assert!(row.top() < bounds(cx, "snoozed-row-1").top());
+
+        cx.simulate_mouse_move(row.center(), None, Modifiers::none());
+        click_on("wake-thread-2", cx);
+        assert_eq!(organizing_requests(cx), [Request::WakeThread(ThreadId(2))]);
+        assert!(cx.debug_bounds("thread-card-2").is_some());
+        assert!(cx.debug_bounds("snoozed-row-2").is_none());
+        assert!(cx.debug_bounds("woke-mark-2").is_none());
+    }
+
+    /// A thread back from its snooze, on time or early because a turn finished, is on the
+    /// cards marked Woke until the mark is clicked, which stays among the buttons under the
+    /// mouse.
+    #[gpui::test]
+    fn a_woken_thread_is_marked_until_its_mark_is_clicked(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(60 * 60);
+        let mut on_time = snoozed(thread(1, false, None), now - Duration::from_secs(60));
+        on_time.snoozed_at = Some(now - hour);
+        let mut finished = snoozed(thread(2, false, None), now + hour);
+        finished.snoozed_at = Some(now - Duration::from_secs(60));
+        finished.completed_at = Some(now);
+        show(&store, vec![on_time, finished, thread(3, false, None)], cx);
+        assert!(cx.debug_bounds("snoozed-shelf-toggle").is_none());
+        assert!(cx.debug_bounds("woke-mark-1").is_some());
+        assert!(cx.debug_bounds("woke-mark-2").is_some());
+        assert!(cx.debug_bounds("woke-mark-3").is_none());
+
+        hover_on("thread-card-1", cx);
+        click_on("woke-button-1", cx);
+        assert_eq!(organizing_requests(cx), [Request::WakeThread(ThreadId(1))]);
+        assert!(cx.debug_bounds("woke-mark-1").is_none());
+        assert!(cx.debug_bounds("woke-mark-2").is_some());
     }
 }
 

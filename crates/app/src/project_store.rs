@@ -19,7 +19,7 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
 use projects::{
-    PlannedWorkspace, ProjectIcon, ProjectId, ProjectsSnapshot, ThreadCreator, ThreadId,
+    PlannedWorkspace, ProjectIcon, ProjectId, ProjectsSnapshot, Thread, ThreadCreator, ThreadId,
     ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
 };
 use util::ResultExt as _;
@@ -45,6 +45,8 @@ pub enum ProjectStoreEvent {
     NeedsAttention(ThreadId, ThreadStatus),
     /// The user archived the thread from this app, rather than an agent or another app.
     Archiving(ThreadId),
+    /// The user snoozed the thread from this app, which offers to undo it for a moment.
+    Snoozing(ThreadId),
 }
 
 pub struct ProjectStore {
@@ -57,6 +59,8 @@ pub struct ProjectStore {
     viewed: BTreeMap<u64, SystemTime>,
     viewed_path: Option<PathBuf>,
     _save_viewed: Option<Task<()>>,
+    /// Notifies as the soonest snooze ends ([`Self::schedule_wake`]).
+    _wake_timer: Option<Task<()>>,
 }
 
 impl EventEmitter<ProjectStoreEvent> for ProjectStore {}
@@ -86,6 +90,7 @@ impl ProjectStore {
             viewed,
             viewed_path: Some(viewed_path),
             _save_viewed: None,
+            _wake_timer: None,
         }
     }
 
@@ -139,7 +144,32 @@ impl ProjectStore {
             }
         }
         self.store = store;
+        self.schedule_wake(cx);
         cx.notify();
+    }
+
+    /// A snoozed thread's state is worked out from the time (t3code's `effectiveSnoozed`), and
+    /// nothing else changes as its snooze ends, so this notifies then.
+    fn schedule_wake(&mut self, cx: &mut Context<Self>) {
+        let now = SystemTime::now();
+        let soonest = self
+            .store
+            .threads()
+            .iter()
+            .filter_map(|thread| thread.snoozed_until)
+            .filter(|until| *until > now)
+            .min();
+        self._wake_timer = soonest.map(|until| {
+            let delay = until.duration_since(now).unwrap_or_default();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |this, cx| {
+                    this.schedule_wake(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+        });
     }
 
     /// A thread's status counts its subthreads': it's where their requests are answered, and
@@ -191,8 +221,12 @@ impl ProjectStore {
             .max()
     }
 
-    /// Records that this client displayed the thread's latest completion.
+    /// Records that this client displayed the thread's latest completion. A thread that woke
+    /// from a snooze is no longer marked once it's seen, as t3code's visit clears it.
     pub fn mark_viewed(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if self.store.has_thread_woken(id, SystemTime::now()) {
+            self.wake_thread(id, cx);
+        }
         let Some(completed_at) = self.store.thread(id).and_then(|thread| thread.completed_at)
         else {
             return;
@@ -654,6 +688,52 @@ impl ProjectStore {
         self.store.unpin_thread(id);
         cx.notify();
         self.send(Request::UnpinThread(id), cx)
+    }
+
+    /// Whether Snooze is offered for the thread (t3code's `canSnooze`): an agent thread in the
+    /// list, neither snoozed already nor waiting for the user, which would hide what it asks.
+    pub fn can_snooze_thread(&self, id: ThreadId) -> bool {
+        self.store.thread(id).is_some_and(Thread::can_snooze)
+            && !self.store.is_thread_snoozed(id, SystemTime::now())
+            && !matches!(
+                self.thread_status(id),
+                Some(ThreadStatus::PendingApproval | ThreadStatus::AwaitingInput)
+            )
+    }
+
+    /// Refused here as the server would refuse it, so whatever asked can say why at once.
+    pub fn snooze_thread(
+        &mut self,
+        id: ThreadId,
+        until: SystemTime,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.store.snooze_thread(id, until)?;
+        self.schedule_wake(cx);
+        cx.notify();
+        self.send(
+            Request::SnoozeThread {
+                thread_id: id,
+                until,
+            },
+            cx,
+        );
+        cx.emit(ProjectStoreEvent::Snoozing(id));
+        Ok(())
+    }
+
+    /// Wake Now for a snoozed thread, or the end of a woken one's mark.
+    pub fn wake_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if self
+            .store
+            .thread(id)
+            .is_none_or(|thread| thread.snoozed_until.is_none())
+        {
+            return;
+        }
+        self.store.wake_thread(id);
+        cx.notify();
+        self.send(Request::WakeThread(id), cx)
     }
 
     pub fn reorder_threads(

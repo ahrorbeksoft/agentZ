@@ -1722,6 +1722,81 @@ async fn threads_waiting_for_input_are_marked() {
         .await;
 }
 
+/// A snoozed thread keeps its wake time until a message brings it back, and one waiting on the
+/// user isn't snoozed (t3code's snooze).
+#[tokio::test(flavor = "multi_thread")]
+async fn snoozed_threads_wake_when_messaged() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "Echo: hello"
+        })
+        .await;
+    let snoozed_until = move |client: &TestClient| client.project_thread(thread_id)?.snoozed_until;
+
+    let error = client
+        .request(Request::SnoozeThread {
+            thread_id,
+            until: SystemTime::now() - Duration::from_secs(60),
+        })
+        .await
+        .expect_err("a wake time that has passed");
+    assert_eq!(error.message, "the wake time has passed");
+    let until = SystemTime::now() + Duration::from_secs(3600);
+    client.ok(Request::SnoozeThread { thread_id, until }).await;
+    client
+        .wait_until(move |client| snoozed_until(client) == Some(until))
+        .await;
+
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("form"),
+        })
+        .await;
+    client
+        .wait_until(move |client| {
+            snoozed_until(client).is_none()
+                && client
+                    .project_thread(thread_id)
+                    .is_some_and(|thread| thread.woke_at.is_some())
+        })
+        .await;
+    client
+        .wait_until(move |client| {
+            client
+                .projects
+                .as_ref()
+                .is_some_and(|projects| projects.awaiting_input_threads.contains(&thread_id))
+        })
+        .await;
+    let error = client
+        .request(Request::SnoozeThread { thread_id, until })
+        .await
+        .expect_err("waiting for input");
+    assert_eq!(
+        error.message,
+        "the thread is waiting for your answer, so it can't be snoozed"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn login_sessions_log_in_and_close_with_their_client() {
     let Some(server) = TestServer::start() else {

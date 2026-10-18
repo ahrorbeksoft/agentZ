@@ -1036,6 +1036,16 @@ impl Server {
                 self.projects.unpin_thread(thread_id);
                 Ok(Response::Ok)
             }
+            Request::SnoozeThread { thread_id, until } => {
+                self.existing_thread(thread_id)?;
+                self.projects.snooze_thread(thread_id, until)?;
+                Ok(Response::Ok)
+            }
+            Request::WakeThread(thread_id) => {
+                self.existing_thread(thread_id)?;
+                self.projects.wake_thread(thread_id);
+                Ok(Response::Ok)
+            }
             Request::ReorderThreads { section, keys } => {
                 self.projects.set_order_keys(section, keys)?;
                 Ok(Response::Ok)

@@ -35,6 +35,7 @@ mod shortcut_sheet;
 mod sidebar;
 mod slide_drag;
 mod slider;
+mod snooze;
 mod sound;
 mod spaces_view;
 mod terminal_drawer;
@@ -283,6 +284,7 @@ fn main() {
             command_palette::init(cx);
             go_to_picker::init(cx);
             save_layout_modal::init(cx);
+            snooze::init(cx);
             project_icon_picker::init(cx);
             agent_view::init(cx);
             agent_login::init(cx);

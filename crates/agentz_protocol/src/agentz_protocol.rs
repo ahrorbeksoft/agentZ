@@ -420,6 +420,13 @@ pub enum Request {
         order_key: Option<String>,
     },
     UnpinThread(ThreadId),
+    /// [`projects::ProjectStore::snooze_thread`]: the thread leaves the list until `until`.
+    SnoozeThread {
+        thread_id: ThreadId,
+        until: std::time::SystemTime,
+    },
+    /// [`projects::ProjectStore::wake_thread`].
+    WakeThread(ThreadId),
     /// The order keys a drag writes on this machine ([`projects::order_key::plan_reorder`]),
     /// all or none.
     ReorderThreads {

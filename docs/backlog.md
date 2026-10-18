@@ -105,10 +105,3 @@ inference about autonomous work starting and ending
 Keep the existing inference for agents without those reports and keep background work tracked
 separately: v2 idle describes foreground state and does not mean all work ended. Preserve
 steering and AIR functionality where agents still provide them only on v1.
-
-### Snooze threads until later
-
-Follow [t3code's thread snooze](https://github.com/pingdotgg/t3code/blob/main/docs/user/thread-sidebar.md):
-hide a thread until a chosen time, including its quota reset when known, then return it to
-the list. Keep snooze independent of archiving and automatic resume; waking a snoozed thread
-does not itself send a prompt. Persist its wake time so snooze survives app and server restarts.

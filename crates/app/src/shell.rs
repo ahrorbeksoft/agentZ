@@ -39,6 +39,7 @@ use crate::server_client::MachineStatus;
 use crate::settings_page::{AccountDialog, SettingsPage, SettingsPageEvent};
 use crate::shortcut_sheet::ShortcutSheet;
 use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
+use crate::snooze::CustomSnoozeModal;
 use crate::sound;
 use crate::spaces_view::{self, PaneKey, SpacesView, SpacesViewEvent};
 use crate::terminal_thread_view::TerminalThreadView;
@@ -167,6 +168,8 @@ enum OverlayKind {
     ProjectIcon,
     /// A project's Choose file, from its settings.
     ProjectIconFile,
+    /// Custom… in a snooze menu, which asks for how long.
+    CustomSnooze,
 }
 
 struct Overlay {
@@ -351,6 +354,8 @@ impl Shell {
                     MachinesEvent::Archiving(thread) => {
                         this.open_draft_after_archiving(*thread, window, cx)
                     }
+                    // A snoozed thread stays open, and the sidebar offers to undo it.
+                    MachinesEvent::Snoozing(_) => {}
                     // A page asked for its thread, as clicking a notification does.
                     MachinesEvent::ShowThread(thread) => {
                         window.activate_window();
@@ -370,6 +375,7 @@ impl Shell {
                 SidebarEvent::OpenProjectSettings(project_id) => {
                     this.open_project_settings(*project_id, window, cx)
                 }
+                SidebarEvent::CustomSnooze(thread) => this.open_custom_snooze(*thread, window, cx),
             }),
             // With the theme mode set to System, the theme follows macOS's appearance.
             cx.observe_window_appearance(window, |_, _, cx| {
@@ -1559,6 +1565,21 @@ impl Shell {
         self.open_overlay(OverlayKind::SaveLayout, modal, None, window, cx);
     }
 
+    /// Custom… from a snooze menu: how long the thread should be away.
+    fn open_custom_snooze(
+        &mut self,
+        thread: ThreadKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.make_room_for(OverlayKind::CustomSnooze, window, cx) {
+            return;
+        }
+        let modal = cx.new(|cx| CustomSnoozeModal::new(thread, window, cx));
+        // What has focus is the menu, which is gone once it closes.
+        self.open_overlay(OverlayKind::CustomSnooze, modal, None, window, cx);
+    }
+
     /// Shows the place in its view and focuses it.
     fn go_to(&mut self, place: Place, window: &mut Window, cx: &mut Context<Self>) {
         if let Place::Thread(thread) = place {
@@ -2352,7 +2373,9 @@ impl Render for Shell {
             || self.account_dialog.is_some()
             || matches!(
                 self.overlay_kind(),
-                Some(OverlayKind::SaveLayout | OverlayKind::ProjectIcon)
+                Some(
+                    OverlayKind::SaveLayout | OverlayKind::ProjectIcon | OverlayKind::CustomSnooze
+                )
             );
         // Beside the thread, or filling its area when full screen.
         let diff_panel = self.diff_panel.clone();
@@ -3051,6 +3074,54 @@ mod modal_tests {
             shell.read_with(cx, |shell, _| shell.overlay_kind()),
             Some(OverlayKind::GoTo)
         );
+    }
+
+    /// Custom… in a snooze menu opens its dialog over the app: Enter snoozes the thread for
+    /// the 2 hours it starts at, and Escape closes it.
+    #[gpui::test]
+    fn custom_snooze_asks_for_how_long(cx: &mut TestAppContext) {
+        init_places(cx);
+        cx.update(crate::snooze::init);
+        let (shell, cx) = cx.add_window_view(|window, cx| Shell::new(window, cx));
+        cx.run_until_parked();
+        let sidebar = shell.read_with(cx, |shell, _| shell.sidebar.clone());
+        let thread = ThreadKey {
+            machine: MachineId::Local,
+            thread: projects::ThreadId(5),
+        };
+        let open_dialog = |cx: &mut gpui::VisualTestContext| {
+            sidebar.update(cx, |_, cx| {
+                cx.emit(crate::sidebar::SidebarEvent::CustomSnooze(thread))
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                shell.read_with(cx, |shell, _| shell.overlay_kind()),
+                Some(OverlayKind::CustomSnooze)
+            );
+            assert!(cx.debug_bounds("custom-snooze-amount").is_some());
+        };
+
+        open_dialog(cx);
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.overlay.is_none()));
+        let sent = cx.update(|_, cx| {
+            Machines::global(cx)
+                .read(cx)
+                .client(MachineId::Local, cx)
+                .map(|client| client.read(cx).sent_for_test())
+                .unwrap_or_default()
+        });
+        assert!(sent.iter().any(|request| matches!(
+            request,
+            agentz_protocol::Request::SnoozeThread { thread_id, .. }
+                if *thread_id == thread.thread
+        )));
+
+        open_dialog(cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(shell.read_with(cx, |shell, _| shell.overlay.is_none()));
     }
 
     #[gpui::test]

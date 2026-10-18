@@ -189,6 +189,8 @@ pub enum MachinesEvent {
     PaneNeedsAttention(PaneKey, ThreadStatus),
     /// The user archived the thread from this app.
     Archiving(ThreadKey),
+    /// The user snoozed the thread from this app.
+    Snoozing(ThreadKey),
     /// A page asks agentZ to show its thread.
     ShowThread(ThreadKey),
     /// A machine's agent published an artifact, or a new version of one.
@@ -696,6 +698,12 @@ impl Machines {
                             thread: *thread,
                         }))
                     }
+                    ProjectStoreEvent::Snoozing(thread) => {
+                        cx.emit(MachinesEvent::Snoozing(ThreadKey {
+                            machine,
+                            thread: *thread,
+                        }))
+                    }
                 }),
             ],
         );
@@ -1145,6 +1153,31 @@ impl Machines {
                 .then(b.id.cmp(&a.id))
         });
         threads
+    }
+
+    /// The active threads that are snoozed, the soonest to wake first, for the sidebar's
+    /// Snoozed shelf (t3code's).
+    pub fn snoozed_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
+        let now = SystemTime::now();
+        let mut threads: Vec<(MachineId, Thread)> = self
+            .active_threads(cx)
+            .into_iter()
+            .filter(|(machine, thread)| self.is_snoozed(*machine, thread.id, now, cx))
+            .collect();
+        threads.sort_by_key(|(_, thread)| thread.snoozed_until);
+        threads
+    }
+
+    /// [`projects::ProjectStore::is_thread_snoozed`] on the thread's machine.
+    pub fn is_snoozed(
+        &self,
+        machine: MachineId,
+        thread: ThreadId,
+        now: SystemTime,
+        cx: &App,
+    ) -> bool {
+        self.projects(machine, cx)
+            .is_some_and(|store| store.read(cx).is_thread_snoozed(thread, now))
     }
 
     /// The order keys of every machine's threads in `section`, shown or not: those a reorder

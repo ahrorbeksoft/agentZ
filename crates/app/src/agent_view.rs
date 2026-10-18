@@ -89,6 +89,7 @@ use crate::server_client::{MachineStatus, ServerClient};
 use crate::settings_page::{
     AccountEntry, account_entries, account_entry, account_selector, render_entry_avatar,
 };
+use crate::snooze;
 use crate::terminal_drawer::{TerminalDrawer, TerminalDrawerEvent};
 use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
@@ -657,7 +658,8 @@ pub struct AgentView {
     /// [`Self::fork_divider_rows`] as last measured.
     synced_fork_rows: Vec<usize>,
     /// Why a switch to another agent or account, a fork or its merge back, or the limit
-    /// notice's Continue at the reset, Switch to Droid Core or Use Reset, didn't work.
+    /// notice's Continue at the reset, Snooze Until Reset, Switch to Droid Core or Use Reset,
+    /// didn't work.
     continue_error: Option<SharedString>,
     /// Fork from This Response, while the fork is being made.
     forking: Option<Task<()>>,
@@ -4667,6 +4669,7 @@ impl AgentView {
                     .children(self.render_lost_history_notice(cx))
                     .children(self.render_session_notices(cx))
                     .children(self.render_errors(cx))
+                    .children(self.render_snooze_notice(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
                         if is_subthread {
@@ -9615,6 +9618,49 @@ impl AgentView {
             .into_any_element()
     }
 
+    /// While the thread is snoozed, an Info callout like the archived thread's says when it
+    /// comes back, with Wake Now. The composer stays: a message wakes it.
+    fn render_snooze_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.is_archived {
+            return None;
+        }
+        let now = SystemTime::now();
+        let store = self.store.read(cx);
+        if !store.is_thread_snoozed(self.thread_id, now) {
+            return None;
+        }
+        let until = store.thread(self.thread_id)?.snoozed_until?;
+        let thread_id = self.thread_id;
+        Some(
+            div()
+                .debug_selector(|| "snooze-notice".into())
+                .px_2()
+                .pb_2()
+                .child(
+                    Callout::new()
+                        .severity(Severity::Info)
+                        .icon(IconName::Info)
+                        .title(format!("Snoozed until {}", snooze::wake_time(until, now)))
+                        .description(
+                            "It comes back to the list then. Sending a message wakes it now.",
+                        )
+                        .actions_slot(
+                            div().debug_selector(|| "snooze-notice-wake".into()).child(
+                                Button::new("snooze-notice-wake", "Wake Now")
+                                    .style(ButtonStyle::Filled)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.store.update(cx, |store, cx| {
+                                            store.wake_thread(thread_id, cx)
+                                        });
+                                    })),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// While the thread's machine is unreachable, in place of the message editor. The draft
     /// stays in the editor for when it's back.
     fn render_offline_notice(&self, cx: &App) -> AnyElement {
@@ -9820,6 +9866,19 @@ impl AgentView {
         });
     }
 
+    /// The limit notice's Snooze Until Reset (t3code's): the thread leaves the list until the
+    /// limit resets, whether or not it continues then.
+    fn snooze_until_reset(&mut self, resets_at: SystemTime, cx: &mut Context<Self>) {
+        self.continue_error = None;
+        let thread_id = self.thread_id;
+        if let Err(error) = self.store.update(cx, |store, cx| {
+            store.snooze_thread(thread_id, resets_at, cx)
+        }) {
+            self.continue_error = Some(format!("Couldn't snooze it: {error:#}").into());
+        }
+        cx.notify();
+    }
+
     /// The limit notice's Continue at <reset>, or its cancel.
     fn continue_at_reset(&mut self, on: bool, cx: &mut Context<Self>) {
         self.continue_error = None;
@@ -9982,10 +10041,30 @@ impl AgentView {
                         })),
                 )
         });
+        // Hidden once the thread is snoozed, as t3code hides it.
+        let snooze_button = reached
+            .window
+            .resets_at
+            .filter(|resets_at| {
+                *resets_at > now && self.store.read(cx).can_snooze_thread(self.thread_id)
+            })
+            .map(|resets_at| {
+                div()
+                    .debug_selector(|| "limit-snooze-until-reset".into())
+                    .child(
+                        Button::new("limit-snooze-until-reset", "Snooze Until Reset")
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.snooze_until_reset(resets_at, cx)
+                            })),
+                    )
+            });
         let has_buttons = limit_reset_button.is_some()
             || switch_button.is_some()
             || extra_usage_button.is_some()
             || reset_button.is_some()
+            || snooze_button.is_some()
             || usage_button.is_some();
         let error = reached.error;
         let callout = Callout::new()
@@ -10012,6 +10091,7 @@ impl AgentView {
                                 .children(switch_button)
                                 .children(extra_usage_button)
                                 .children(reset_button)
+                                .children(snooze_button)
                                 .children(usage_button),
                         )
                     }),
@@ -17168,6 +17248,58 @@ mod tests {
         );
     }
 
+    /// t3code's Snooze Until Reset on the limit notice: the thread is snoozed until the limit
+    /// resets, and the button gives way to the snoozed thread's notice, whose Wake Now wakes it.
+    #[gpui::test]
+    fn the_limit_notice_snoozes_until_the_reset(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, StatusRead};
+
+        let (view, cx) = open(2, false, cx);
+        let now = SystemTime::now();
+        let resets_at = now + Duration::from_secs(2 * 60 * 60);
+        let accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(StatusRead {
+                status: AccountStatus {
+                    windows: vec![LimitWindow {
+                        label: "5-hour".into(),
+                        used_percent: 100.,
+                        resets_at: Some(resets_at),
+                        length: None,
+                    }],
+                    ..AccountStatus::default()
+                },
+                read_at: now,
+            }),
+            ..AgentAccounts::default()
+        };
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx);
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx);
+            thread.set_turn_error_for_test("Usage limit reached", cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("snooze-notice").is_none());
+
+        click_on("limit-snooze-until-reset", cx);
+        assert!(sent(&client, cx).contains(&Request::SnoozeThread {
+            thread_id: ThreadId(2),
+            until: resets_at,
+        }));
+        assert!(cx.debug_bounds("limit-snooze-until-reset").is_none());
+        assert!(cx.debug_bounds("snooze-notice").is_some());
+        // Continuing at the reset can be asked for too.
+        assert!(cx.debug_bounds("limit-continue-at-reset").is_some());
+
+        click_on("snooze-notice-wake", cx);
+        assert!(sent(&client, cx).contains(&Request::WakeThread(ThreadId(2))));
+        assert!(cx.debug_bounds("snooze-notice").is_none());
+        assert!(cx.debug_bounds("limit-snooze-until-reset").is_some());
+    }
     /// Droid's ways on: the notice names the pool that ran out, and Switch to Droid Core saves
     /// it, then sends the thread's last message again. It's gone once Droid Core is chosen.
     #[gpui::test]

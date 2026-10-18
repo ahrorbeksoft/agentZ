@@ -278,8 +278,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Go To** (`go_to_picker.rs`; `SpacesView::places`, `go_to_picker::thread_places`): Cmd-P
   lists the workspaces, tabs and panes, and the Agents view's threads and chats, the view on screen's
   first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
-  it in its view and focuses it. The palette, Go To, the shortcut sheet and Save Layout are the
-  shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
+  it in its view and focuses it. The palette, Go To, the shortcut sheet, Save Layout and Custom
+  snooze are the shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
   focus goes back to what had it.
 - **Developer diagnostics** (`diagnostics.rs`, Zed's, from GPUI's `profiler` feature, which the
   app turns on as Zed does): Ctrl-Alt-Shift-P, on macOS too, cycles GPUI's frame-time overlay
@@ -388,7 +388,29 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   whose last activity (or creation) is older than that, unless pinned, working, blocked,
   awaiting input or waiting, open in some client, or with something for their agent to do.
   Chats, Workspaces threads, drafts, subthreads and terminal threads are never archived.
-- **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
+- **Snooze** (`snooze.rs`, `sidebar.rs`, `projects::ProjectStore::{snooze_thread,
+  wake_thread, is_thread_snoozed, has_thread_woken}`; t3code's snooze, the user's picks in
+  `design/snooze/`): a card's clock ("Snooze Thread", before Archive), Snooze ▸ after Archive
+  in a card's menu (Wake Now on a snoozed thread) and the limit notice's Snooze Until Reset
+  (hidden once it's snoozed) snooze an agent thread in the list (`Request::SnoozeThread`),
+  never while it waits for an approval or an answer (`ProjectStore::can_snooze_thread`). The
+  menu has t3code's presets, each with its time: In 1 hour, In 3 hours, This evening (18:00,
+  while that's over an hour away), Tomorrow (9:00) and Next week (Monday 9:00, unless that's
+  tomorrow), after "Until the limit resets" while the thread's account has a limit used up,
+  then Custom…, a dialog for an amount of minutes, hours or days (`CustomSnoozeModal`, one of
+  the shell's overlays). A notice over the sidebar's footer, "Snoozed 2 threads, Undo", counts
+  those snoozed from the app in a row and goes 5 seconds after the last. A snoozed thread
+  leaves the cards for the Snoozed shelf, first under them, in the accent, folded at first (in
+  this window alone), its rows the soonest to wake first with the time left in the accent and
+  Wake Now on hover (`Request::WakeThread`); the open thread's row stays while it's folded. It
+  wakes at its time, or early once it asks for a permission or an answer or ends a turn after
+  it was snoozed (`raised_hand_while_snoozed`), and its card is back where it was, marked Woke
+  (an alarm clock, in the warning color, over Completed and under what needs the user) until
+  it's opened or the mark is clicked. The app's store wakes the soonest at its time
+  (`ProjectStore::schedule_wake`). Sending a message, pinning or archiving wakes it on the
+  server. Opened, a snoozed thread shows an Info callout over its composer, "Snoozed until Wed
+  9:00", with Wake Now. Auto-archive counts a snooze as activity until it ends, and waking one
+  by hand too (`Thread::woke_at`).- **Draft rows** (`sidebar.rs`, `Machines::typed_drafts`; t3code's `SidebarDraftBlock`): drafts
   (below, under Agent threads) aren't cards. One with text typed in it is a row above the cards,
   newest first, with its project, a gray "Draft" badge at the end of that line
   (`render_draft_badge`, picked in `design/draft-cards/` over t3code's yellow pen and tint,
@@ -2334,7 +2356,6 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Opening files** from tool calls.
 - **Searching message text**, not only titles.
 - **Deleting sessions on the agent's side** when a thread is deleted.
-- **t3code's snooze** for threads.
 - **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
 - **Accounts**: several logins per agent with their quota, plus skills and MCP servers managed in
   agentZ. Planned in [`design/accounts/plan.md`](../design/accounts/plan.md).
