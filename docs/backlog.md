@@ -38,6 +38,12 @@ do, so a gesture started in a code block never scrolls the thread, and one start
 thread isn't caught by a code block passing under the cursor. A new gesture goes to whatever is
 under the cursor.
 
+### A newly added account shows as "New account"
+
+After an account is added, the agent's Accounts list shows it as "New account", with no name
+or usage ([screenshot](backlog/new-account-row.png), Factory Droid on proton-cloud, the
+existing account's name covered). At least add a refresh button or something like it.
+
 ## Features
 
 ### Artifacts move with their thread to another machine
