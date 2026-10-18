@@ -73,3 +73,75 @@ cross-platform headless windowing API and Linux implementation
 For all copied-crate updates, preserve agentZ's Metal drawable handling, nested scrolling,
 Markdown image rendering and link chips, and animation frame limits, documented under
 Crates in `docs/architecture.md`.
+
+## Other upstream updates
+
+Requested October 18, 2026: add the findings from the other references. Compared with our
+saved snapshots, t3code had 715 newer commits, herdr 68 and OpenUsage 17. Cow had no changes
+since our v0.1.10 snapshot. These are source findings; the failures have not been reproduced
+in agentZ.
+
+### Return from a delegated task wait when the child asks a question
+
+Follow t3code's [#19538](https://github.com/pingdotgg/t3code/pull/19538): a blocking
+`delegate_task` wait returns when its child needs an answer, with the question identified and
+without marking the wait as timed out. The child's later completion must still reach the
+parent. Our `wait_for_task` in `crates/agentz_server/src/server/tools.rs` currently checks only
+completion and timeout. Verify the behavior with the mock agent.
+
+### Isolate Codex automatic title generation from MCP servers, plugins and apps
+
+Follow t3code's [#17058](https://github.com/pingdotgg/t3code/pull/17058). Our Codex title runner
+in `crates/agentz_server/src/title_generation.rs` lacks the overrides that disable the user's
+MCP servers, plugins and apps. Titles need only their prompt; starting them in an empty folder
+with a read-only sandbox does not disable the user's MCP configuration.
+
+### Clean up archived threads' workspaces automatically
+
+Use t3code's new archived-thread retention rules
+([#15208](https://github.com/pingdotgg/t3code/pull/15208), called settled retention there),
+shared-subagent-worktree cleanup
+([#19748](https://github.com/pingdotgg/t3code/pull/19748)) and orphan reporting
+([#19749](https://github.com/pingdotgg/t3code/pull/19749)) as the implementation reference for
+our existing automatic workspace cleanup plan in `docs/architecture.md`. Active sessions,
+shared worktrees and the chosen local-change protection must be respected. Any new UI starts
+on the design board.
+
+### Update herdr's terminal attention detection rules
+
+Port the newer rules into `crates/agentz_server/src/detect/manifests/`: Claude questions in
+named sessions ([#5192](https://github.com/herdrdev/herdr/pull/5192)), Codex's startup update
+chooser ([#5174](https://github.com/herdrdev/herdr/pull/5174)), and newer Antigravity dialogs
+([#4959](https://github.com/herdrdev/herdr/pull/4959)). Our copied manifests lack these rules.
+Keep terminal detection distinct from ACP threads' reported work and background tasks.
+
+### Bound server handshakes and recover SSH connections after wake
+
+Follow herdr's handshake deadlines
+([#5242](https://github.com/herdrdev/herdr/pull/5242)), recovery of stuck shared SSH connections
+([#5252](https://github.com/herdrdev/herdr/pull/5252)), and prompt recovery after wake
+([#5249](https://github.com/herdrdev/herdr/pull/5249)). Our initial server welcome read in
+`crates/agentz_client/src/agentz_client.rs` has no deadline, despite timeouts elsewhere in the
+SSH startup path. Review the connection and reconnection paths without ending remote agents.
+
+### Make state and transcript saves durable before replacing files
+
+Follow herdr's [#5152](https://github.com/herdrdev/herdr/pull/5152): sync temporary file contents
+to disk before replacing the saved file, then sync its parent directory. Our transcript saves
+flush their buffers but do not sync to disk. Review the same pattern in project state and
+other persisted files so a hard crash cannot leave a successful rename with unwritten contents.
+
+### Check Antigravity's Argon quota and correct the Codex usage link
+
+OpenUsage added Antigravity's separate Argon weekly quota
+([#1395](https://github.com/robinebers/openusage/pull/1395)). Our generic group parser already
+handles additional quota groups, and we already use the production endpoint it now prefers;
+add coverage for the reported Argon payload and check disabled or invalid buckets rather than
+copying its fixed pool list.
+
+Update the Codex usage page in `crates/agentz_server/src/accounts/codex.rs` from
+`https://chatgpt.com/codex/settings/usage` to `https://chatgpt.com/settings/usage`, following
+OpenUsage's [#1364](https://github.com/robinebers/openusage/pull/1364).
+
+Within this group, prioritize delegated-task questions, title isolation, terminal detection
+and handshake deadlines.
