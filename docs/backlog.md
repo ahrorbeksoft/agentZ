@@ -139,16 +139,6 @@ Keep the existing inference for agents without those reports and keep background
 separately: v2 idle describes foreground state and does not mean all work ended. Preserve
 steering and AIR functionality where agents still provide them only on v1.
 
-### Replace custom question controls with Zed's ChoiceCard
-
-Port Zed's reusable `ChoiceCard` for radio and checkbox choices
-([#63885](https://github.com/zed-industries/zed/pull/63885)), replacing the hand-drawn controls
-in `crates/app/src/elicitation_card.rs` with its focus and accessibility handling. Preserve
-validation, Recommended tags, Other answers and multi-question navigation.
-
-The user explicitly approved implementing Zed's ChoiceCard without a design round. Implement
-the upstream component directly; no additional design-board approval is needed for this item.
-
 ### Step reasoning effort with keyboard shortcuts
 
 Follow t3code's [#19928](https://github.com/pingdotgg/t3code/pull/19928): shortcuts step through

@@ -1,7 +1,7 @@
 //! A request for input from an agent (ACP's `elicitation/create`): a form to fill in, or a URL
-//! to open. The fields, validation and the URL's safety checks are ported from Zed's
-//! `agent_ui::conversation_view::elicitation`; the card is agentZ's: who's asking, the fields
-//! with their labels above them, and Decline beside Submit or Open
+//! to open. The fields, their choices (`ui::ChoiceCard`), validation and the URL's safety checks
+//! are ported from Zed's `agent_ui::conversation_view::elicitation`; the card is agentZ's: who's
+//! asking, the fields with their labels above them, and Decline beside Submit or Open
 //! (`design/agent-input/decisions.md`). An agent's own questions show one at a time.
 
 use std::collections::BTreeMap;
@@ -10,16 +10,16 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::thread::{Elicitation, form_questions, recommended_choice};
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, Context, Entity, Focusable as _, KeyBinding, SharedString, Subscription,
-    Window, div,
+    AnyElement, App, ClickEvent, Context, Entity, Focusable as _, KeyBinding, Role, SharedString,
+    Subscription, Window, div,
 };
 use text_input::TextInput;
-use ui::{Tooltip, prelude::*};
+use ui::{Checkbox, ChoiceCard, ToggleState, Tooltip, prelude::*};
 
 use crate::agent_login::login_elicitation;
 use crate::controls::{
     ActionButton, ActionStyle, CONTROL_TEXT_SIZE, copy_to_clipboard, field_label, key_hint,
-    link_host, on_fill_color, spinner, text_field,
+    link_host, spinner, text_field,
 };
 use crate::thread_entity::AgentThread;
 
@@ -553,17 +553,28 @@ impl ElicitationCard {
                         .any(|required| required == name),
                     _ => false,
                 };
+                let focused_background = cx.theme().colors().element_hover;
+                let state = if *value {
+                    ToggleState::Selected
+                } else {
+                    ToggleState::Unselected
+                };
                 h_flex()
                     .id(SharedString::from(format!("elicitation-bool-{id}-{name}")))
+                    .tab_index(0)
                     .gap_2()
                     .cursor_pointer()
+                    .focus_visible(move |this| this.bg(focused_background))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(form) = &mut this.form {
                             form.set(&field_name, Field::Boolean(next_value));
                             cx.notify();
                         }
                     }))
-                    .child(check_box(*value, error.is_some(), cx))
+                    .child(div().child(Checkbox::new(
+                        SharedString::from(format!("elicitation-bool-check-{id}-{name}")),
+                        state,
+                    )))
                     .child(
                         Label::new(property_title(name, property))
                             .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
@@ -577,32 +588,38 @@ impl ElicitationCard {
                     acp::ElicitationPropertySchema::String(schema) => single_select_options(schema),
                     _ => Vec::new(),
                 };
-                choice_group(&options)
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "elicitation-select-{id}-{name}"
+                    )))
+                    .role(Role::RadioGroup)
+                    .aria_label(property_title(name, property))
+                    .gap_1()
                     .children(options.iter().map(|option| {
                         let is_selected = selected.as_ref() == Some(&option.value);
                         let field_name = name.to_string();
                         let value = option.value.clone();
                         choice(
-                            SharedString::from(format!(
-                                "elicitation-select-{id}-{name}-{}",
-                                option.value
-                            )),
-                            radio(is_selected, error.is_some(), cx),
+                            ChoiceCard::radio,
+                            format!("elicitation-select-{id}-{name}-{}", option.value),
                             option,
+                            is_selected,
+                            error.is_some(),
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(form) = &mut this.form {
+                                    form.set(&field_name, Field::SingleSelect(Some(value.clone())));
+                                }
+                                let is_question =
+                                    this.questions.as_ref().is_some_and(|questions| {
+                                        questions.iter().any(|(field, _)| field == &field_name)
+                                    });
+                                if is_question && !this.is_last_step() {
+                                    this.step += 1;
+                                }
+                                cx.notify();
+                            }),
                             cx,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(form) = &mut this.form {
-                                form.set(&field_name, Field::SingleSelect(Some(value.clone())));
-                            }
-                            let is_question = this.questions.as_ref().is_some_and(|questions| {
-                                questions.iter().any(|(field, _)| field == &field_name)
-                            });
-                            if is_question && !this.is_last_step() {
-                                this.step += 1;
-                            }
-                            cx.notify();
-                        }))
                     }))
                     .into_any_element()
             }
@@ -611,26 +628,29 @@ impl ElicitationCard {
                     acp::ElicitationPropertySchema::Array(schema) => multi_select_options(schema),
                     _ => Vec::new(),
                 };
-                choice_group(&options)
+                v_flex()
+                    .id(SharedString::from(format!("elicitation-multi-{id}-{name}")))
+                    .role(Role::Group)
+                    .aria_label(property_title(name, property))
+                    .gap_1()
                     .children(options.iter().map(|option| {
                         let is_selected = selected.contains(&option.value);
                         let field_name = name.to_string();
                         let value = option.value.clone();
                         choice(
-                            SharedString::from(format!(
-                                "elicitation-multi-{id}-{name}-{}",
-                                option.value
-                            )),
-                            check_box(is_selected, error.is_some(), cx),
+                            ChoiceCard::checkbox,
+                            format!("elicitation-multi-{id}-{name}-{}", option.value),
                             option,
+                            is_selected,
+                            error.is_some(),
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(form) = &mut this.form {
+                                    form.toggle(&field_name, &value);
+                                    cx.notify();
+                                }
+                            }),
                             cx,
                         )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(form) = &mut this.form {
-                                form.toggle(&field_name, &value);
-                                cx.notify();
-                            }
-                        }))
                     }))
                     .into_any_element()
             }
@@ -911,67 +931,42 @@ impl Render for ElicitationCard {
     }
 }
 
-/// Choices sit in a row when they're short and have no descriptions, else one to a line.
-fn choice_group(options: &[ChoiceOption]) -> gpui::Div {
-    let is_inline = options.len() <= 4
-        && options
-            .iter()
-            .all(|option| option.description.is_none() && option.label.len() <= 24);
-    if is_inline {
-        h_flex().flex_wrap().gap_x_4().gap_y_1p5()
-    } else {
-        v_flex().gap_1p5()
-    }
-}
-
-/// A choice's control beside its label and description. The one the agent suggests ("…
-/// (Recommended)") has a tag instead.
+/// A choice as Zed's `ChoiceCard` (`ChoiceCard::radio` or `ChoiceCard::checkbox`). The one
+/// the agent suggests ("… (Recommended)") has a tag instead.
 fn choice(
-    id: SharedString,
-    control: AnyElement,
+    card: fn(SharedString, SharedString, bool) -> ChoiceCard,
+    id: String,
     option: &ChoiceOption,
+    is_selected: bool,
+    is_invalid: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
-) -> gpui::Stateful<gpui::Div> {
+) -> impl IntoElement {
     let (label, is_recommended) = recommended_choice(&option.label);
     let accent = cx.theme().colors().text_accent;
-    let selector = id.to_string();
-    h_flex()
-        .id(id)
-        .debug_selector(move || selector)
-        .items_start()
-        .gap_2()
-        .cursor_pointer()
-        .child(div().h(px(19.)).flex().items_center().child(control))
-        .child(
-            v_flex()
-                .min_w_0()
-                .gap_0p5()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Label::new(label.to_string())
-                                .size(LabelSize::Custom(rems_from_px(CONTROL_TEXT_SIZE))),
-                        )
-                        .when(is_recommended, |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.))
-                                    .rounded(px(4.))
-                                    .bg(accent.opacity(0.15))
-                                    .text_size(rems_from_px(11_f32))
-                                    .text_color(accent)
-                                    .child("Recommended"),
-                            )
-                        }),
-                )
-                .children(option.description.clone().map(|description| {
-                    Label::new(description)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                })),
+    let card = card(
+        SharedString::from(id.clone()),
+        SharedString::from(label.to_string()),
+        is_selected,
+    )
+    .when_some(option.description.clone(), |this, description| {
+        this.description(description)
+    })
+    .when(is_recommended, |this| {
+        this.tag(
+            div()
+                .flex_none()
+                .px(px(6.))
+                .rounded(px(4.))
+                .bg(accent.opacity(0.15))
+                .text_size(rems_from_px(11_f32))
+                .text_color(accent)
+                .child("Recommended"),
         )
+    })
+    .invalid(is_invalid)
+    .on_click(on_click);
+    div().debug_selector(move || id).child(card)
 }
 
 /// The red star after a required field's label.
@@ -984,60 +979,6 @@ fn required_mark(name: &str) -> impl IntoElement {
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn radio(is_selected: bool, is_invalid: bool, cx: &App) -> AnyElement {
-    let colors = cx.theme().colors();
-    let border = if is_selected {
-        colors.text_accent
-    } else if is_invalid {
-        cx.theme().status().error
-    } else {
-        colors.border
-    };
-    div()
-        .size(px(14.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .border_1()
-        .border_color(border)
-        .bg(colors.editor_background)
-        .when(is_selected, |this| {
-            this.child(div().size(px(6.)).rounded_full().bg(colors.text_accent))
-        })
-        .into_any_element()
-}
-
-fn check_box(is_checked: bool, is_invalid: bool, cx: &App) -> AnyElement {
-    let colors = cx.theme().colors();
-    let (border, background) = if is_checked {
-        (colors.text_accent, colors.text_accent)
-    } else if is_invalid {
-        (cx.theme().status().error, colors.editor_background)
-    } else {
-        (colors.border, colors.editor_background)
-    };
-    div()
-        .size(px(14.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(border)
-        .bg(background)
-        .when(is_checked, |this| {
-            this.child(
-                Icon::new(IconName::Check)
-                    .size(IconSize::Custom(rems_from_px(10_f32)))
-                    .color(Color::Custom(on_fill_color(cx))),
-            )
-        })
-        .into_any_element()
 }
 
 enum Field {

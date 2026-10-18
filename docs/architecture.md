@@ -1450,8 +1450,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   which replays the conversation.
 - **Requests for input** (`elicitation_card.rs`, Zed's checks for ACP's `elicitation/create`,
   picked in `design/agent-input/`): a card in the thread for a form (text, numbers, a choice,
-  checkboxes) with Decline and Submit, or a page to open. A text field wraps a long answer onto
-  a second row, then scrolls, without line breaks; a number's stays one row. A required
+  checkboxes) with Decline and Submit, or a page to open. Choices are Zed's `ui::ChoiceCard`
+  (a full-width card with its radio or checkbox, focusable and announced as one of its group,
+  with a `tag` agentZ adds for Recommended), and a checkbox field is Zed's `Checkbox` in a
+  focusable row. A text field wraps a long answer onto a second row, then scrolls, without
+  line breaks; a number's stays one row. A required
   field's label ends in a red *, Submit stays dim until each is filled
   (`FormState::lacks_required`), and a text field says what's wrong as it loses focus
   (`ElicitationCard::check_field`). The agent's own
