@@ -25,6 +25,18 @@ Notes for whoever continues:
   …/desktop` (`{"action": "start"}`) and `POST …/desktop/stream` (`{"viewOnly", "ttlSeconds"}`),
   with `X-API-Key`.
 - Never sign in or out of a provider's CLI: the user does that (topic 3's note).
+- What holds off Instabox's idle pause, tried on three test machines with the user's leave
+  (2026-10-19, then deleted): a machine paused 30 to 33 minutes after it was made, resumed
+  or last signed in to over SSH (Instabox checks every 2 minutes or so), whatever ran on it.
+  An open SSH session, silent, printing every 30 seconds, or with a terminal and nothing in
+  it, didn't hold it off, and neither did a process making a web request every 20 seconds,
+  nor `instabox get` reading it. A process printing to a terminal of its own on the machine
+  every minute, with no SSH session, did: the guest's `instabox-guest-agent` reads terminals
+  (PTYs), a herdr session and CPU. On the user's account `auto-suspend <machine> 0` says the
+  pause is fixed and still exits 0, so the server goes by `fixedAutoSuspendSeconds` rather
+  than the exit code. SSH to a machine paused for being idle is refused by Instabox's gateway
+  ("machine … is suspended; run: instabox start …"), so it doesn't wake by itself as topic
+  11's "Today" says; `instabox wake` or `resume` wakes it.
 
 ## Items
 
@@ -106,4 +118,5 @@ Notes for whoever continues:
    account has none, so it's fixed at 30 minutes there, holding it off is tested with a fake
    `instabox` only, and the machine's page says turns may stop when Instabox pauses it.
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
-   not started.
+   done in its own commit ("Document cloud machines…"): the Cloud machines feature section, the
+   `cloud` crate, `cloud.json` and the Instabox key in the data table, and the fake CLIs.

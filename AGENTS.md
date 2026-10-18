@@ -197,6 +197,14 @@ From Zed's guidelines, which this code follows:
   `agents_call_tools_on_their_acp_connection` has it call them on its ACP connection.
   Delegated tasks run the mock agent too, so a task's prompt is a mock script (`hello`,
   `slow`, `permission`).
+- **Cloud providers:** the real `instabox` and `proton` CLIs on this Mac are signed in to the
+  user's accounts, so only read-only commands may be run against them
+  (`design/cloud/progress.md` lists them), and never `login` or `logout`. The server's tests
+  run fake CLIs on `PATH` (`ServerConfig::cloud_path`; `fake_proton_cli` and
+  `fake_instabox_cli` in `agentz_server/src/tests.rs`, scripts that keep a machine's state in
+  files beside them). The app's tests give a test client a snapshot
+  (`ServerClient::set_cloud_for_test`), a cloud transport (`set_transport_for_test`) and
+  answers (`answer_for_test`).
 - **The app against a scratch server:** set `AGENTZ_DATA_DIR` to a short temporary directory
   (`mktemp -d /tmp/az.XXXX`: `server.sock`'s path must fit in `SUN_LEN`, which the scratchpad's
   doesn't) and put
