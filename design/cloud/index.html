@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Machines Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="cloud" data-title="Cloud Machines">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Cloud Machines <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Today every machine but this Mac is an <b>SSH target</b>. A cloud computer is one too (proton-cloud is the Proton computer devbox-3), so agentZ can’t create, start, stop or pause it, and doesn’t know what it costs.</p>
+<p>This round adds <b>cloud providers</b>, starting with <b>Instabox</b> (free in beta: Linux machines with pause and resume, snapshots, public ports, a desktop, a Vault) and <b>Proton</b> ($20 a month while running, billed by the second: one persistent computer). Each needs a way to sign in, and offers everything it has, as planned in <a href="plan.md">plan.md</a>. Already decided there: agentZ talks to the providers’ APIs itself (no vendor CLI needed), this Mac’s server keeps the accounts, and once a cloud machine runs it connects over SSH exactly as Devbox 1 does, with its own server, agents and logins. A third provider adds a module, not UI: everything here shows only what a provider has.</p>
+<p>The demo world: This Mac, <b>Devbox 1</b> over SSH, an Instabox account (alex@hey.com) with <b>agents-1</b> running and <b>review-box</b> paused, and a Proton account with <b>proton-cloud</b> (devbox-3) running and <b>scratch</b> stopped, $14.20 left. Mocks are One Dark at the app’s sizes; the screenshots beside topics are today’s app.</p>`;
+</script>
+<script src="topics-cloud.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

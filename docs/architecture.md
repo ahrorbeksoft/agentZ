@@ -2387,6 +2387,9 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Deleting sessions on the agent's side** when a thread is deleted.
 - **Accounts**: several logins per agent with their quota, plus skills and MCP servers managed in
   agentZ. Planned in [`design/accounts/plan.md`](../design/accounts/plan.md).
+- **Cloud machines**: providers (Instabox and Proton first) that create, start, stop and pause
+  machines agentZ then reaches over SSH, with everything each provider offers. Planned in
+  [`design/cloud/plan.md`](../design/cloud/plan.md), on the design board.
 
 Open questions for the user:
 
