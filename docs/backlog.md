@@ -128,15 +128,6 @@ container queries, optional reduced motion and diagnostics. These APIs are alrea
 copied GPUI crates but are not wired into the app. The review was of source; runtime behavior
 and performance gains have not been verified.
 
-### Use container queries for responsive layouts
-
-Use GPUI's `container_query`
-([#60774](https://github.com/zed-industries/zed/pull/60774)) to replace the corresponding
-custom width measurement and deferred rerenders in `crates/app/src/agent_view.rs`, including
-compact headers and composers where suitable. The parent must supply the container's size;
-its contents cannot determine that size. Preserve existing responsive behavior and retain
-measurement needed for conversation scrolling and other behavior beyond layout breakpoints.
-
 ### Offer optional reduced motion
 
 Expose an optional reduced-motion preference using GPUI's `reduce_motion` support

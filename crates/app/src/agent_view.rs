@@ -40,8 +40,8 @@ use gpui::{
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, FollowMode, FontWeight, Hsla, ImageSource, KeyBinding, ListAlignment,
     ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel, ScrollHandle,
-    Stateful, Subscription, Task, WeakEntity, Window, anchored, canvas, deferred, img, list,
-    pulsating_between,
+    Stateful, Subscription, Task, WeakEntity, Window, anchored, canvas, container_query, deferred,
+    img, list, pulsating_between,
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownFont, MarkdownImage, MarkdownOptions, MarkdownStyle,
@@ -486,8 +486,8 @@ pub struct AgentView {
     list_state: ListState,
     /// The conversation's width when it was last drawn, which places the turn rail.
     conversation_width: Pixels,
-    /// The view's width when it was last drawn, which the header and composer fit; zero
-    /// until then.
+    /// The view's width, set as its contents are laid out, which the header and composer
+    /// fit; zero until it's first drawn.
     view_width: Pixels,
     /// Its height, which the new thread screen fits.
     view_height: Pixels,
@@ -3902,28 +3902,147 @@ impl AgentView {
         .size_full()
     }
 
-    /// Measures the view, whose width decides what its header and composer leave out, and
-    /// draws it again when that changes.
-    fn render_view_measure(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let drawn_size = (self.view_width, self.view_height);
-        canvas(
-            move |bounds, window, cx| {
-                let size = (bounds.size.width, bounds.size.height);
-                if size != drawn_size {
-                    window.defer(cx, move |_, cx| {
-                        view.update(cx, |view, cx| {
-                            (view.view_width, view.view_height) = size;
-                            cx.notify();
-                        })
-                        .log_err();
-                    });
-                }
-            },
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full()
+    /// The header, the conversation or new thread screen, the composer and the drawer, laid
+    /// out for the view's size.
+    fn render_contents(
+        &mut self,
+        layout: ContentsLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ContentsLayout {
+            has_rows,
+            is_connecting,
+            needs_login,
+            parent,
+            is_subthread,
+            is_drawer_full_screen,
+            shows_new_thread_screen,
+        } = layout;
+        v_flex()
+            .size_full()
+            .relative()
+            .when(!self.is_in_pane, |this| this.child(self.render_toolbar(cx)))
+            .when(is_subthread, |this| {
+                this.child(self.render_subthread_title_bar(parent, cx))
+            })
+            .when(!is_drawer_full_screen && shows_new_thread_screen, |this| {
+                this.child(self.render_new_thread(window, cx))
+            })
+            // A full-screen terminal hides the conversation and the composer.
+            .when(!is_drawer_full_screen && !shows_new_thread_screen, |this| {
+                this.children(self.render_restore_notice(cx))
+                    .child(
+                        // Only the rows in view are drawn, so long threads stay quick (Zed's list).
+                        v_flex()
+                            .id("agent-conversation")
+                            .flex_1()
+                            .min_h_0()
+                            // A link scrolled from under the mouse no longer shows its image.
+                            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                if this.hovered_image.take().is_some() {
+                                    cx.notify();
+                                }
+                            }))
+                            .when(!has_rows, |this| this.pt_2().pb_4())
+                            .relative()
+                            .items_center()
+                            .when(has_rows, |this| {
+                                this.child(
+                                    list(
+                                        self.list_state.clone(),
+                                        cx.processor(|this, index: usize, window, cx| {
+                                            this.render_conversation_row(index, window, cx)
+                                        }),
+                                    )
+                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                                    .flex_1()
+                                    .w_full(),
+                                )
+                                .child(self.render_conversation_measure(cx))
+                                .children(self.render_turn_rail(window, cx))
+                                .children(self.render_waiting_pill(cx))
+                                .vertical_scrollbar_for(
+                                    &self.list_state,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .when(!has_rows && is_connecting, |this| {
+                                // Zed's loading state: while the agent starts and the session (and its
+                                // history) loads, not the empty-thread prompt.
+                                this.child(
+                                    v_flex()
+                                        .flex_1()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Label::new("Loading…")
+                                                .color(Color::Muted)
+                                                .with_animation(
+                                                    "loading-agent-label",
+                                                    Animation::new(Duration::from_secs(2))
+                                                        .repeat()
+                                                        .with_max_fps(LOOPING_ANIMATION_FPS)
+                                                        .with_easing(pulsating_between(0.3, 0.7)),
+                                                    |label, delta| label.alpha(delta),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(!has_rows && !is_connecting && !needs_login, |this| {
+                                let prompt =
+                                    format!("Start a conversation with {}.", self.agent_name(cx));
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .max_w(MAX_CONTENT_WIDTH)
+                                        .px_5()
+                                        .py_8()
+                                        .child(Label::new(prompt).color(Color::Muted)),
+                                )
+                            })
+                            // The login's card takes the empty thread's middle. After a message,
+                            // a line over the composer opens it in a dialog.
+                            .when(needs_login && !has_rows, |this| {
+                                this.child(
+                                    v_flex()
+                                        .debug_selector(|| "thread-login".into())
+                                        .w_full()
+                                        .max_w(MAX_CONTENT_WIDTH)
+                                        .px_5()
+                                        .py_8()
+                                        .items_center()
+                                        .flex_1()
+                                        .justify_center()
+                                        .child(self.login.clone()),
+                                )
+                            }),
+                    )
+                    .children(self.render_request_elicitations(cx))
+                    .children(self.render_limit_notice(cx))
+                    .children(self.render_login_notice(has_rows, cx))
+                    .children(self.render_lost_history_notice(cx))
+                    .children(self.render_errors(cx))
+                    .children(self.render_activity_bar(window, cx))
+                    .map(|this| {
+                        if is_subthread {
+                            this.child(self.render_subthread_bar(parent, cx))
+                        } else if self.is_archived {
+                            this.child(self.render_archived_notice(cx))
+                        } else if !self.client.read(cx).is_online() {
+                            this.child(self.render_offline_notice(cx))
+                        } else {
+                            this.child(self.render_message_editor(ComposerStyle::Bar, window, cx))
+                        }
+                    })
+            })
+            .children(self.render_drawer(cx))
+            .children(self.render_image_hover(cx))
+            .children(self.render_image_viewer())
+            .children(self.render_login_dialog())
+            .into_any_element()
     }
 
     /// Whether the view is narrower than `width`. Before it's drawn, it's taken to be wide.
@@ -13290,6 +13409,18 @@ impl Focusable for AgentView {
 
 impl EventEmitter<AgentViewEvent> for AgentView {}
 
+/// What the view's render works out before its size is known, for its contents.
+#[derive(Clone, Copy)]
+struct ContentsLayout {
+    has_rows: bool,
+    is_connecting: bool,
+    needs_login: bool,
+    parent: Option<ThreadKey>,
+    is_subthread: bool,
+    is_drawer_full_screen: bool,
+    shows_new_thread_screen: bool,
+}
+
 impl Render for AgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(position) = self.pending_composer_menu.take() {
@@ -13337,6 +13468,17 @@ impl Render for AgentView {
                 .update(cx, |login, cx| login.set_account(account, cx));
         }
 
+        let layout = ContentsLayout {
+            has_rows,
+            is_connecting,
+            needs_login,
+            parent,
+            is_subthread,
+            is_drawer_full_screen,
+            shows_new_thread_screen,
+        };
+        let view = cx.entity();
+
         v_flex()
             .key_context(THREAD_KEY_CONTEXT)
             // Otherwise clicking the conversation would take focus from the message editor.
@@ -13356,9 +13498,7 @@ impl Render for AgentView {
                 this.answer_first_request(acp::PermissionOptionKind::RejectOnce, cx)
             }))
             .size_full()
-            .relative()
             .bg(panel_background)
-            .child(self.render_view_measure(cx))
             .when(!self.is_in_pane, |this| {
                 this.on_action(cx.listener(Self::toggle_terminal_drawer))
                     .on_action(cx.listener(Self::open_in_editor))
@@ -13375,126 +13515,14 @@ impl Render for AgentView {
                     }
                 }),
             )
-            .when(!self.is_in_pane, |this| this.child(self.render_toolbar(cx)))
-            .when(is_subthread, |this| {
-                this.child(self.render_subthread_title_bar(parent, cx))
-            })
-            .when(!is_drawer_full_screen && shows_new_thread_screen, |this| {
-                this.child(self.render_new_thread(window, cx))
-            })
-            // A full-screen terminal hides the conversation and the composer.
-            .when(!is_drawer_full_screen && !shows_new_thread_screen, |this| {
-                this.children(self.render_restore_notice(cx))
-                    .child(
-                        // Only the rows in view are drawn, so long threads stay quick (Zed's list).
-                        v_flex()
-                            .id("agent-conversation")
-                            .flex_1()
-                            .min_h_0()
-                            // A link scrolled from under the mouse no longer shows its image.
-                            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                                if this.hovered_image.take().is_some() {
-                                    cx.notify();
-                                }
-                            }))
-                            .when(!has_rows, |this| this.pt_2().pb_4())
-                            .relative()
-                            .items_center()
-                            .when(has_rows, |this| {
-                                this.child(
-                                    list(
-                                        self.list_state.clone(),
-                                        cx.processor(|this, index: usize, window, cx| {
-                                            this.render_conversation_row(index, window, cx)
-                                        }),
-                                    )
-                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                                    .flex_1()
-                                    .w_full(),
-                                )
-                                .child(self.render_conversation_measure(cx))
-                                .children(self.render_turn_rail(window, cx))
-                                .children(self.render_waiting_pill(cx))
-                                .vertical_scrollbar_for(
-                                    &self.list_state,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .when(!has_rows && is_connecting, |this| {
-                                // Zed's loading state: while the agent starts and the session (and its
-                                // history) loads, not the empty-thread prompt.
-                                this.child(
-                                    v_flex()
-                                        .flex_1()
-                                        .w_full()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Label::new("Loading…")
-                                                .color(Color::Muted)
-                                                .with_animation(
-                                                    "loading-agent-label",
-                                                    Animation::new(Duration::from_secs(2))
-                                                        .repeat()
-                                                        .with_max_fps(LOOPING_ANIMATION_FPS)
-                                                        .with_easing(pulsating_between(0.3, 0.7)),
-                                                    |label, delta| label.alpha(delta),
-                                                ),
-                                        ),
-                                )
-                            })
-                            .when(!has_rows && !is_connecting && !needs_login, |this| {
-                                let prompt =
-                                    format!("Start a conversation with {}.", self.agent_name(cx));
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .max_w(MAX_CONTENT_WIDTH)
-                                        .px_5()
-                                        .py_8()
-                                        .child(Label::new(prompt).color(Color::Muted)),
-                                )
-                            })
-                            // The login's card takes the empty thread's middle. After a message,
-                            // a line over the composer opens it in a dialog.
-                            .when(needs_login && !has_rows, |this| {
-                                this.child(
-                                    v_flex()
-                                        .debug_selector(|| "thread-login".into())
-                                        .w_full()
-                                        .max_w(MAX_CONTENT_WIDTH)
-                                        .px_5()
-                                        .py_8()
-                                        .items_center()
-                                        .flex_1()
-                                        .justify_center()
-                                        .child(self.login.clone()),
-                                )
-                            }),
-                    )
-                    .children(self.render_request_elicitations(cx))
-                    .children(self.render_limit_notice(cx))
-                    .children(self.render_login_notice(has_rows, cx))
-                    .children(self.render_lost_history_notice(cx))
-                    .children(self.render_errors(cx))
-                    .children(self.render_activity_bar(window, cx))
-                    .map(|this| {
-                        if is_subthread {
-                            this.child(self.render_subthread_bar(parent, cx))
-                        } else if self.is_archived {
-                            this.child(self.render_archived_notice(cx))
-                        } else if !self.client.read(cx).is_online() {
-                            this.child(self.render_offline_notice(cx))
-                        } else {
-                            this.child(self.render_message_editor(ComposerStyle::Bar, window, cx))
-                        }
-                    })
-            })
-            .children(self.render_drawer(cx))
-            .children(self.render_image_hover(cx))
-            .children(self.render_image_viewer())
-            .children(self.render_login_dialog())
+            // The header and composer leave parts out as the view narrows, so its contents
+            // are built for the size it was given.
+            .child(container_query(move |size, window, cx| {
+                view.update(cx, |view, cx| {
+                    (view.view_width, view.view_height) = (size.width, size.height);
+                    view.render_contents(layout, window, cx)
+                })
+            }))
     }
 }
 

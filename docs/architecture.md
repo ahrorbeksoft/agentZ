@@ -996,8 +996,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   The Changes panel's file headers have the same editor's icon beside Viewed ("Open in VS
   Code"), opening the file at its first change (`DiffFile::first_changed_line`; not for a
   deleted file), hidden when no editor is found.
-- **Narrow threads** (`AgentView::view_width`, measured by `render_view_measure`;
-  `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
+- **Narrow threads** (`AgentView::view_width`, given by GPUI's `container_query`
+  (zed-industries/zed#60774) as `render_contents` lays the view out, so a resize needs no
+  second frame; `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
   `design/thread-narrow/`, 2 C and 3 B, from t3code's compact controls): a thread can be as
   narrow as 320 px (a small window, or the Changes panel beside it). In the header the
   branch gives way first, as it shrinks faster than the rest (to 72 px, and under 560 px
