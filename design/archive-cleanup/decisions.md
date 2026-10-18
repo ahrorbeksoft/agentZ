@@ -18,6 +18,8 @@ Picked on the design board (`design/archive-cleanup/`, see `design/README.md`). 
 
 **E. Workspaces with nothing of their own** (from t3code): t3code’s “Delete unchanged worktrees”: removed when they have no commits beyond the default branch and no changes, whatever their thread’s state.
 
+**Note:** Do what t3code does: every rule starts off. Inactive threads’ workspaces has its own number of days, as t3code’s “Delete inactive worktrees”: a switch, 8 days when turned on (1 to 3650), going by the thread’s last activity.
+
 ## 2. Where the setting lives: A. On the Storage page
 
 *Rules*

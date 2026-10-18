@@ -40,13 +40,19 @@ Picked on the design board (`design/thread-search/`, see `design/README.md`). Ea
 
 **A. The theme’s search colors** (from Zed): Every match in the theme’s search color, the current one in its active color (One Dark: blue, orange), as Zed and agentZ’s terminal do.
 
-## 5. Opening it and moving between matches: B. ⌘G and ⌘⇧G
+## 5. Opening it and moving between matches: A. ⌘F, Enter, Esc + B. ⌘G and ⌘⇧G + C. In the command palette
 
 *Find · pick any*
 
 **Today:** ⌘F and Ctrl-Shift-F are bound only in the terminal. Nothing in the command palette or the thread’s menus finds text.
 
+**A. ⌘F, Enter, Esc** (from t3code): t3code’s keys: ⌘F (Ctrl-F on Linux) opens find unless a terminal is focused, which keeps its own; pressed again it selects the query. Enter and ⇧Enter go to the next and previous match. Esc closes it and puts the cursor back in the composer.
+
 **B. ⌘G and ⌘⇧G** (from Zed): Zed’s ⌘G and ⌘⇧G go to the next and previous match from anywhere in the thread, even with the cursor in the composer.
+
+**C. In the command palette** (from t3code): “Find in Thread” in the command palette, found by “find”, “search”, “messages” or “plans”, as t3code’s “Find in current thread”.
+
+**Note:** ⌘F opens it, and it can be in the command palette too.
 
 ## 6. Switching threads: A. It closes
 

@@ -40,11 +40,13 @@
     "open": {
       "pick": null,
       "picks": [
-        "B"
+        "A",
+        "B",
+        "C"
       ],
       "none": false,
       "comments": {},
-      "note": "",
+      "note": "⌘F opens it, and it can be in the command palette too.",
       "also": []
     },
     "switch": {
