@@ -294,22 +294,15 @@ pub struct DesignVariant {
     /// A picture of it, by its file name in the version.
     #[serde(default)]
     pub picture: Option<String>,
-    /// A live page of it, an HTML file, by its file name in the version.
+    /// A live page of it, an HTML file, by its file name in the version. One responsive page,
+    /// which the user resizes to see a phone's layout.
     #[serde(default)]
     pub page: Option<String>,
     #[serde(default)]
     pub phone_picture: Option<String>,
-    #[serde(default)]
-    pub phone_page: Option<String>,
     /// What it is against the version before (topic 19 A).
     #[serde(default)]
     pub change: Option<VariantChange>,
-}
-
-impl DesignVariant {
-    pub fn has_phone(&self) -> bool {
-        self.phone_picture.is_some() || self.phone_page.is_some()
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,18 +439,24 @@ impl DesignDefaults {
             ", without today's version"
         };
         let sizes = match self.sizes {
-            DesignSizes::Desktop => "Desktop only.",
-            DesignSizes::Phone => "Phone only: give each variant as phonePicture or phonePage.",
-            DesignSizes::Both => "Desktop and phone: give each variant a phone version too.",
+            DesignSizes::Desktop => "Pictures at desktop size only.",
+            DesignSizes::Phone => "Pictures at phone size only: give each variant as phonePicture.",
+            DesignSizes::Both => {
+                "Pictures at desktop and phone size: give each variant a phonePicture too."
+            }
         };
+        let live_page = "a live page is one responsive page, which the user resizes to see a \
+                         phone's layout, so it has no phone version";
         let variants_as = match self.variants_as {
-            VariantsAs::Pictures => "Pictures for the variants.",
-            VariantsAs::LivePages => "Live pages for the variants.",
-            VariantsAs::Both => "A picture and a live page for each variant.",
+            VariantsAs::Pictures => format!("Pictures for the variants. {sizes}"),
+            VariantsAs::LivePages => format!("Live pages for the variants: {live_page}."),
+            VariantsAs::Both => {
+                format!("A picture and a live page for each variant. {sizes} A {live_page}.")
+            }
         };
         format!(
             "The user's design defaults, for when they haven't said otherwise: {} variant{} a \
-             topic{today}. {sizes} {variants_as} agentZ checks every design against them and \
+             topic{today}. {variants_as} agentZ checks every design against them and \
              sends back one that differs, unless it has a deviationReason: one sentence on why \
              this design needs to, which the user sees. Follow the defaults when the user hasn't \
              asked for something else. They don't apply to a multi topic.",
@@ -505,8 +504,6 @@ impl DesignDefaults {
             .filter(|topic| !topic.multi)
             .flat_map(|topic| &topic.variants)
             .collect();
-        let wants_desktop = self.sizes != DesignSizes::Phone;
-        let wants_phone = self.sizes != DesignSizes::Desktop;
         let wants_picture = self.variants_as != VariantsAs::LivePages;
         let wants_page = self.variants_as != VariantsAs::Pictures;
         let mut differs = |wanted: bool, has: fn(&DesignVariant) -> bool, what: &str| {
@@ -524,22 +521,26 @@ impl DesignDefaults {
                 found.push(format!("{count} variant{} {verb} {what}", plural(count)));
             }
         };
-        differs(
-            wants_desktop,
-            |variant| variant.picture.is_some() || variant.page.is_some(),
-            "a desktop version",
-        );
-        differs(wants_phone, DesignVariant::has_phone, "a phone version");
-        differs(
-            wants_picture,
-            |variant| variant.picture.is_some() || variant.phone_picture.is_some(),
-            "a picture",
-        );
-        differs(
-            wants_page,
-            |variant| variant.page.is_some() || variant.phone_page.is_some(),
-            "a live page",
-        );
+        // Sizes size the pictures only: a live page is one page for every width.
+        if wants_picture {
+            differs(
+                self.sizes != DesignSizes::Phone,
+                |variant| variant.picture.is_some(),
+                "a desktop picture",
+            );
+            differs(
+                self.sizes != DesignSizes::Desktop,
+                |variant| variant.phone_picture.is_some(),
+                "a phone picture",
+            );
+        } else {
+            differs(
+                false,
+                |variant| variant.picture.is_some() || variant.phone_picture.is_some(),
+                "a picture",
+            );
+        }
+        differs(wants_page, |variant| variant.page.is_some(), "a live page");
         found
     }
 }
@@ -811,7 +812,6 @@ mod tests {
             picture: picture.then(|| "a.png".to_string()),
             page: page.then(|| "a.html".to_string()),
             phone_picture: (phone && picture).then(|| "a-phone.png".to_string()),
-            phone_page: (phone && page).then(|| "a-phone.html".to_string()),
             ..Default::default()
         }
     }
@@ -880,7 +880,7 @@ mod tests {
             ])),
             [
                 "topic 2 has 5 variants, not 3",
-                "5 variants have a phone version",
+                "5 variants have a phone picture",
                 "5 variants have a live page",
             ]
         );
@@ -930,10 +930,38 @@ mod tests {
             [
                 "the topic has 2 variants, not 3",
                 "the topic has no today's version",
-                "2 variants lack a desktop version",
-                "2 variants lack a picture",
+                "2 variants lack a desktop picture",
             ]
         );
+    }
+
+    /// Sizes size pictures only: a live page is one page for every width, so live pages never
+    /// ask for a phone version, and Both asks only the pictures for one.
+    #[test]
+    fn sizes_apply_to_pictures_only() {
+        let live_pages = DesignDefaults {
+            variants_as: VariantsAs::LivePages,
+            sizes: DesignSizes::Both,
+            ..DesignDefaults::default()
+        };
+        assert!(
+            live_pages
+                .deviations(&design(vec![topic(3, true, false, true, false)]))
+                .is_empty()
+        );
+        assert!(live_pages.instructions().contains("has no phone version"));
+        assert!(!live_pages.instructions().contains("phonePage"));
+
+        let both = DesignDefaults {
+            variants_as: VariantsAs::Both,
+            sizes: DesignSizes::Both,
+            ..DesignDefaults::default()
+        };
+        assert_eq!(
+            both.deviations(&design(vec![topic(3, true, true, true, false)])),
+            ["3 variants lack a phone picture"]
+        );
+        assert!(both.instructions().contains("phonePicture too"));
     }
 
     #[test]

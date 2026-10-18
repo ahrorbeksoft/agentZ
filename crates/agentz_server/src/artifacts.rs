@@ -573,14 +573,9 @@ fn check_design(design: &Design, files: &[(String, Vec<u8>)]) -> Result<()> {
                 + variant.description.len()
                 + variant.good.len()
                 + variant.cost.len();
-            for name in [
-                &variant.picture,
-                &variant.page,
-                &variant.phone_picture,
-                &variant.phone_page,
-            ]
-            .into_iter()
-            .flatten()
+            for name in [&variant.picture, &variant.page, &variant.phone_picture]
+                .into_iter()
+                .flatten()
             {
                 ensure!(
                     files.iter().any(|(file, _)| file == name),
@@ -592,8 +587,7 @@ fn check_design(design: &Design, files: &[(String, Vec<u8>)]) -> Result<()> {
                 topic.multi
                     || variant.picture.is_some()
                     || variant.page.is_some()
-                    || variant.phone_picture.is_some()
-                    || variant.phone_page.is_some(),
+                    || variant.phone_picture.is_some(),
                 "{:?} in topic {number} needs a picture or a page",
                 variant.name
             );
@@ -689,7 +683,6 @@ fn carry_over(
                     (&new.picture, &before.picture),
                     (&new.page, &before.page),
                     (&new.phone_picture, &before.phone_picture),
-                    (&new.phone_page, &before.phone_page),
                 ]
                 .into_iter()
                 .all(|(new_name, old_name)| match (new_name, old_name) {
@@ -966,7 +959,6 @@ fn variant_text(
         (&variant.picture, "picture"),
         (&variant.page, "page"),
         (&variant.phone_picture, "phone picture"),
-        (&variant.phone_page, "phone page"),
     ]
     .into_iter()
     .filter_map(|(name, what)| Some(format!("{} ({what})", name.as_ref()?)))

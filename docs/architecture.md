@@ -1482,20 +1482,21 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   `agentz_design_publish`, `agentz_artifact_list` and `_read` in `AGENTZ_TOOLS`): a document
   is a `.md` file with files to offer as downloads; a design is a title, an intro and topics,
   each with a description, today's (kept with Keep today's), variants (name, description,
-  Good, Cost, a picture and/or a live page, at desktop and phone sizes) and the one
-  recommended. Its files are named by topic and letter (`1-B.png`, `1-today-phone.html`). A
+  Good, Cost, a picture, at desktop and phone sizes, and/or a live page, which is one
+  responsive page with no phone version: the user resizes it, below) and the one
+  recommended. Its files are named by topic and letter (`1-B.png`, `1-today-phone.png`). A
   topic can be `multi` ("feature selection", the design board's `type: 'multi'` topics: pick
   any, for features or options that go together, `DesignTopic::multi`): its variants may be
   words alone, it has no today's, and the defaults' variant count, today's, sizes and pictures
   don't apply to it (`deviations` skips it).
   `artifactId` adds a version. 16 MiB a file at most, Claude Code's limit, 128 MiB a design.
   The design tool's description ends with the design defaults (`DesignDefaults::instructions`:
-  how many variants, today's, sizes, pictures or pages), the project's or General's
+  how many variants, today's, the pictures' sizes, pictures or pages), the project's or General's
   (`DesignSettings::for_project`, `Request::SetDesignDefaults`), so its tool list is made per
   caller (`Request::ListTools { caller }`). Any thread's or chat's agent can publish.
   Agents treat a description as advice, and a session lists its tools once, so the defaults are
   also enforced as they are when a design is published (`DesignDefaults::deviations`): one that
-  differs (variants a topic, today's, desktop or phone, pictures or pages) is sent back saying
+  differs (variants a topic, today's, desktop or phone pictures, pictures or pages) is sent back saying
   how, unless it has a `deviationReason`, a sentence that then shows in the design's intro.
 - **Reading** (`agentz_artifact_read`): a document's Markdown, or the whole design as text,
   like a round's README and decisions.md together (`artifacts::design_text`): whether it's
@@ -1549,8 +1550,15 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
     Recommended, Changed and New tags, the picture or the live page scaled down (Open page
     for the page itself), Pick, + Also and a comment. A pick-any topic has Want this on each
     card (words-only cards have no picture), None of these under them, and the letters
-    wanted ("AC", or ∅) in the list. A close-up (←→, Esc), Desktop · Phone,
-    the progress, Saved, and Submit (Also send, a note, ⌘↩) in the bar; Decided afterwards,
+    wanted ("AC", or ∅) in the list. A close-up (←→, Esc): a picture at full size, or a live
+    page in a frame the user resizes (`resizablePage`; `design/live-preview` topics 1 and 2):
+    a grip on each side moves both edges, so the page stays centred, with its width beside
+    the grip while it's dragged, and Phone 390 · Tablet 768 · Laptop 1280 · Fit over it,
+    the one equal to the width lit. It opens as wide as the window allows, every time, and
+    only the close-up resizes (the cards draw it at 1280 px, scaled). Desktop · Phone in the
+    bar swaps the pictures for their phone pictures, and shows only when some variant has one
+    (a live page doesn't change with it). Also the progress, Saved, and Submit (Also send, a
+    note, ⌘↩) in the bar; Decided afterwards,
     and a banner on a new version saying what changed and what was dropped. An earlier
     version is read-only. Keys 1–9 pick (or want), ←→ change topics.
   - Open pages hear of republishes (a bar to show the new version), picks, deletions and
@@ -1601,7 +1609,10 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   `SettingsPage::{render_design_default_rows, render_project_design_defaults}`,
   `Machines::sync_design_defaults`; `design/artifacts-2` topic 21 B): Settings › General ›
   Artifacts has Variants (a stepper, 3 at first), Include today's, Sizes (Desktop · Phone ·
-  Both) and Variants as (Pictures · Live pages · Both). Each project's page has Design
+  Both) and Variants as (Pictures · Live pages · Both). Sizes size the pictures only
+  (`design/live-preview` topic 3 A): with Variants as › Live pages it's greyed and does
+  nothing, its line saying "Pictures only: a live page is one responsive page." Each
+  project's page has Design
   defaults: "Use General's" (on at first, saying General's in a line); off, the same four rows
   for that project, kept by its combined project's key. Every server gets General's and its
   own copies' (`Request::SetDesignDefaults`) as they change and as it connects.

@@ -44,11 +44,6 @@ version of another machine's artifact ("there's no artifact … to update").
 When a thread is forked, show the fork in something like the new thread view's style. The
 user doesn't like the current design.
 
-### A live page design doesn't need desktop and mobile views
-
-When a design is a live page, it doesn't need separate desktop and mobile views. Maybe make the
-preview resizable instead; the user is open to ideas.
-
 ### An Open in Editor button
 
 Add an Open in Editor button, as t3code has.

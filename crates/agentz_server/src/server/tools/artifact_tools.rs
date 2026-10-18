@@ -658,7 +658,7 @@ async fn read_file(path: &Path) -> Result<Vec<u8>, Failure> {
 }
 
 /// A design's pictures and pages by their paths, each named in the version by its topic and
-/// variant ("1-B.png", "1-today-phone.html").
+/// variant ("1-B.png", "1-today-phone.png").
 #[derive(Default)]
 struct DesignFiles {
     files: Vec<(PathBuf, String)>,
@@ -719,13 +719,7 @@ fn variant(
     let page = files.add(arguments, "page", &base, &PAGES)?;
     let phone = format!("{base}-phone");
     let phone_picture = files.add(arguments, "phonePicture", &phone, &PICTURES)?;
-    let phone_page = files.add(arguments, "phonePage", &phone, &PAGES)?;
-    if !words_only
-        && picture.is_none()
-        && page.is_none()
-        && phone_picture.is_none()
-        && phone_page.is_none()
-    {
+    if !words_only && picture.is_none() && page.is_none() && phone_picture.is_none() {
         return Err(invalid(format!(
             "{name:?} in topic {topic} needs a picture or a page."
         )));
@@ -738,7 +732,6 @@ fn variant(
         picture,
         page,
         phone_picture,
-        phone_page,
         change: None,
     })
 }
@@ -755,9 +748,8 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
                 "good": {"type": "string", "maxLength": MAX_TEXT_CHARS, "description": "What's good about it."},
                 "cost": {"type": "string", "maxLength": MAX_TEXT_CHARS, "description": "What it costs or gives up."},
                 "picture": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "A picture of it (.png, .jpg, .webp, .gif, .svg), by its absolute path or one starting with ~: a screenshot or a mock at its real size."},
-                "page": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "A live page of it, a self-contained .html file by its path, which the user can scroll and click through. Its scripts may use only a few well-known CDNs, and its images must be embedded."},
-                "phonePicture": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "Its picture at a phone's size (about 390 px wide), when the design has phone versions."},
-                "phonePage": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "Its live page at a phone's size."},
+                "page": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "A live page of it, a self-contained .html file by its path, which the user can scroll and click through. Its scripts may use only a few well-known CDNs, and its images must be embedded. Make it responsive: the user resizes it to see a phone's layout, so it has no phone version."},
+                "phonePicture": {"type": "string", "maxLength": MAX_PATH_CHARS, "description": "Its picture at a phone's size (about 390 px wide), when the design has phone pictures."},
             },
             "additionalProperties": false,
         })

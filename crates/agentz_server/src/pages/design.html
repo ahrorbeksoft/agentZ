@@ -104,8 +104,24 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 .over { position: fixed; inset: 0; z-index: 20; background: rgba(8, 9, 12, .86); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 20px 64px 14px; }
 .over .stage { position: relative; max-width: 100%; max-height: calc(100vh - 64px); overflow: auto; border-radius: 6px; flex: none; }
 .over .stage img { display: block; max-width: 100%; }
-.over .stage iframe { display: block; border: none; background: #fff; }
 .over .stage .none { width: 320px; background: var(--solid-background); }
+.sizes { display: flex; gap: 6px; flex: none; }
+.chip { height: 24px; padding: 0 9px; border-radius: 6px; border: 1px solid rgba(255, 255, 255, .18); display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #c9ccd1; background: rgba(0, 0, 0, .35); cursor: pointer; }
+.chip:hover { background: rgba(255, 255, 255, .1); }
+.chip.on { background: rgba(255, 255, 255, .18); color: #fff; }
+.chip i { font-style: normal; font-size: 11px; color: #8a8f99; }
+.chip.on i { color: #c9ccd1; }
+.pageframe { position: relative; flex: none; height: calc(100vh - 104px); }
+.pageframe iframe { display: block; width: 100%; height: 100%; border: none; background: #fff; border-radius: 6px; }
+.pageframe.dragging iframe { pointer-events: none; }
+.grip { position: absolute; top: 50%; width: 12px; height: 64px; margin-top: -32px; border-radius: 6px; background: #c9ccd1; display: flex; align-items: center; justify-content: center; gap: 2px; box-shadow: 0 2px 8px rgba(0, 0, 0, .5); cursor: ew-resize; touch-action: none; z-index: 5; }
+.grip::before, .grip::after { content: ''; width: 1.5px; height: 24px; background: #6b6f78; }
+.grip.left { left: -16px; }
+.grip.right { right: -16px; }
+.readout { display: none; position: absolute; top: 50%; transform: translateY(-50%); z-index: 4; background: rgba(0, 0, 0, .78); color: #fff; font: 11px ui-monospace, 'IBM Plex Mono', monospace; border-radius: 6px; padding: 3px 8px; white-space: nowrap; pointer-events: none; }
+.pageframe.dragging .readout { display: block; }
+.pageframe.dragging.left .readout { left: 16px; }
+.pageframe.dragging.right .readout { right: 16px; }
 .over .cap { color: #c9ccd1; font-size: 12px; display: flex; gap: 10px; align-items: center; }
 .over .cap a { color: #8fb2fa; cursor: pointer; }
 .arrow { position: fixed; top: 50%; margin-top: -16px; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; background: rgba(0, 0, 0, .55); color: #fff; border: none; cursor: pointer; z-index: 21; }
@@ -125,7 +141,8 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 <script>
 // The design page agentZ draws (design/artifacts-2, topics 9 to 19): the topics on the left
 // with Summary at the end, a topic's variants in cards to pick, take parts of (+ Also) and
-// comment on, today's version as one to keep, a variant up close, Desktop · Phone, and Submit.
+// comment on, today's version as one to keep, a variant up close (a live page there is resized,
+// live-preview topics 1 to 3), Desktop · Phone for pictures, and Submit.
 // A multi topic (pick any) has Want this on each variant, and None of these, in place of
 // Pick and + Also. Picks are saved on the server as they're made, on the latest version only.
 let listing = null;
@@ -177,9 +194,10 @@ function wantedKeys(index) {
   return design.topics[index].variants.map((variant) => variant.name).filter((name) => entry.wanted.includes(name));
 }
 
-// Desktop or phone, for a topic's cards: a topic of words alone has neither.
+// Desktop or phone pictures, for a topic's cards: a topic with no phone picture, a topic of
+// live pages or of words alone, is the same either way (a live page is resized, not swapped).
 function phoneView(index) {
-  return mode === 'phone' && entries(index).some(({ variant }) => variant.picture || variant.page || variant.phone_picture || variant.phone_page);
+  return mode === 'phone' && entries(index).some(({ variant }) => variant.phone_picture);
 }
 
 // "B. Compare table", or "Today’s page (today’s)".
@@ -216,8 +234,8 @@ const commentCount = () => design.topics.reduce((sum, _, index) => sum + Object.
 const hasComment = (index) => Object.values(topicPicks(index).comments).some((text) => text.trim());
 const anyPicks = () => design.topics.some((_, index) => pickText(index) || topicPicks(index).also.length || hasComment(index));
 const variantsOf = () => design.topics.flatMap((designTopic) => [designTopic.today, ...designTopic.variants].filter(Boolean));
-const hasPhone = () => variantsOf().some((variant) => variant.phone_picture || variant.phone_page);
-const hasDesktop = () => variantsOf().some((variant) => variant.picture || variant.page);
+const hasPhone = () => variantsOf().some((variant) => variant.phone_picture);
+const hasDesktop = () => variantsOf().some((variant) => variant.picture);
 
 // The bar: the page's (home, title, version, where) and the design's (Desktop · Phone, how
 // many topics are decided, Saved, Submit or Decided).
@@ -419,21 +437,21 @@ function preview(index, entry, place) {
   const variant = entry.variant;
   const phone = phoneView(index);
   const picture = phone ? variant.phone_picture : variant.picture;
-  const pageFile = phone ? variant.phone_page : variant.page;
+  const pageFile = variant.page;
   if (!picture && !pageFile && design.topics[index].multi) return null;
-  if (!picture && !pageFile) return h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone version' : 'No desktop version' });
+  if (!picture && !pageFile) return h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone picture' : 'No desktop picture' });
   const fit = h('div', { class: 'fit', title: 'Show it up close', onclick: () => openCloseUp(index, place, false) });
   if (picture) fit.append(h('img', { src: file(picture), loading: 'lazy', alt: variant.name }));
-  else fit.append(livePage(pageFile, phone));
+  else fit.append(livePage(pageFile));
   if (pageFile) fit.append(h('button', { class: 'hint', onclick: (event) => { event.stopPropagation(); openCloseUp(index, place, true); } }, icon('external', 11), 'Open page'));
   return fit;
 }
 
-// A variant's live page in its card, at its real width and zoomed to fit, as the design
+// A variant's live page in its card, at a laptop's width and zoomed to fit, as the design
 // board draws its mocks.
-function livePage(name, phone) {
-  const width = phone ? 390 : 1280;
-  const height = phone ? 844 : 800;
+function livePage(name) {
+  const width = 1280;
+  const height = 800;
   const frame = h('iframe', { sandbox: 'allow-scripts allow-forms', src: file(name), tabindex: '-1', scrolling: 'no', style: { width: width + 'px', height: height + 'px' } });
   const box = h('div', { class: 'live', style: { aspectRatio: `${width} / ${height}` } }, frame);
   new ResizeObserver(() => { frame.style.transform = `scale(${box.clientWidth / width})`; }).observe(box);
@@ -630,10 +648,73 @@ function showSubmit() {
 function hideSubmit() { $('submit').hidden = true; }
 
 // A variant up close (topic 12 A): its picture at full size, or its page running, with its
-// name under it; ← → go to the next variant and Esc closes.
+// name under it; ← → go to the next variant and Esc closes. The window's width less this
+// leaves the arrows and the page's grips room on each side.
+const PAGE_MARGIN = 128;
+const MIN_PAGE_WIDTH = 320;
+
 function openCloseUp(index, place, page) {
   closeUp = { index, place, page };
   renderCloseUp();
+}
+
+// A live page up close, in a frame the user resizes (live-preview topic 1 D): a grip on each
+// side moves both, so the page stays centred, with its width beside the grip while it's
+// dragged, and a row of presets over it. It opens as wide as the window allows, and every
+// variant opens that way again. Returns what goes in the close-up, and what to call once it's
+// in the page, to light the preset that is the frame's width.
+function resizablePage(pageFile) {
+  const presets = [['phone', 'Phone', 390], ['tablet', 'Tablet', 768], ['monitor', 'Laptop', 1280], [null, 'Fit', null]];
+  const room = () => window.innerWidth - PAGE_MARGIN;
+  const iframe = h('iframe', { sandbox: 'allow-scripts allow-forms allow-modals allow-popups', src: file(pageFile) });
+  const readout = h('span', { class: 'readout' });
+  const frame = h('div', { class: 'pageframe' }, iframe, readout);
+  const setWidth = (width) => {
+    frame.style.width = width ? `min(${width}px, calc(100vw - ${PAGE_MARGIN}px))` : `calc(100vw - ${PAGE_MARGIN}px)`;
+  };
+  const chips = presets.map(([name, label, width]) => ({
+    width,
+    element: h('button', { class: 'chip', onclick: () => { setWidth(width); lightPreset(); } }, name ? icon(name, 12) : null, label, width ? h('i', { text: String(width) }) : null),
+  }));
+  const lightPreset = () => {
+    const now = Math.round(frame.getBoundingClientRect().width);
+    // Fit first: in a window under 1280 px wide, Laptop's width is the window's too.
+    const fit = chips[chips.length - 1];
+    const onFit = now === Math.round(room());
+    fit.element.classList.toggle('on', onFit);
+    for (const { width, element } of chips.slice(0, -1)) {
+      element.classList.toggle('on', !onFit && now === Math.round(Math.min(width, room())));
+    }
+  };
+  for (const side of ['left', 'right']) {
+    const grip = h('div', { class: 'grip ' + side, title: 'Drag to resize' });
+    grip.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      grip.setPointerCapture(event.pointerId);
+      const startX = event.clientX;
+      const startWidth = frame.getBoundingClientRect().width;
+      frame.classList.add('dragging', side);
+      const move = (moveEvent) => {
+        const change = (moveEvent.clientX - startX) * (side === 'left' ? -2 : 2);
+        const width = Math.round(Math.min(room(), Math.max(MIN_PAGE_WIDTH, startWidth + change)));
+        setWidth(width);
+        readout.textContent = width + ' px';
+        lightPreset();
+      };
+      const end = () => {
+        frame.classList.remove('dragging', side);
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', end);
+        grip.removeEventListener('pointercancel', end);
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', end);
+      grip.addEventListener('pointercancel', end);
+    });
+    frame.append(grip);
+  }
+  setWidth(null);
+  return { nodes: [h('div', { class: 'sizes' }, chips.map(({ element }) => element)), frame], settled: lightPreset };
 }
 
 function renderCloseUp() {
@@ -644,30 +725,32 @@ function renderCloseUp() {
   const variant = entry.variant;
   const phone = phoneView(closeUp.index);
   const picture = phone ? variant.phone_picture : variant.picture;
-  const pageFile = phone ? variant.phone_page : variant.page;
+  const pageFile = variant.page;
   const showPage = !!pageFile && (closeUp.page || !picture);
-  const stage = h('div', { class: 'stage' });
+  let stage;
+  let settled = null;
   if (showPage) {
-    const width = phone ? 390 : Math.min(1280, window.innerWidth - 128);
-    const height = phone ? Math.min(844, window.innerHeight - 64) : window.innerHeight - 64;
-    stage.append(h('iframe', { sandbox: 'allow-scripts allow-forms allow-modals allow-popups', src: file(pageFile), style: { width: width + 'px', height: height + 'px' } }));
+    const resizable = resizablePage(pageFile);
+    stage = resizable.nodes;
+    settled = resizable.settled;
   } else if (picture) {
-    stage.append(h('img', { src: file(picture), alt: variant.name }));
+    stage = [h('div', { class: 'stage' }, h('img', { src: file(picture), alt: variant.name }))];
   } else {
-    stage.append(h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone version' : 'No desktop version' }));
+    stage = [h('div', { class: 'stage' }, h('div', { class: 'none' + (phone ? '' : ' desktop'), text: phone ? 'No phone picture' : 'No desktop picture' }))];
   }
   const name = entry.today ? `${variant.name} (today’s)` : `${entry.letter}. ${variant.name}`;
   const caption = h('div', { class: 'cap' }, h('span', { text: name + (list.length > 1 ? ' · ← → the other variants' : '') + ' · Esc closes' }));
   if (picture && pageFile) {
     caption.append(h('a', { text: showPage ? 'Show picture' : 'Open page', onclick: () => { closeUp.page = !showPage; renderCloseUp(); } }));
   }
-  const children = [stage, caption];
+  const children = [...stage, caption];
   if (list.length > 1) {
     children.push(h('button', { class: 'arrow left', title: 'The one before', onclick: () => stepCloseUp(-1) }, icon('chev-left', 16)));
     children.push(h('button', { class: 'arrow right', title: 'The next', onclick: () => stepCloseUp(1) }, icon('chev-right', 16)));
   }
   fill(over, ...children);
   over.hidden = false;
+  if (settled) settled();
 }
 
 function stepCloseUp(step) {
@@ -732,7 +815,7 @@ async function reload() {
   picks.topics = picks.topics || [];
   design.topics.forEach((_, index) => topicPicks(index));
   document.title = listing.artifact.title + ' · agentZ';
-  if (!mode) mode = hasDesktop() ? 'desktop' : 'phone';
+  if (!mode) mode = hasPhone() && !hasDesktop() ? 'phone' : 'desktop';
   if (topic > design.topics.length) topic = 0;
   const earlier = $('earlier');
   earlier.hidden = !readOnly();

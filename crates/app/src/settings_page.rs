@@ -1399,7 +1399,13 @@ impl SettingsPage {
                 )
                 .into_any_element()
         };
+        // Sizes size the pictures: a live page is one page for every width, which the user
+        // resizes, so with live pages alone the row has nothing to say.
+        let live_pages_only = defaults.variants_as == VariantsAs::LivePages;
         let sizes = DesignSizes::ALL.map(|sizes| -> Rc<dyn Fn(&mut App)> {
+            if live_pages_only {
+                return Rc::new(|_| {});
+            }
             Rc::new(change(Rc::new(move |defaults| defaults.sizes = sizes)))
         });
         let variants_as = VariantsAs::ALL.map(|variants_as| -> Rc<dyn Fn(&mut App)> {
@@ -1427,16 +1433,23 @@ impl SettingsPage {
             ),
             render_row(
                 "Sizes",
-                "The sizes each variant is shown at.",
-                segments(
-                    format!("{prefix}-sizes"),
-                    ["Desktop", "Phone", "Both"],
-                    DesignSizes::ALL
-                        .iter()
-                        .position(|sizes| *sizes == defaults.sizes)
-                        .unwrap_or(0),
-                    sizes,
-                ),
+                if live_pages_only {
+                    "Pictures only: a live page is one responsive page."
+                } else {
+                    "The sizes each picture is shown at."
+                },
+                div()
+                    .when(live_pages_only, |control| control.opacity(0.45))
+                    .child(segments(
+                        format!("{prefix}-sizes"),
+                        ["Desktop", "Phone", "Both"],
+                        DesignSizes::ALL
+                            .iter()
+                            .position(|sizes| *sizes == defaults.sizes)
+                            .unwrap_or(0),
+                        sizes,
+                    ))
+                    .into_any_element(),
                 cx,
             ),
             render_row(
@@ -11885,6 +11898,52 @@ mod tests {
         click("project-design-use-general", cx);
         assert!(cx.debug_bounds("project-design-variants").is_none());
         assert_eq!(last_sent(&devbox, cx), sent(general, Vec::new()));
+    }
+
+    /// `design/live-preview` topic 3 A: Sizes size the pictures. With live pages alone the
+    /// row is greyed and says why, and a click on it changes nothing.
+    #[gpui::test]
+    fn sizes_do_nothing_while_variants_are_live_pages_alone(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        cx.update(|cx| {
+            for client in [&local, &devbox] {
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx)
+        });
+        let variants_as = |variants_as, cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                AppSettingsStore::global(cx).update(cx, |store, cx| {
+                    store.update(
+                        |settings| settings.design_defaults.variants_as = variants_as,
+                        cx,
+                    )
+                })
+            });
+            cx.run_until_parked();
+        };
+        let click_phone = |cx: &mut gpui::VisualTestContext| {
+            // The middle of Desktop · Phone · Both is Phone.
+            let bounds = cx.debug_bounds("design-sizes").expect("Sizes is shown");
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                AppSettingsStore::global(cx)
+                    .read(cx)
+                    .settings()
+                    .design_defaults
+                    .sizes
+            })
+        };
+
+        variants_as(VariantsAs::LivePages, cx);
+        assert_eq!(click_phone(cx), DesignSizes::Desktop);
+        variants_as(VariantsAs::Both, cx);
+        assert_eq!(click_phone(cx), DesignSizes::Phone);
     }
 
     /// Auto-archive is the app's setting, which every machine's server is given as it's
