@@ -15,6 +15,11 @@ binding (`secondary-,` in the `Shell` context) reaching `OpenSettings` with a te
 so the cause is likely in what a real Linux keyboard sends (xkb's key and `key_char` for the
 comma while Ctrl is down). Needs a run under a real X or Wayland session.
 
+Skipped for now (October 18, 2026). Not reproduced under X11 either: on Xvfb with no input
+method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane, a thread's
+terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
+which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
+
 
 ## Features
 
