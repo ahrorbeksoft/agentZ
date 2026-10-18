@@ -76,14 +76,6 @@ saved snapshots, t3code had 715 newer commits, herdr 68 and OpenUsage 17. Cow ha
 since our v0.1.10 snapshot. These are source findings; the failures have not been reproduced
 in agentZ.
 
-### Return from a delegated task wait when the child asks a question
-
-Follow t3code's [#19538](https://github.com/pingdotgg/t3code/pull/19538): a blocking
-`delegate_task` wait returns when its child needs an answer, with the question identified and
-without marking the wait as timed out. The child's later completion must still reach the
-parent. Our `wait_for_task` in `crates/agentz_server/src/server/tools.rs` currently checks only
-completion and timeout. Verify the behavior with the mock agent.
-
 ### Isolate Codex automatic title generation from MCP servers, plugins and apps
 
 Follow t3code's [#17058](https://github.com/pingdotgg/t3code/pull/17058). Our Codex title runner

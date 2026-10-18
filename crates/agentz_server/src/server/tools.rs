@@ -197,7 +197,8 @@ enum Step {
     Done(Value),
     /// Try again once something changes, for at most this long.
     Wait(Duration),
-    /// Answer once the delegated task ends, or with `waitTimedOut` after this long.
+    /// Answer once the delegated task ends or asks a question, or with `waitTimedOut` after
+    /// this long.
     WaitForTask(ThreadId, Duration),
     /// Answer with this work's result, done off the server's task.
     Background(BoxFuture<'static, Result<Value, Failure>>),
@@ -1446,7 +1447,9 @@ impl Server {
         })
     }
 
-    /// `delegate_task`'s wait: the result once the task ends, or `waitTimedOut`.
+    /// `delegate_task`'s wait: the result once the task ends or asks a question, as t3code's
+    /// wait returns on a question the parent has to get answered, or `waitTimedOut`. A
+    /// permission request doesn't end it.
     fn wait_for_task(&mut self, caller: Caller, task: ThreadId, timed_out: bool) -> Outcome {
         let task = self.task(caller, Some(task))?;
         let ended = self
@@ -1454,10 +1457,11 @@ impl Server {
             .thread(task)
             .and_then(|thread| thread.task.as_ref())
             .is_some_and(|task| task.outcome.is_some());
-        if !ended && !timed_out {
+        let asking = !ended && self.task_thread_status(task) == "waiting_for_input";
+        if !ended && !asking && !timed_out {
             return Ok(Step::Wait(MAX_WAIT));
         }
-        Ok(Step::Done(self.task_result(task, !ended, true)))
+        Ok(Step::Done(self.task_result(task, !ended && !asking, true)))
     }
 
     fn task_cancel(&mut self, caller: Caller, arguments: &Arguments) -> Outcome {
@@ -1559,6 +1563,9 @@ impl Server {
         let Some(delegated) = thread.task.as_ref() else {
             return json!({"taskId": task.0});
         };
+        // Only a running task's question: an ended task's thread may ask in a later turn.
+        let has_pending_question =
+            delegated.outcome.is_none() && thread_status == "waiting_for_input";
         let has_pending_tasks = self.projects.subthreads(task).iter().any(|thread| {
             thread
                 .task
@@ -1586,6 +1593,7 @@ impl Server {
             "model": thread.model,
             "summary": delegated.outcome.as_ref().and_then(|outcome| outcome.summary.clone()),
             "endedAt": delegated.outcome.as_ref().map(|outcome| timestamp(outcome.ended_at)),
+            "hasPendingQuestion": has_pending_question,
             "waitTimedOut": wait_timed_out,
         });
         let parent = delegated.parent;
@@ -2587,7 +2595,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
         {
             "name": "delegate_task",
             "title": "Delegate a child task",
-            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows in this thread's Agents control. Prefer mode='async' for long work: when the task ends, this thread gets a message saying so, queued until its turn ends, so end the turn instead of polling. mode='wait' blocks until the task ends or timeoutMs (default 10 minutes) passes; a timeout returns waitTimedOut=true and doesn't cancel the task. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status and task_cancel without machine. Keep the taskId for task_status and task_cancel.",
+            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows in this thread's Agents control. Prefer mode='async' for long work: when the task ends, this thread gets a message saying so, queued until its turn ends, so end the turn instead of polling. mode='wait' blocks until the task ends, asks a question, or timeoutMs (default 10 minutes) passes. A question returns hasPendingQuestion=true and waitTimedOut=false: ask the user to answer it in the task's thread; the task's end is still announced to this thread. A timeout returns waitTimedOut=true and doesn't cancel the task. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status and task_cancel without machine. Keep the taskId for task_status and task_cancel.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

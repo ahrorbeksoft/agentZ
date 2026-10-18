@@ -5837,6 +5837,78 @@ async fn subthread_permission_requests_block_the_parent() {
     assert_eq!(status["status"], json!("completed"));
 }
 
+/// A task's question ends the parent's wait for it, as in t3code, without timing out, and its
+/// end still reaches the parent. A permission request doesn't end the wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_question_ends_a_blocking_task_wait() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+
+    let asked = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "question", "mode": "wait"}),
+        )
+        .await;
+    let child = task_id(&asked);
+    assert_eq!(asked["status"], json!("waiting"));
+    assert_eq!(asked["threadStatus"], json!("waiting_for_input"));
+    assert_eq!(asked["hasPendingQuestion"], json!(true));
+    assert_eq!(asked["waitTimedOut"], json!(false));
+    assert_eq!(client.task(child).map(|task| task.delivered), Some(false));
+
+    let connection = ConnectionId::Thread(child);
+    client.subscribe_thread(connection).await;
+    client
+        .wait_until(|client| !client.thread(connection).elicitations().is_empty())
+        .await;
+    let elicitation = client
+        .thread(connection)
+        .elicitations()
+        .first()
+        .expect("the task asked")
+        .clone();
+    client
+        .ok(Request::RespondToElicitation {
+            connection,
+            elicitation: elicitation.id,
+            action: acp::ElicitationAction::Decline,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client.user_messages(parent).iter().any(|message| {
+                message.starts_with("Delegated task") && message.contains(&child.0.to_string())
+            })
+        })
+        .await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": child.0}))
+        .await;
+    assert_eq!(status["status"], json!("completed"));
+    assert_eq!(status["hasPendingQuestion"], json!(false));
+
+    let waited = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "permission", "mode": "wait", "timeoutMs": 3_000}),
+        )
+        .await;
+    assert_eq!(waited["waitTimedOut"], json!(true));
+    assert_eq!(waited["hasPendingQuestion"], json!(false));
+}
+
 /// The agent's own subagents (Claude Agent's) work in subthreads, which show what the agent
 /// sends in their sessions and end with their reports. The agent hears of their ends itself.
 #[tokio::test(flavor = "multi_thread")]
