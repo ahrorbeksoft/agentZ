@@ -12,7 +12,7 @@ use gpui::{
 use text_input::{TextInput, TextInputEvent};
 use ui::{WithScrollbar as _, prelude::*};
 
-use crate::agent_view::{self, AcceptSlashCommand};
+use crate::agent_view::{self, AcceptSlashCommand, DecreaseEffort, IncreaseEffort};
 use crate::spaces_view::{
     self, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivateTab,
     ClosePane, NewTab, NewWorkspace, NextTab, PreviousTab, SplitDown, SplitRight, ToggleZoom,
@@ -156,6 +156,8 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
                 entry("Send Message", &menu::Confirm),
                 entry("Stop Generation", &menu::Cancel),
                 entry("Complete Slash Command", &AcceptSlashCommand),
+                entry("Increase Effort", &IncreaseEffort),
+                entry("Decrease Effort", &DecreaseEffort),
             ],
         ));
     }
@@ -469,6 +471,8 @@ mod tests {
         assert_eq!(titles(&sheet, cx), ["Thread", "General"]);
         let all = labels(&sheet, cx);
         assert!(all.contains(&"Send Message"));
+        assert!(all.contains(&"Increase Effort"));
+        assert!(all.contains(&"Decrease Effort"));
         assert!(all.contains(&"Toggle Changes"));
         assert!(!all.contains(&"Split Right"));
     }

@@ -139,12 +139,6 @@ Keep the existing inference for agents without those reports and keep background
 separately: v2 idle describes foreground state and does not mean all work ended. Preserve
 steering and AIR functionality where agents still provide them only on v1.
 
-### Step reasoning effort with keyboard shortcuts
-
-Follow t3code's [#19928](https://github.com/pingdotgg/t3code/pull/19928): shortcuts step through
-the current agent/model's advertised reasoning-effort choices. Use the existing configuration
-path and keep the picker in sync; do not assume every model has the same effort levels.
-
 ### Search the conversation in a thread
 
 Add in-thread message and plan search, beyond title search, following

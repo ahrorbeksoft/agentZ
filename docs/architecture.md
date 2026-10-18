@@ -696,6 +696,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Clicks select as in Zed's editor: a double-click selects a word (or a run of punctuation or
   spaces, or a chip whole), a triple-click its line, a fourth all of it, and dragging on from a
   double- or triple-click extends by whole words or lines.
+- **Effort keys** (`AgentView::step_effort`; t3code's Increase and Decrease Effort, on Zed's
+  `CycleThinkingEffort` key): in the composer, Ctrl-' moves the agent's reasoning effort to the
+  next of the levels it offers for its model, and Ctrl-" (Ctrl-Shift-') to the one before,
+  wrapping around at either end. They set it as its picker does, so the picker shows the new
+  level; an on/off thinking setting flips. They're in the shortcut sheet and the command
+  palette. A held key repeats, as Zed's does: GPUI's actions can't tell a repeat apart, so
+  t3code's ignoring of repeats isn't ported.
 - **Mentions** (`mention_menu.rs`, `agent_view.rs`, `server/prompt_requests.rs`; Zed's mentions
   with t3code's menu, picked in `design/composer/`): @ lists matches at once, under Files and
   Threads: the thread folder's files and folders (`Request::ListFiles`, gitignored ones left

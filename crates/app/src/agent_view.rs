@@ -122,6 +122,11 @@ gpui::actions!(
         AllowAlways,
         /// Answers the first permission request waiting with its first "reject once" choice.
         RejectOnce,
+        /// Raises the agent's reasoning effort to its next level, from the highest to the lowest.
+        IncreaseEffort,
+        /// Lowers the agent's reasoning effort to its previous level, from the lowest to the
+        /// highest.
+        DecreaseEffort,
     ]
 );
 /// Matches Zed's default `agent.max_content_width`.
@@ -267,6 +272,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", menu::SelectPrevious, Some(KEY_CONTEXT)),
         KeyBinding::new("down", menu::SelectNext, Some(KEY_CONTEXT)),
         KeyBinding::new("tab", AcceptSlashCommand, Some(KEY_CONTEXT)),
+        // Zed's key for cycling the thinking effort steps up; with Shift, down. Shift-' is read
+        // as `"`, with no Shift.
+        KeyBinding::new("ctrl-'", IncreaseEffort, Some(KEY_CONTEXT)),
+        KeyBinding::new("ctrl-\"", DecreaseEffort, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
         // Zed's `use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
@@ -8468,6 +8477,54 @@ impl AgentView {
         })
     }
 
+    /// t3code's Increase and Decrease Effort: the agent's reasoning effort one of the levels it
+    /// offers up or down, wrapping around, set as its picker sets it. An on/off thinking setting
+    /// flips, as Zed's `CycleThinkingEffort` flips it.
+    fn step_effort(&mut self, up: bool, cx: &mut Context<Self>) {
+        let change = self
+            .thread
+            .read(cx)
+            .config_options()
+            .iter()
+            .find_map(|option| {
+                if option.category != Some(acp::SessionConfigOptionCategory::ThoughtLevel) {
+                    return None;
+                }
+                let value = match &option.kind {
+                    acp::SessionConfigKind::Select(select) => {
+                        let choices = select_choices(&select.options);
+                        if choices.len() < 2 {
+                            return None;
+                        }
+                        let current = choices
+                            .iter()
+                            .position(|(_, value, _)| *value == select.current_value);
+                        let index = match (current, up) {
+                            (Some(index), true) => (index + 1) % choices.len(),
+                            (Some(index), false) => {
+                                index.checked_sub(1).unwrap_or(choices.len() - 1)
+                            }
+                            (None, true) => 0,
+                            (None, false) => choices.len() - 1,
+                        };
+                        acp::SessionConfigOptionValue::value_id(choices[index].1.clone())
+                    }
+                    acp::SessionConfigKind::Boolean(boolean) => {
+                        acp::SessionConfigOptionValue::boolean(!boolean.current_value)
+                    }
+                    _ => return None,
+                };
+                Some((option.id.clone(), value))
+            });
+        let Some((config_id, value)) = change else {
+            cx.propagate();
+            return;
+        };
+        self.thread.update(cx, |thread, cx| {
+            thread.set_config_option(config_id, value, cx)
+        });
+    }
+
     /// Zed's AllowOnce, AllowAlways and RejectOnce: the first request's first choice of that
     /// kind.
     fn answer_first_request(&mut self, kind: acp::PermissionOptionKind, cx: &mut Context<Self>) {
@@ -11109,6 +11166,8 @@ impl AgentView {
             .on_action(cx.listener(Self::select_next_command))
             .on_action(cx.listener(Self::accept_slash_command))
             .on_action(cx.listener(Self::select_previous_command))
+            .on_action(cx.listener(|this, _: &IncreaseEffort, _, cx| this.step_effort(true, cx)))
+            .on_action(cx.listener(|this, _: &DecreaseEffort, _, cx| this.step_effort(false, cx)))
             .justify_center()
             .map(|this| match style {
                 ComposerStyle::Bar => this
@@ -18831,6 +18890,60 @@ mod tests {
 
     fn sent(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> Vec<Request> {
         client.read_with(cx, |client, _| client.sent_for_test())
+    }
+
+    /// t3code's Increase and Decrease Effort: Ctrl-' and Ctrl-" step through the levels the
+    /// agent offers, wrapping around at either end, as its picker sets them.
+    #[gpui::test]
+    fn effort_keys_step_through_the_agents_levels(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let offer = |current: &str, cx: &mut VisualTestContext| {
+            let options: Vec<acp::SessionConfigOption> =
+                serde_json::from_value(serde_json::json!([
+                    {"id": "effort", "name": "Effort", "category": "thought_level",
+                     "type": "select", "currentValue": current,
+                     "options": [{"value": "low", "name": "Low"},
+                                 {"value": "medium", "name": "Medium"},
+                                 {"value": "high", "name": "High"}]},
+                ]))
+                .expect("options");
+            thread.update(cx, |thread, cx| {
+                thread.update_state_for_test(|state| state.config_options = options, cx)
+            });
+            cx.run_until_parked();
+        };
+        let last_set = |cx: &mut VisualTestContext| {
+            sent(&client, cx)
+                .into_iter()
+                .rev()
+                .find_map(|request| match request {
+                    Request::SetConfigOption {
+                        config_id, value, ..
+                    } if &*config_id.0 == "effort" => {
+                        value.as_value_id().map(|value| value.0.to_string())
+                    }
+                    _ => None,
+                })
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into())], cx)
+        });
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        offer("medium", cx);
+        cx.simulate_keystrokes("ctrl-'");
+        assert_eq!(last_set(cx).as_deref(), Some("high"));
+        cx.simulate_keystrokes("ctrl-\"");
+        assert_eq!(last_set(cx).as_deref(), Some("low"));
+        offer("high", cx);
+        cx.simulate_keystrokes("ctrl-'");
+        assert_eq!(last_set(cx).as_deref(), Some("low"));
+        offer("low", cx);
+        cx.simulate_keystrokes("ctrl-\"");
+        assert_eq!(last_set(cx).as_deref(), Some("high"));
     }
 
     /// What the agent left running shows above the composer, each with Stop, which asks the
