@@ -560,6 +560,10 @@ pub struct Task {
     /// `parent` is a thread there.
     #[serde(default)]
     pub parent_machine: Option<String>,
+    /// Set on the agent's own subagent that its agent lets agentZ stop (ACP's subagent
+    /// `cancel` capability).
+    #[serde(default)]
+    pub stoppable: bool,
 }
 
 /// A thread on another machine, by the name the app gives that machine.
@@ -578,6 +582,12 @@ impl Task {
     /// Listed with the parent's subthreads: the agent's own subagents only while they run.
     pub fn is_listed(&self) -> bool {
         !self.is_agents_own() || self.outcome.is_none()
+    }
+
+    /// Whether it runs and can be stopped: the agent's own subagent only when its agent lets
+    /// agentZ stop it.
+    pub fn can_stop(&self) -> bool {
+        self.outcome.is_none() && (!self.is_agents_own() || self.stoppable)
     }
 }
 
@@ -2688,6 +2698,7 @@ mod tests {
             agent_session: None,
             runs_on: None,
             parent_machine: None,
+            stoppable: false,
         };
         let child = store.add_subthread(task(parent), None).expect("subthread");
         let grandchild = store.add_subthread(task(child), None).expect("subthread");
@@ -2839,6 +2850,7 @@ mod tests {
                     agent_session: None,
                     runs_on: None,
                     parent_machine: None,
+                    stoppable: false,
                 },
                 None,
             )
@@ -2917,6 +2929,7 @@ mod tests {
                     agent_session: None,
                     runs_on: None,
                     parent_machine: None,
+                    stoppable: false,
                 },
                 None,
             )

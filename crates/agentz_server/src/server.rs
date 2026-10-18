@@ -1083,7 +1083,13 @@ impl Server {
 
             Request::Prompt { connection, prompt } => self.prompt(connection, prompt, false),
             Request::Cancel(connection) => {
-                self.update_thread(connection, |thread| thread.cancel())?;
+                let is_subagent = match connection {
+                    ConnectionId::Thread(thread_id) => self.stop_subagent(thread_id),
+                    ConnectionId::LoginSession(_) => false,
+                };
+                if !is_subagent {
+                    self.update_thread(connection, |thread| thread.cancel())?;
+                }
                 Ok(Response::Ok)
             }
             request @ (Request::QueueMessage { .. }
@@ -2392,6 +2398,7 @@ impl Server {
                     ConnectionId::Thread(_),
                     event @ (AgentThreadEvent::SubagentStarted(_)
                     | AgentThreadEvent::SubagentUpdate { .. }
+                    | AgentThreadEvent::SubagentPrompted { .. }
                     | AgentThreadEvent::SubagentEnded { .. }),
                 ) => subagent_events.push(event),
                 (ConnectionId::LoginSession(_), _) => {}

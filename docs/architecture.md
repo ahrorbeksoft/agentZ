@@ -1836,22 +1836,35 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
 Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`,
 `render_subagent_expanded_content`) and t3code's child threads.
 
-- **Claude Agent's run as subthreads** (`server/subagents.rs`): agentZ's `initialize` says it
-  takes AIR's `nativeSubagentSessions`, so Claude Agent announces each subagent
-  (`subagent_spawned`: name, task, prompt), sends its steps and words in a session of its own,
-  and says when it ends (`subagent_state_update`). `AgentThread` reads them raw
-  (`subagent_notice`) and emits `SubagentStarted`, `SubagentUpdate` and `SubagentEnded`. The
-  server makes each a subthread with a `Task` marked by its session (`Task::agent_session`,
-  `is_agents_own`), whose `AgentThread::subagent` has no agent of its own: it shows what the
-  parent's agent sends in that session, and takes no messages. A subagent's own subagents go
-  under it. The parent gets a card (a tool call with `subthread`, `add_subagent_card`), which
-  ends with the subagent, with its report and how long it ran (`end_subagent_card`). The
-  agent hears of the end itself, so the parent isn't told (`delivered`); subagents still
-  running when the agent stops, or at shutdown, end as Interrupted
-  (`end_orphaned_subagents`). A subagent's permission request is asked in the parent, at the
-  end of the thread as the agent's own would be, its card naming the subagent ("<description>
-  · Edit .env") (`PermissionRequest::subagent_card`), while its tool call goes to the
-  subthread.
+- **Agents' subagent sessions run as subthreads** (`server/subagents.rs`): agentZ's
+  `initialize` says it takes ACP's subagent sessions (`clientCapabilities.subagents`), so an
+  agent announces each subagent (a `subagent_update`: its session, title and description),
+  sends its steps and words in that session, and says when it's running, waiting on the user or
+  idle, with why it stopped (`state`). A subagent's prompt comes as a `session_message` in
+  its session (streamed as `session_message_chunk`s); another one later runs the idle subagent
+  again, as Claude Agent does when it sends a subagent more work. `AgentThread::subagent_update`
+  reads them, and `subagent_notice` reads Claude Agent's own: as AIR (see Background tasks),
+  it keeps AIR's `nativeSubagentSessions`, announcing each subagent (`subagent_spawned`:
+  name, task, prompt) and its end (`subagent_state_update`) raw. Either way `AgentThread`
+  emits `SubagentStarted`, `SubagentPrompted`, `SubagentUpdate` and `SubagentEnded`, once
+  per run of a session, so a child is shown once. The server makes each a subthread with a
+  `Task` marked by its session (`Task::agent_session`, `is_agents_own`), whose
+  `AgentThread::subagent` has no agent of its own: it shows what the parent's agent sends in
+  that session, and takes no messages. A subagent's own subagents go under it. One that runs
+  again goes on in its subthread (`subagent_resumed`), its new prompt a message there. The
+  parent gets a card (a tool call with `subthread`, `add_subagent_card`), which ends with the
+  subagent, with its report and how long it ran (`end_subagent_card`). The agent hears of the
+  end itself, so the parent isn't told (`delivered`); subagents still running when the agent
+  stops, or at shutdown, end as Interrupted (`end_orphaned_subagents`). A subagent's
+  permission request is asked in the parent, at the end of the thread as the agent's own would
+  be, its card naming the subagent ("<description> · Edit .env")
+  (`PermissionRequest::subagent_card`), while its tool call goes to the subthread.
+- **Stop** (`Task::stoppable`, `Task::can_stop`): the agent runs its subagents, so agentZ can
+  stop one only when its `subagent_update` says it may (`capabilities.cancel`). Then its card,
+  its row in the Agents list and its subthread have Stop, which cancels its session
+  (`session/cancel` with the subagent's session, `AgentThread::stop_subagent`, sent by the
+  server's `Request::Cancel` for the subthread). It ends as its agent says, Stopped once idle
+  as cancelled.
 - **The row** (`AgentView::render_subagent`, `tool_calls::SubagentCall`): any subagent call
   (one with a subthread, or whose input has a `subagent_type`, as Factory Droid's Task has) is
   a row of its own, not folded into a run of work: a bot icon, the description, the type as a
@@ -1861,18 +1874,19 @@ Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`
   background" instead, since its call ended as it started.
 - **At work in a subthread** (picked in `design/agentz-tools/`): Zed's card while it runs
   (`render_subthread_card`): a spinner, the description, its type when the agent says, no
-  Stop (the agent runs it), the step it's on inside, and the strip that opens it full screen.
-  While it waits on a permission, "Waiting for you" in its header takes the step's place.
-  Once it ends, it's the row again.
+  Stop unless its agent lets agentZ stop it, the step it's on inside, and the strip that opens
+  it full screen. While it waits on a permission, "Waiting for you" in its header takes the
+  step's place. Once it ends, it's the row again.
 - **Opened**: a subthread's shows Zed's preview (`render_subagent_preview`, following the
   subthread with `sync_subagent_threads`): its last 8 steps, fading at the top when there are
   more, its report, and a strip that opens the subthread ("Make Subagent Full Screen").
   Droid's, which has no steps, shows its report, then a "Task" line that opens its options as
   tags and its prompt, as Input opens JSON (`render_subagent_task`). A background one, whose
   report is only the launch notice, and one still running open to their task.
-- **Its subthread** opens as agentZ's own do, with no Stop in its title bar or bar: the agent
-  runs it. The Agents list and the sidebar's count show it only while it runs
-  (`Task::is_listed`), with "Claude Agent’s" in place of the model and Stop.
+- **Its subthread** opens as agentZ's own do, with no Stop in its title bar or bar unless its
+  agent lets agentZ stop it. The Agents list and the sidebar's count show it only while it
+  runs (`Task::is_listed`), with "Claude Agent’s" in place of the model, and Stop only when it
+  can be stopped.
 
 ### Diffs
 

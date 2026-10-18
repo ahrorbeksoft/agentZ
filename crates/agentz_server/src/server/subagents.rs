@@ -1,13 +1,15 @@
-//! The agent's own subagents (Claude Agent's native subagent sessions) as subthreads. Each is a
-//! thread with no agent of its own, which shows what the parent's agent sends in the
-//! subagent's session, and a card in the parent's conversation opens it. The agent hears of
-//! its subagents' ends itself, so they're never announced to it.
+//! The agent's own subagents (ACP's subagent sessions, or Claude Agent's in AIR's draft of them)
+//! as subthreads. Each is a thread with no agent of its own, which shows what the parent's
+//! agent sends in the subagent's session, and a card in the parent's conversation opens it. The
+//! agent hears of its subagents' ends itself, so they're never announced to it.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use agent_client_protocol::schema::v1 as acp;
 use agent_thread::{AgentThread, AgentThreadEvent, Attachments, Subagent};
 use agentz_protocol::ConnectionId;
+use agentz_protocol::thread::Entry;
 use gpui_shared_string::SharedString;
 use projects::{Task, TaskEnd, TaskOutcome, ThreadCreator, ThreadId};
 use util::ResultExt as _;
@@ -25,21 +27,47 @@ impl Server {
                 self.subagent_started(thread_id, subagent)
             }
             AgentThreadEvent::SubagentUpdate { session, update } => {
-                let Some(subthread) = self.subagent_thread(thread_id, &session) else {
+                let Some(subthread) = self.loaded_subagent_thread(thread_id, &session) else {
                     return;
                 };
-                // Its thread went with the server that handed the agent on.
-                if !self.threads.contains_key(&subthread) {
-                    let Some(thread) = self.start_thread(subthread).log_err() else {
-                        return;
-                    };
-                    self.threads.insert(subthread, thread);
-                    self.thread_changed(ConnectionId::Thread(subthread));
+                let streams_prompt = matches!(update, acp::SessionUpdate::UserMessageChunk(_));
+                let Some(thread) = self.threads.get_mut(&subthread) else {
+                    return;
+                };
+                thread.apply_subagent_update(update);
+                self.changed_connections
+                    .insert(ConnectionId::Thread(subthread));
+                // The rest of the first prompt it was sent, streamed.
+                let mut prompts = thread.entries().iter().filter_map(|entry| match entry {
+                    Entry::UserMessage(text) => Some(text),
+                    _ => None,
+                });
+                if streams_prompt && let (Some(prompt), None) = (prompts.next(), prompts.next()) {
+                    let prompt = prompt.clone();
+                    self.projects
+                        .update_task(subthread, |task| task.prompt = prompt);
                 }
+            }
+            AgentThreadEvent::SubagentPrompted { session, prompt } => {
+                let Some(subthread) = self.loaded_subagent_thread(thread_id, &session) else {
+                    return;
+                };
+                let Some(parent) = self
+                    .projects
+                    .thread(subthread)
+                    .and_then(|thread| thread.task.as_ref())
+                    .map(|task| task.parent)
+                else {
+                    return;
+                };
+                self.projects.update_task(subthread, |task| {
+                    if task.prompt.is_empty() {
+                        task.prompt = prompt.clone();
+                    }
+                });
                 if let Some(thread) = self.threads.get_mut(&subthread) {
-                    thread.apply_subagent_update(update);
-                    self.changed_connections
-                        .insert(ConnectionId::Thread(subthread));
+                    thread.start_subagent(Some((prompt, ThreadCreator::Thread(parent))));
+                    self.thread_changed(ConnectionId::Thread(subthread));
                 }
             }
             AgentThreadEvent::SubagentEnded { session, end } => {
@@ -52,6 +80,11 @@ impl Server {
     }
 
     fn subagent_started(&mut self, thread_id: ThreadId, subagent: Subagent) {
+        // ACP's subagents are reused: one that was done goes on in its subthread.
+        if let Some(subthread) = self.loaded_subagent_thread(thread_id, &subagent.session) {
+            self.subagent_resumed(subthread, subagent);
+            return;
+        }
         let parent = subagent
             .parent_session
             .as_deref()
@@ -72,7 +105,7 @@ impl Server {
         let Some(subthread) = self.projects.add_subthread(
             Task {
                 parent,
-                prompt: subagent.task.clone(),
+                prompt: subagent.task.clone().unwrap_or_default(),
                 role: None,
                 client_request_id: None,
                 outcome: None,
@@ -80,6 +113,7 @@ impl Server {
                 agent_session: Some(subagent.session.clone()),
                 runs_on: None,
                 parent_machine: None,
+                stoppable: subagent.stoppable,
             },
             agent_id,
         ) else {
@@ -93,7 +127,12 @@ impl Server {
         };
         let mut thread = AgentThread::subagent(agent_name, cwd);
         thread.set_attachments(Attachments::for_thread(&self.data_dir, subthread));
-        thread.start_subagent(Some((subagent.task.clone(), ThreadCreator::Thread(parent))));
+        thread.start_subagent(
+            subagent
+                .task
+                .clone()
+                .map(|task| (task, ThreadCreator::Thread(parent))),
+        );
         self.threads.insert(subthread, thread);
         self.thread_changed(ConnectionId::Thread(subthread));
         if let Some(parent_thread) = self.threads.get_mut(&parent) {
@@ -101,6 +140,60 @@ impl Server {
             self.changed_connections
                 .insert(ConnectionId::Thread(parent));
         }
+    }
+
+    /// The subagent in `subthread` works again, with a new card in its parent's conversation
+    /// if it was done.
+    fn subagent_resumed(&mut self, subthread: ThreadId, subagent: Subagent) {
+        let Some(thread) = self.projects.thread(subthread) else {
+            return;
+        };
+        let Some(task) = thread.task.as_ref() else {
+            return;
+        };
+        let parent = task.parent;
+        let was_done = task.outcome.is_some();
+        // Its agent may not name it again.
+        let card = Subagent {
+            name: thread.title.clone(),
+            ..subagent.clone()
+        };
+        self.projects.update_task(subthread, |task| {
+            task.outcome = None;
+            task.delivered = false;
+            task.stoppable = subagent.stoppable;
+        });
+        if let Some(thread) = self.threads.get_mut(&subthread) {
+            thread.start_subagent(
+                subagent
+                    .task
+                    .map(|task| (task, ThreadCreator::Thread(parent))),
+            );
+            self.thread_changed(ConnectionId::Thread(subthread));
+        }
+        if was_done && let Some(parent_thread) = self.threads.get_mut(&parent) {
+            parent_thread.add_subagent_card(&card, subthread);
+            self.changed_connections
+                .insert(ConnectionId::Thread(parent));
+        }
+    }
+
+    /// Asks the agent that runs the subagent in `subthread` to stop it, if it lets agentZ.
+    /// Returns whether `subthread` is an agent's own subagent's, which only its agent stops.
+    pub(super) fn stop_subagent(&mut self, subthread: ThreadId) -> bool {
+        let Some(session) = self
+            .projects
+            .thread(subthread)
+            .and_then(|thread| thread.task.as_ref())
+            .and_then(|task| task.agent_session.clone())
+        else {
+            return false;
+        };
+        let owner = self.subagent_owner(subthread);
+        if let Some(thread) = self.threads.get_mut(&owner) {
+            thread.stop_subagent(&session);
+        }
+        true
     }
 
     /// Ends the subagent's subthread and its card, and the task, unless it ended already:
@@ -214,6 +307,18 @@ impl Server {
                     && self.subagent_owner(thread.id) == owner
             })
             .map(|thread| thread.id)
+    }
+
+    /// [`Self::subagent_thread`], started if its thread went with the server that handed the
+    /// agent on.
+    fn loaded_subagent_thread(&mut self, owner: ThreadId, session: &str) -> Option<ThreadId> {
+        let subthread = self.subagent_thread(owner, session)?;
+        if !self.threads.contains_key(&subthread) {
+            let thread = self.start_thread(subthread).log_err()?;
+            self.threads.insert(subthread, thread);
+            self.thread_changed(ConnectionId::Thread(subthread));
+        }
+        Some(subthread)
     }
 
     /// A subagent's subthread as it was kept: working if the subagent still is.

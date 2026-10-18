@@ -19,8 +19,13 @@ with "Usage limit reached", the command still running. "subagents [seconds]" run
 its native subagent sessions (`_meta.jetbrains.air.capabilities` has "nativeSubagentSessions"),
 it announces each (`subagent_spawned`), sends their searches, reads and reports in their own
 sessions, a step every 0.2 seconds (or the seconds given), and ends each with
-`subagent_state_update`; to others, each is one completed call with its report. "subagents
-permission" has the first ask for permission in its session first. "droid-task [seconds]" runs
+`subagent_state_update`; to other clients that take ACP's subagent sessions
+(`clientCapabilities.subagents`) it runs them in those (`subagent_update`, with each prompt a
+`session_message`); to others, each is one completed call with its report. "subagents
+permission" has the first ask for permission in its session first, "subagents standard" uses
+ACP's sessions with any client that takes them, as an agent that doesn't know AIR does, and
+"subagents standard resume" then sends the first another message, which sets it working again.
+"subagent-stop" runs one in ACP's sessions that searches until `session/cancel` stops it. "droid-task [seconds]" runs
 a subagent as Factory Droid does: a "Task" tool call, with its type, description, complexity and
 prompt as input, that completes with the report after half a second (or the seconds given);
 "droid-task background" sends it to the background, so it ends at once with Droid's notice
@@ -354,6 +359,11 @@ async_tasks = False
 # Whether the client takes Claude Agent's native subagent sessions, in which it runs each
 # subagent.
 native_subagents = False
+# Whether the client takes ACP's subagent sessions (`clientCapabilities.subagents`).
+standard_subagents = False
+# The subagent of the "subagent-stop" prompt, which works until it's stopped: its session, the
+# session it runs under, and the prompt's request id.
+stoppable_subagent = None
 # Background commands still running, by task id: an event set to stop each, and its name.
 background_tasks = {}
 background_task_count = 0
@@ -555,8 +565,103 @@ SUBAGENTS = [
 ]
 
 
-def run_subagents(request_id, session_id, pause, asks_permission):
-    """Two subagents at once, as Claude Agent runs them."""
+def session_message(child, sender, message_id, text):
+    return {"sessionUpdate": "session_message", "messageId": message_id,
+            "senderSessionId": sender, "recipientSessionId": child,
+            "content": [{"type": "text", "text": text}]}
+
+
+def subagent_state(child, state, **fields):
+    return {"sessionUpdate": "subagent_update", "sessionId": child,
+            "state": {"state": state, **fields}}
+
+
+def run_standard_subagents(request_id, session_id, pause, asks_permission, resumes):
+    """Two subagents at once, as an agent that implements ACP's subagent sessions runs them
+    (Claude Agent's, to clients other than AIR): each announced with its title, working and
+    stoppable, its prompt a message in its session (the second's streamed in chunks), and idle
+    once done. With `resumes`, the first is sent another message once both are done, and works
+    again."""
+    sessions = [f"subagent-{request_id}-{index}" for index in range(len(SUBAGENTS))]
+    for index, (subagent, child) in enumerate(zip(SUBAGENTS, sessions)):
+        send_task_update(session_id, {"sessionUpdate": "subagent_update", "sessionId": child,
+                                      "title": subagent["name"], "description": "Explore",
+                                      "capabilities": {"cancel": {}},
+                                      "state": {"state": "running"}})
+        if index == 0:
+            send_task_update(child, session_message(child, session_id, f"{child}-prompt",
+                                                    subagent["prompt"]))
+        else:
+            words = subagent["prompt"].split(" ")
+            for part in [" ".join(words[:3]) + " ", " ".join(words[3:])]:
+                send_task_update(child, {"sessionUpdate": "session_message_chunk",
+                                         "messageId": f"{child}-prompt",
+                                         "senderSessionId": session_id,
+                                         "recipientSessionId": child,
+                                         "content": {"type": "text", "text": part}})
+    if asks_permission:
+        send_task_update(session_id, subagent_state(sessions[0], "requires_action"))
+        client_request("session/request_permission", {
+            "sessionId": sessions[0],
+            "toolCall": {"toolCallId": f"{sessions[0]}-edit", "title": "Edit .env",
+                         "kind": "edit", "status": "pending"},
+            "options": [{"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]})
+        send_task_update(session_id, subagent_state(sessions[0], "running"))
+        send_task_update(sessions[0], {"sessionUpdate": "tool_call_update",
+                                       "toolCallId": f"{sessions[0]}-edit",
+                                       "status": "completed"})
+    for step in range(max(len(subagent["steps"]) for subagent in SUBAGENTS)):
+        for subagent, child in zip(SUBAGENTS, sessions):
+            if step >= len(subagent["steps"]):
+                continue
+            call_id = f"{child}-step-{step}"
+            send_task_update(child, {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                                     "status": "in_progress", **subagent["steps"][step]})
+            time.sleep(pause)
+            send_task_update(child, {"sessionUpdate": "tool_call_update",
+                                     "toolCallId": call_id, "status": "completed"})
+    for subagent, child in zip(SUBAGENTS, sessions):
+        send_task_update(child, text_chunk("agent_message_chunk", subagent["report"]))
+        send_task_update(session_id, subagent_state(child, "idle", stopReason="end_turn"))
+        time.sleep(pause)
+    if resumes:
+        child = sessions[0]
+        send_task_update(session_id, subagent_state(child, "running"))
+        send_task_update(child, session_message(child, session_id, f"{child}-again",
+                                                "Find where it's styled too."))
+        send_task_update(child, text_chunk("agent_message_chunk",
+                                           "It's styled in the same file."))
+        send_task_update(session_id, subagent_state(child, "idle", stopReason="end_turn"))
+    update(session_id, text_chunk("agent_message_chunk", "Both subagents are done."))
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+
+def start_stoppable_subagent(request_id, session_id):
+    """A subagent in ACP's subagent sessions that searches until it's stopped with
+    `session/cancel` for its session, after which the turn goes on."""
+    global stoppable_subagent
+    child = f"subagent-{request_id}-0"
+    send_task_update(session_id, {"sessionUpdate": "subagent_update", "sessionId": child,
+                                  "title": "Search the whole disk",
+                                  "capabilities": {"cancel": {}},
+                                  "state": {"state": "running"}})
+    send_task_update(child, session_message(child, session_id, f"{child}-prompt",
+                                            "Search the whole disk for Rust files."))
+    send_task_update(child, {"sessionUpdate": "tool_call", "toolCallId": f"{child}-search",
+                             "title": "Search for \"*.rs\"", "kind": "search",
+                             "status": "in_progress"})
+    stoppable_subagent = (child, session_id, request_id)
+
+
+def run_subagents(request_id, session_id, pause, asks_permission, standard=False,
+                  resumes=False):
+    """Two subagents at once, as Claude Agent runs them: in AIR's draft of subagent sessions to
+    a client that takes it, in ACP's to other clients that take those (or to any that does, for
+    "standard", as an agent that doesn't know AIR does), and as tool calls to the rest."""
+    if standard_subagents and (standard or not native_subagents):
+        run_standard_subagents(request_id, session_id, pause, asks_permission, resumes)
+        return
     if not native_subagents:
         for index, subagent in enumerate(SUBAGENTS):
             update(session_id, {"sessionUpdate": "tool_call",
@@ -882,6 +987,7 @@ for line in sys.stdin:
         air = ((capabilities.get("_meta") or {}).get("jetbrains") or {}).get("air") or {}
         async_tasks = "asyncTasks" in (air.get("capabilities") or [])
         native_subagents = "nativeSubagentSessions" in (air.get("capabilities") or [])
+        standard_subagents = capabilities.get("subagents") is not None
         if capabilities.get("auth", {}).get("terminal"):
             auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
                                  "type": "terminal", "args": ["--login"]})
@@ -992,7 +1098,16 @@ for line in sys.stdin:
                                                    f"**Task stopped by user:** {name}."))
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopped": task is not None}})
     elif method == "session/cancel":
-        if running_turn is not None:
+        if (stoppable_subagent is not None
+                and message["params"]["sessionId"] == stoppable_subagent[0]):
+            child, parent, request_id = stoppable_subagent
+            stoppable_subagent = None
+            send_task_update(child, {"sessionUpdate": "tool_call_update",
+                                     "toolCallId": f"{child}-search", "status": "failed"})
+            send_task_update(parent, subagent_state(child, "idle", stopReason="cancelled"))
+            update(parent, text_chunk("agent_message_chunk", "The subagent stopped."))
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+        elif running_turn is not None:
             send({"jsonrpc": "2.0", "id": running_turn, "result": {"stopReason": "cancelled"}})
             running_turn = None
     elif method == "session/set_config_option":
@@ -1200,9 +1315,14 @@ for line in sys.stdin:
             threading.Thread(target=run_background_task,
                              args=(session_id, task_id, seconds, stop), daemon=True).start()
         elif prompt_text == "subagents" or prompt_text.startswith("subagents "):
-            argument = prompt_text.split(" ", 1)[1] if " " in prompt_text else ""
-            pause = 0.2 if argument in ("", "permission") else float(argument)
-            run_subagents(message["id"], params["sessionId"], pause, argument == "permission")
+            words = prompt_text.split()[1:]
+            flags = ("standard", "permission", "resume")
+            numbers = [word for word in words if word not in flags]
+            pause = float(numbers[0]) if numbers else 0.2
+            run_subagents(message["id"], params["sessionId"], pause, "permission" in words,
+                          standard="standard" in words, resumes="resume" in words)
+        elif prompt_text == "subagent-stop":
+            start_stoppable_subagent(message["id"], params["sessionId"])
         elif prompt_text == "droid-task background":
             run_droid_task(message["id"], params["sessionId"], 0, background=True)
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):

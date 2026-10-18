@@ -144,7 +144,9 @@ From Zed's guidelines, which this code follows:
   once it ends (`background-task 4 limit` uses the account's limit up as its turn ends, the
   command still running). `subagents [seconds]` runs two subagents at once in sessions of their own, as
   Claude Agent does with AIR's native subagent sessions (`subagents permission` has the first
-  ask for permission), and `droid-task [seconds]` runs one as Factory Droid's Task call does
+  ask for permission; `subagents standard` runs them in ACP's subagent sessions, and
+  `subagents standard resume` then sends the first more work; `subagent-stop` runs one there
+  that searches until it's stopped), and `droid-task [seconds]` runs one as Factory Droid's Task call does
   (`droid-task background` sends it to the background, as Droid's Task with `await: false`).
   With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with

@@ -1140,7 +1140,8 @@ impl AgentView {
 
     /// t3code's Agents control with Zed's subagent headers as its rows: each subthread's state,
     /// title and model, and what it changed. The agent's own subagents show only while they
-    /// run, with the agent's name: it runs them, so they have no Stop or model of their own.
+    /// run, with the agent's name: it runs them, so they have no model of their own, and Stop
+    /// only when it lets agentZ stop them.
     fn render_agents_section(
         &self,
         window: &mut Window,
@@ -1212,11 +1213,11 @@ impl AgentView {
                     .as_ref()
                     .and_then(|task| task.outcome.as_ref())
                     .map(|outcome| outcome.end);
-                let is_running = end.is_none();
                 let is_agents_own = thread
                     .task
                     .as_ref()
                     .is_some_and(projects::Task::is_agents_own);
+                let can_stop = thread.task.as_ref().is_some_and(projects::Task::can_stop);
                 // Zed's subagent card: a spinner while it runs, then a check, a cross, or a
                 // faint circle once stopped.
                 let status = match end {
@@ -1356,7 +1357,7 @@ impl AgentView {
                                 .child(diff_stat(changes.additions, changes.deletions)),
                         )
                     })
-                    .when(is_running && !is_agents_own, |this| {
+                    .when(can_stop, |this| {
                         this.child(
                             div()
                                 .debug_selector(move || {
@@ -1651,14 +1652,14 @@ impl AgentView {
         Some(thread.task.as_ref()?.outcome.as_ref()?.end)
     }
 
-    /// Whether this is one of the parent's agent's own subagents, which that agent runs and
-    /// stops: its subthread has no Stop.
-    fn is_agents_own_subagent(&self, cx: &App) -> bool {
+    /// Whether the subthread runs and has Stop. The parent's agent runs its own subagents, so
+    /// one of those has it only when that agent lets agentZ stop it.
+    fn can_stop_subthread(&self, cx: &App) -> bool {
         self.store
             .read(cx)
             .thread(self.thread_id)
             .and_then(|thread| thread.task.as_ref())
-            .is_some_and(projects::Task::is_agents_own)
+            .is_none_or(projects::Task::can_stop)
     }
 
     /// Zed's subagent title bar, under the parent's header: the subthread's title and how it
@@ -1675,7 +1676,7 @@ impl AgentView {
             end,
             Some(TaskEnd::Failed | TaskEnd::Cancelled | TaskEnd::Interrupted)
         );
-        let can_stop = !is_done && !self.is_agents_own_subagent(cx);
+        let can_stop = self.can_stop_subthread(cx);
         let focus_handle = self.focus_handle.clone();
         h_flex()
             .debug_selector(|| "subthread-title-bar".into())
@@ -1804,7 +1805,7 @@ impl AgentView {
             .and_then(|thread| thread.task.as_ref())
             .and_then(|task| task.outcome.as_ref());
         let status = subthread_status(started_at, outcome, SystemTime::now());
-        let can_stop = outcome.is_none() && !self.is_agents_own_subagent(cx);
+        let can_stop = self.can_stop_subthread(cx);
         let runs = self.subthread_runs(cx);
         let focus_handle = self.focus_handle.clone();
         h_flex()
@@ -7401,7 +7402,12 @@ impl AgentView {
                 meta: subagent.kind.clone(),
                 state: CardState::Running,
                 changes: None,
-                can_stop: false,
+                can_stop: self
+                    .store
+                    .read(cx)
+                    .thread(subthread)
+                    .and_then(|thread| thread.task.as_ref())
+                    .is_some_and(projects::Task::can_stop),
                 is_waiting,
                 question,
             };
@@ -20100,6 +20106,7 @@ mod tests {
                 agent_session: None,
                 runs_on: None,
                 parent_machine: None,
+                stoppable: false,
             });
             snapshot.threads.push(subthread);
         }
@@ -20327,6 +20334,7 @@ mod tests {
             agent_session: None,
             runs_on: None,
             parent_machine: Some("This Mac".into()),
+            stoppable: false,
         });
         devbox.threads.push(working);
         (mac, devbox)
@@ -20609,6 +20617,7 @@ mod tests {
             agent_session: Some("subagent-session".into()),
             runs_on: None,
             parent_machine: None,
+            stoppable: false,
         });
         snapshot.threads.push(subagent);
         snapshot
@@ -20847,6 +20856,71 @@ mod tests {
         assert!(cx.debug_bounds("subthread-bar").is_some());
         assert!(cx.debug_bounds("subthread-title-bar-stop").is_none());
         assert!(cx.debug_bounds("subthread-bar-stop").is_none());
+    }
+
+    /// [`subagent_snapshot`] of a running subagent whose agent lets agentZ stop it (ACP's
+    /// subagent `cancel` capability).
+    fn stoppable_subagent_snapshot() -> ProjectsSnapshot {
+        let mut snapshot = subagent_snapshot(true);
+        for thread in &mut snapshot.threads {
+            if let Some(task) = thread.task.as_mut().filter(|task| task.is_agents_own()) {
+                task.stoppable = true;
+            }
+        }
+        snapshot
+    }
+
+    /// One its agent lets agentZ stop has Stop in its row, which asks its server to stop it.
+    #[gpui::test]
+    fn an_agents_own_subagent_its_agent_lets_stop_has_stop(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+
+        let (view, cx) = open_parent(stoppable_subagent_snapshot(), cx);
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                Some(Response::Ok)
+            });
+        });
+        let stop = cx.debug_bounds("stop-subthread-row-12").expect("Stop");
+        cx.simulate_click(stop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().contains(&Request::Cancel(
+            agentz_protocol::ConnectionId::Thread(ThreadId(12))
+        )));
+    }
+
+    /// Its subthread has Stop too.
+    #[gpui::test]
+    fn the_subthread_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
+        let (_, cx) = open_in(stoppable_subagent_snapshot(), 12, false, cx);
+        assert!(cx.debug_bounds("subthread-title-bar-stop").is_some());
+        assert!(cx.debug_bounds("subthread-bar-stop").is_some());
+    }
+
+    /// And its card in the parent has Stop while it runs.
+    #[gpui::test]
+    fn the_card_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
+        let (view, cx) = open_parent(stoppable_subagent_snapshot(), cx);
+        let mut call = subagent_call(
+            "subagent:subagent-session",
+            "Find where the login view is drawn",
+            acp::ToolCallStatus::InProgress,
+        );
+        call.subthread = Some(ThreadId(12));
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![Entry::UserMessage("Find it".into()), Entry::ToolCall(call)],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subthread-card-1").is_some());
+        assert!(cx.debug_bounds("subthread-card-stop-1").is_some());
     }
 
     /// Ctrl-minus, Minimize and Open Parent all open the parent, and the command palette offers

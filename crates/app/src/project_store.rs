@@ -892,6 +892,7 @@ mod tests {
                     agent_session: None,
                     runs_on: None,
                     parent_machine: None,
+                    stoppable: false,
                 },
                 None,
             )

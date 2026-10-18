@@ -96,15 +96,6 @@ app and its machine servers still update together. Coordinate the ACP work with 
 protocol update above. Verify behavior with the mock agent; installed adapters' support has
 not been verified.
 
-### Support standard ACP subagent sessions
-
-Use typed subagent announcements, state and cancellation in place of AIR-specific
-`subagent_spawned` and `subagent_state_update` parsing where supported. Standard subagents
-can be adopted on v1 as well as v2; the current Claude adapter implements them
-([subagent sessions](https://github.com/agentclientprotocol/claude-agent-acp#subagent-sessions)).
-Keep the AIR path for agents that need it, preserve its async-task support, and avoid showing
-the same child twice. Keep agentZ-owned delegated tasks and their parent relationships.
-
 ### Fork native sessions when supported
 
 Use `session/fork` for a fork of the current session with the same agent, preserving the
