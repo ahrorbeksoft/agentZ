@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
+use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{AccountChoice, AccountId};
 use agentz_protocol::agents::{AgentId, InstallState};
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
@@ -438,7 +439,9 @@ impl Server {
     /// Fork from This Response ([`Request::ForkThread`]): a thread on the same agent and
     /// account, in the same folder, that begins with the conversation up to the end of the
     /// turn of the reply at `entry`, as t3code forks a finished run. Its first message brings
-    /// that conversation ([`fork_handoff`]).
+    /// that conversation ([`fork_handoff`]), unless its agent forks the thread's session
+    /// ([`agent_thread::AgentThread::fork_session`]), which it can only when the fork has all
+    /// of it.
     pub(super) fn fork_thread(&mut self, thread_id: ThreadId, entry: usize) -> Result<ThreadId> {
         let thread = self
             .projects
@@ -483,6 +486,18 @@ impl Server {
                 }
             },
         };
+        // The agent's session stands in for the conversation only when the fork has all of it
+        // and the agent knows it all: nothing waits to be told to it, and its session loaded.
+        let source_session = thread
+            .session_id
+            .clone()
+            .filter(|_| {
+                end == running.entries.len()
+                    && !running.is_working()
+                    && running.state.pending_handoffs.is_empty()
+                    && running.state.lost_history.is_none()
+            })
+            .map(acp::SessionId::new);
         let state = &running.state;
         let fork_view = ThreadView {
             entries: running.entries[..end].to_vec(),
@@ -574,6 +589,9 @@ impl Server {
                 handoffs: state.handoffs,
             });
             thread.set_handoffs(handoffs);
+            if let Some(source_session) = source_session {
+                thread.fork_session(source_session);
+            }
         })?;
         Ok(fork)
     }

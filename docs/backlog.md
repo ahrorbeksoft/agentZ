@@ -96,15 +96,6 @@ app and its machine servers still update together. Coordinate the ACP work with 
 protocol update above. Verify behavior with the mock agent; installed adapters' support has
 not been verified.
 
-### Fork native sessions when supported
-
-Use `session/fork` for a fork of the current session with the same agent, preserving the
-agent's context instead of sending a text handoff
-([SDK lifecycle](https://github.com/agentclientprotocol/rust-sdk/blob/v3.4.0/md/protocol-v2.md)).
-Verify that the returned session is usable. Keep the existing handoff for unsupported agents,
-cross-agent forks and earlier-turn forks the native operation cannot express. Preserve the
-fork's local conversation and its link to the parent.
-
 ### Use MCP-over-ACP with the stdio bridge as a fallback
 
 Attach agentZ's tools to the existing ACP connection where supported, replacing the

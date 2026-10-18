@@ -23,7 +23,7 @@ use agentz_protocol::terminal::{
 };
 use agentz_protocol::thread::{
     ConnectionStatus, Entry, FailedMessage, HandoffSource, LoginInput, LostHistory, ModeSwitch,
-    ThreadView, api_key_meta, login_input,
+    SessionRestore, ThreadView, api_key_meta, login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -771,6 +771,156 @@ async fn refuses_to_switch_a_working_threads_agent() {
     assert!(error.message.contains("working"), "{}", error.message);
 }
 
+/// An agent that forks sessions forks the source's for a fork from its last reply, which then
+/// knows the conversation: none waits for the fork's first message, and the fork goes on in
+/// that session. A fork from an earlier reply, which the source's session can't be, brings the
+/// conversation with its first message as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn forks_the_agents_session_from_the_last_reply() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let history_dir = tempfile::tempdir().expect("temp dir");
+    let history = history_dir.path().join("history.json");
+    command.args.push(history.to_string_lossy().into_owned());
+    command.env.insert("MOCK_FORK".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let source = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(source).await;
+    for (prompt, reply) in [
+        ("build the page", "Echo: build the page"),
+        ("add a test", "Echo: add a test"),
+    ] {
+        client
+            .ok(Request::Prompt {
+                connection: source,
+                prompt: PromptPart::text(prompt),
+            })
+            .await;
+        client
+            .wait_until(|client| {
+                let thread = client.thread(source);
+                !thread.is_working() && agent_text(thread).ends_with(reply)
+            })
+            .await;
+    }
+    client
+        .wait_until(|client| {
+            client
+                .project_thread(thread_id)
+                .is_some_and(|thread| thread.session_id.is_some())
+        })
+        .await;
+    let entries = client.thread(source).entries().to_vec();
+    let first_reply = entries
+        .iter()
+        .position(|entry| matches!(entry, Entry::AgentMessage(_)))
+        .expect("the first reply");
+    let last_reply = entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::AgentMessage(_)))
+        .expect("the last reply");
+
+    let Response::ThreadCreated(fork_id) = client
+        .ok(Request::ForkThread {
+            thread_id,
+            entry: last_reply,
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let fork = ConnectionId::Thread(fork_id);
+    client.subscribe_thread(fork).await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(fork);
+            thread.session_restore() == Some(SessionRestore::Forked)
+                && thread.pending_handoffs().is_empty()
+                && client
+                    .project_thread(fork_id)
+                    .and_then(|thread| thread.session_id.as_deref())
+                    == Some("session-1-fork")
+        })
+        .await;
+    // It keeps the conversation it began with, and its source.
+    assert_eq!(client.thread(fork).entries(), entries.as_slice());
+    assert_eq!(
+        client
+            .project_thread(fork_id)
+            .and_then(|thread| thread.forked_from),
+        Some(projects::ForkPoint {
+            thread: thread_id,
+            entries: entries.len(),
+        })
+    );
+    let saved = server
+        .data_dir
+        .path()
+        .join(format!("handoffs/{}.json", fork_id.0));
+    assert!(!saved.exists());
+    client
+        .ok(Request::Prompt {
+            connection: fork,
+            prompt: PromptPart::text("recall"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(fork);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Remembered: build the page, add a test")
+        })
+        .await;
+
+    let Response::ThreadCreated(early_id) = client
+        .ok(Request::ForkThread {
+            thread_id,
+            entry: first_reply,
+        })
+        .await
+    else {
+        panic!("expected a thread");
+    };
+    let early = ConnectionId::Thread(early_id);
+    client.subscribe_thread(early).await;
+    client
+        .wait_until(|client| client.thread(early).status() == &ConnectionStatus::Ready)
+        .await;
+    assert_eq!(
+        client.thread(early).session_restore(),
+        Some(SessionRestore::New)
+    );
+    let handoff = client
+        .thread(early)
+        .pending_handoffs()
+        .first()
+        .cloned()
+        .expect("the conversation waits for the fork's first message");
+    assert_eq!(handoff.source, HandoffSource::Fork { source: thread_id });
+    client
+        .ok(Request::Prompt {
+            connection: early,
+            prompt: PromptPart::text("try another way"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(early);
+            !thread.is_working()
+                && agent_text(thread).ends_with("Echo: try another way [with agentz://handoff]")
+        })
+        .await;
+}
 /// Fork from This Response: a thread in the same folder that begins with the conversation up
 /// to the end of that reply's turn, which its first message brings. Merge Back hands what
 /// happened in the fork since to the source's next message.

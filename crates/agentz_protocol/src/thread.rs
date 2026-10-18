@@ -652,6 +652,9 @@ pub enum SessionRestore {
     ResumedWithoutHistory,
     /// The previous session couldn't be restored, so a new one was started.
     Unavailable,
+    /// A fork of the session of the thread it was forked from (ACP's `session/fork`): the
+    /// agent knows that conversation, which it doesn't replay.
+    Forked,
 }
 
 /// Why the thread's new session is without its conversation ([`ThreadState::lost_history`]).

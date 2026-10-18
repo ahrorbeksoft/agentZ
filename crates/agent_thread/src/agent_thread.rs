@@ -100,7 +100,8 @@ pub enum AgentThreadEvent {
     /// The agent took a message with handoffs that went with it
     /// ([`ThreadState::pending_handoffs`]).
     HandoffSent,
-    /// The user went on without a conversation the next message would have brought.
+    /// The user went on without a conversation the next message would have brought, or the
+    /// agent knows it already (a fork's, once its session is forked).
     HandoffDropped,
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
@@ -384,6 +385,8 @@ pub struct AgentThread {
     /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
     connection: Option<ConnectionTo<Agent>>,
     previous_session: Option<acp::SessionId>,
+    /// The session the thread's first one forks ([`Self::fork_session`]).
+    fork_source: Option<acp::SessionId>,
     /// The login the agent reported while `previous_session` was in use.
     session_login: Option<LoginIdentity>,
     session: Option<Session>,
@@ -812,6 +815,7 @@ impl AgentThread {
             next_elicitation_id: 0,
             connection: None,
             previous_session: None,
+            fork_source: None,
             session_login: None,
             session: None,
             pending_title: None,
@@ -1907,6 +1911,7 @@ impl AgentThread {
             self.view.state.capabilities.clone(),
             self.view.state.cwd.clone(),
             self.previous_session.clone(),
+            self.fork_source.clone(),
             self.mcp_servers.clone(),
         );
         self.spawn(async move {
@@ -1926,6 +1931,7 @@ impl AgentThread {
         match result {
             Ok(setup) => {
                 self.has_conversation = true;
+                self.fork_source = None;
                 self.view.state.config_options = setup.config_options;
                 self.view.state.modes = setup.modes;
                 self.view.state.session_restore = Some(setup.restore);
@@ -1933,11 +1939,17 @@ impl AgentThread {
                     connection,
                     session_id: setup.session_id,
                 });
+                // A fork holds its source's conversation, so it's worth restoring at once.
                 if matches!(
                     setup.restore,
-                    SessionRestore::Loaded | SessionRestore::ResumedWithoutHistory
+                    SessionRestore::Loaded
+                        | SessionRestore::ResumedWithoutHistory
+                        | SessionRestore::Forked
                 ) {
                     self.remember_session();
+                }
+                if setup.restore == SessionRestore::Forked {
+                    self.drop_fork_handoffs();
                 }
                 self.view.state.status = ConnectionStatus::Ready;
                 self.view.state.logged_in = Some(true);
@@ -2107,6 +2119,29 @@ impl AgentThread {
             .retain(|mark| mark.made_at != handoff.made_at);
         self.conversation_revision += 1;
         self.emit(AgentThreadEvent::HandoffDropped);
+    }
+
+    /// Opens the thread's first session as a fork of `source`, another thread's session (ACP's
+    /// `session/fork`), when the agent can fork sessions: the agent then knows that
+    /// conversation, so the fork's conversation doesn't go with its first message. Otherwise a
+    /// new session opens, and it does. Call it right after starting.
+    pub fn fork_session(&mut self, source: acp::SessionId) {
+        self.fork_source = Some(source);
+    }
+
+    /// The forked session knows the conversation the fork began with.
+    fn drop_fork_handoffs(&mut self) {
+        let forks: Vec<SystemTime> = self
+            .view
+            .state
+            .pending_handoffs
+            .iter()
+            .filter(|handoff| matches!(handoff.source, HandoffSource::Fork { .. }))
+            .map(|handoff| handoff.made_at)
+            .collect();
+        for made_at in forks {
+            self.drop_handoff(made_at);
+        }
     }
 
     /// The handoffs that went with a prompt the agent didn't take wait for the next message
@@ -4784,7 +4819,8 @@ struct SessionSetup {
 }
 
 /// Opens the thread's session: loads or resumes `previous_session` when the agent supports it
-/// (in that order, like Zed), otherwise starts a new one.
+/// (in that order, like Zed), or else forks `fork_source` when the agent can, otherwise starts
+/// a new one.
 ///
 /// If the agent can't open a session with the given MCP servers, it is opened without them.
 /// Factory Droid 0.233.0's `acp-daemon` fails every session that has any: it passes them on to
@@ -4794,18 +4830,27 @@ async fn open_session(
     capabilities: acp::AgentCapabilities,
     cwd: PathBuf,
     previous_session: Option<acp::SessionId>,
+    fork_source: Option<acp::SessionId>,
     mcp_servers: Vec<acp::McpServer>,
 ) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
     let mcp_servers = servers_the_agent_takes(&capabilities.mcp_capabilities, mcp_servers);
     if mcp_servers.is_empty() {
-        return open_session_with(connection, capabilities, cwd, previous_session, mcp_servers)
-            .await;
+        return open_session_with(
+            connection,
+            capabilities,
+            cwd,
+            previous_session,
+            fork_source,
+            mcp_servers,
+        )
+        .await;
     }
     match open_session_with(
         connection.clone(),
         capabilities.clone(),
         cwd.clone(),
         previous_session.clone(),
+        fork_source.clone(),
         mcp_servers,
     )
     .await
@@ -4815,7 +4860,15 @@ async fn open_session(
                 "couldn't open a session with MCP servers, opening it without them: {}",
                 error_message(&error)
             );
-            open_session_with(connection, capabilities, cwd, previous_session, Vec::new()).await
+            open_session_with(
+                connection,
+                capabilities,
+                cwd,
+                previous_session,
+                fork_source,
+                Vec::new(),
+            )
+            .await
         }
         result => result,
     }
@@ -4842,6 +4895,7 @@ async fn open_session_with(
     capabilities: acp::AgentCapabilities,
     cwd: PathBuf,
     previous_session: Option<acp::SessionId>,
+    fork_source: Option<acp::SessionId>,
     mcp_servers: Vec<acp::McpServer>,
 ) -> std::result::Result<SessionSetup, agent_client_protocol::Error> {
     let had_previous_session = previous_session.is_some();
@@ -4895,6 +4949,32 @@ async fn open_session_with(
                         error_message(&error)
                     )
                 }
+            }
+        }
+    } else if let Some(source) = fork_source
+        && capabilities.session_capabilities.fork.is_some()
+    {
+        match connection
+            .send_request(
+                acp::ForkSessionRequest::new(source.clone(), cwd.clone())
+                    .mcp_servers(mcp_servers.clone()),
+            )
+            .block_task()
+            .await
+        {
+            // Going on in the source's own session would mix the two threads' conversations.
+            Ok(response) if response.session_id != source => {
+                return Ok(SessionSetup {
+                    session_id: response.session_id,
+                    config_options: response.config_options.unwrap_or_default(),
+                    modes: response.modes,
+                    restore: SessionRestore::Forked,
+                });
+            }
+            Ok(_) => log::warn!("forking session {source} gave back the same session"),
+            Err(error) if is_auth_required(&error) => return Err(error),
+            Err(error) => {
+                log::warn!("couldn't fork session {source}: {}", error_message(&error))
             }
         }
     }
@@ -6867,6 +6947,55 @@ mod tests {
         );
     }
 
+    /// A thread given another's session to fork opens a fork of it when the agent can fork
+    /// sessions, which knows that conversation and is worth restoring at once. When forking
+    /// fails, a new session opens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forks_the_session_it_was_given_when_the_agent_can() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(mut command) = mock_agent(&[history_file]) else {
+            return;
+        };
+        command.env.insert("MOCK_FORK".into(), "1".into());
+        let mut source = start(command.clone(), None);
+        source
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        source.update(|thread| thread.send("hello".into()));
+        source
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 2)
+            .await;
+
+        let mut fork = start(command.clone(), None);
+        fork.update(|thread| thread.fork_session(acp::SessionId::new("session-1")));
+        fork.wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(fork.thread.session_restore(), Some(SessionRestore::Forked));
+        assert!(fork.events.iter().any(|event| matches!(
+            event,
+            AgentThreadEvent::SessionStarted(session_id) if &*session_id.0 == "session-1-fork"
+        )));
+        fork.update(|thread| thread.send("recall".into()));
+        fork.wait_until(|thread| !thread.is_working() && last_agent_message(thread).is_some())
+            .await;
+        assert_eq!(
+            last_agent_message(&fork.thread).as_deref(),
+            Some("Remembered: hello")
+        );
+
+        command.env.insert("MOCK_FORK".into(), "fail".into());
+        let mut unforked = start(command, None);
+        unforked.update(|thread| thread.fork_session(acp::SessionId::new("session-1")));
+        unforked
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(unforked.thread.session_restore(), Some(SessionRestore::New));
+    }
     /// A session that doesn't load leaves the new one without the conversation: messages fail
     /// rather than go to an agent that doesn't know it, until the user sends one anyway. When
     /// the agent is logged in to another account than the session ran on, the thread says so.

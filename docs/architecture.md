@@ -1030,6 +1030,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   agent and account, named "<title> fork". It begins with the source's conversation up to the
   end of that reply's turn, its turns and marks included, and its first message brings that
   conversation (`HandoffSource::Fork`), since its agent has no session yet; then it opens.
+  When the fork has the whole conversation (the last reply, the source idle, nothing waiting
+  to be told to its session, which loaded), its agent forks the source's session if it can
+  (ACP's `session/fork`, `AgentThread::fork_session`, `SessionRestore::Forked`), so it
+  knows the conversation itself: the fork's waiting conversation is dropped, and the forked
+  session is kept to restore at once. One the agent gives back as the source's own, a failed
+  fork, an agent that can't fork, and a fork from an earlier reply open a new session, and the
+  first message brings the conversation.
   Until its first message (`AgentView::is_fresh_fork`: its entries are still only the copied
   ones, nothing queued or running) it opens on the new thread screen
   (`design/forked-thread/`, 1 C), not the copied conversation: the carried conversation is a

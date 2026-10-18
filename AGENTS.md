@@ -157,7 +157,9 @@ From Zed's guidelines, which this code follows:
   names context embedded in a prompt in its echo ("Echo: next [with agentz://handoff]"). With
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
-  Its `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
+  With `MOCK_FORK` it forks sessions (`session/fork`; `fail` fails them), and `recall` names
+  the messages the fork's source had ("Remembered: hello"), from the history path. Its
+  `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
   linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones.
   For accounts, `MOCK_HOME` is its home (the login is then `login` there) and `MOCK_API_KEY`
   logs it in (unless it's `refused`), as does its `mock-env-key` login in a home, which reads

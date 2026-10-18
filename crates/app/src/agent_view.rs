@@ -8730,7 +8730,7 @@ impl AgentView {
                 "New Session",
                 "This agent couldn't restore the previous conversation, so this is a new session.",
             ),
-            SessionRestore::New | SessionRestore::Loaded => return None,
+            SessionRestore::New | SessionRestore::Loaded | SessionRestore::Forked => return None,
         };
         Some(
             Callout::new()

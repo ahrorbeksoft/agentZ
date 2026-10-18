@@ -135,6 +135,10 @@ With MOCK_SESSIONS_FILE set, it lists the sessions in that file (`session/list`,
 page): a JSON array of ACP session infos, each with an optional "history" of session updates
 that `session/load` replays for it. Listing needs a login, as sessions do.
 
+With MOCK_FORK set, it forks sessions (`session/fork`), as Claude Agent does: the fork, named
+"<session>-fork", knows the messages of the session it forks from its recorded history, which
+"recall" names ("Remembered: hello, build the page"). With MOCK_FORK=fail, forking fails.
+
 With MOCK_SCRIPTS set to a JSON object of prompts and the prompts above they stand for, such
 as {"Add a checkout page": "demo"}, those prompts run their scripts, so a demo thread shows a
 real-looking prompt.
@@ -335,6 +339,8 @@ HISTORY_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 HISTORY_LOGIN_PATH = HISTORY_PATH + ".login" if HISTORY_PATH else None
 # The session opened with `session/new` has had no prompt yet.
 session_is_new = False
+# The user's messages in the session the open one was forked from.
+forked_messages = []
 
 LONG_BUILD_OUTPUT = "".join(f"   Compiling page {n}/60\n" for n in range(1, 61))
 # A 1×1 PNG, for the "image" prompt.
@@ -1006,6 +1012,8 @@ for line in sys.stdin:
         session_capabilities = {"close": {}}
         if SESSIONS_FILE:
             session_capabilities["list"] = {}
+        if os.environ.get("MOCK_FORK"):
+            session_capabilities["fork"] = {}
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
                          "_meta": ({"steering": {"supported": True}}
@@ -1029,12 +1037,12 @@ for line in sys.stdin:
             os.remove(LOGIN_FILE)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
         send_auth_status()
-    elif (method in ("session/new", "session/load", "session/list") and not logged_in()
-          and not os.environ.get("MOCK_OPENS_LOGGED_OUT")):
+    elif (method in ("session/new", "session/load", "session/fork", "session/list")
+          and not logged_in() and not os.environ.get("MOCK_OPENS_LOGGED_OUT")):
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
-    elif (method in ("session/new", "session/load") and os.environ.get("MOCK_REJECT_MCP")
-          and message["params"].get("mcpServers")):
+    elif (method in ("session/new", "session/load", "session/fork")
+          and os.environ.get("MOCK_REJECT_MCP") and message["params"].get("mcpServers")):
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32603, "message": "Internal error", "data": {
                   "details": "Droid process exited unexpectedly (exit code 1)"}}})
@@ -1064,6 +1072,17 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": session_id, "update": payload}})
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
+    elif method == "session/fork" and os.environ.get("MOCK_FORK") == "fail":
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32603, "message": "Internal error"}})
+    elif method == "session/fork":
+        mcp_servers = message["params"].get("mcpServers", [])
+        session_cwd = message["params"].get("cwd", session_cwd)
+        source = message["params"]["sessionId"]
+        forked_messages = [payload["content"]["text"] for payload in load_history(source)
+                           if payload.get("sessionUpdate") == "user_message_chunk"]
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "result": {"sessionId": source + "-fork", "configOptions": config_options()}})
     elif method == "session/list":
         send({"jsonrpc": "2.0", "id": message["id"], "result": list_sessions(message["params"])})
     elif method == "session/close":
@@ -1155,6 +1174,11 @@ for line in sys.stdin:
                              "options": [
                                  {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
                                  {"optionId": "deny", "name": "Deny", "kind": "reject_once"}]}})
+        elif prompt_text == "recall":
+            update(params["sessionId"], text_chunk(
+                "agent_message_chunk",
+                "Remembered: " + (", ".join(forked_messages) or "nothing")))
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "mcp-servers":
             names = [server["name"] + (" (http)" if server.get("type") == "http" else "")
                      for server in mcp_servers]
