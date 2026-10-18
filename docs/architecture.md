@@ -182,6 +182,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts |
 | `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
+| `logs/input-latency.txt`, `logs/hangs.jsonl` | app | The last input-latency report, and the hangs the hang monitor saw (Developer diagnostics) |
 
 Both sides replace a file as herdr saves its state (`projects::write_durably`): written beside
 it, synced to disk, renamed into place, then the folder synced, so a crash or power loss leaves
@@ -266,6 +267,18 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   it in its view and focuses it. The palette, Go To, the shortcut sheet and Save Layout are the
   shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
   focus goes back to what had it.
+- **Developer diagnostics** (`diagnostics.rs`, Zed's, from GPUI's `profiler` feature, which the
+  app turns on as Zed does): Ctrl-Alt-Shift-P, on macOS too, cycles GPUI's frame-time overlay
+  (zed-industries/zed#62749) from hidden to the last frame's draw time, then to its 1% and 10%
+  worst and slowest of the last 1,000 frames and the frame count, and Ctrl-Alt-Shift-O clears
+  those. The overlay paints into the frames the window draws anyway and asks for none of its
+  own, so an idle window stays idle while it shows (`diagnostics::tests`). `dev: dump input
+  latency histogram` in the command palette writes Zed's input-to-frame latency report, with
+  what changed since the last one, to `logs/input-latency.txt` and opens it, where Zed opens a
+  buffer. With `AGENTZ_HANG_MONITOR` set, GPUI's hang monitor (zed-industries/zed#64944) watches
+  the main thread with Zed's thresholds (one piece of work taking 100 ms, or one frame's work
+  24 ms; 5 s and 100 ms in a debug build) and adds each hang to `logs/hangs.jsonl`, a JSON line
+  in the form Zed's telemetry sends, with when it was logged. Nothing is sent anywhere.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
   favicons or monograms, git branches. The switcher is Zed's recent-projects popover. Each

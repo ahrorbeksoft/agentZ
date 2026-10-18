@@ -9,6 +9,7 @@ mod branch_picker;
 mod command_palette;
 mod confirm_dialog;
 mod controls;
+mod diagnostics;
 mod diff_panel;
 mod elicitation_card;
 mod go_to_picker;
@@ -205,6 +206,13 @@ fn bind_keys(cx: &mut App) {
         // Zed's keys: its command palette, and its file finder for places.
         KeyBinding::new("secondary-shift-p", ToggleCommandPalette, context),
         KeyBinding::new("secondary-p", GoTo, context),
+        // Zed's, the same on macOS.
+        KeyBinding::new("ctrl-alt-shift-p", diagnostics::ToggleFpsOverlay, context),
+        KeyBinding::new(
+            "ctrl-alt-shift-o",
+            diagnostics::ResetFrameOverlayStats,
+            context,
+        ),
     ]);
 }
 
@@ -258,6 +266,7 @@ fn main() {
                 log::error!("failed to load fonts: {error:#}");
             }
             init_theme(cx);
+            diagnostics::init(cx);
             text_input::init(cx);
             project_switcher::init(cx);
             artifacts_list::init(cx);

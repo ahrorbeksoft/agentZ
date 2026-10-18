@@ -424,6 +424,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "hdrhistogram",
  "http_client",
  "idna",
  "image",

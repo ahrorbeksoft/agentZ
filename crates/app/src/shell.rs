@@ -27,6 +27,7 @@ use crate::app_settings::{AppSettingsStore, ArtifactAutoOpen, MachineProfile, is
 use crate::artifacts_list::{ArtifactsList, ShowInList};
 use crate::command_palette::CommandPalette;
 use crate::confirm_dialog::{ConfirmDialog, ConfirmRequest};
+use crate::diagnostics;
 use crate::diff_panel::{DIFF_PANEL_WIDTH, DiffPanel, DiffPanelEvent};
 use crate::go_to_picker::{GoToPicker, Place, thread_places};
 use crate::machine_modal::MachineModal;
@@ -2396,6 +2397,15 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(Self::show_artifact_in_list))
+            .on_action(|_: &diagnostics::ToggleFpsOverlay, window, _| {
+                window.cycle_debug_frame_overlay_mode()
+            })
+            .on_action(|_: &diagnostics::ResetFrameOverlayStats, window, _| {
+                window.reset_debug_frame_overlay_stats()
+            })
+            .on_action(|_: &diagnostics::DumpInputLatencyHistogram, window, cx| {
+                diagnostics::dump_input_latency_histogram(window, cx)
+            })
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<DraggedDiffEdge>, _, cx| {
                     let available = event.bounds.size.width - SIDEBAR_WIDTH - MIN_THREAD_WIDTH;

@@ -58,3 +58,13 @@ pub fn server_pid_file() -> PathBuf {
 pub fn server_log_file() -> PathBuf {
     data_dir().join("logs").join("server.log")
 }
+
+/// The app's hangs, while `AGENTZ_HANG_MONITOR` has it watch for them.
+pub fn hang_log_file() -> PathBuf {
+    data_dir().join("logs").join("hangs.jsonl")
+}
+
+/// The app's last input-latency report (`dev: dump input latency histogram`).
+pub fn input_latency_report_file() -> PathBuf {
+    data_dir().join("logs").join("input-latency.txt")
+}

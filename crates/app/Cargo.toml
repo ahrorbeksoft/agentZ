@@ -29,8 +29,10 @@ assets.workspace = true
 dirs.workspace = true
 env_logger.workspace = true
 futures.workspace = true
-gpui.workspace = true
+# Zed's: the frame-time overlay, input-latency histograms and the hang monitor.
+gpui = { workspace = true, features = ["profiler"] }
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+hdrhistogram.workspace = true
 http_client.workspace = true
 idna.workspace = true
 image.workspace = true

@@ -119,19 +119,3 @@ Follow [t3code's thread snooze](https://github.com/pingdotgg/t3code/blob/main/do
 hide a thread until a chosen time, including its quota reset when known, then return it to
 the list. Keep snooze independent of archiving and automatic resume; waking a snoozed thread
 does not itself send a prompt. Persist its wake time so snooze survives app and server restarts.
-
-## Approved GPUI features
-
-Requested October 18, 2026, after reviewing the
-[GPUI release tracker](https://github.com/gpui-archipelago/gpui-release-notes/issues/3): add
-container queries, optional reduced motion and diagnostics. These APIs are already in our
-copied GPUI crates but are not wired into the app. The review was of source; runtime behavior
-and performance gains have not been verified.
-
-### Enable optional local performance diagnostics
-
-Wire up GPUI's profiler feature and Zed's controls for the frame-time overlay
-([#62749](https://github.com/zed-industries/zed/pull/62749)), frame and input-latency statistics,
-and hang monitoring ([#64944](https://github.com/zed-industries/zed/pull/64944)). Keep these
-developer diagnostics opt-in and local. Follow the upstream controls and verify that enabling
-diagnostics does not itself cause continuous redraws.
