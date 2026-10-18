@@ -107,6 +107,17 @@ draws itself should check `App::reduce_motion` too.
 and `MarkdownStyle::link_chip` draws chosen links as chips (see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
 so an open tool call's output raced the conversation.
+`gpui` has Zed's hot reloading through Dioxus's Subsecond (zed-industries/zed#65738): in a
+debug build with `app`'s `hot-reload` feature, run by `dx` 0.7.10 (`dx serve --hot-patch
+--package app --features hot-reload`, with a server already running or `AGENTZ_SERVER_BIN`
+naming `target/debug/agentz-server`, since `dx` puts the app elsewhere), every view's and
+component's render, and what it calls, is patched in place when its code changes, keeping the
+app's state. A custom element's layout and paint aren't. `gpui/build.rs` leaves it out of
+release builds. Zed's headless windowing (zed-industries/zed#64969), which lets an app switch
+between running with and without a display, isn't copied: a headless Linux window lays out but
+draws nothing, so it gives UI work no screenshots and tests nothing the test platform
+(`TestAppContext`) and `HeadlessAppContext` renders don't, and the work that outlives a display
+runs in `agentz-server`, not the app.
 
 | Crate | What it is |
 |---|---|

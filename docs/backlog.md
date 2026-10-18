@@ -58,13 +58,6 @@ Follow Zed's developing v2 session lifecycle, including resume/replay and metada
 [#65709](https://github.com/zed-industries/zed/pull/65709). Treat this as a deliberate protocol
 update, separate from the smaller copied-crate fixes. Test with the mock agent.
 
-### Add GPUI hot reloading and headless windowing support
-
-Bring in optional debug hot reloading of view and component render functions through
-Subsecond ([#65738](https://github.com/zed-industries/zed/pull/65738)), and evaluate the
-cross-platform headless windowing API and Linux implementation
-([#64969](https://github.com/zed-industries/zed/pull/64969)) for UI iteration and testing.
-
 For all copied-crate updates, preserve agentZ's Metal drawable handling, nested scrolling,
 Markdown image rendering and link chips, and animation frame limits, documented under
 Crates in `docs/architecture.md`.

@@ -242,6 +242,8 @@ impl Application {
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
+            #[cfg(gpui_hot_reload)]
+            crate::hot_reload::init(cx);
             on_finish_launching(cx);
         }));
 
@@ -266,6 +268,8 @@ impl Application {
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
+            #[cfg(gpui_hot_reload)]
+            crate::hot_reload::init(cx);
             on_finish_launching(cx);
         }));
         ApplicationHandle { app: self.0 }

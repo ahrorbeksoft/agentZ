@@ -13,6 +13,8 @@ path = "src/main.rs"
 # Compiles Metal shaders at runtime so macOS builds work without a full Xcode install.
 default = ["runtime_shaders"]
 runtime_shaders = ["gpui_platform/runtime_shaders"]
+# Patches render functions in place in a debug build run with `dx serve --hot-patch`.
+hot-reload = ["gpui/hot-reload"]
 
 [lints]
 workspace = true
