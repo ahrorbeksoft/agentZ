@@ -57,7 +57,7 @@ use crate::diff::{DiffScope, ThreadDiff};
 use crate::mcp_servers::McpServer;
 use crate::skills::{Skill, SkillFile};
 use crate::spaces::{PaneLocation, SpaceRequest, SpacesSnapshot};
-use crate::storage::{Storage, StorageCache};
+use crate::storage::{CleanupRules, Storage, StorageCache};
 use crate::terminal::{
     TerminalCommand, TerminalFrame, TerminalInput, TerminalKey, TerminalMatches,
 };
@@ -783,6 +783,12 @@ pub enum Request {
     /// Threads are deleted with [`Request::DeleteThread`], checkouts with
     /// [`Request::RemoveWorkspace`].
     ClearStorage(StorageCache),
+    /// Settings › Storage's Cleaning up rules for this machine's worktrees and pastures. The
+    /// server keeps them, and runs them now and every hour while any is on.
+    SetCleanupRules(CleanupRules),
+    /// Settings › Storage's Clean Up Now. Answered once the run ends; its report is in
+    /// [`Storage::cleanup`]. Refused while no rule is on.
+    CleanUpNow,
 
     /// Answers [`Response::Ok`] at once, to show the connection still carries messages, as
     /// herdr's heartbeat does after the Mac wakes.

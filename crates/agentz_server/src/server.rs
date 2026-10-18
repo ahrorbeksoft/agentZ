@@ -26,6 +26,7 @@ mod terminal_requests;
 mod title_requests;
 mod tools;
 mod usage_reads;
+mod workspace_cleanup;
 mod workspace_requests;
 mod workspace_setup;
 
@@ -45,7 +46,7 @@ use agentz_protocol::agents::{
 use agentz_protocol::diff::{DiffScope, RestoreAvailability, ThreadDiff};
 use agentz_protocol::mcp_servers::{AGENTZ_SERVER_NAME, McpServer};
 use agentz_protocol::skills::Skill;
-use agentz_protocol::storage::Storage;
+use agentz_protocol::storage::{Storage, WorkspaceCleanup};
 use agentz_protocol::terminal::{TerminalFrame, TerminalKey};
 use agentz_protocol::thread::ThreadAgent;
 use agentz_protocol::title_generation::TitleGenerationState;
@@ -231,6 +232,9 @@ pub(crate) struct Server {
     /// What agentZ keeps on the machine, as last measured, for Settings › Storage.
     storage: Storage,
     storage_reads: storage_reads::StorageReads,
+    /// What Settings › Storage's cleanup rules noted and are doing, besides the rules and the
+    /// last run's report in `storage`.
+    cleanups: workspace_cleanup::Cleanups,
     /// The pages agents published (design/artifacts), and the server that serves them to the
     /// browser, when its port could be had.
     artifacts: ArtifactStore,
@@ -374,6 +378,9 @@ impl Server {
             providers: Vec::new(),
         };
         let auto_archive_days = auto_archive::load(&data_dir).log_err().flatten();
+        let cleanup_file = workspace_cleanup::load(&data_dir)
+            .log_err()
+            .unwrap_or_default();
         let artifacts = ArtifactStore::load(&data_dir);
         let artifact_pages = pages::start(&runtime, &data_dir, inputs.clone());
         let browser_programs = config.agent_control.as_ref().and_then(|control| {
@@ -426,8 +433,16 @@ impl Server {
             favicon_projects: BTreeMap::new(),
             reading_favicons: false,
             reading_copy_statuses: false,
-            storage: Storage::default(),
+            storage: Storage {
+                cleanup: WorkspaceCleanup {
+                    rules: cleanup_file.rules.clone(),
+                    last_run: cleanup_file.last_run.clone(),
+                    running: false,
+                },
+                ..Storage::default()
+            },
             storage_reads: storage_reads::StorageReads::default(),
+            cleanups: workspace_cleanup::Cleanups::new(&cleanup_file),
             artifacts,
             pages: artifact_pages,
             artifacts_revision_sent: 0,
@@ -559,6 +574,18 @@ impl Server {
                 if inputs.unbounded_send(sweep).is_err() {
                     break;
                 }
+            }
+        });
+        let inputs = server.inputs.clone();
+        server.runtime.spawn(async move {
+            tokio::time::sleep(workspace_cleanup::FIRST_CLEANUP_DELAY).await;
+            loop {
+                let cleanup =
+                    Input::Run(Box::new(|server: &mut Server| server.clean_up_workspaces()));
+                if inputs.unbounded_send(cleanup).is_err() {
+                    break;
+                }
+                tokio::time::sleep(workspace_cleanup::CLEANUP_INTERVAL).await;
             }
         });
         let inputs = server.inputs.clone();
@@ -806,6 +833,11 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::CleanUpNow,
+            } => self.clean_up_now(client, id),
+            Input::Request {
+                client,
+                id,
                 request:
                     request @ (Request::AddAttachment { .. }
                     | Request::Attachment { .. }
@@ -1016,6 +1048,7 @@ impl Server {
             Request::ArchiveThread(thread_id) => {
                 self.existing_thread(thread_id)?;
                 self.projects.archive_thread(thread_id);
+                self.thread_archived();
                 Ok(Response::Ok)
             }
             Request::UnarchiveThread(thread_id) => {
@@ -1359,6 +1392,11 @@ impl Server {
                 Err(anyhow!("regenerating titles is handled separately"))
             }
             Request::ClearStorage(_) => Err(anyhow!("clearing storage is handled separately")),
+            Request::CleanUpNow => Err(anyhow!("cleaning up is handled separately")),
+            Request::SetCleanupRules(rules) => {
+                self.set_cleanup_rules(rules)?;
+                Ok(Response::Ok)
+            }
             Request::ProjectImageFiles(_) => {
                 Err(anyhow!("listing image files is handled separately"))
             }
@@ -1725,6 +1763,9 @@ impl Server {
             ));
         };
         let account = thread.account;
+        if self.workspace_is_gone(thread_id) {
+            return Ok(self.thread_without_folder(thread_id, &agent_id, account, cwd));
+        }
         let mut command = self.agent_command(&agent_id, account, true);
         let session_account = AgentAccount {
             agent_id: agent_id.clone(),
@@ -1904,7 +1945,9 @@ impl Server {
         }
         self.delete_attachments(threads.clone());
         self.delete_checkpoints(threads);
+        let workspaces = self.note_deleted_workspaces(thread_id);
         self.projects.delete_thread(thread_id);
+        self.thread_deleted(workspaces);
         self.forget_thread_storage();
         if let Some(folder) = chat_folder {
             self.remove_chat_folder(folder);

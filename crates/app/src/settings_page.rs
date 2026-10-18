@@ -9379,7 +9379,7 @@ impl SettingsPage {
             Section::Machines => (headline("Machines".into()), self.render_machines(cx)),
             Section::Storage => (
                 self.render_storage_header(window, cx),
-                self.render_storage(cx),
+                self.render_storage(window, cx),
             ),
             Section::Project(key) => match self.project(key, cx) {
                 Some(project) => (

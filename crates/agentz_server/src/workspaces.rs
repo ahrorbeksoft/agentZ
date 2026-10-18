@@ -198,6 +198,13 @@ async fn fetch(folder: &Path, args: &[&str]) -> Result<()> {
 }
 
 async fn create_pasture(repo: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
+    copy_project(repo, path).await?;
+    switch_copy(path, branch, base, false).await?;
+    finish_pasture(repo, path).await
+}
+
+/// A pasture's copy of the project, before it's put on its branch.
+async fn copy_project(repo: &Path, path: &Path) -> Result<()> {
     // A linked worktree's `.git` is a file pointing into its main repository, which a clone
     // would share (cow refuses them too).
     anyhow::ensure!(
@@ -220,8 +227,10 @@ async fn create_pasture(repo: &Path, path: &Path, branch: &str, base: &str) -> R
     // The clone has the source's remote-tracking refs, so `git checkout origin/main` could
     // otherwise create a local branch shadowing them (cow).
     git(path, &["config", "--local", "checkout.guess", "false"], &[]).await?;
-    switch_copy(path, branch, base).await?;
+    Ok(())
+}
 
+async fn finish_pasture(repo: &Path, path: &Path) -> Result<()> {
     remove_runtime_files(path).await?;
     let config = repo.join(".cow.json");
     if config.exists() {
@@ -230,11 +239,13 @@ async fn create_pasture(repo: &Path, path: &Path, branch: &str, base: &str) -> R
     Ok(())
 }
 
-/// Puts a pasture's copy on a new branch from `base`. git carries the copy's uncommitted
-/// changes over when they fit the base; the ones to files the base changes are left out, as
-/// are untracked files where the base has files, so the switch goes through.
-async fn switch_copy(path: &Path, branch: &str, base: &str) -> Result<()> {
-    let switch = ["checkout", "-q", "--no-track", "-b", branch, base];
+/// Puts a pasture's copy on a new branch from `base`, or with `reset` on `branch` at `base`
+/// whether the copy has the branch or not. git carries the copy's uncommitted changes over
+/// when they fit the base; the ones to files the base changes are left out, as are untracked
+/// files where the base has files, so the switch goes through.
+async fn switch_copy(path: &Path, branch: &str, base: &str, reset: bool) -> Result<()> {
+    let create = if reset { "-B" } else { "-b" };
+    let switch = ["checkout", "-q", "--no-track", create, branch, base];
     let Err(error) = git(path, &switch, &[]).await else {
         return Ok(());
     };
@@ -876,6 +887,123 @@ async fn branches_under(repo: &Path, prefix: &str) -> Result<Vec<String>> {
     Ok(output.lines().map(str::to_string).collect())
 }
 
+/// Makes a workspace a cleanup removed again at its folder (t3code): a worktree on its branch,
+/// a pasture as a new copy of the project on it. A branch that's gone starts again from `head`,
+/// the commit it was at, if the project has it, or else from the workspace's base.
+pub(crate) async fn recreate(repo: &Path, workspace: &Workspace, head: Option<&str>) -> Result<()> {
+    let path = &workspace.path;
+    anyhow::ensure!(!path.exists(), "{} already exists", path.display());
+    let branch = workspace
+        .branch
+        .as_deref()
+        .context("the workspace had no branch to check out")?;
+    let parent = path
+        .parent()
+        .context("the workspace folder has no parent")?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating {}", parent.display()))?;
+    let start = match head {
+        Some(head) if has_commit(repo, head).await => head.to_string(),
+        _ => workspace.base.clone().unwrap_or_else(|| "HEAD".into()),
+    };
+    match workspace.kind {
+        WorkspaceKind::Worktree => {
+            // The removed worktree's entry, if its folder went some other way.
+            git(repo, &["worktree", "prune"], &[]).await?;
+            if has_branch(repo, branch).await {
+                let path_arg = path.to_string_lossy();
+                git(repo, &["worktree", "add", &path_arg, branch], &[]).await?;
+            } else {
+                create_worktree(repo, path, branch, &start).await?;
+            }
+        }
+        WorkspaceKind::Pasture => {
+            let made = async {
+                copy_project(repo, path).await?;
+                switch_copy(path, branch, &start, true).await?;
+                finish_pasture(repo, path).await
+            };
+            if let Err(error) = made.await {
+                remove_folder(path).await.ok();
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn has_branch(repo: &Path, branch: &str) -> bool {
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        &[],
+    )
+    .await
+    .is_ok()
+}
+
+/// origin's default branch, for cleanup's merged and unchanged rules (t3code's): the one
+/// `origin/HEAD` names, or else origin's `main` or `master`. `None` without origin.
+pub(crate) async fn origin_default(repo: &Path) -> Option<String> {
+    if let Some(branch) = origin_default_branch(repo).await {
+        return Some(branch);
+    }
+    for name in ["main", "master"] {
+        let reference = format!("refs/remotes/origin/{name}");
+        if git(repo, &["rev-parse", "--verify", "--quiet", &reference], &[])
+            .await
+            .is_ok()
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Whether origin's `branch`, as last fetched, has `commit`.
+pub(crate) async fn origin_branch_has(repo: &Path, branch: &str, commit: &str) -> bool {
+    let reference = format!("refs/remotes/origin/{branch}");
+    git(
+        repo,
+        &["merge-base", "--is-ancestor", commit, &reference],
+        &[],
+    )
+    .await
+    .is_ok()
+}
+
+/// Files with uncommitted changes, new ones included.
+pub(crate) async fn changed_files(folder: &Path) -> Result<usize> {
+    let status = git(
+        folder,
+        &["status", "--porcelain"],
+        &[("GIT_OPTIONAL_LOCKS", "0")],
+    )
+    .await?;
+    Ok(status.lines().count())
+}
+
+/// The commits at the folder's `HEAD` that no remote has, or `None` when the repository has no
+/// remote to push to.
+pub(crate) async fn unpushed_commits(folder: &Path) -> Result<Option<usize>> {
+    let remotes = git(folder, &["remote"], &[]).await?;
+    if remotes.trim().is_empty() {
+        return Ok(None);
+    }
+    let count = git(
+        folder,
+        &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        &[],
+    )
+    .await?;
+    Ok(Some(count.trim().parse()?))
+}
 /// The branch `origin/HEAD` points at, as a clone sets it: `main`.
 async fn origin_default_branch(repo: &Path) -> Option<String> {
     let output = git(
@@ -1192,6 +1320,58 @@ prunable gitdir file points to non-existent location
         );
     }
 
+    #[tokio::test]
+    async fn removed_workspaces_are_made_again_on_their_branch() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let repo = repository(root.path()).await;
+        let main = head_commit(&repo).await.expect("a commit");
+        let data_dir = root.path().join("data");
+        for kind in [WorkspaceKind::Worktree, WorkspaceKind::Pasture] {
+            let workspace = create(NewWorkspace {
+                kind,
+                repo: repo.clone(),
+                data_dir: data_dir.clone(),
+                base: None,
+                branch: Some(format!("agentz/{}", kind.label().to_lowercase())),
+                submodules: false,
+            })
+            .await
+            .expect("creates");
+            // Different for each, or both commits would be one and the project would have it.
+            std::fs::write(workspace.path.join("work.txt"), kind.label()).expect("write");
+            run(&workspace.path, &["add", "-A"]).await;
+            run(&workspace.path, &["commit", "-q", "-m", "work"]).await;
+            let head = head_commit(&workspace.path).await.expect("a commit");
+            let removal = remove(&repo, &workspace, true).await.expect("removes");
+            assert_eq!(removal, WorkspaceRemoval::Removed);
+            assert!(!workspace.path.exists());
+
+            recreate(&repo, &workspace, Some(&head))
+                .await
+                .expect("made again");
+            assert_eq!(
+                current_branch(&workspace.path).await.expect("branch"),
+                workspace.branch
+            );
+            match kind {
+                // The branch stayed in the project, with its commit.
+                WorkspaceKind::Worktree => {
+                    assert_eq!(head_commit(&workspace.path).await, Some(head));
+                    assert!(workspace.path.join("work.txt").exists());
+                }
+                // The commit was the copy's alone, so it starts again from its base.
+                WorkspaceKind::Pasture => {
+                    assert_eq!(head_commit(&workspace.path).await, Some(main.clone()));
+                    assert!(!workspace.path.join("work.txt").exists());
+                }
+            }
+            assert!(
+                recreate(&repo, &workspace, None).await.is_err(),
+                "it's there already"
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn pastures_clone_everything_and_bring_work_back() {
@@ -1483,7 +1663,7 @@ prunable gitdir file points to non-existent location
         std::fs::write(repo.join("added.txt"), "mine\n").expect("write");
         std::fs::write(repo.join(".gitignore"), ".env\n").expect("write");
 
-        switch_copy(&repo, "agentz/copy", "other")
+        switch_copy(&repo, "agentz/copy", "other", false)
             .await
             .expect("switches");
         assert_eq!(

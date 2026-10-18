@@ -104,6 +104,11 @@ pub struct WorkspaceSetup {
     /// Why it stopped. The message waits for [`crate::Request::RetryWorkspaceSetup`] or
     /// [`crate::Request::UseLocal`].
     pub error: Option<String>,
+    /// The thread's workspace was removed by a cleanup (design/archive-cleanup), and is made
+    /// again at its folder, on its branch (`base`), before the message goes. Use Local isn't
+    /// offered.
+    #[serde(default)]
+    pub remake: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -155,7 +160,21 @@ impl WorkspaceSetup {
                 })
                 .collect(),
             error: None,
+            remake: false,
         }
+    }
+
+    /// The steps to make a removed workspace again on `branch`.
+    pub fn remake(
+        kind: WorkspaceKind,
+        branch: String,
+        message: String,
+        has_submodules: bool,
+    ) -> Self {
+        let mut setup = Self::new(kind, branch, message, has_submodules);
+        setup.steps.retain(|step| step.kind != SetupStepKind::Fetch);
+        setup.remake = true;
+        setup
     }
 
     pub fn is_failed(&self) -> bool {

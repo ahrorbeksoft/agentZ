@@ -2836,19 +2836,11 @@ impl Sidebar {
         let Some(store) = self.store(thread_id.machine, cx) else {
             return;
         };
-        let is_chat = store
-            .read(cx)
-            .thread(thread_id.thread)
-            .is_some_and(Thread::is_chat);
-        let detail = if is_chat {
-            "The chat and its conversation will be removed. This can't be undone."
-        } else {
-            "The thread and its conversation will be removed. This can't be undone."
-        };
+        let detail = delete_thread_detail(store.read(cx), thread_id.thread, cx);
         let answer = window.prompt(
             PromptLevel::Warning,
             &format!("Delete “{title}”?"),
-            Some(detail),
+            Some(&detail),
             &["Delete", "Cancel"],
             cx,
         );
@@ -3811,6 +3803,21 @@ pub fn render_footer_item(
 
 fn matches_query(thread: &Thread, query: &str) -> bool {
     query.is_empty() || thread.title.to_lowercase().contains(query)
+}
+
+/// What Delete… on a thread removes, as its confirmation says.
+pub(crate) fn delete_thread_detail(store: &ProjectStore, thread_id: ThreadId, cx: &App) -> String {
+    if store.thread(thread_id).is_some_and(Thread::is_chat) {
+        return "The chat and its conversation will be removed. This can't be undone.".into();
+    }
+    match store.workspace_removed_on_delete(thread_id, cx) {
+        Some(kind) => format!(
+            "The thread and its conversation will be removed, and its {} too unless it has \
+             changes or another thread uses it. This can't be undone.",
+            kind.label().to_lowercase()
+        ),
+        None => "The thread and its conversation will be removed. This can't be undone.".into(),
+    }
 }
 
 /// A short "time ago" label: `now`, `5m`, `3h`, `2d`, `1w`.

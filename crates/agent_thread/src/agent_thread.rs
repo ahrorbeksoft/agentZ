@@ -722,6 +722,13 @@ impl AgentThread {
         this
     }
 
+    /// A thread whose agent can't start until its folder is made again: it shows the
+    /// conversation restored into it, and takes no messages itself.
+    pub fn without_agent(agent_name: SharedString, cwd: PathBuf) -> Self {
+        let (this, _) = Self::new(None, agent_name, ConnectionStatus::Ready, cwd);
+        this
+    }
+
     /// The subthread of one of the agent's own subagents ([`Subagent`]). It has no agent of its
     /// own: the parent's runs the subagent, and the owner passes on what that sends in the
     /// subagent's session ([`Self::apply_subagent_update`]).

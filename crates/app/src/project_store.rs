@@ -750,6 +750,19 @@ impl ProjectStore {
         self.send(Request::ReorderThreads { section, keys }, cx)
     }
 
+    /// The worktree or pasture that deleting the thread removes too, by its machine's cleanup
+    /// rule (design/archive-cleanup), unless it has changes or another thread uses it.
+    pub fn workspace_removed_on_delete(&self, id: ThreadId, cx: &App) -> Option<WorkspaceKind> {
+        let client = self.client.upgrade()?;
+        if !client.read(cx).storage().cleanup.rules.deleted {
+            return None;
+        }
+        self.thread_and_subthreads(id)
+            .into_iter()
+            .find_map(|thread_id| self.thread_workspace(thread_id))
+            .map(|workspace| workspace.kind)
+    }
+
     /// Gone at once, as archiving is: a draft made again with another account or agent is
     /// deleted right after, and its row would otherwise flash above the cards until the server
     /// answers.

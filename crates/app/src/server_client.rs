@@ -18,7 +18,7 @@ use agentz_protocol::layout::PaneId;
 use agentz_protocol::mcp_servers::McpServer;
 use agentz_protocol::skills::Skill;
 use agentz_protocol::spaces::{Pane, PaneAgentState, PaneContent, SpacesSnapshot};
-use agentz_protocol::storage::{Storage, StorageCache};
+use agentz_protocol::storage::{CleanupRules, Storage, StorageCache};
 use agentz_protocol::terminal::TerminalKey;
 use agentz_protocol::title_generation::{TitleGeneration, TitleGenerationState};
 use agentz_protocol::{
@@ -775,6 +775,19 @@ impl ServerClient {
     /// Settings › Storage's Delete or Clear for what isn't a thread or a checkout.
     pub fn clear_storage(&self, cache: StorageCache, cx: &App) -> Task<Result<()>> {
         let response = self.request(Request::ClearStorage(cache));
+        cx.background_spawn(async move { response.await.map(|_| ()) })
+    }
+
+    /// Settings › Storage's cleanup rules, shown at once as the server will have them.
+    pub fn set_cleanup_rules(&mut self, rules: CleanupRules, cx: &mut Context<Self>) {
+        self.storage.cleanup.rules = rules.clone();
+        cx.notify();
+        self.send(Request::SetCleanupRules(rules), cx);
+    }
+
+    /// Runs the cleanup rules now. Resolves once the run ends.
+    pub fn clean_up_now(&self, cx: &App) -> Task<Result<()>> {
+        let response = self.request(Request::CleanUpNow);
         cx.background_spawn(async move { response.await.map(|_| ()) })
     }
 

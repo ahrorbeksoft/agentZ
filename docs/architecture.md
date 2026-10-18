@@ -187,6 +187,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
+| `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
 | `artifacts/<id>/` | server | An artifact: `meta.json` (title, kind, versions, its thread and project), `pages/<version>.md` (a document) or `.json` (a design), each version's files (`files/<version>/`: a document's downloads, a design's pictures and pages), and a design's picks (`picks/<version>.json`) |
@@ -632,29 +633,55 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   forgets its choices.
 - **Settings › Storage** (`settings_page/storage.rs`, `agentz_server::storage`,
   `server/storage_reads.rs`; `design/storage/`, macOS's Storage settings for the top): what
-  agentZ keeps on the machine. "agentZ uses 1.2 GB on This Mac" and the data folder lead, over
-  a bar with a color for each kind and a legend with their sizes. Then a group for each kind,
-  its rows biggest first: Chats (one line each: the chat or archive icon, title, size, last
-  used), Threads by project (a row per project, with Workspaces threads under Workspaces,
-  opening to its five biggest threads, then Show more), Worktrees and pastures (the branch,
-  then "shop · Worktree · Its thread finished 3 hours ago": working, finished, archived,
-  deleted, or the changes that keep it), Agents (each installed agent's size, uninstalled on
-  the Agents page, and the registry's cache) and Node.js and logs (downloaded Node.js and the
-  server's log). A thread's size counts its subthreads' conversations, images, uploaded files
-  and handoffs, and a chat's folder. Hovering a row shows a trash button that asks first
-  (`ConfirmRequest::delete_storage`, with the size and what goes) and deletes as the sidebar
-  and Workspaces view do (`Request::DeleteThread`, `Request::RemoveWorkspace` without
+  agentZ keeps on the machine. "agentZ uses 1.2 GB on This Mac" and the data folder lead, over a
+  bar with a color for each kind and a legend with their sizes. Then a group for each kind, its
+  rows biggest first: Chats (one line each: the chat or archive icon, title, size, last used),
+  Threads by project (a row per project, with Workspaces threads under Workspaces, opening to
+  its five biggest threads, then Show more), Worktrees and pastures (the branch, then "shop ·
+  Worktree · Its thread finished 3 hours ago": working, finished, archived, deleted, "No thread
+  uses this worktree", or the changes that keep it), Agents (each installed agent's size,
+  uninstalled on the Agents page, and the registry's cache) and Node.js and logs (downloaded
+  Node.js and the server's log). A thread's size counts its subthreads' conversations, images,
+  uploaded files and handoffs, and a chat's folder. Hovering a row shows a trash button that
+  asks first (`ConfirmRequest::delete_storage`, with the size and what goes) and deletes as the
+  sidebar and Workspaces view do (`Request::DeleteThread`, `Request::RemoveWorkspace` without
   `force`). A working thread or chat, a checkout whose thread works, and one with uncommitted
   files or a pasture's own commits are listed with a Working or Has changes tag and no trash.
   Node.js has Delete (off while a running agent uses it) and the cache and log have Clear
-  (`Request::ClearStorage`). Nothing is deleted on its own. With more than one machine, the
-  Agents page's machine picker sits in the header. The server measures as `du` does, on a
-  blocking thread (`storage::measure`), only while an app is subscribed: threads again at most
-  every 5 seconds after they change, worktrees, pastures and agents every 5 minutes or when
-  an agent is installed or removed, and sends it in the session snapshot and `Event::Storage`.
-  Worktrees and pastures left in `worktrees/` and `pastures/` by a removed project are listed
-  too; without `force`, the server won't remove a left pasture with commits on no remote, as
-  it won't a project's.
+  (`Request::ClearStorage`). Only the cleanup rules (below) delete anything on their own. With
+  more than one machine, the Agents page's machine picker sits in the header. The server
+  measures as `du` does, on a blocking thread (`storage::measure`), only while an app is
+  subscribed: threads again at most every 5 seconds after they change, worktrees, pastures and
+  agents every 5 minutes or when an agent is installed or removed, and sends it in the session
+  snapshot and `Event::Storage`. Worktrees and pastures left in `worktrees/` and `pastures/` by
+  a removed project are listed too; without `force`, the server won't remove a left pasture with
+  commits on no remote, as it won't a project's.
+- **Cleaning up** (`settings_page/storage.rs`'s `render_cleanup`, `server/workspace_cleanup.rs`;
+  `design/archive-cleanup/`, t3code's storage cleanup, `storageCleanup.ts`): a "Cleaning up"
+  group heads the Storage page, for the machine picked. t3code's rules, every one off at
+  first: remove archived threads' workspaces (Never, Right away, After a day, After a week,
+  After a month), deleted threads' (once no other thread uses it), inactive threads' (a switch,
+  then a number of days by the thread's last activity, 8 at first, 1 to 3650), merged
+  worktrees (the branch is in origin's default branch) and workspaces with nothing of their
+  own (no commits beyond it and no changes). A change shows at once and goes to the server
+  (`Request::SetCleanupRules`), which keeps the rules in `workspace-cleanup.json` and runs
+  them as they change, every hour (first 5 minutes after it starts), when a thread is archived
+  with Right away or deleted with the deleted rule, and with Clean Up Now (`Request::CleanUpNow`,
+  answered once the run ends; off while every rule is). A workspace stays when it has
+  uncommitted changes or commits not pushed (or no remote), when two threads use it ("Shared
+  by 2 threads"), or while a thread there works or is open or a terminal is in it, checked
+  again just before it's removed. The merged and unchanged rules fetch the default branch once
+  a project. Under the rules, "Last run 2 hours ago. 2.0 GB recovered." and a fold, "Last run:
+  2 removed, 2 kept", list each workspace looked at with its thread, the reason ("Archived for
+  9 days", "Has uncommitted changes (3 files)"), Removed, Kept or Failed (in red) and its size,
+  50 at most, then "N more results.". A removed workspace stays its project's with the commit
+  it was at, and the thread's next message makes it again (`Server::remake_workspace`,
+  `WorkspaceSetup::remake`, `workspaces::recreate`): a worktree on its branch, a pasture as a
+  new copy put on it, at that commit if the project has it or else at its base. Meanwhile the
+  thread's activity row says so ("Checking out agentz/fix-login…", "Copying the project…"),
+  and a failure shows its step and error with Retry and no Use Local. With the deleted rule
+  on, deleting a thread says its worktree or pasture goes too
+  (`ProjectStore::workspace_removed_on_delete`).
 - **Themes** (`app_settings.rs`, `theme_json`): System/Light/Dark with one theme for each, Zed's.
   Bundled in `assets/themes`, as Zed theme files: One, Ayu, Gruvbox, JetBrains and Catppuccin.
 - **A picture behind the window** (`window_background.rs`, `design/appearance`; as Warp's and
@@ -2071,6 +2098,8 @@ t3code's workspace model, herdr's folder layout and safe removal, cow's pastures
   threads (`create_threads`) get theirs at once.
 - **Pastures** sync from the project (temporary remote, rebase or merge, abort on conflict) and
   bring their branch back (cow's `sync` and `extract`).
+- **Cleanup** rules remove them on their own, and a thread's next message makes its removed one
+  again (Settings › Storage's Cleaning up, above).
 - **Handoff** (`agentz_workspace_handoff`) moves a thread after its turn: the agent restarts in the
   new folder, with `session/load` when it can.
 - **UI**: the new thread screen's checkout picker (`agent_view.rs`), card markers, thread menu (Sync,
@@ -2356,7 +2385,6 @@ Wanted, not scheduled. Each should follow Zed's agent panel or t3code.
 - **Opening files** from tool calls.
 - **Searching message text**, not only titles.
 - **Deleting sessions on the agent's side** when a thread is deleted.
-- **Automatic workspace cleanup**: t3code's inactive-days and merged rules, cow's `gc`.
 - **Accounts**: several logins per agent with their quota, plus skills and MCP servers managed in
   agentZ. Planned in [`design/accounts/plan.md`](../design/accounts/plan.md).
 

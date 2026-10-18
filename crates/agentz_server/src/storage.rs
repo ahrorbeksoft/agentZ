@@ -77,6 +77,7 @@ pub(crate) async fn measure(plan: StoragePlan) -> Storage {
             bytes: 0,
             changed_files: 0,
             has_own_commits: false,
+            thread_deleted: false,
         };
         read_checkout(&mut storage, Some(&checkout.project_folder)).await;
         checkouts.push(storage);
@@ -91,6 +92,7 @@ pub(crate) async fn measure(plan: StoragePlan) -> Storage {
             bytes: 0,
             changed_files: 0,
             has_own_commits: false,
+            thread_deleted: false,
         };
         read_checkout(&mut storage, None).await;
         checkouts.push(storage);
@@ -148,6 +150,7 @@ pub(crate) async fn measure(plan: StoragePlan) -> Storage {
             server_log: std::fs::metadata(&server_log)
                 .map(|metadata| metadata.len())
                 .unwrap_or_default(),
+            cleanup: Default::default(),
         }
     })
     .await

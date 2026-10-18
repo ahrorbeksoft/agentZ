@@ -10337,6 +10337,242 @@ async fn storage_is_measured_and_freed() {
 }
 
 impl TestClient {
+    /// A thread whose first message made it a worktree from origin/main, and the worktree.
+    async fn thread_in_new_worktree(&mut self, project_id: ProjectId) -> (ThreadId, PathBuf) {
+        let Response::ThreadCreated(thread_id) = self
+            .ok(Request::CreateThread {
+                project_id,
+                agent_id: AgentId::new("mock"),
+                workspace: WorkspaceChoice::New {
+                    kind: WorkspaceKind::Worktree,
+                    base: Some("origin/main".into()),
+                    branch: None,
+                },
+                account: Default::default(),
+            })
+            .await
+        else {
+            panic!("expected a thread");
+        };
+        let connection = ConnectionId::Thread(thread_id);
+        self.wait_until_ready(thread_id).await;
+        self.ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("hello"),
+        })
+        .await;
+        self.wait_until(|client| {
+            client.user_messages(thread_id).len() == 1
+                && !client.thread(connection).is_working()
+                && client.thread(connection).workspace_setup().is_none()
+        })
+        .await;
+        let path = self
+            .project_thread(thread_id)
+            .and_then(|thread| thread.workspace.clone())
+            .expect("the thread works in a worktree");
+        (thread_id, path)
+    }
+
+    /// The project's workspace at `path`, if it still keeps one there.
+    fn project_workspace(&self, path: &Path) -> Option<&projects::Workspace> {
+        self.projects
+            .as_ref()?
+            .projects
+            .iter()
+            .flat_map(|project| &project.workspaces)
+            .find(|workspace| workspace.path == path)
+    }
+
+    /// What the last cleanup run did with the folder.
+    fn cleanup_entry(&self, path: &Path) -> Option<&agentz_protocol::storage::CleanupEntry> {
+        self.storage()?
+            .cleanup
+            .last_run
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+    }
+}
+
+/// The cleanup rules remove an archived thread's worktree but keep one with changes, and the
+/// thread's next message makes it again on its branch. A deleted thread's worktree goes with
+/// it, and so does a merged one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn workspaces_are_cleaned_up_by_their_rules() {
+    use agentz_protocol::storage::{ArchivedCleanup, CleanupOutcome, CleanupRules};
+
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    // The project is a clone of origin, so its worktrees' commits are pushed.
+    let remotes = tempfile::tempdir().expect("temp dir");
+    let upstream = remotes.path().join("upstream");
+    let origin = remotes.path().join("origin.git");
+    std::fs::create_dir_all(&upstream).expect("a folder");
+    git(&upstream, &["init", "-q", "-b", "main"]).await;
+    git(&upstream, &["config", "user.name", "Test"]).await;
+    git(&upstream, &["config", "user.email", "test@example.com"]).await;
+    std::fs::write(upstream.join("README.md"), "one\n").expect("a file");
+    git(&upstream, &["add", "."]).await;
+    git(&upstream, &["commit", "-q", "-m", "first"]).await;
+    let origin_path = origin.to_string_lossy().into_owned();
+    git(
+        remotes.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &upstream.to_string_lossy(),
+            &origin_path,
+        ],
+    )
+    .await;
+    let repository = std::fs::canonicalize(server.project_dir.path()).expect("a resolved path");
+    git(&repository, &["clone", "-q", &origin_path, "."]).await;
+
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let project_id = client.add_project(&repository).await;
+    let (archived, archived_path) = client.thread_in_new_worktree(project_id).await;
+    let (changed, changed_path) = client.thread_in_new_worktree(project_id).await;
+    std::fs::write(changed_path.join("NOTES.md"), "mine\n").expect("a file");
+    let (deleted, deleted_path) = client.thread_in_new_worktree(project_id).await;
+    let branch = client
+        .project_workspace(&archived_path)
+        .and_then(|workspace| workspace.branch.clone())
+        .expect("the worktree's branch");
+    // An open thread's workspace stays.
+    for thread_id in [archived, changed, deleted] {
+        client
+            .ok(Request::UnsubscribeThread(ConnectionId::Thread(thread_id)))
+            .await;
+    }
+
+    let refused = client
+        .request(Request::CleanUpNow)
+        .await
+        .expect_err("every rule is off");
+    assert_eq!(refused.message, "turn on a cleanup rule first");
+
+    client.ok(Request::ArchiveThread(archived)).await;
+    client.ok(Request::ArchiveThread(changed)).await;
+    client
+        .ok(Request::SetCleanupRules(CleanupRules {
+            archived: ArchivedCleanup::RightAway,
+            ..CleanupRules::default()
+        }))
+        .await;
+    // Turning a rule on runs it.
+    client
+        .wait_until(|client| {
+            client.cleanup_entry(&archived_path).is_some()
+                && client.cleanup_entry(&changed_path).is_some()
+        })
+        .await;
+    let removed = client
+        .cleanup_entry(&archived_path)
+        .expect("listed")
+        .clone();
+    assert_eq!(
+        (removed.outcome, removed.reason.as_str()),
+        (CleanupOutcome::Removed, "Archived")
+    );
+    assert!(removed.bytes > 0);
+    assert!(!archived_path.exists());
+    let kept = client.cleanup_entry(&changed_path).expect("listed");
+    assert_eq!(
+        (kept.outcome, kept.reason.as_str()),
+        (CleanupOutcome::Kept, "Has uncommitted changes (1 file)")
+    );
+    assert!(changed_path.exists());
+    // Its thread stays in it, to make it again.
+    assert!(client.project_workspace(&archived_path).is_some());
+    let deleted_entry = client.cleanup_entry(&deleted_path).expect("listed");
+    assert_eq!(
+        (deleted_entry.outcome, deleted_entry.reason.as_str()),
+        (CleanupOutcome::Kept, "Not archived")
+    );
+
+    // Unarchived, its next message makes the worktree again on its branch first.
+    client.ok(Request::UnarchiveThread(archived)).await;
+    let connection = ConnectionId::Thread(archived);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("again"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            client
+                .user_messages(archived)
+                .contains(&"again".to_string())
+                && !client.thread(connection).is_working()
+                && client.thread(connection).workspace_setup().is_none()
+        })
+        .await;
+    assert!(archived_path.exists());
+    assert_eq!(
+        git(&archived_path, &["branch", "--show-current"])
+            .await
+            .trim(),
+        branch
+    );
+    client.ok(Request::UnsubscribeThread(connection)).await;
+
+    // With the deleted rule, deleting a thread removes its worktree, which the project forgets.
+    client
+        .ok(Request::SetCleanupRules(CleanupRules {
+            deleted: true,
+            ..CleanupRules::default()
+        }))
+        .await;
+    client.ok(Request::DeleteThread(deleted)).await;
+    client
+        .wait_until(|client| {
+            client.cleanup_entry(&deleted_path).is_some()
+                && client.project_workspace(&deleted_path).is_none()
+        })
+        .await;
+    let removed = client.cleanup_entry(&deleted_path).expect("listed");
+    assert_eq!(
+        (removed.outcome, removed.reason.as_str()),
+        (CleanupOutcome::Removed, "Its thread was deleted")
+    );
+    assert!(!deleted_path.exists());
+
+    // A worktree with nothing beyond origin's main is merged.
+    client
+        .ok(Request::SetCleanupRules(CleanupRules {
+            merged: true,
+            ..CleanupRules::default()
+        }))
+        .await;
+    client
+        .wait_until(|client| {
+            client
+                .cleanup_entry(&archived_path)
+                .is_some_and(|entry| entry.reason == "Merged into main")
+        })
+        .await;
+    assert!(!archived_path.exists());
+    let kept = client.cleanup_entry(&changed_path).expect("listed");
+    assert_eq!(kept.reason, "Has uncommitted changes (1 file)");
+
+    // Clean Up Now answers once its run ends, which reports what's left.
+    client.ok(Request::CleanUpNow).await;
+    client
+        .wait_until(|client| {
+            client.cleanup_entry(&archived_path).is_none()
+                && client.cleanup_entry(&changed_path).is_some()
+        })
+        .await;
+}
+impl TestClient {
     /// The artifacts the server last said it has.
     fn artifacts(&self) -> Option<&agentz_protocol::artifacts::Artifacts> {
         self.events.iter().rev().find_map(|event| match event {

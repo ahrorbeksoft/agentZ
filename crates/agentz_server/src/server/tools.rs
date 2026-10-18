@@ -1843,7 +1843,10 @@ impl Server {
                 .pin_thread(thread_id, None)
                 .map_err(|error| invalid(error.to_string()))?,
             Some("unpin") => self.projects.unpin_thread(thread_id),
-            Some("archive") => self.projects.archive_thread(thread_id),
+            Some("archive") => {
+                self.projects.archive_thread(thread_id);
+                self.thread_archived();
+            }
             Some("unarchive") => self.projects.unarchive_thread(thread_id),
             Some(action) => return Err(invalid(format!("Unknown action {action}."))),
             None => {

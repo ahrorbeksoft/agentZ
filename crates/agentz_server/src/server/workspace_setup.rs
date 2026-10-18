@@ -2,10 +2,18 @@
 //! setup). The message waits while the steps run, shown in the thread; then the agent starts
 //! there and gets it. A failed step waits for Retry or Use Local. Once the thread has a title,
 //! the workspace's temporary branch is renamed after it.
+//!
+//! A workspace a cleanup removed (workspace_cleanup.rs) is made again the same way with its
+//! thread's next message, at its folder and on its branch, and the agent goes on in its
+//! session there. Until then the thread shows its conversation without an agent.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
+use agent_thread::{AgentThread, Attachments};
+use agentz_protocol::accounts::AccountId;
+use agentz_protocol::agents::AgentId;
+use agentz_protocol::thread::ThreadAgent;
 use agentz_protocol::workspace::{SetupStepKind, SetupStepState, WorkspaceSetup, remote_branch};
 use agentz_protocol::{ConnectionId, PromptPart, Response};
 use anyhow::{Context as _, Result, anyhow};
@@ -16,6 +24,7 @@ use util::ResultExt as _;
 
 use super::Server;
 use crate::workspaces::{self, NewWorkspace};
+use crate::{continuations, transcripts};
 
 /// A first message waiting for its thread's workspace.
 pub(super) struct SetupRun {
@@ -28,6 +37,8 @@ pub(super) struct SetupRun {
     resolved: Option<(PathBuf, String)>,
     made: Option<Workspace>,
     step_started: Instant,
+    /// A removed workspace to make again, with the commit it was at.
+    remake: Option<(Workspace, Option<String>)>,
 }
 
 impl Server {
@@ -71,15 +82,7 @@ impl Server {
             .projects
             .thread_folder(thread_id)
             .context("no such thread")?;
-        let message: String = prompt
-            .iter()
-            .filter_map(|part| match part {
-                PromptPart::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let message = prompt_text(&prompt);
         let setup = WorkspaceSetup::new(
             plan.kind,
             plan.base.clone().unwrap_or_default(),
@@ -96,6 +99,7 @@ impl Server {
                 resolved: None,
                 made: None,
                 step_started: Instant::now(),
+                remake: None,
             },
         );
         if !message.is_empty() {
@@ -107,6 +111,118 @@ impl Server {
         self.projects.set_thread_working(thread_id, true);
         self.advance_workspace_setup(thread_id);
         Ok(())
+    }
+
+    /// Whether the thread's worktree or pasture is gone, so its agent can't start: a cleanup
+    /// removed it, or is removing it.
+    pub(super) fn workspace_is_gone(&self, thread_id: ThreadId) -> bool {
+        self.projects
+            .thread_workspace(thread_id)
+            .is_some_and(|workspace| {
+                !workspace.path.exists() || self.cleanups.removing.contains(&workspace.path)
+            })
+    }
+
+    /// The thread while its workspace is gone: its conversation as kept, with no agent.
+    pub(super) fn thread_without_folder(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        cwd: PathBuf,
+    ) -> AgentThread {
+        let agent_name = self.agent_name(agent_id);
+        let mut agent_thread = AgentThread::without_agent(agent_name.clone(), cwd);
+        agent_thread.set_agent(ThreadAgent {
+            agent_id: agent_id.0.to_string(),
+            name: agent_name.to_string(),
+            account,
+        });
+        if let Some(handoffs) = continuations::load(&self.data_dir, thread_id).log_err() {
+            agent_thread.set_handoffs(handoffs);
+        }
+        if let Some(transcript) = transcripts::load(&self.data_dir, thread_id)
+            .log_err()
+            .flatten()
+        {
+            agent_thread.restore_transcript(transcript);
+        }
+        self.end_subagent_cards(thread_id, &mut agent_thread);
+        self.saved_transcripts.remove(&thread_id);
+        if let Some(revision) = agent_thread.conversation_revision() {
+            self.saved_transcripts.insert(thread_id, revision);
+        }
+        agent_thread.set_attachments(Attachments::for_thread(&self.data_dir, thread_id));
+        let (queued_messages, steering) = self.queues.state(thread_id);
+        agent_thread.set_queued_messages(queued_messages, steering);
+        agent_thread.set_workspace_setup(self.workspace_setup(thread_id));
+        agent_thread
+    }
+
+    /// Makes the thread's workspace again if a cleanup removed it, holding the message until
+    /// it's there, as t3code's next turn does. The message comes back when there's nothing to
+    /// make.
+    pub(super) fn remake_workspace(
+        &mut self,
+        thread_id: ThreadId,
+        prompt: Vec<PromptPart>,
+    ) -> Result<Option<Vec<PromptPart>>> {
+        if !self.workspace_is_gone(thread_id) {
+            return Ok(Some(prompt));
+        }
+        let workspace = self
+            .projects
+            .thread_workspace(thread_id)
+            .cloned()
+            .context("the thread has no workspace")?;
+        anyhow::ensure!(
+            !self.cleanups.removing.contains(&workspace.path),
+            "the thread's {} is being removed by a cleanup; send the message again in a moment",
+            workspace.kind.label().to_lowercase()
+        );
+        let branch = workspace
+            .branch
+            .clone()
+            .context("the thread's workspace had no branch to make it again on")?;
+        let repo = self
+            .projects
+            .projects()
+            .iter()
+            .find(|project| {
+                project
+                    .workspaces
+                    .iter()
+                    .any(|kept| kept.path == workspace.path)
+            })
+            .map(|project| project.path.clone())
+            .context("the workspace's project is gone")?;
+        let setup = WorkspaceSetup::remake(
+            workspace.kind,
+            branch,
+            prompt_text(&prompt),
+            workspaces::has_submodules(&repo),
+        );
+        let head = self.cleanups.removed_head(&workspace.path);
+        self.workspace_setups.insert(
+            thread_id,
+            SetupRun {
+                folder: repo.clone(),
+                plan: PlannedWorkspace {
+                    kind: workspace.kind,
+                    base: workspace.base.clone(),
+                    branch: workspace.branch.clone(),
+                },
+                prompt,
+                setup,
+                resolved: Some((repo, workspace.base.clone().unwrap_or_default())),
+                made: None,
+                step_started: Instant::now(),
+                remake: Some((workspace, head)),
+            },
+        );
+        self.projects.set_thread_working(thread_id, true);
+        self.advance_workspace_setup(thread_id);
+        Ok(None)
     }
 
     /// [`agentz_protocol::Request::RetryWorkspaceSetup`]: from the step that failed.
@@ -130,13 +246,16 @@ impl Server {
     /// [`agentz_protocol::Request::UseLocal`]: the message goes to the agent where the draft
     /// was.
     pub(super) fn use_local(&mut self, thread_id: ThreadId) -> Result<Response> {
-        let is_failed = self
+        let run = self
             .workspace_setups
             .get(&thread_id)
-            .context("the thread's workspace isn't being made")?
-            .setup
-            .is_failed();
-        anyhow::ensure!(is_failed, "the workspace is still being made");
+            .context("the thread's workspace isn't being made")?;
+        anyhow::ensure!(
+            run.remake.is_none(),
+            "the thread's {} is made again where it was; retry instead",
+            run.setup.kind.label().to_lowercase()
+        );
+        anyhow::ensure!(run.setup.is_failed(), "the workspace is still being made");
         let run = self
             .workspace_setups
             .remove(&thread_id)
@@ -210,6 +329,15 @@ impl Server {
                 async move {
                     workspaces::fetch_base(&folder, &branch).await?;
                     Ok(None)
+                }
+                .boxed()
+            }
+            SetupStepKind::CheckOut if run.remake.is_some() => {
+                let remake = run.remake.clone();
+                async move {
+                    let (workspace, head) = remake.context("nothing to make again")?;
+                    workspaces::recreate(&repo, &workspace, head.as_deref()).await?;
+                    Ok(Some(workspace))
                 }
                 .boxed()
             }
@@ -323,6 +451,14 @@ impl Server {
         let Some(run) = self.workspace_setups.remove(&thread_id) else {
             return;
         };
+        if let Some((workspace, _)) = run.remake {
+            self.forget_removed_workspace(&workspace.path);
+            // The agent starts there now, and goes on in its session.
+            self.stop_agent(thread_id);
+            self.prompt(ConnectionId::Thread(thread_id), run.prompt, false)
+                .log_err();
+            return;
+        }
         let (Some((repo, _)), Some(workspace)) = (run.resolved, run.made) else {
             log::error!(
                 "thread {}'s workspace setup ended without a workspace",
@@ -443,4 +579,17 @@ impl Server {
             None => Ok(()),
         }
     }
+}
+
+/// A message's text, shown as the user's while it waits.
+fn prompt_text(prompt: &[PromptPart]) -> String {
+    prompt
+        .iter()
+        .filter_map(|part| match part {
+            PromptPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }

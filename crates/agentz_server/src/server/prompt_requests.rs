@@ -59,20 +59,27 @@ impl Server {
                 "a subthread only takes its task; message its parent instead"
             ));
         }
-        if let ConnectionId::Thread(thread_id) = connection {
-            self.refuse_during_setup(thread_id)?;
-            // As t3code's turn start does: a message to a snoozed thread brings it back.
-            self.projects.wake_thread(thread_id);
-            self.give_chat_its_folder(thread_id, &prompt)?;
-            let plan = self
-                .projects
-                .thread(thread_id)
-                .and_then(|thread| thread.planned_workspace.clone());
-            if let Some(plan) = plan {
-                self.set_up_workspace(thread_id, plan, prompt)?;
-                return Ok(Response::Ok);
+        let prompt = match connection {
+            ConnectionId::Thread(thread_id) => {
+                self.refuse_during_setup(thread_id)?;
+                // As t3code's turn start does: a message to a snoozed thread brings it back.
+                self.projects.wake_thread(thread_id);
+                self.give_chat_its_folder(thread_id, &prompt)?;
+                let plan = self
+                    .projects
+                    .thread(thread_id)
+                    .and_then(|thread| thread.planned_workspace.clone());
+                if let Some(plan) = plan {
+                    self.set_up_workspace(thread_id, plan, prompt)?;
+                    return Ok(Response::Ok);
+                }
+                match self.remake_workspace(thread_id, prompt)? {
+                    Some(prompt) => prompt,
+                    None => return Ok(Response::Ok),
+                }
             }
-        }
+            ConnectionId::LoginSession(_) => prompt,
+        };
         if prompt
             .iter()
             .all(|part| matches!(part, PromptPart::Text(_)))

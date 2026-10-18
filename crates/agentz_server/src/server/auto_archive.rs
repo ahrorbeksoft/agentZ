@@ -54,6 +54,9 @@ impl Server {
             .into_iter()
             .filter(|thread_id| !watched.contains(thread_id) && !self.needs_agent(*thread_id))
             .collect();
+        if stale.is_empty() {
+            return;
+        }
         for thread_id in stale {
             log::info!(
                 "archiving thread {}, left alone for {days} days",
@@ -61,5 +64,6 @@ impl Server {
             );
             self.projects.archive_thread(thread_id);
         }
+        self.thread_archived();
     }
 }

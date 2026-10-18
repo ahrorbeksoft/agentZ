@@ -4268,6 +4268,12 @@ impl AgentView {
                 .text_ui(cx)
                 .child(setup.message.clone()),
         );
+        if setup.remake {
+            return vec![
+                message.into_any_element(),
+                self.render_workspace_remake(&setup, cx),
+            ];
+        }
         let steps = setup.steps.iter().map(|step| {
             let (icon, color) = match step.state {
                 SetupStepState::Done => (
@@ -4390,6 +4396,87 @@ impl AgentView {
         vec![message.into_any_element(), card.into_any_element()]
     }
 
+    /// A workspace a cleanup removed, made again before the message goes (design/archive-cleanup,
+    /// topic 7): the activity row says so. A failure offers Retry; the thread's folder is its
+    /// workspace's, so there's no Use Local.
+    fn render_workspace_remake(
+        &self,
+        setup: &WorkspaceSetup,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some(error) = setup.error.clone() {
+            let failed = setup
+                .steps
+                .iter()
+                .find(|step| step.state == SetupStepState::Failed)
+                .map(|step| setup_step_label(setup, step.kind, step.state));
+            return v_flex()
+                .debug_selector(|| "workspace-remake".into())
+                .py_2()
+                .px(rems_from_px(22_f32))
+                .gap_1p5()
+                .children(failed.map(|failed| {
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Label::new(failed)
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                }))
+                .child(Label::new(error).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    div()
+                        .debug_selector(|| "workspace-setup-retry".into())
+                        .child(
+                            Button::new("workspace-setup-retry", "Retry")
+                                .style(ButtonStyle::Outlined)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.thread
+                                        .update(cx, |thread, cx| thread.retry_workspace_setup(cx));
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
+        let step = setup
+            .steps
+            .iter()
+            .find(|step| step.state == SetupStepState::Running)
+            .or_else(|| {
+                setup
+                    .steps
+                    .iter()
+                    .find(|step| step.state == SetupStepState::Waiting)
+            });
+        let label = match step {
+            Some(step) => format!(
+                "{}…",
+                setup_step_label(setup, step.kind, SetupStepState::Running)
+            ),
+            None => format!("Making the {} again…", setup.kind.label().to_lowercase()),
+        };
+        h_flex()
+            .debug_selector(|| "workspace-remake".into())
+            .py_2()
+            .px(rems_from_px(22_f32))
+            .gap_2()
+            .child(
+                h_flex().w_2().justify_center().child(
+                    SpinnerLabel::dots()
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            .into_any_element()
+    }
     /// The entries of the user's own messages: the turns the turn rail goes between.
     fn user_turns(&self, cx: &App) -> Vec<usize> {
         let thread = self.thread.read(cx);
@@ -14245,6 +14332,13 @@ fn setup_step_label(setup: &WorkspaceSetup, kind: SetupStepKind, state: SetupSte
             format!("Fetched {base} from origin"),
             format!("Couldn't fetch {base} from origin"),
         ),
+        // A removed worktree is made again on its branch.
+        (SetupStepKind::CheckOut, WorkspaceKind::Worktree) if setup.remake => (
+            format!("Check out {base}"),
+            format!("Checking out {base}"),
+            format!("Checked out {base}"),
+            format!("Couldn't check out {base}"),
+        ),
         (SetupStepKind::CheckOut, WorkspaceKind::Worktree) => (
             "Check out".to_string(),
             "Checking out".to_string(),
@@ -15022,10 +15116,11 @@ fn confirm_delete_thread(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let detail = crate::sidebar::delete_thread_detail(store.read(cx), thread_id, cx);
     let answer = window.prompt(
         PromptLevel::Warning,
         &format!("Delete “{title}”?"),
-        Some("The thread and its conversation will be removed. This can't be undone."),
+        Some(&detail),
         &["Delete", "Cancel"],
         cx,
     );
@@ -16816,6 +16911,44 @@ mod tests {
         let sent = sent(&client, cx);
         assert!(sent.contains(&Request::RetryWorkspaceSetup(ThreadId(1))));
         assert!(sent.contains(&Request::UseLocal(ThreadId(1))));
+    }
+
+    /// A worktree a cleanup removed is made again on its branch before the message goes: an
+    /// activity row says so, and a failure offers Retry but not Use Local.
+    #[gpui::test]
+    fn a_removed_worktree_is_made_again_before_the_message(cx: &mut TestAppContext) {
+        let (view, cx) = open(1, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let mut setup = WorkspaceSetup::remake(
+            WorkspaceKind::Worktree,
+            "agentz/fix-login".into(),
+            "Go on".into(),
+            false,
+        );
+        setup.steps[0].state = SetupStepState::Running;
+        assert_eq!(
+            setup_step_label(&setup, setup.steps[0].kind, SetupStepState::Running),
+            "Checking out agentz/fix-login"
+        );
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.workspace_setup = Some(setup.clone()), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-remake").is_some());
+        assert!(cx.debug_bounds("workspace-setup").is_none());
+        assert!(cx.debug_bounds("workspace-setup-retry").is_none());
+
+        setup.steps[0].state = SetupStepState::Failed;
+        setup.error = Some("fatal: 'agentz/fix-login' is already used by a worktree".into());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(|state| state.workspace_setup = Some(setup), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("workspace-remake").is_some());
+        assert!(cx.debug_bounds("workspace-setup-use-local").is_none());
+        click_on("workspace-setup-retry", cx);
+        assert!(sent(&client, cx).contains(&Request::RetryWorkspaceSetup(ThreadId(1))));
     }
 
     /// With two accounts, the strip under the composer shows the draft's account, and picking

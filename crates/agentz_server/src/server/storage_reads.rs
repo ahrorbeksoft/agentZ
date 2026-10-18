@@ -76,6 +76,10 @@ impl Server {
             }
             // Deleted while it was measured.
             measured.checkouts.retain(|checkout| checkout.path.exists());
+            for checkout in &mut measured.checkouts {
+                checkout.thread_deleted = server.cleanups.is_deleted_threads(&checkout.path);
+            }
+            measured.cleanup = std::mem::take(&mut server.storage.cleanup);
             server.storage = measured;
             server.forget_thread_storage();
             server.update_node_in_use();

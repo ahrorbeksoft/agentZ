@@ -886,6 +886,23 @@ impl Server {
         })
     }
 
+    /// Whether a terminal still running is in the folder: one whose shell was last seen there,
+    /// or one of a thread that works there.
+    pub(super) fn has_terminal_in(&self, folder: &Path) -> bool {
+        self.terminals.running.iter().any(|(key, running)| {
+            let in_folder = running
+                .folder
+                .as_ref()
+                .is_some_and(|seen| seen.starts_with(folder))
+                || key.thread_id().is_some_and(|thread_id| {
+                    self.projects
+                        .thread_folder(thread_id)
+                        .is_some_and(|thread_folder| thread_folder.starts_with(folder))
+                });
+            in_folder && running.terminal.exit().is_none()
+        })
+    }
+
     /// Whether a command an agent started still runs (until the agent lets it go), or an agent
     /// CLI in a terminal thread or pane works rather than waiting on the user.
     pub(super) fn terminal_agents_work(&self) -> bool {

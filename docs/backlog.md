@@ -70,24 +70,6 @@ For all copied-crate updates, preserve agentZ's Metal drawable handling, nested 
 Markdown image rendering and link chips, and animation frame limits, documented under
 Crates in `docs/architecture.md`.
 
-## Other upstream updates
-
-Requested October 18, 2026: add the findings from the other references. Compared with our
-saved snapshots, t3code had 715 newer commits, herdr 68 and OpenUsage 17. Cow had no changes
-since our v0.1.10 snapshot. These are source findings; the failures have not been reproduced
-in agentZ.
-
-### Clean up archived threads' workspaces automatically
-
-Use t3code's new archived-thread retention rules
-([#15208](https://github.com/pingdotgg/t3code/pull/15208), called settled retention there),
-shared-subagent-worktree cleanup
-([#19748](https://github.com/pingdotgg/t3code/pull/19748)) and orphan reporting
-([#19749](https://github.com/pingdotgg/t3code/pull/19749)) as the implementation reference for
-our existing automatic workspace cleanup plan in `docs/architecture.md`. Active sessions,
-shared worktrees and the chosen local-change protection must be respected. Any new UI starts
-on the design board.
-
 ## Approved upstream features and replacements
 
 Requested October 18, 2026: support all of the following, with fallbacks where necessary.

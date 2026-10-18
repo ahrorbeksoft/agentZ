@@ -8,15 +8,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::SystemTime;
 
-use agentz_protocol::storage::{CheckoutStorage, Storage, StorageCache};
+use agentz_protocol::storage::{
+    ArchivedCleanup, CheckoutStorage, CleanupEntry, CleanupOutcome, CleanupRules, Storage,
+    StorageCache, WorkspaceCleanup,
+};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use gpui::{AnyElement, App, Context, Entity, Hsla, Window};
 use projects::{ProjectId, Thread, ThreadId, WorkspaceKind};
-use ui::{Tooltip, prelude::*};
+use ui::{ContextMenu, DropdownMenu, IconPosition, Switch, Tooltip, prelude::*};
 use util::ResultExt as _;
 
 use super::skills::render_error;
-use super::{SettingsPage, SettingsPageEvent, render_rows};
+use super::{SettingsPage, SettingsPageEvent, render_row, render_rows, render_section_with_note};
 use crate::agent_icons::agent_icon;
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::ACCOUNT_COLORS;
@@ -37,6 +40,8 @@ const WHEN_WIDTH: Pixels = px(34.);
 const SLOT_WIDTH: Pixels = px(22.);
 /// How far a project's threads are set in, past its chevron and icon.
 const THREAD_INDENT: Pixels = px(34.);
+/// The last cleanup run's results shown; the rest are counted.
+const CLEANUP_RESULTS_SHOWN: usize = 50;
 
 /// What Settings › Storage remembers while it's open.
 #[derive(Default)]
@@ -45,8 +50,12 @@ pub(super) struct StoragePage {
     open_projects: HashSet<(MachineId, ProjectId)>,
     /// How many of an open project's threads show.
     threads_shown: HashMap<(MachineId, ProjectId), usize>,
-    /// Why the last Delete or Clear failed.
+    /// Why the last Delete, Clear or Clean Up Now failed.
     pub(super) error: Option<SharedString>,
+    /// The last cleanup run's results are unfolded.
+    report_open: bool,
+    /// The machines whose Clean Up Now hasn't answered yet.
+    cleaning_up: HashSet<MachineId>,
 }
 
 /// The kinds the bar and the groups show, in their order.
@@ -146,7 +155,11 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    pub(super) fn render_storage(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn render_storage(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let machine = self.agents_machine;
         let client = self.agents_client(cx);
         let label = self.machines.read(cx).label(machine, cx);
@@ -196,6 +209,7 @@ impl SettingsPage {
                 .child(render_error(error, "storage-error"))
                 .into_any_element()
         }));
+        sections.push(self.render_cleanup(machine, &client, &storage.cleanup, window, cx));
         if !chats.is_empty() {
             let rows = chats
                 .iter()
@@ -289,6 +303,329 @@ impl SettingsPage {
             cx,
         ));
         sections
+    }
+
+    /// Cleaning up (design/archive-cleanup): t3code's cleanup rules, every one off at first,
+    /// then Clean Up Now and what the last run did.
+    fn render_cleanup(
+        &self,
+        machine: MachineId,
+        client: &Entity<ServerClient>,
+        cleanup: &WorkspaceCleanup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rules = cleanup.rules.clone();
+        let set = |rules: CleanupRules| {
+            let client = client.clone();
+            move |cx: &mut App| {
+                client.update(cx, |client, cx| client.set_cleanup_rules(rules.clone(), cx))
+            }
+        };
+        let colors = cx.theme().colors().clone();
+
+        let archived = rules.archived;
+        let menu = {
+            let client = client.clone();
+            ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for value in ArchivedCleanup::ALL {
+                    let client = client.clone();
+                    let rules = CleanupRules {
+                        archived: value,
+                        ..rules
+                    };
+                    menu = menu.toggleable_entry(
+                        value.label(),
+                        archived == value,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            client.update(cx, |client, cx| {
+                                client.set_cleanup_rules(rules.clone(), cx)
+                            })
+                        },
+                    );
+                }
+                menu
+            })
+        };
+        let switch = |id: &'static str, on: bool, toggle: Box<dyn Fn(&mut App)>| {
+            div()
+                .debug_selector(move || id.to_string())
+                .child(Switch::new(id, on.into()).on_click(move |_, _, cx| toggle(cx)))
+                .into_any_element()
+        };
+
+        let inactive = match rules.inactive_days {
+            Some(days) => {
+                let fewer = set(CleanupRules {
+                    inactive_days: Some(days.saturating_sub(1).max(1)),
+                    ..rules
+                });
+                let more = set(CleanupRules {
+                    inactive_days: Some((days + 1).min(CleanupRules::MAX_INACTIVE_DAYS)),
+                    ..rules
+                });
+                h_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .debug_selector(|| "cleanup-inactive-days".into())
+                            .h(px(28.))
+                            .px_0p5()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .child(
+                                div().debug_selector(|| "cleanup-fewer-days".into()).child(
+                                    IconButton::new("cleanup-fewer-days", IconName::Dash)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(days <= 1)
+                                        .on_click(move |_, _, cx| fewer(cx)),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(16.))
+                                    .flex()
+                                    .justify_center()
+                                    .child(Label::new(days.to_string())),
+                            )
+                            .child(
+                                div().debug_selector(|| "cleanup-more-days".into()).child(
+                                    IconButton::new("cleanup-more-days", IconName::Plus)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(days >= CleanupRules::MAX_INACTIVE_DAYS)
+                                        .on_click(move |_, _, cx| more(cx)),
+                                ),
+                            ),
+                    )
+                    .child(
+                        Label::new("days")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+            None => Label::new("Off")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
+        let inactive = h_flex()
+            .gap_3()
+            .child(inactive)
+            .child(switch(
+                "cleanup-inactive",
+                rules.inactive_days.is_some(),
+                Box::new(set(CleanupRules {
+                    inactive_days: match rules.inactive_days {
+                        Some(_) => None,
+                        None => Some(CleanupRules::DEFAULT_INACTIVE_DAYS),
+                    },
+                    ..rules
+                })),
+            ))
+            .into_any_element();
+
+        let is_running = cleanup.running || self.storage_page.cleaning_up.contains(&machine);
+        let last_run = if !rules.any() {
+            "Turn on a cleanup rule to use this.".to_string()
+        } else if let Some(report) = &cleanup.last_run {
+            let failed = match report.count(CleanupOutcome::Failed) {
+                0 => String::new(),
+                1 => " 1 couldn't be removed.".to_string(),
+                failed => format!(" {failed} couldn't be removed."),
+            };
+            format!(
+                "Last run {}. {} recovered.{failed}",
+                long_ago(report.finished_at, SystemTime::now()),
+                format_size(report.bytes_freed())
+            )
+        } else {
+            "Cleanup hasn't run yet.".to_string()
+        };
+        let clean_up = {
+            let client = client.clone();
+            div()
+                .debug_selector(|| "cleanup-now".into())
+                .child(
+                    Button::new(
+                        "cleanup-now",
+                        if is_running {
+                            "Cleaning Up…"
+                        } else {
+                            "Clean Up Now"
+                        },
+                    )
+                    .style(ButtonStyle::Outlined)
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .disabled(is_running || !rules.any())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.clean_up_now(machine, &client, cx)),
+                    ),
+                )
+                .into_any_element()
+        };
+
+        let mut rows = vec![
+            render_row(
+                "Remove archived threads’ workspaces",
+                "Removes the worktree or pasture of a thread archived this long ago. Its branch \
+                 and conversation stay.",
+                div()
+                    .debug_selector(|| "cleanup-archived".into())
+                    .child(DropdownMenu::new(
+                        "cleanup-archived",
+                        archived.label(),
+                        menu,
+                    ))
+                    .into_any_element(),
+                cx,
+            ),
+            render_row(
+                "Remove deleted threads’ workspaces",
+                "Removes the worktree or pasture of a thread you delete, once no other thread \
+                 uses it.",
+                switch(
+                    "cleanup-deleted",
+                    rules.deleted,
+                    Box::new(set(CleanupRules {
+                        deleted: !rules.deleted,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+            render_row(
+                "Remove inactive threads’ workspaces",
+                "Removes the worktree or pasture of a thread inactive this long, archived or \
+                 not. Its branch and conversation stay.",
+                inactive,
+                cx,
+            ),
+            render_row(
+                "Remove merged worktrees",
+                "Removes worktrees whose branch is merged into the project’s default branch.",
+                switch(
+                    "cleanup-merged",
+                    rules.merged,
+                    Box::new(set(CleanupRules {
+                        merged: !rules.merged,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+            render_row(
+                "Remove workspaces with nothing of their own",
+                "Removes worktrees and pastures with no commits beyond the default branch and no \
+                 changes.",
+                switch(
+                    "cleanup-unchanged",
+                    rules.unchanged,
+                    Box::new(set(CleanupRules {
+                        unchanged: !rules.unchanged,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+            render_row("Clean up now", last_run, clean_up, cx),
+        ];
+        if let Some(report) = &cleanup.last_run {
+            let is_open = self.storage_page.report_open;
+            let mut summary = format!(
+                "Last run: {} removed, {} kept",
+                report.count(CleanupOutcome::Removed),
+                report.count(CleanupOutcome::Kept)
+            );
+            let failed = report.count(CleanupOutcome::Failed);
+            if failed > 0 {
+                summary.push_str(&format!(", {failed} failed"));
+            }
+            rows.push(
+                h_flex()
+                    .id("cleanup-report")
+                    .debug_selector(|| "cleanup-report".into())
+                    .px_4()
+                    .py_2()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(colors.ghost_element_hover))
+                    .child(
+                        Icon::new(if is_open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.storage_page.report_open = !this.storage_page.report_open;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if is_open {
+                rows.extend(
+                    report
+                        .entries
+                        .iter()
+                        .take(CLEANUP_RESULTS_SHOWN)
+                        .map(|entry| render_cleanup_entry(entry, cx)),
+                );
+                let hidden = report.entries.len().saturating_sub(CLEANUP_RESULTS_SHOWN);
+                if report.entries.is_empty() {
+                    rows.push(render_cleanup_note("Nothing needed cleanup.".into()));
+                } else if hidden > 0 {
+                    rows.push(render_cleanup_note(format!("{hidden} more results.")));
+                }
+            }
+        }
+        div()
+            .debug_selector(|| "storage-cleanup".into())
+            .child(render_section_with_note(
+                "Cleaning up",
+                rows,
+                "Workspaces with changes, and ones a working thread or another thread still \
+                 uses, are never removed.",
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn clean_up_now(
+        &mut self,
+        machine: MachineId,
+        client: &Entity<ServerClient>,
+        cx: &mut Context<Self>,
+    ) {
+        self.storage_page.error = None;
+        self.storage_page.cleaning_up.insert(machine);
+        let cleaned = client.read(cx).clean_up_now(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cleaned.await;
+            this.update(cx, |this, cx| {
+                this.storage_page.cleaning_up.remove(&machine);
+                if let Err(error) = result {
+                    this.storage_page.error = Some(format!("Couldn't clean up: {error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn render_thread_row(
@@ -491,7 +828,7 @@ impl SettingsPage {
         } else if checkout.has_own_commits {
             "Commits the project doesn't have".to_string()
         } else {
-            thread_state(&threads, SystemTime::now())
+            thread_state(&threads, checkout, SystemTime::now())
         };
         let tag = if is_working {
             Some(("Working", Color::Warning))
@@ -758,6 +1095,12 @@ impl SettingsPage {
         let size = format_size(bytes);
         let message = if thread.is_chat() {
             format!("It takes {size}: its conversation, images and folder. This can’t be undone.")
+        } else if let Some(kind) = store.read(cx).workspace_removed_on_delete(thread_id, cx) {
+            format!(
+                "It takes {size}: its conversation, images and subthreads. Its {} goes too, \
+                 unless it has changes or another thread uses it. This can’t be undone.",
+                kind.label().to_lowercase()
+            )
         } else {
             format!(
                 "It takes {size}: its conversation, images and subthreads. Its worktree or \
@@ -875,9 +1218,15 @@ fn listed_threads(
 }
 
 /// What a checkout's threads did last, when none is working: the newest one's.
-fn thread_state(threads: &[&Thread], now: SystemTime) -> String {
+fn thread_state(threads: &[&Thread], checkout: &CheckoutStorage, now: SystemTime) -> String {
     let Some(thread) = threads.iter().max_by_key(|thread| thread.last_activity_at) else {
-        return "Its thread was deleted".to_string();
+        if checkout.thread_deleted {
+            return "Its thread was deleted".to_string();
+        }
+        return format!(
+            "No thread uses this {}",
+            checkout.kind.label().to_lowercase()
+        );
     };
     match (thread.archived_at, thread.last_activity_at) {
         (Some(archived_at), _) => format!("Its thread was archived {}", long_ago(archived_at, now)),
@@ -1079,15 +1428,7 @@ fn render_storage_row(row: StorageRow, cx: &App) -> AnyElement {
                         .truncate()
                 })),
         )
-        .children(tag.map(|(text, color)| {
-            div()
-                .flex_none()
-                .px(px(6.))
-                .py(px(1.))
-                .rounded(px(4.))
-                .bg(colors.ghost_element_selected)
-                .child(Label::new(text).size(LabelSize::XSmall).color(color))
-        }))
+        .children(tag.map(|(text, color)| render_tag(text, color, cx)))
         .child(
             div().w(SIZE_WIDTH).flex_none().flex().justify_end().child(
                 Label::new(format_size(bytes))
@@ -1110,6 +1451,81 @@ fn render_storage_row(row: StorageRow, cx: &App) -> AnyElement {
                 .justify_center()
                 .children(end),
         )
+        .into_any_element()
+}
+
+/// Why a row stays, or what became of a workspace a cleanup looked at.
+fn render_tag(text: &'static str, color: Color, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .px(px(6.))
+        .py(px(1.))
+        .rounded(px(4.))
+        .bg(cx.theme().colors().ghost_element_selected)
+        .child(Label::new(text).size(LabelSize::XSmall).color(color))
+}
+
+/// A workspace the last cleanup run looked at (t3code's cleanup results): its folder's name
+/// over its thread and why, what became of it, and its size.
+fn render_cleanup_entry(entry: &CleanupEntry, cx: &App) -> AnyElement {
+    let name = entry
+        .path
+        .file_name()
+        .unwrap_or(entry.path.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let detail = match &entry.thread_title {
+        Some(title) if *title != name => format!("{title}. {}", entry.reason),
+        _ => entry.reason.clone(),
+    };
+    let (tag, color) = match entry.outcome {
+        CleanupOutcome::Removed => ("Removed", Color::Muted),
+        CleanupOutcome::Kept => ("Kept", Color::Success),
+        CleanupOutcome::Failed => ("Failed", Color::Error),
+    };
+    let is_failed = entry.outcome == CleanupOutcome::Failed;
+    let selector = format!("cleanup-entry-{name}");
+    h_flex()
+        .debug_selector(move || selector)
+        .min_h(px(34.))
+        .py_1()
+        .pl_8()
+        .pr_3()
+        .gap_2p5()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(Label::new(name).truncate())
+                .child(
+                    Label::new(detail)
+                        .size(LabelSize::XSmall)
+                        .color(if is_failed {
+                            Color::Error
+                        } else {
+                            Color::Placeholder
+                        })
+                        .when(!is_failed, |label| label.truncate()),
+                ),
+        )
+        .child(render_tag(tag, color, cx))
+        .child(
+            div().w(SIZE_WIDTH).flex_none().flex().justify_end().child(
+                Label::new(format_size(entry.bytes))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .into_any_element()
+}
+
+/// A line under the last run's results.
+fn render_cleanup_note(text: String) -> AnyElement {
+    div()
+        .pl_8()
+        .pr_3()
+        .py_2p5()
+        .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
         .into_any_element()
 }
 
@@ -1141,7 +1557,7 @@ mod tests {
 
     use agentz_protocol::agents::AgentId;
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::storage::{AgentStorage, NodeStorage, ThreadStorage};
+    use agentz_protocol::storage::{AgentStorage, CleanupReport, NodeStorage, ThreadStorage};
     use agentz_protocol::{Request, Response};
     use gpui::{TestAppContext, VisualTestContext};
     use projects::ProjectsSnapshot;
@@ -1178,6 +1594,7 @@ mod tests {
             bytes: 300 * 1024 * 1024,
             changed_files,
             has_own_commits: false,
+            thread_deleted: false,
         }
     }
 
@@ -1228,6 +1645,7 @@ mod tests {
                 in_use: false,
             }),
             server_log: 0,
+            cleanup: WorkspaceCleanup::default(),
         }
     }
 
@@ -1285,6 +1703,7 @@ mod tests {
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
         cx.update(|_, cx| {
             let confirms = confirms.clone();
@@ -1313,6 +1732,7 @@ mod tests {
         };
         let groups = [
             "storage-summary",
+            "storage-cleanup",
             "storage-group-Chats",
             "storage-group-Threads",
             "storage-group-Worktrees and pastures",
@@ -1390,6 +1810,121 @@ mod tests {
             .collect();
         assert_eq!(cleared, [StorageCache::Node, StorageCache::RegistryCache]);
         assert!(page.read_with(cx, |page, _| page.storage_page.error.is_none()));
+    }
+
+    /// The cleanup rules change at once and go to the server; Clean Up Now runs them once one
+    /// is on, and the last run's results fold open under it.
+    #[gpui::test]
+    fn cleanup_rules_change_at_once_and_run_when_asked(cx: &mut TestAppContext) {
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let requests = requests.clone();
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    matches!(request, Request::CleanUpNow).then_some(Response::Ok)
+                })
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Storage, window, cx)
+        });
+        let entry = |name: &str, outcome, reason: &str| CleanupEntry {
+            path: format!("/data/worktrees/agentz/{name}").into(),
+            kind: WorkspaceKind::Worktree,
+            thread_title: Some(format!("The {name} thread")),
+            outcome,
+            reason: reason.into(),
+            bytes: 300 * 1024 * 1024,
+        };
+        let mut storage = storage();
+        storage.cleanup.last_run = Some(CleanupReport {
+            finished_at: SystemTime::now(),
+            entries: vec![
+                entry("done", CleanupOutcome::Removed, "Archived for 9 days"),
+                entry(
+                    "wip",
+                    CleanupOutcome::Kept,
+                    "Has uncommitted changes (3 files)",
+                ),
+            ],
+        });
+        client.update(cx, |client, cx| client.set_storage_for_test(storage, cx));
+        cx.run_until_parked();
+
+        let click = |selector: &'static str, cx: &mut VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let rules = |cx: &mut VisualTestContext| {
+            client.read_with(cx, |client, _| client.storage().cleanup.rules.clone())
+        };
+
+        // Every rule starts off, so there's nothing to run.
+        click("cleanup-now", cx);
+        assert!(!requests.borrow().contains(&Request::CleanUpNow));
+        assert!(cx.debug_bounds("cleanup-inactive-days").is_none());
+
+        click("cleanup-deleted", cx);
+        assert!(rules(cx).deleted);
+        click("cleanup-inactive", cx);
+        assert_eq!(
+            rules(cx).inactive_days,
+            Some(CleanupRules::DEFAULT_INACTIVE_DAYS)
+        );
+        click("cleanup-more-days", cx);
+        let chosen = CleanupRules {
+            deleted: true,
+            inactive_days: Some(CleanupRules::DEFAULT_INACTIVE_DAYS + 1),
+            ..CleanupRules::default()
+        };
+        assert_eq!(rules(cx), chosen);
+        let sent = client.read_with(cx, |client, _| client.sent_for_test());
+        assert_eq!(sent.last(), Some(&Request::SetCleanupRules(chosen)));
+
+        click("cleanup-now", cx);
+        assert!(requests.borrow().contains(&Request::CleanUpNow));
+
+        assert!(cx.debug_bounds("cleanup-entry-done").is_none());
+        click("cleanup-report", cx);
+        let done = cx
+            .debug_bounds("cleanup-entry-done")
+            .expect("the removed one is listed");
+        let kept = cx
+            .debug_bounds("cleanup-entry-wip")
+            .expect("the kept one is listed");
+        assert!(done.top() < kept.top());
+        assert!(page.read_with(cx, |page, _| page.storage_page.error.is_none()));
+    }
+
+    #[test]
+    fn checkouts_without_threads_say_why() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000_000);
+        let mut pasture = checkout(
+            "/data/pastures/agentz/old",
+            WorkspaceKind::Pasture,
+            "old",
+            0,
+        );
+        assert_eq!(
+            thread_state(&[], &pasture, now),
+            "No thread uses this pasture"
+        );
+        pasture.thread_deleted = true;
+        assert_eq!(thread_state(&[], &pasture, now), "Its thread was deleted");
     }
 
     #[test]
