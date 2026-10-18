@@ -8,18 +8,19 @@
 //! over and Backspace removes whole (Zed's mention creases).
 
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, Hsla, ImageSource, Img, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, SharedString, Size,
-    Style, Subscription, TextAlign, TextRun, TransformationMatrix, UTF16Selection, UnderlineStyle,
-    Window, WrappedLine, actions, anchored, deferred, div, fill, img, point, prelude::*, px, quad,
-    relative, size,
+    Anchor, AnyElement, App, Axis, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, Hsla, ImageSource, Img, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ScrollReach,
+    ScrollWheelEvent, SharedString, Size, Style, Subscription, TextAlign, TextRun,
+    TransformationMatrix, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, anchored,
+    deferred, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use theme::ActiveTheme as _;
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -211,6 +212,8 @@ pub struct TextInput {
     hovered_chip: Option<(ChipId, Bounds<Pixels>)>,
     /// The chip a click went down on, a click on it once the mouse goes up there.
     pressed_chip: Option<ChipId>,
+    /// Stands for the input in the window's scroll latching (`Window::takes_scroll`).
+    scroll_area: Rc<()>,
 }
 
 /// What a drag selects by, set by the click that started it (Zed's editor's `SelectMode`).
@@ -373,6 +376,7 @@ impl TextInput {
             handles_paste: false,
             hovered_chip: None,
             pressed_chip: None,
+            scroll_area: Rc::default(),
         }
     }
 
@@ -979,26 +983,43 @@ impl TextInput {
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(layout) = &self.layout else {
             return;
         };
         let delta = event.delta.pixel_delta(layout.line_height);
-        if self.is_multi_line() {
+        let multi_line = self.is_multi_line();
+        // One line scrolls only sideways, so a list the input sits in still scrolls under it.
+        let (axis, overflow, offset, change) = if multi_line {
             let overflow = layout.content_height() - layout.bounds.size.height;
-            if overflow <= px(0.) {
-                return;
-            }
-            self.scroll_top = (self.scroll_top - delta.y).clamp(px(0.), overflow);
+            (Axis::Vertical, overflow, self.scroll_top, -delta.y)
         } else {
-            // Only sideways, so a list the input sits in still scrolls under it.
             let overflow = layout.horizontal_overflow();
-            if overflow <= px(0.) || delta.x == px(0.) {
-                return;
-            }
-            self.scroll_left = (self.scroll_left - delta.x).clamp(px(0.), overflow);
+            (Axis::Horizontal, overflow, self.scroll_left, -delta.x)
+        };
+        if overflow <= px(0.) {
+            return;
+        }
+        let scrolled = (offset + change).clamp(px(0.), overflow);
+        // Nothing inside the input scrolls, so it can offer itself as the scroll bubbles up,
+        // before the areas around it.
+        if window.unlatched_scroll_axis() == Some(axis) {
+            let reach = if scrolled != offset {
+                ScrollReach::Along
+            } else {
+                ScrollReach::AtEnd
+            };
+            window.offer_scroll(&self.scroll_area, reach);
+        }
+        if !window.takes_scroll(&self.scroll_area) || scrolled == offset {
+            return;
+        }
+        if multi_line {
+            self.scroll_top = scrolled;
+        } else {
+            self.scroll_left = scrolled;
         }
         cx.stop_propagation();
         cx.notify();
@@ -2187,6 +2208,75 @@ mod tests {
                 layout.bounds,
             )
         })
+    }
+
+    struct ScrollingHost {
+        input: Entity<TextInput>,
+        page: gpui::ScrollHandle,
+    }
+
+    impl Render for ScrollingHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("page")
+                .h(px(100.))
+                .overflow_y_scroll()
+                .track_scroll(&self.page)
+                .child(
+                    div()
+                        .w(px(240.))
+                        .debug_selector(|| "input".into())
+                        .child(self.input.clone()),
+                )
+                .child(div().h(px(400.)))
+        }
+    }
+
+    /// Inside a page that scrolls, a scroll gesture over several lines scrolls them to their end
+    /// and stays with them there; only the next gesture goes on to the page.
+    #[gpui::test]
+    fn a_scroll_gesture_over_several_lines_stays_with_them(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(theme::LoadThemes::JustBase, cx);
+            theme::set_theme_settings_provider(Box::new(Fonts(gpui::font("Helvetica"))), cx);
+            init(cx);
+        });
+        let page = gpui::ScrollHandle::new();
+        let (host, cx) = cx.add_window_view(|_, cx| ScrollingHost {
+            input: cx.new(|cx| TextInput::new("", cx).multi_line(3)),
+            page: page.clone(),
+        });
+        let input = host.read_with(cx, |host, _| host.input.clone());
+        input.update(cx, |input, cx| input.set_text("1\n2\n3\n4\n5\n6", cx));
+        cx.run_until_parked();
+        input.update(cx, |input, cx| {
+            input.scroll_top = px(0.);
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let over_input = cx.debug_bounds("input").expect("the input").center();
+        let scroll = |delta: f32, cx: &mut VisualTestContext| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: over_input,
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(delta))),
+                ..Default::default()
+            });
+            cx.run_until_parked();
+        };
+        let scroll_top =
+            |cx: &mut VisualTestContext| input.read_with(cx, |input, _| input.scroll_top);
+
+        scroll(-1000., cx);
+        let at_end = scroll_top(cx);
+        assert!(at_end > px(0.), "the lines didn't scroll");
+        assert_eq!(page.offset().y, px(0.));
+        scroll(-20., cx);
+        assert_eq!((scroll_top(cx), page.offset().y), (at_end, px(0.)));
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        scroll(-20., cx);
+        assert_eq!((scroll_top(cx), page.offset().y), (at_end, px(-20.)));
     }
 
     #[gpui::test]

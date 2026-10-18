@@ -65,8 +65,11 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+mod scroll_latch;
 
 pub use a11y::A11ySubtreeBuilder;
+use scroll_latch::ScrollLatch;
+pub use scroll_latch::ScrollReach;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1255,6 +1258,8 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    /// The area the scroll gesture under way goes to.
+    scroll_latch: ScrollLatch,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -2144,6 +2149,7 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            scroll_latch: ScrollLatch::default(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -5809,6 +5815,11 @@ impl Window {
             self.handle_inspector_mouse_event(event, cx);
             // When inspector is picking, all other mouse handling is skipped.
             return;
+        }
+
+        if let Some(event) = event.downcast_ref::<crate::ScrollWheelEvent>() {
+            let now = cx.background_executor().now();
+            self.scroll_latch.begin_scroll(event, now);
         }
 
         let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);

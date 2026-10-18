@@ -29,14 +29,6 @@ in the last. So Droid sends no first message, and its thoughts are what sit fold
 N commands…" header. Open question: show something in that place (say the latest thought's
 first line) or leave it as it is.
 
-### Scrolling inside a code block carries on into the thread
-
-A thread has areas that scroll on their own, such as code blocks, and once a scroll inside one
-reaches its end, the whole thread scrolls instead. Keep the scroll inside the area. Suggested in
-the conversation: latch each scroll gesture to the area it started in, as macOS and browsers
-do, so a gesture started in a code block never scrolls the thread, and one started on the
-thread isn't caught by a code block passing under the cursor. A new gesture goes to whatever is
-under the cursor.
 
 ### A newly added account shows as "New account"
 

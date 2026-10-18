@@ -20176,8 +20176,10 @@ mod tests {
         panic!("never scrolled up to the image");
     }
 
-    /// An open tool call's output scrolls on its own: over it, the conversation stays put until
-    /// the output reaches its end.
+    /// An open tool call's output scrolls on its own: a scroll gesture over it stays with it,
+    /// even at its end, and only one that starts there once it's at its end goes on to the
+    /// conversation. A gesture on the conversation stays with it as the output comes under the
+    /// mouse.
     #[gpui::test]
     fn scrolling_over_a_tool_calls_output_scrolls_only_the_output(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -20205,14 +20207,22 @@ mod tests {
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
 
-        let scroll = |name: &'static str, delta: f32, cx: &mut VisualTestContext| {
-            let bounds = cx.debug_bounds(name).expect(name);
+        let scroll_at = |position: gpui::Point<Pixels>, delta: f32, cx: &mut VisualTestContext| {
             cx.simulate_event(gpui::ScrollWheelEvent {
-                position: bounds.center(),
+                position,
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(delta))),
                 ..Default::default()
             });
             cx.run_until_parked();
+        };
+        let scroll = |name: &'static str, delta: f32, cx: &mut VisualTestContext| {
+            let bounds = cx.debug_bounds(name).expect(name);
+            scroll_at(bounds.center(), delta, cx);
+        };
+        // A wheel's scrolls have no phase, so a pause ends their gesture.
+        let end_gesture = |cx: &mut VisualTestContext| {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_secs(1));
         };
         let row_top = |cx: &mut VisualTestContext| {
             f32::from(
@@ -20230,11 +20240,35 @@ mod tests {
             top,
             "the conversation scrolled with the output"
         );
-        // Back at the output's top, the scroll goes on to the conversation.
+        // Back at the output's top, the rest of the gesture stays with the output.
         scroll("tool-call-output-31", 40., cx);
         assert_eq!(row_top(cx), top);
         scroll("tool-call-output-31", 40., cx);
+        assert_eq!(row_top(cx), top, "the scroll went on to the conversation");
+        // A gesture that starts there at the output's top goes to the conversation.
+        end_gesture(cx);
+        scroll("tool-call-output-31", 40., cx);
         assert_eq!(row_top(cx), top + 40.);
+
+        // Scrolled down, the output could take a scroll down too, but not one of a gesture
+        // that started above it.
+        end_gesture(cx);
+        scroll("tool-call-output-31", -40., cx);
+        assert_eq!(row_top(cx), top + 40.);
+        end_gesture(cx);
+        let output = cx
+            .debug_bounds("tool-call-output-31")
+            .expect("the tool call's output");
+        let above = gpui::point(output.center().x, output.top() - px(15.));
+        for step in 0..10 {
+            let before = row_top(cx);
+            scroll_at(above, -10., cx);
+            assert_eq!(
+                row_top(cx),
+                before - 10.,
+                "the output caught the scroll at step {step}"
+            );
+        }
     }
 
     /// A tool call's output has a scrollbar of its own: dragging its thumb scrolls the output.

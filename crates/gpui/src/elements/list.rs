@@ -8,10 +8,10 @@
 //! If all of your elements are the same height, see [`crate::UniformList`] for a simpler API
 
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
-    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    AnyElement, App, AvailableSpace, Axis, Bounds, ContentMask, DispatchPhase, Edges, Element,
+    EntityId, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, Overflow, Pixels, Point, ScrollDelta, ScrollReach, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -895,6 +895,42 @@ impl StateInner {
         scroll_top.item_ix..cursor.start().count + 1
     }
 
+    /// What scrolling by `delta_y` would do to the list, offered for the gesture it starts.
+    fn scroll_reach(
+        &self,
+        scroll_top: &ListOffset,
+        height: Pixels,
+        delta_y: Pixels,
+    ) -> Option<ScrollReach> {
+        if self.reset {
+            return None;
+        }
+        // Items that were never drawn count no height yet, so any of them past the view is
+        // room to scroll as well.
+        let summary = self.items.summary();
+        let mut cursor = self.items.cursor::<ListItemSummary>(());
+        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+        let unmeasured_above = cursor.start().unrendered_count;
+        let padding = self.last_padding.unwrap_or_default();
+        let scroll_max = (summary.height + padding.top + padding.bottom - height).max(px(0.));
+        let room_above = scroll_top.item_ix > 0 || scroll_top.offset_in_item > px(0.);
+        let room_below = summary.unrendered_count > unmeasured_above
+            || scroll_max - self.scroll_top(scroll_top) > px(0.5);
+        if !room_above && !room_below {
+            return None;
+        }
+        let moves = if delta_y > px(0.) {
+            room_above
+        } else {
+            delta_y < px(0.) && room_below
+        };
+        Some(if moves {
+            ScrollReach::Along
+        } else {
+            ScrollReach::AtEnd
+        })
+    }
+
     fn scroll(
         &mut self,
         scroll_top: &ListOffset,
@@ -1599,7 +1635,23 @@ impl Element for List {
         let hitbox_id = prepaint.hitbox.id;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+            if !hitbox_id.should_handle_scroll(window) {
+                return;
+            }
+            if phase == DispatchPhase::Capture {
+                if window.unlatched_scroll_axis() == Some(Axis::Vertical)
+                    && let Some(reach) = list_state.0.borrow().scroll_reach(
+                        &scroll_top,
+                        height,
+                        event.delta.pixel_delta(px(20.)).y,
+                    )
+                {
+                    window.offer_scroll(&list_state.0, reach);
+                }
+                return;
+            }
+            // Only the area the gesture went to scrolls (see `Window::takes_scroll`).
+            if window.takes_scroll(&list_state.0) {
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(

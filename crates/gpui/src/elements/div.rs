@@ -16,15 +16,15 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Axis, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    ScrollReach, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -3344,8 +3344,36 @@ impl Interactivity {
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             let scroll_max = self.scroll_max(bounds, style, window);
+            // The offset is clamped in prepaint, so it can be past the end here.
+            let clamp = move |offset: Point<Pixels>| {
+                point(
+                    offset.x.clamp(-scroll_max.x, px(0.)),
+                    offset.y.clamp(-scroll_max.y, px(0.)),
+                )
+            };
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if !hitbox.should_handle_scroll(window) {
+                    return;
+                }
+                if phase == DispatchPhase::Capture {
+                    if let Some(axis) = window.unlatched_scroll_axis() {
+                        let offset = clamp(*scroll_offset.borrow());
+                        if let Some(reach) = scroll_reach(
+                            axis,
+                            event.delta.pixel_delta(line_height),
+                            offset,
+                            scroll_max,
+                            overflow,
+                            restrict_scroll_to_axis,
+                        ) {
+                            window.offer_scroll(&scroll_offset, reach);
+                        }
+                    }
+                    return;
+                }
+                // Inside another scrolling element, only the one the gesture went to scrolls,
+                // so both don't scroll at once, and neither passes the scroll on partway.
+                if window.takes_scroll(&scroll_offset) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
@@ -3389,21 +3417,7 @@ impl Interactivity {
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }
-
-                    // Scrolling inside another scrolling element, this one takes the scroll
-                    // while it moves along the scroll's own axis, so both don't scroll at
-                    // once; at its end it passes the scroll on, as Zed's editor does. The
-                    // offset is clamped in prepaint, so it can be past the end here.
-                    let clamp = |offset: Point<Pixels>| {
-                        point(
-                            offset.x.clamp(-scroll_max.x, px(0.)),
-                            offset.y.clamp(-scroll_max.y, px(0.)),
-                        )
-                    };
-                    let (old, new) = (clamp(old_scroll_offset), clamp(*scroll_offset));
-                    let moved_along_y = !delta.y.is_zero() && delta_y == delta.y && new.y != old.y;
-                    let moved_along_x = !delta.x.is_zero() && delta_x == delta.x && new.x != old.x;
-                    if moved_along_y || moved_along_x {
+                    if clamp(*scroll_offset) != clamp(old_scroll_offset) {
                         cx.stop_propagation();
                     }
                 }
@@ -3691,6 +3705,43 @@ pub(crate) enum ActiveTooltip {
         tooltip: AnyTooltip,
         _task: Task<()>,
     },
+}
+
+/// What a scroll would do to a scrolling div, offered for the gesture it starts.
+fn scroll_reach(
+    axis: Axis,
+    delta: Point<Pixels>,
+    offset: Point<Pixels>,
+    scroll_max: Point<Pixels>,
+    overflow: Point<Overflow>,
+    restrict_scroll_to_axis: bool,
+) -> Option<ScrollReach> {
+    let on = |axis: Axis| match axis {
+        Axis::Horizontal => (overflow.x, scroll_max.x, offset.x),
+        Axis::Vertical => (overflow.y, scroll_max.y, offset.y),
+    };
+    let amount = match axis {
+        Axis::Horizontal => delta.x,
+        Axis::Vertical => delta.y,
+    };
+    let moves = |(_, max, offset): (Overflow, Pixels, Pixels)| {
+        (offset + amount).clamp(-max, px(0.)) != offset
+    };
+    let along = on(axis);
+    if along.0 == Overflow::Scroll {
+        return (along.1 > px(0.)).then(|| {
+            if moves(along) {
+                ScrollReach::Along
+            } else {
+                ScrollReach::AtEnd
+            }
+        });
+    }
+    // Scrolling only the other way, it turns the scroll that way, as `paint_scroll_listener`
+    // does, unless it's restricted to its axis.
+    let across = on(axis.invert());
+    (!restrict_scroll_to_axis && across.0 == Overflow::Scroll && moves(across))
+        .then_some(ScrollReach::Across)
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -5626,7 +5677,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_a_nested_scroller_takes_the_scroll_until_its_end(cx: &mut TestAppContext) {
+    fn test_a_scroll_gesture_stays_with_the_area_it_started_in(cx: &mut TestAppContext) {
         struct Nested {
             outer: ScrollHandle,
             inner: ScrollHandle,
@@ -5669,38 +5720,227 @@ mod tests {
                 move |_, _| Nested { outer, inner }
             })
             .into();
-        let mut scroll = |position: Point<Pixels>, delta_y: f32| {
-            cx.update_window(window, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.simulate_mouse_move(position, cx);
-                window.dispatch_event(
-                    ScrollWheelEvent {
-                        position,
-                        delta: ScrollDelta::Pixels(point(px(0.), px(delta_y))),
-                        ..Default::default()
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.draw(cx).clear(cx);
-            })
-            .unwrap();
+        let scroll = |position: Point<Pixels>,
+                      delta_y: f32,
+                      touch_phase: TouchPhase,
+                      cx: &mut TestAppContext| {
+            scroll_window(
+                window,
+                position,
+                point(px(0.), px(delta_y)),
+                touch_phase,
+                cx,
+            );
         };
+        // Wheel scrolls have no phase, so a pause ends their gesture.
+        let end_gesture = |cx: &mut TestAppContext| {
+            cx.executor().advance_clock(Duration::from_secs(1));
+        };
+        let offsets = || (outer.offset().y, inner.offset().y);
         let over_inner = point(px(50.), px(40.));
 
-        scroll(over_inner, -20.);
-        assert_eq!((outer.offset().y, inner.offset().y), (px(0.), px(-20.)));
+        scroll(over_inner, -20., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(0.), px(-20.)));
         // Only 10px are left in the inner box, and then it's at its end.
-        scroll(over_inner, -20.);
-        assert_eq!((outer.offset().y, inner.offset().y), (px(0.), px(-30.)));
-        scroll(over_inner, -20.);
-        assert_eq!((outer.offset().y, inner.offset().y), (px(-20.), px(-30.)));
-        // Back up, the inner box scrolls first again.
-        scroll(point(px(50.), px(30.)), 10.);
-        assert_eq!((outer.offset().y, inner.offset().y), (px(-20.), px(-20.)));
-        // Outside it, the outer box scrolls.
-        scroll(point(px(50.), px(90.)), -10.);
-        assert_eq!((outer.offset().y, inner.offset().y), (px(-30.), px(-20.)));
+        scroll(over_inner, -20., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(0.), px(-30.)));
+        // The rest of the gesture stays with it.
+        scroll(over_inner, -20., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(0.), px(-30.)));
+
+        // A gesture that starts there once it's at its end goes to the outer box, and stays
+        // with it.
+        end_gesture(cx);
+        scroll(over_inner, -20., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(-20.), px(-30.)));
+        scroll(over_inner, -20., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(-40.), px(-30.)));
+
+        // Scrolling the outer box back brings the inner box under the mouse, and it doesn't
+        // catch the scroll on its way.
+        end_gesture(cx);
+        let below_inner = point(px(50.), px(55.));
+        for _ in 0..5 {
+            scroll(below_inner, 10., TouchPhase::Moved, cx);
+        }
+        assert_eq!(offsets(), (px(0.), px(-30.)));
+
+        // A trackpad's touch starts a new gesture at once.
+        scroll(below_inner, 10., TouchPhase::Started, cx);
+        assert_eq!(offsets(), (px(0.), px(-20.)));
+        scroll(below_inner, 10., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(0.), px(-10.)));
+
+        // So does moving the mouse: outside the inner box, the outer one scrolls.
+        scroll(point(px(50.), px(90.)), -10., TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(-10.), px(-10.)));
+    }
+
+    #[gpui::test]
+    fn test_a_scroll_gesture_keeps_to_one_axis_of_nested_scrollers(cx: &mut TestAppContext) {
+        struct Nested {
+            outer: ScrollHandle,
+            code: ScrollHandle,
+        }
+
+        impl Render for Nested {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                // A code block 50px wide that scrolls sideways 150px, as a markdown one does,
+                // inside a box that scrolls up and down 140px, and only that way, as a list.
+                div().size_full().child(
+                    div()
+                        .id("outer")
+                        .h(px(100.))
+                        .w(px(50.))
+                        .overflow_y_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&self.outer)
+                        .child(
+                            div()
+                                .id("code")
+                                .h(px(40.))
+                                .w_full()
+                                .overflow_x_scroll()
+                                .restrict_scroll_to_axis()
+                                .track_scroll(&self.code)
+                                .child(div().w(px(200.)).h(px(40.))),
+                        )
+                        .child(div().w_full().h(px(200.))),
+                )
+            }
+        }
+
+        let outer = ScrollHandle::new();
+        let code = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (outer, code) = (outer.clone(), code.clone());
+                move |_, _| Nested { outer, code }
+            })
+            .into();
+        let scroll = |delta: Point<Pixels>, touch_phase: TouchPhase, cx: &mut TestAppContext| {
+            scroll_window(window, point(px(25.), px(20.)), delta, touch_phase, cx);
+        };
+        let offsets = || (outer.offset().y, code.offset().x);
+
+        // A gesture up and down over the code block scrolls the box around it, even where it
+        // goes sideways.
+        scroll(point(px(0.), px(-10.)), TouchPhase::Started, cx);
+        scroll(point(px(-10.), px(0.)), TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(-10.), px(0.)));
+
+        // One sideways scrolls the code block, and only it, even where it goes up and down.
+        scroll(point(px(-10.), px(0.)), TouchPhase::Started, cx);
+        scroll(point(px(0.), px(-10.)), TouchPhase::Moved, cx);
+        assert_eq!(offsets(), (px(-10.), px(-10.)));
+    }
+
+    #[gpui::test]
+    fn test_a_scroll_turns_sideways_only_where_nothing_scrolls_its_way(cx: &mut TestAppContext) {
+        struct Sideways {
+            outer: ScrollHandle,
+            inside: ScrollHandle,
+            outside: ScrollHandle,
+        }
+
+        impl Render for Sideways {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let code_block = |id: &'static str, handle: &ScrollHandle| {
+                    // 50px wide, it scrolls sideways 150px, and turns a scroll up and down.
+                    div()
+                        .id(id)
+                        .h(px(40.))
+                        .w(px(50.))
+                        .overflow_x_scroll()
+                        .track_scroll(handle)
+                        .child(div().w(px(200.)).h(px(40.)))
+                };
+                // One code block at the end of a box that scrolls up and down 140px, and one
+                // below it, where nothing else scrolls.
+                div()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("outer")
+                            .h(px(100.))
+                            .w(px(50.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.outer)
+                            .child(div().w_full().h(px(200.)))
+                            .child(code_block("inside", &self.inside)),
+                    )
+                    .child(code_block("outside", &self.outside))
+            }
+        }
+
+        let outer = ScrollHandle::new();
+        let inside = ScrollHandle::new();
+        let outside = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (outer, inside, outside) = (outer.clone(), inside.clone(), outside.clone());
+                move |_, _| Sideways {
+                    outer,
+                    inside,
+                    outside,
+                }
+            })
+            .into();
+        let scroll = |position: Point<Pixels>, delta_y: f32, cx: &mut TestAppContext| {
+            scroll_window(
+                window,
+                position,
+                point(px(0.), px(delta_y)),
+                TouchPhase::Started,
+                cx,
+            );
+        };
+        let offsets = || (outer.offset().y, inside.offset().x, outside.offset().x);
+
+        scroll(point(px(25.), px(20.)), -200., cx);
+        assert_eq!(offsets(), (px(-140.), px(0.), px(0.)));
+
+        // The box around the code block is at its end, but it still scrolls up and down, so the
+        // gesture goes to it, and the code block doesn't scroll sideways.
+        scroll(point(px(25.), px(80.)), -10., cx);
+        assert_eq!(offsets(), (px(-140.), px(0.), px(0.)));
+
+        // Where nothing scrolls up and down, the code block turns the scroll sideways.
+        scroll(point(px(25.), px(120.)), -10., cx);
+        assert_eq!(offsets(), (px(-140.), px(0.), px(-10.)));
+    }
+
+    fn scroll_window(
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+        touch_phase: TouchPhase,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(position, cx);
+            window.dispatch_event(
+                ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(delta),
+                    touch_phase,
+                    ..Default::default()
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
     }
 
     struct ContentSizedGrid;

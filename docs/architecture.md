@@ -107,9 +107,19 @@ draws itself should check `App::reduce_motion` too.
 and `MarkdownStyle::link_chip` draws chosen links as chips (see Images).
 `Markdown::request_autoscroll_to_source_index_at_top` scrolls the list holding a markdown so a
 place in it sits a given distance below the view's top (see Find in a thread), where Zed's
-autoscroll only brings it into view. `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
-on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
-so an open tool call's output raced the conversation.
+autoscroll only brings it into view. `gpui` latches each scroll gesture to one area that
+scrolls, as macOS and browsers do (`window/scroll_latch.rs`): on a gesture's first scroll, each
+scrolling `div`, `list` and `text_input` under the mouse offers itself with what that scroll
+would do to it (`Window::offer_scroll`, `ScrollReach`), and the whole gesture goes to the
+innermost one that moves along the scroll's axis; if none does, to the innermost one already at
+its end that way, so nothing moves; and only where nothing scrolls that way, to one that turns
+the scroll sideways. A gesture started in a code block or a tool call's output then never
+carries on into the conversation once the area reaches its end, and one started on the
+conversation isn't caught by an area passing under the mouse. A gesture ends at a trackpad's
+touch, 500 ms after its last scroll (Chromium's wheel transaction timeout, for a mouse wheel's
+and every Linux scroll, which have no phase), once the mouse moves more than 10 px, or when its
+area goes away. In Zed a nested `div` and the list around it scroll at once, so an open tool
+call's output raced the conversation.
 `gpui` has Zed's hot reloading through Dioxus's Subsecond (zed-industries/zed#65738): in a
 debug build with `app`'s `hot-reload` feature, run by `dx` 0.7.10 (`dx serve --hot-patch
 --package app --features hot-reload`, with a server already running or `AGENTZ_SERVER_BIN`
