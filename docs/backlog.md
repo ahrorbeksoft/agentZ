@@ -44,6 +44,10 @@ After an account is added, the agent's Accounts list shows it as "New account", 
 or usage ([screenshot](backlog/new-account-row.png), Factory Droid on proton-cloud, the
 existing account's name covered). At least add a refresh button or something like it.
 
+The Account added dialog shows it the same way
+([screenshot](backlog/account-added-dialog.png), email covered): "New account", then "Its
+settings were copied from … You can rename it from its ··· menu."
+
 ## Features
 
 ### Artifacts move with their thread to another machine
