@@ -57,12 +57,6 @@ Follow Zed's developing v2 session lifecycle, including resume/replay and metada
 [#65709](https://github.com/zed-industries/zed/pull/65709). Treat this as a deliberate protocol
 update, separate from the smaller copied-crate fixes. Test with the mock agent.
 
-### Port GPUI's focus cleanup performance fix
-
-Follow [#65177](https://github.com/zed-industries/zed/pull/65177): queue final focus-handle drops
-instead of scanning the entire registry before every app effect. Upstream fixed hangs when
-restoring large conversations with subagents; check its benefit to agentZ's thread views.
-
 ### Add GPUI hot reloading and headless windowing support
 
 Bring in optional debug hot reloading of view and component render functions through
