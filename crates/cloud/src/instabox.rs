@@ -5,7 +5,8 @@
 use std::time::SystemTime;
 
 use agentz_protocol::cloud::{
-    CloudMachine, CloudState, CloudUsage, CreateMachine, Lifecycle, MachineSize, MachineSource,
+    CloudMachine, CloudState, CloudTemplate, CloudUsage, CreateMachine, Lifecycle, MachineSize,
+    MachineSnapshot, MachineSource,
 };
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -31,7 +32,7 @@ struct Template {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Spec {
     #[serde(default)]
@@ -71,33 +72,34 @@ pub(crate) fn parse_machines(json: &str) -> Result<Vec<CloudMachine>> {
 }
 
 fn machine(machine: Machine) -> CloudMachine {
-    let spec = machine.spec.unwrap_or(Spec {
-        vcpus: None,
-        mem_mi_b: None,
-        persistent_disk_gi_b: None,
-    });
     CloudMachine {
         id: machine.id,
         name: machine.name,
         state: state(&machine.state),
-        size: MachineSize {
-            vcpus: spec.vcpus,
-            memory_mib: spec.mem_mi_b,
-            memory_ceiling_mib: None,
-            disk_gib: spec.persistent_disk_gi_b,
-        },
+        size: size(machine.spec.unwrap_or_default()),
         template: machine.template.map(|template| template.id),
         // Its gateway reaches every machine by its id, so the address names none of them.
         ssh_address: None,
-        created_at: machine
-            .created_at
-            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
-            .map(SystemTime::from),
+        created_at: time(machine.created_at),
         error: machine
             .error
             .and_then(|error| error.message.or(error.code))
             .filter(|message| !message.is_empty()),
     }
+}
+
+fn size(spec: Spec) -> MachineSize {
+    MachineSize {
+        vcpus: spec.vcpus,
+        memory_mib: spec.mem_mi_b,
+        memory_ceiling_mib: None,
+        disk_gib: spec.persistent_disk_gi_b,
+    }
+}
+
+fn time(at: Option<String>) -> Option<SystemTime> {
+    at.and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+        .map(SystemTime::from)
 }
 
 /// The API's states: it says `suspend` for pause.
@@ -115,6 +117,77 @@ fn state(state: &str) -> CloudState {
         "error" => CloudState::Failed,
         other => CloudState::Other(other.to_string()),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TemplateEntry {
+    id: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default_spec: Option<Spec>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Templates {
+    Page { templates: Vec<TemplateEntry> },
+    List(Vec<TemplateEntry>),
+}
+
+pub(crate) fn parse_templates(json: &str) -> Result<Vec<CloudTemplate>> {
+    let templates: Templates = serde_json::from_str(json).context("parsing the templates")?;
+    let templates = match templates {
+        Templates::Page { templates } | Templates::List(templates) => templates,
+    };
+    Ok(templates
+        .into_iter()
+        .map(|template| CloudTemplate {
+            id: template.id,
+            description: template
+                .description
+                .filter(|description| !description.is_empty()),
+            size: size(template.default_spec.unwrap_or_default()),
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Snapshot {
+    id: String,
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    source_machine_id: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Snapshots {
+    Page { snapshots: Vec<Snapshot> },
+    List(Vec<Snapshot>),
+}
+
+pub(crate) fn parse_snapshots(json: &str) -> Result<Vec<MachineSnapshot>> {
+    let snapshots: Snapshots = serde_json::from_str(json).context("parsing the snapshots")?;
+    let snapshots = match snapshots {
+        Snapshots::Page { snapshots } | Snapshots::List(snapshots) => snapshots,
+    };
+    Ok(snapshots
+        .into_iter()
+        .map(|snapshot| MachineSnapshot {
+            id: snapshot.id,
+            name: snapshot.name,
+            is_ready: snapshot.status.as_deref() == Some("ready"),
+            source_machine: snapshot.source_machine_id,
+            created_at: time(snapshot.created_at),
+        })
+        .collect())
 }
 
 pub(crate) fn create_args(machine: &CreateMachine) -> Vec<String> {
@@ -254,6 +327,38 @@ mod tests {
                 max_stored_gib: Some(200),
             }
         );
+    }
+
+    #[test]
+    fn reads_the_templates() {
+        let templates =
+            parse_templates(include_str!("instabox_outputs/templates.json")).expect("parses");
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].id, "universal");
+        assert_eq!(
+            templates[0].description.as_deref(),
+            Some("Docker, Python (uv), Node, Go and Rust")
+        );
+        assert_eq!(templates[0].size.memory_mib, Some(8192));
+        assert_eq!(
+            parse_templates(r#"[{"id": "orca"}]"#).expect("parses")[0].description,
+            None
+        );
+    }
+
+    #[test]
+    fn reads_the_snapshots() {
+        let snapshots =
+            parse_snapshots(include_str!("instabox_outputs/snapshots.json")).expect("parses");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].name, "dev-base");
+        assert!(snapshots[0].is_ready);
+        assert_eq!(
+            snapshots[0].source_machine.as_deref(),
+            Some("m_q4mz7tk2bx5rn3wd6vp2hj4sye")
+        );
+        assert!(snapshots[0].created_at.is_some());
+        assert!(!snapshots[1].is_ready);
     }
 
     #[test]

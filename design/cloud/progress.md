@@ -42,7 +42,13 @@ Notes for whoever continues:
    Starting asks first (topic 5 C) from the row's button already; item 5 adds it to creating.
 5. **Adding, starting, removing**: Add Machine's menu and each provider's dialog (topic 4 C),
    asking before charging the first time per account (topic 5 C), Remove with a box to delete
-   (topic 9 B). Status: not started.
+   (topic 9 B). Status: done in its own commit ("Add, create and remove cloud machines…"):
+   `Request::CloudSources` (Instabox's templates and snapshots; Proton has none) and
+   `Response::CloudMachineCreated` in the server, `settings_page/new_cloud_machine.rs` for the
+   dialog, Add Machine's menu and Remove in `settings_page/cloud_providers.rs`, and
+   `ConfirmCheckbox::type_to_confirm` for the name to type. Instabox's `templates` and
+   `snapshot ls` fixtures are *(unverified)*; creating a Proton computer is tested with a fake
+   `proton` only.
 6. **A machine's page** with its provider's tabs (topic 7 A), snapshots on it (topic 8 A),
    ports, Vault, SSH tokens and Proton's keys; Instabox's API key through its CLI, for desktop
    links and CPU and memory. Status: not started.

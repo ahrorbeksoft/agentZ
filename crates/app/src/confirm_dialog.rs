@@ -2,15 +2,17 @@
 //! an icon in the danger tint beside the question, what will happen, and Cancel beside a red
 //! button. It sits in the shell's modal layer, centered, as t3code's dialogs do. A charge (a
 //! cloud computer that bills while it runs) asks in the accent's tint instead, and may offer
-//! not to ask again.
+//! not to ask again. A box that does something that can't be undone (deleting a cloud machine
+//! too) asks for a name to be typed once it's ticked, as Proton's own Delete does.
 
 use std::rc::Rc;
 
 use agentz_protocol::accounts::AccountStatus;
 use gpui::{
-    App, BoxShadow, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, FontWeight,
-    KeyBinding, SharedString, Window,
+    App, BoxShadow, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, KeyBinding, SharedString, Window,
 };
+use text_input::{TextInput, TextInputEvent};
 use ui::{Checkbox, ToggleState, prelude::*};
 
 use crate::controls::{ActionButton, ActionStyle};
@@ -41,6 +43,8 @@ pub struct ConfirmRequest {
 #[derive(Clone)]
 pub struct ConfirmCheckbox {
     pub label: SharedString,
+    /// What has to be typed to confirm while it's ticked.
+    pub type_to_confirm: Option<SharedString>,
     pub on_confirm_ticked: Rc<dyn Fn(&mut App)>,
 }
 
@@ -221,6 +225,9 @@ pub struct ConfirmDialog {
     focus_handle: FocusHandle,
     request: ConfirmRequest,
     is_ticked: bool,
+    /// Where the checkbox's name is typed, for one that asks for it.
+    typed: Option<Entity<TextInput>>,
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl EventEmitter<DismissEvent> for ConfirmDialog {}
@@ -235,14 +242,52 @@ impl ConfirmDialog {
     pub fn new(request: ConfirmRequest, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
+        let typed = request
+            .checkbox
+            .as_ref()
+            .and_then(|checkbox| checkbox.type_to_confirm.clone())
+            .map(|name| cx.new(|cx| TextInput::new(name, cx)));
+        let subscriptions = typed
+            .iter()
+            .map(|input| cx.subscribe(input, |_, _, _: &TextInputEvent, cx| cx.notify()))
+            .collect();
         Self {
             focus_handle,
             request,
             is_ticked: false,
+            typed,
+            _subscriptions: subscriptions,
         }
     }
 
+    /// Whether it can be confirmed: a ticked box that asks for a name has it typed.
+    fn can_confirm(&self, cx: &App) -> bool {
+        let expected = self
+            .request
+            .checkbox
+            .as_ref()
+            .and_then(|checkbox| checkbox.type_to_confirm.as_ref());
+        match (self.is_ticked, expected, &self.typed) {
+            (true, Some(expected), Some(typed)) => {
+                typed.read(cx).text().trim() == expected.as_ref()
+            }
+            _ => true,
+        }
+    }
+
+    fn set_ticked(&mut self, is_ticked: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.is_ticked = is_ticked;
+        match self.typed.as_ref().filter(|_| is_ticked) {
+            Some(typed) => window.focus(&typed.focus_handle(cx), cx),
+            None => window.focus(&self.focus_handle, cx),
+        }
+        cx.notify();
+    }
+
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_confirm(cx) {
+            return;
+        }
         cx.emit(DismissEvent);
         if self.is_ticked
             && let Some(checkbox) = &self.request.checkbox
@@ -279,9 +324,8 @@ impl Render for ConfirmDialog {
                         },
                     )
                     .on_click(cx.listener(
-                        |this, state: &ToggleState, _, cx| {
-                            this.is_ticked = *state == ToggleState::Selected;
-                            cx.notify();
+                        |this, state: &ToggleState, window, cx| {
+                            this.set_ticked(*state == ToggleState::Selected, window, cx)
                         },
                     )),
                 )
@@ -290,6 +334,28 @@ impl Render for ConfirmDialog {
                         .size(LabelSize::Custom(rems_from_px(13_f32))),
                 )
         });
+        let typed = self.typed.clone().filter(|_| self.is_ticked).map(|input| {
+            v_flex()
+                .gap_1()
+                .child(
+                    Label::new("Type its name to delete it")
+                        .size(LabelSize::Custom(rems_from_px(13_f32))),
+                )
+                .child(
+                    div()
+                        .h(px(28.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_background)
+                        .child(input),
+                )
+        });
+        let can_confirm = self.can_confirm(cx);
         v_flex()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -337,7 +403,8 @@ impl Render for ConfirmDialog {
                             .size(LabelSize::Custom(rems_from_px(13_f32)))
                             .color(Color::Muted),
                     )
-                    .children(checkbox),
+                    .children(checkbox)
+                    .children(typed),
             )
             .child(
                 h_flex()
@@ -361,6 +428,7 @@ impl Render for ConfirmDialog {
                             self.request.confirm_label.clone(),
                         )
                         .style(confirm_style)
+                        .disabled(!can_confirm)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.confirm(&menu::Confirm, window, cx)
                         })),
@@ -402,5 +470,38 @@ mod tests {
         assert_eq!((dismissed.get(), confirmed.get()), (1, 0));
         cx.simulate_keystrokes("enter");
         assert_eq!((dismissed.get(), confirmed.get()), (2, 1));
+    }
+
+    /// A ticked box that asks for a name confirms only once it's typed, and then does what
+    /// ticking it does too.
+    #[gpui::test]
+    fn a_box_that_deletes_asks_for_the_name(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            init(cx);
+        });
+        let confirmed = Rc::new(Cell::new(0));
+        let deleted = Rc::new(Cell::new(0));
+        let request = ConfirmRequest {
+            checkbox: Some(ConfirmCheckbox {
+                label: "Also delete it at Proton, with its disk".into(),
+                type_to_confirm: Some("devbox-3".into()),
+                on_confirm_ticked: {
+                    let deleted = deleted.clone();
+                    Rc::new(move |_| deleted.set(deleted.get() + 1))
+                },
+            }),
+            ..ConfirmRequest::delete_storage("Remove devbox-3?", "", {
+                let confirmed = confirmed.clone();
+                move |_, _| confirmed.set(confirmed.get() + 1)
+            })
+        };
+        let (dialog, cx) = cx.add_window_view(|window, cx| ConfirmDialog::new(request, window, cx));
+        dialog.update_in(cx, |dialog, window, cx| dialog.set_ticked(true, window, cx));
+        cx.simulate_keystrokes("enter");
+        assert_eq!((confirmed.get(), deleted.get()), (0, 0));
+        cx.simulate_input("devbox-3");
+        cx.simulate_keystrokes("enter");
+        assert_eq!((confirmed.get(), deleted.get()), (1, 1));
     }
 }

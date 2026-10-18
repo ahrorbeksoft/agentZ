@@ -29,6 +29,8 @@ impl Provider {
 #[derive(Debug, PartialEq)]
 pub struct ProviderDescription {
     pub name: &'static str,
+    /// What it calls its machines ("computer"), in "New Proton Computer".
+    pub noun: &'static str,
     /// The CLI's program, looked up on the login shell's `PATH`.
     pub program: &'static str,
     /// The command that installs the CLI, shown to copy.
@@ -43,6 +45,8 @@ pub struct ProviderDescription {
     /// One line on what it is.
     pub pitch: &'static str,
     pub price: &'static str,
+    /// What a new machine is, where every one is the same.
+    pub new_machine: Option<&'static str>,
     /// agentZ's promo, invite or referral code, once the provider offers one.
     pub code: Option<ProviderCode>,
     /// What a running machine costs, for a provider whose machines bill from when they're
@@ -77,6 +81,7 @@ pub struct Capabilities {
 
 static INSTABOX: ProviderDescription = ProviderDescription {
     name: "Instabox",
+    noun: "machine",
     program: "instabox",
     install: "curl -fsSL https://api.instabox.sh/install.sh | sh",
     sign_in: "instabox login",
@@ -85,6 +90,8 @@ static INSTABOX: ProviderDescription = ProviderDescription {
     add_credit: None,
     pitch: "Linux machines for agents: pause and resume, snapshots, public ports, a desktop.",
     price: "Free during the beta",
+    // Its templates say.
+    new_machine: None,
     code: None,
     charge: None,
     lifecycle: &[
@@ -109,6 +116,7 @@ static INSTABOX: ProviderDescription = ProviderDescription {
 
 static PROTON: ProviderDescription = ProviderDescription {
     name: "Proton",
+    noun: "computer",
     program: "proton",
     install: "curl -fsSL https://app.proton.computer/install.sh | sh",
     sign_in: "proton login",
@@ -117,6 +125,7 @@ static PROTON: ProviderDescription = ProviderDescription {
     add_credit: Some("https://app.cube.computer/billing"),
     pitch: "One persistent Linux computer, with Claude Code, Codex and Docker installed.",
     price: "$20 a month while running",
+    new_machine: Some("8 shared vCPUs · 2–64 GB memory · 50 GB disk · Ubuntu 24.04"),
     code: None,
     charge: Some("$20 per 730 running hours, billed by the second from your Cube balance"),
     lifecycle: &[
@@ -225,6 +234,33 @@ pub enum Lifecycle {
     Pause,
     Resume,
     Delete,
+}
+
+/// What a provider's machines can start from, for a new one.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CloudSources {
+    pub templates: Vec<CloudTemplate>,
+    pub snapshots: Vec<MachineSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CloudTemplate {
+    pub id: String,
+    /// What it has ("dev plus Docker, Python (uv), Go and Rust").
+    pub description: Option<String>,
+    pub size: MachineSize,
+}
+
+/// A saved machine (Instabox's snapshot), which new machines start from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MachineSnapshot {
+    pub id: String,
+    pub name: String,
+    /// Saved and uploaded, so a machine can start from it.
+    pub is_ready: bool,
+    /// The machine it was saved from, by its id.
+    pub source_machine: Option<String>,
+    pub created_at: Option<SystemTime>,
 }
 
 /// What a new machine is made with.

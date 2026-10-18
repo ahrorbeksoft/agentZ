@@ -6,23 +6,27 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use agentz_protocol::Request;
-use agentz_protocol::cloud::{CloudMachine, Lifecycle, Provider, ProviderState, ProviderStatus};
-use gpui::{AnyElement, Context, FontWeight, SharedString, Window};
+use agentz_protocol::cloud::{
+    Change, CloudMachine, CreateMachine, Lifecycle, Provider, ProviderState, ProviderStatus,
+};
+use agentz_protocol::{Request, Response};
+use anyhow::anyhow;
+use gpui::{AnyElement, Context, DismissEvent, FontWeight, SharedString, WeakEntity, Window};
 use ui::{
     ContextMenu, ContextMenuEntry, IconPosition, PopoverMenu, Switch, ToggleState, Tooltip,
     prelude::*,
 };
 use util::ResultExt as _;
 
+use super::new_cloud_machine::NewCloudMachine;
 use super::{
     SettingsPage, SettingsPageEvent, connection_line, on_page, render_rows,
     render_section_with_actions,
 };
 use crate::app_settings::{CloudLink, MachineProfile};
 use crate::cloud_machines::{
-    MainAction, balance_left, change_label, charges, lifecycle_label, machine_summary, main_action,
-    other_changes, provider_icon, state_color, state_label, usage_summary,
+    MainAction, change_label, charge_message, charges, lifecycle_label, machine_summary,
+    main_action, noun_title, other_changes, provider_icon, state_color, state_label, usage_summary,
 };
 use crate::confirm_dialog::{ConfirmCheckbox, ConfirmRequest};
 use crate::controls::{copy_to_clipboard, icon_tile, status_badge};
@@ -94,6 +98,16 @@ impl SettingsPage {
                 .is_some_and(|link| listed.iter().any(|machine| machine.id == link.machine));
             if !is_listed {
                 rows.push(self.render_cloud_row(provider, state, None, Some(profile), cx));
+            }
+        }
+        // Machines being made are named until they're listed.
+        let creating = state.map_or(&[][..], |state| state.changing.as_slice());
+        for changing in creating {
+            let is_listed = listed
+                .iter()
+                .any(|machine| machine.name == changing.machine);
+            if changing.change == Change::Create && !is_listed {
+                rows.push(render_creating_row(provider, &changing.machine, cx));
             }
         }
         if rows.is_empty() {
@@ -230,6 +244,27 @@ impl SettingsPage {
             .tooltip(Tooltip::text("Copy Command"))
             .on_click(cx.listener(move |this, _, _, cx| this.copy_command(description.sign_in, cx)))
         });
+        let new_machine = signed_in_account(state).map(|_| {
+            div()
+                .debug_selector(|| format!("cloud-new-machine-{slug}"))
+                .child(
+                    Button::new(
+                        SharedString::from(format!("cloud-new-machine-{slug}")),
+                        format!("New {}", noun_title(provider)),
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_new_cloud_machine(provider, window, cx)
+                    })),
+                )
+        });
         h_flex()
             .debug_selector(|| format!("cloud-provider-{slug}"))
             .min_h(px(20.))
@@ -261,6 +296,7 @@ impl SettingsPage {
                 h_flex()
                     .flex_none()
                     .gap_1()
+                    .children(new_machine)
                     .child(
                         Button::new(
                             SharedString::from(format!("cloud-provider-link-{slug}")),
@@ -414,7 +450,13 @@ impl SettingsPage {
                 Some(target) => format!("ssh {target}"),
                 None => format!("{} ssh {machine_name}", description.program),
             };
-            let removable = profile.map(|profile| (profile.id, label.clone()));
+            let removable = profile.map(|profile| {
+                // Deleting it needs the provider to list it, by the name it has there.
+                let deletable = machine
+                    .filter(|_| can_change)
+                    .map(|machine| (machine.id.clone(), machine.name.clone()));
+                (profile.id, label.clone(), deletable)
+            });
             let machine_id = machine_id.clone();
             let label = label.clone();
             PopoverMenu::new(element_id("menu"))
@@ -455,13 +497,19 @@ impl SettingsPage {
                                 .icon_color(Color::Muted)
                                 .handler(move |_, cx| copy_to_clipboard(&ssh_command, cx)),
                         );
-                        if let Some((id, name)) = removable {
+                        if let Some((id, name, deletable)) = removable {
                             menu = menu.separator().item(
-                                ContextMenuEntry::new("Remove from agentZ")
-                                    .icon(IconName::Close)
+                                ContextMenuEntry::new("Remove…")
+                                    .icon(IconName::Trash)
                                     .icon_color(Color::Muted)
-                                    .handler(on_page(&page, move |page, window, cx| {
-                                        page.confirm_remove_machine(id, name.clone(), window, cx)
+                                    .handler(on_page(&page, move |page, _, cx| {
+                                        page.confirm_remove_cloud_machine(
+                                            provider,
+                                            id,
+                                            name.clone(),
+                                            deletable.clone(),
+                                            cx,
+                                        )
                                     })),
                             );
                         }
@@ -490,26 +538,12 @@ impl SettingsPage {
                 ))
             }
             None => {
-                let link = CloudLink {
-                    provider,
-                    machine: machine_id,
-                };
                 let name = machine_name;
                 Switch::new(element_id("switch"), ToggleState::Unselected).on_click(cx.listener(
                     move |this, state: &ToggleState, _, cx| {
-                        if *state != ToggleState::Selected {
-                            return;
+                        if *state == ToggleState::Selected {
+                            this.save_cloud_machine(provider, &machine_id, &name, cx);
                         }
-                        let link = link.clone();
-                        let name = name.clone();
-                        this.app_settings.update(cx, |store, cx| {
-                            store.update(
-                                |settings| {
-                                    settings.add_cloud_machine(name, link);
-                                },
-                                cx,
-                            )
-                        });
                     },
                 ))
             }
@@ -798,19 +832,16 @@ impl SettingsPage {
             self.send_cloud_change(provider, machine, change, cx);
             return;
         };
-        let balance = state
-            .as_ref()
-            .and_then(|state| state.usage.as_ref())
-            .and_then(balance_left)
-            .map(|left| format!(" ({left})"))
-            .unwrap_or_default();
         let verb = lifecycle_label(change);
         let page = cx.weak_entity();
-        let app_settings = self.app_settings.clone();
         cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
             icon: IconName::Coins,
             title: format!("{verb} {name}?").into(),
-            message: format!("It costs {charge}{balance}. Stopping it stops the charge.").into(),
+            message: charge_message(
+                charge,
+                state.as_ref().and_then(|state| state.usage.as_ref()),
+            )
+            .into(),
             confirm_label: verb.into(),
             on_confirm: Rc::new(move |_, cx| {
                 page.update(cx, |page, cx| {
@@ -818,19 +849,26 @@ impl SettingsPage {
                 })
                 .log_err();
             }),
-            checkbox: account.map(|account| ConfirmCheckbox {
-                label: "Don’t ask again for this account".into(),
-                on_confirm_ticked: Rc::new(move |cx| {
-                    app_settings.update(cx, |store, cx| {
-                        store.update(
-                            |settings| settings.set_asks_before_charging(provider, &account, false),
-                            cx,
-                        )
-                    })
-                }),
-            }),
+            checkbox: account.map(|account| self.dont_ask_again(provider, account)),
             is_charge: true,
         }));
+    }
+
+    /// "Don't ask again for this account", under a question about a charge.
+    fn dont_ask_again(&self, provider: Provider, account: String) -> ConfirmCheckbox {
+        let app_settings = self.app_settings.clone();
+        ConfirmCheckbox {
+            label: "Don’t ask again for this account".into(),
+            type_to_confirm: None,
+            on_confirm_ticked: Rc::new(move |cx| {
+                app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| settings.set_asks_before_charging(provider, &account, false),
+                        cx,
+                    )
+                })
+            }),
+        }
     }
 
     fn send_cloud_change(
@@ -862,6 +900,298 @@ impl SettingsPage {
         cx.notify();
     }
 
+    /// Add Machine's menu (topic 4 C): an SSH machine, a new machine from each signed-in
+    /// provider, and the machines its accounts have that agentZ hasn't saved.
+    pub(super) fn render_add_machine_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let cloud = Machines::local(cx).read(cx).cloud().clone();
+        let settings = self.app_settings.read(cx).settings();
+        let signed_in: Vec<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|provider| {
+                cloud
+                    .provider(*provider)
+                    .is_some_and(|state| state.status.is_signed_in())
+            })
+            .collect();
+        let existing: Vec<(Provider, CloudMachine)> = signed_in
+            .iter()
+            .filter_map(|provider| Some((*provider, cloud.provider(*provider)?)))
+            .flat_map(|(provider, state)| {
+                state
+                    .machines
+                    .iter()
+                    .filter(move |machine| settings.cloud_machine(provider, &machine.id).is_none())
+                    .map(move |machine| (provider, machine.clone()))
+            })
+            .collect();
+        let page = cx.weak_entity();
+        let menu = PopoverMenu::new("machines-add-menu")
+            .menu(move |window, cx| {
+                let page = page.clone();
+                let signed_in = signed_in.clone();
+                let existing = existing.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.item(
+                        ContextMenuEntry::new("SSH Machine…")
+                            .icon(IconName::Server)
+                            .icon_color(Color::Muted)
+                            .handler(on_page(&page, |_, _, cx| {
+                                cx.emit(SettingsPageEvent::EditMachine(None))
+                            })),
+                    );
+                    if !signed_in.is_empty() {
+                        menu = menu.separator().header("New");
+                    }
+                    for provider in signed_in {
+                        let description = provider.description();
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!(
+                                "{} {}…",
+                                description.name,
+                                noun_title(provider)
+                            ))
+                            .icon(provider_icon(provider))
+                            .icon_color(Color::Muted)
+                            .handler(on_page(
+                                &page,
+                                move |page, window, cx| {
+                                    page.open_new_cloud_machine(provider, window, cx)
+                                },
+                            )),
+                        );
+                    }
+                    if !existing.is_empty() {
+                        menu = menu.separator().header("Add existing");
+                    }
+                    for (provider, machine) in existing {
+                        menu = menu.item(
+                            ContextMenuEntry::new(format!(
+                                "{}: {}",
+                                provider.description().name,
+                                machine.name
+                            ))
+                            .icon(IconName::Link)
+                            .icon_color(Color::Muted)
+                            .handler(on_page(
+                                &page,
+                                move |page, _, cx| {
+                                    page.save_cloud_machine(
+                                        provider,
+                                        &machine.id,
+                                        &machine.name,
+                                        cx,
+                                    )
+                                },
+                            )),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .trigger(
+                Button::new("machines-add", "Add Machine")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .offset(gpui::point(px(0.), px(4.)));
+        div()
+            .debug_selector(|| "machines-add".into())
+            .child(menu)
+            .into_any_element()
+    }
+
+    /// Saves a provider's machine, switched on, under the name it has there.
+    fn save_cloud_machine(
+        &mut self,
+        provider: Provider,
+        machine: &str,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let link = CloudLink {
+            provider,
+            machine: machine.to_string(),
+        };
+        let name = name.to_string();
+        self.app_settings.update(cx, |store, cx| {
+            store.update(
+                |settings| {
+                    if settings.cloud_machine(provider, &link.machine).is_none() {
+                        settings.add_cloud_machine(name, link);
+                    }
+                },
+                cx,
+            )
+        });
+    }
+
+    /// The provider's New Machine dialog, in the shell's modal layer.
+    pub(super) fn open_new_cloud_machine(
+        &mut self,
+        provider: Provider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page = cx.weak_entity();
+        let dialog = cx.new(|cx| NewCloudMachine::new(provider, page, window, cx));
+        cx.emit(SettingsPageEvent::NewCloudMachine(dialog));
+    }
+
+    /// Makes the machine the dialog describes, asking first when making it charges, until
+    /// "Don't ask again" for its account (topic 5 C). Whether it's being made now; otherwise
+    /// the dialog stays under the question, and closes once it's answered yes.
+    pub(super) fn create_cloud_machine(
+        &mut self,
+        provider: Provider,
+        machine: CreateMachine,
+        dialog: WeakEntity<NewCloudMachine>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = Machines::local(cx)
+            .read(cx)
+            .cloud()
+            .provider(provider)
+            .cloned();
+        let account = signed_in_account(state.as_ref());
+        let asks = account.as_ref().is_none_or(|account| {
+            !self
+                .app_settings
+                .read(cx)
+                .settings()
+                .charges_without_asking(provider, account)
+        });
+        let Some(charge) = provider.description().charge.filter(|_| asks) else {
+            self.send_cloud_create(provider, machine, cx);
+            return true;
+        };
+        let page = cx.weak_entity();
+        let title = format!("Create {}?", machine.name);
+        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
+            icon: IconName::Coins,
+            title: title.into(),
+            message: charge_message(
+                charge,
+                state.as_ref().and_then(|state| state.usage.as_ref()),
+            )
+            .into(),
+            confirm_label: "Create".into(),
+            on_confirm: Rc::new(move |_, cx| {
+                page.update(cx, |page, cx| {
+                    page.send_cloud_create(provider, machine.clone(), cx)
+                })
+                .log_err();
+                dialog.update(cx, |_, cx| cx.emit(DismissEvent)).log_err();
+            }),
+            checkbox: account.map(|account| self.dont_ask_again(provider, account)),
+            is_charge: true,
+        }));
+        false
+    }
+
+    /// Makes the machine through its provider's CLI, and saves it once it's made, so agentZ
+    /// connects to it. Its row says it's being made meanwhile.
+    fn send_cloud_create(
+        &mut self,
+        provider: Provider,
+        machine: CreateMachine,
+        cx: &mut Context<Self>,
+    ) {
+        self.cloud_errors.remove(&provider);
+        let name = machine.name.clone();
+        let request = Machines::local(cx)
+            .read(cx)
+            .request(Request::CreateCloudMachine { provider, machine });
+        let app_settings = self.app_settings.clone();
+        cx.spawn(async move |this, cx| {
+            let created = match request.await {
+                Ok(Response::CloudMachineCreated(created)) => Ok(created),
+                Ok(_) => Err(anyhow!("its server didn't say which machine it made")),
+                Err(error) => Err(error),
+            };
+            match created {
+                // Saved even if Settings closed meanwhile.
+                Ok(created) => app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| {
+                            if settings.cloud_machine(provider, &created.id).is_none() {
+                                settings.add_cloud_machine(
+                                    created.name.clone(),
+                                    CloudLink {
+                                        provider,
+                                        machine: created.id.clone(),
+                                    },
+                                );
+                            }
+                        },
+                        cx,
+                    )
+                }),
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.cloud_errors
+                            .insert(provider, format!("Couldn't make {name}: {error:#}").into());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// One Remove… (topic 9 B): agentZ forgets the machine, and with the box ticked, its
+    /// provider deletes it with its disk once its name is typed.
+    pub(super) fn confirm_remove_cloud_machine(
+        &mut self,
+        provider: Provider,
+        profile: u64,
+        label: SharedString,
+        deletable: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let description = provider.description();
+        let page = cx.weak_entity();
+        let app_settings = self.app_settings.clone();
+        cx.emit(SettingsPageEvent::Confirm(ConfirmRequest {
+            icon: IconName::Trash,
+            title: format!("Remove {label} from agentZ?").into(),
+            message: format!(
+                "agentZ stops connecting to it. It stays at {}, and you can add it back.",
+                description.name
+            )
+            .into(),
+            confirm_label: "Remove".into(),
+            on_confirm: Rc::new(move |_, cx| {
+                app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| settings.machines.retain(|saved| saved.id != profile),
+                        cx,
+                    )
+                })
+            }),
+            checkbox: deletable.map(|(machine, name)| ConfirmCheckbox {
+                label: format!("Also delete it at {}, with its disk", description.name).into(),
+                type_to_confirm: Some(name.into()),
+                on_confirm_ticked: Rc::new(move |cx| {
+                    page.update(cx, |page, cx| {
+                        page.send_cloud_change(provider, machine.clone(), Lifecycle::Delete, cx)
+                    })
+                    .log_err();
+                }),
+            }),
+            is_charge: false,
+        }));
+    }
+
     fn set_asks_before_charging(
         &mut self,
         provider: Provider,
@@ -878,11 +1208,47 @@ impl SettingsPage {
     }
 }
 
-fn signed_in_account(state: Option<&ProviderState>) -> Option<String> {
+pub(super) fn signed_in_account(state: Option<&ProviderState>) -> Option<String> {
     match &state?.status {
         ProviderStatus::SignedIn { account, .. } => Some(account.clone()),
         _ => None,
     }
+}
+
+/// A machine its provider is making, named as it was asked for, until it's listed.
+fn render_creating_row(provider: Provider, name: &str, cx: &App) -> AnyElement {
+    let slug = provider.description().program;
+    let selector = format!("cloud-creating-{slug}-{name}");
+    h_flex()
+        .debug_selector(move || selector)
+        .px_4()
+        .py_2p5()
+        .gap_3()
+        .child(icon_tile(
+            Icon::new(provider_icon(provider)).color(Color::Muted),
+            MARK_SIZE,
+            cx,
+        ))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(Label::new(name.to_string()).truncate())
+                .child(
+                    Label::new(format!(
+                        "{} is making it. agentZ connects once it's made.",
+                        provider.description().name
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+                ),
+        )
+        .child(status_badge(
+            change_label(Change::Create),
+            Color::Accent.color(cx),
+        ))
+        .into_any_element()
 }
 
 fn lifecycle_icon(change: Lifecycle) -> IconName {

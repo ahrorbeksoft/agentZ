@@ -113,6 +113,26 @@ pub fn charges(provider: Provider, change: Lifecycle) -> Option<&'static str> {
         .filter(|_| change == Lifecycle::Start)
 }
 
+/// What a machine that charges costs, as starting or making one asks: "It costs $20 per 730
+/// running hours, billed by the second from your Cube balance ($14.20 left). Stopping it stops
+/// the charge."
+pub fn charge_message(charge: &str, usage: Option<&CloudUsage>) -> String {
+    let balance = usage
+        .and_then(balance_left)
+        .map(|left| format!(" ({left})"))
+        .unwrap_or_default();
+    format!("It costs {charge}{balance}. Stopping it stops the charge.")
+}
+
+/// What the provider calls its machines, as a title ("Computer").
+pub fn noun_title(provider: Provider) -> String {
+    let mut chars = provider.description().noun.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 /// What's left of a prepaid balance ("$14.20 left").
 pub fn balance_left(usage: &CloudUsage) -> Option<String> {
     match usage {
@@ -306,5 +326,17 @@ mod tests {
         assert!(charges(Provider::Proton, Lifecycle::Start).is_some());
         assert!(charges(Provider::Proton, Lifecycle::Restart).is_none());
         assert!(charges(Provider::Instabox, Lifecycle::Start).is_none());
+        assert_eq!(
+            charge_message(
+                "$20 per 730 running hours",
+                Some(&CloudUsage::Balance {
+                    balance_micro_usd: Some(14_200_000),
+                    running_hours: 1.,
+                    charged_micro_usd: 0,
+                })
+            ),
+            "It costs $20 per 730 running hours ($14.20 left). Stopping it stops the charge."
+        );
+        assert_eq!(noun_title(Provider::Proton), "Computer");
     }
 }

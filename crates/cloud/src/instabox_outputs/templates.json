@@ -1,0 +1,18 @@
+{
+  "templates": [
+    {
+      "id": "universal",
+      "version": "2026-10-13.10",
+      "description": "Docker, Python (uv), Node, Go and Rust",
+      "arch": "x86_64",
+      "defaultSpec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 }
+    },
+    {
+      "id": "agent-browser",
+      "version": "2026-10-13.10",
+      "description": "universal plus Chromium and a desktop for browser agents",
+      "arch": "x86_64",
+      "defaultSpec": { "vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20 }
+    }
+  ]
+}

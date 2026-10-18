@@ -1,0 +1,22 @@
+{
+  "snapshots": [
+    {
+      "id": "s_h3kq8zv2mt5rn7wd4xp6bj2yce",
+      "name": "dev-base",
+      "status": "ready",
+      "sourceMachineId": "m_q4mz7tk2bx5rn3wd6vp2hj4sye",
+      "rootOnly": false,
+      "sizeBytes": 3328599654,
+      "createdAt": "2026-10-12T16:40:11Z"
+    },
+    {
+      "id": "s_n6tw2qk8vz3mr5hd7xp4bj2yce",
+      "name": "before-upgrade",
+      "status": "pending",
+      "sourceMachineId": "m_r7kd2vq4mx5tz3nb6wp2hj4sye",
+      "rootOnly": true,
+      "createdAt": "2026-10-18T08:41:57Z"
+    }
+  ],
+  "nextCursor": null
+}

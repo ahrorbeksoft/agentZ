@@ -11308,7 +11308,8 @@ async fn artifacts_are_published_served_and_sent_back() {
 }
 
 /// A fake `proton` CLI in a folder of its own: signed in as `alex@example.com`, with one
-/// computer whose state is kept in a file, so `start` changes what `list` says.
+/// computer whose state is kept in a file, so `start` changes what `list` says, and `create
+/// scratch` adds a second.
 #[cfg(unix)]
 fn fake_proton_cli() -> (tempfile::TempDir, std::ffi::OsString) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -11322,7 +11323,8 @@ echo "$*" >> '{log}'
 case "$*" in
   "--version") echo "proton 0.1.2" ;;
   "whoami") echo "alex@example.com" ;;
-  "list --json") printf '[{{"id": "c-1", "name": "devbox-3", "state": "%s", "vcpus": 8, "error": "", "public_ssh": {{"hostname": "ssh.proton.computer", "port": 22021, "enabled": 1}}}}]' "$(cat '{state}')" ;;
+  "list --json") printf '[{{"id": "c-1", "name": "devbox-3", "state": "%s", "vcpus": 8, "error": "", "public_ssh": {{"hostname": "ssh.proton.computer", "port": 22021, "enabled": 1}}}}%s]' "$(cat '{state}')" "$(cat '{created}' 2>/dev/null)" ;;
+  "create scratch --yes") printf ', {{"id": "c-2", "name": "scratch", "state": "running"}}' > '{created}' ;;
   "balance") printf 'Shared Cube balance: $24.27\nProton runtime: 26.78 hours · deducted $0.7336\n' ;;
   "start c-1 --yes") echo running > '{state}'; echo "  start: succeeded" >&2 ;;
   "ssh-config c-1") printf 'Host proton-devbox-3\n  HostName ssh.proton.computer\n  User ubuntu\n  Port 22021\n' ;;
@@ -11331,6 +11333,7 @@ esac
 "#,
         log = folder.path().join("log").display(),
         state = state.display(),
+        created = folder.path().join("created").display(),
     );
     let program = folder.path().join("proton");
     std::fs::write(&program, script).expect("writes the CLI");
@@ -11352,12 +11355,13 @@ fn cloud_snapshot(client: &TestClient) -> Option<agentz_protocol::cloud::CloudSn
 /// Once an app asks, this Mac's server looks for the providers' CLIs and runs them: Proton
 /// signed in, with its computer and balance, and Instabox not installed. It starts a computer
 /// through the CLI, skipping the CLI's own price question, lists it again after, and gives the
-/// computer's SSH options; a change the provider doesn't have is refused.
+/// computer's SSH options; a change the provider doesn't have is refused. It makes a computer
+/// and answers with it, and Proton has nothing to start one from.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn finds_cloud_providers_and_changes_their_machines() {
     use agentz_protocol::cloud::{
-        CloudState, CloudUsage, Lifecycle, Provider, ProviderStatus, SshOptions,
+        CloudState, CloudUsage, CreateMachine, Lifecycle, Provider, ProviderStatus, SshOptions,
     };
 
     let Some(command) = mock_agent() else {
@@ -11437,8 +11441,39 @@ async fn finds_cloud_providers_and_changes_their_machines() {
             options: Vec::new(),
         })
     );
+    assert_eq!(
+        client.ok(Request::CloudSources(Provider::Proton)).await,
+        Response::CloudSources(Default::default())
+    );
+    let Response::CloudMachineCreated(created) = client
+        .ok(Request::CreateCloudMachine {
+            provider: Provider::Proton,
+            machine: CreateMachine {
+                name: "scratch".into(),
+                ..Default::default()
+            },
+        })
+        .await
+    else {
+        panic!("not a machine");
+    };
+    assert_eq!(created.id, "c-2");
+    client
+        .wait_until(|client| {
+            cloud_snapshot(client).is_some_and(|cloud| {
+                cloud.machine(Provider::Proton, "c-2").is_some()
+                    && cloud
+                        .provider(Provider::Proton)
+                        .is_some_and(|proton| proton.changing.is_empty())
+            })
+        })
+        .await;
     let log = std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
     assert!(log.lines().any(|line| line == "start c-1 --yes"), "{log}");
+    assert!(
+        log.lines().any(|line| line == "create scratch --yes"),
+        "{log}"
+    );
     // Kept for after a restart.
     let saved = std::fs::read_to_string(server.data_dir.path().join("cloud.json"))
         .expect("cloud.json was written");

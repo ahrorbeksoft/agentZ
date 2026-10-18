@@ -5,6 +5,7 @@
 mod accounts_menu;
 mod cloud_providers;
 mod mcp_servers;
+mod new_cloud_machine;
 mod skills;
 mod storage;
 
@@ -116,9 +117,13 @@ actions!(
     ]
 );
 
+pub use new_cloud_machine::NewCloudMachine;
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", menu::Confirm, Some(new_cloud_machine::KEY_CONTEXT)),
+        KeyBinding::new("escape", menu::Cancel, Some(new_cloud_machine::KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_DIALOG_KEY_CONTEXT)),
@@ -130,6 +135,8 @@ pub enum SettingsPageEvent {
     Close,
     /// Open the Add Machine dialog, or Edit… for the machine given.
     EditMachine(Option<MachineProfile>),
+    /// Show a provider's New Machine dialog, in the shell's modal layer.
+    NewCloudMachine(Entity<NewCloudMachine>),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
     /// Leave settings for the thread, as an agent's Threads tab opens one.
@@ -7471,20 +7478,7 @@ impl SettingsPage {
                         })),
                 )
             })
-            .child(
-                Button::new("machines-add", "Add Machine")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .start_icon(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(SettingsPageEvent::EditMachine(None))),
-                    ),
-            );
+            .child(self.render_add_machine_menu(cx));
         let mut sections = vec![render_section_with_actions(
             "This Mac and SSH",
             rows,
@@ -9586,8 +9580,8 @@ mod tests {
     use agentz_protocol::accounts::{Account, DuplicateLogin, ExtraUsage, LimitPool, StatusRead};
     use agentz_protocol::agents::{AgentSettings, RegistryAgentMetadata, RegistrySnapshot};
     use agentz_protocol::cloud::{
-        CloudMachine, CloudSnapshot, CloudState, CloudUsage, Lifecycle, MachineSize, Provider,
-        ProviderState, ProviderStatus,
+        Change, CloudMachine, CloudSnapshot, CloudState, CloudUsage, Lifecycle, MachineChange,
+        MachineSize, Provider, ProviderState, ProviderStatus,
     };
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
@@ -12218,7 +12212,7 @@ mod tests {
         assert_eq!(next_copy(&copies[..1], this_mac(1), |_| true), None);
     }
 
-    fn cloud_machine(id: &str, name: &str, state: CloudState) -> CloudMachine {
+    pub(super) fn cloud_machine(id: &str, name: &str, state: CloudState) -> CloudMachine {
         CloudMachine {
             id: id.into(),
             name: name.into(),
@@ -12236,7 +12230,7 @@ mod tests {
         }
     }
 
-    fn provider_state(provider: Provider, status: ProviderStatus) -> ProviderState {
+    pub(super) fn provider_state(provider: Provider, status: ProviderStatus) -> ProviderState {
         ProviderState {
             provider,
             status,
@@ -12252,7 +12246,9 @@ mod tests {
     /// provider's machines under its account, saved or not (design/cloud topics 1 C, 6 B,
     /// 10 B); the providers that aren't set up are under More Providers, with Check Again
     /// (topic 2 A). Starting a machine that charges asks first, until the account says not to
-    /// (topic 5 C), and switching on one that isn't saved saves it.
+    /// (topic 5 C), and switching on one that isn't saved saves it. The group's New Computer
+    /// opens Proton's dialog, a computer being made shows until it's listed (topic 4 C), and
+    /// Remove… can delete the computer too, once its name is typed (topic 9 B).
     #[gpui::test]
     fn machines_are_grouped_by_their_cloud_provider(cx: &mut TestAppContext) {
         let account = "me@example.com";
@@ -12329,12 +12325,16 @@ mod tests {
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        let new_machine_dialogs = Rc::new(std::cell::Cell::new(0));
         cx.update(|_, cx| {
             let confirms = confirms.clone();
-            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| {
-                if let SettingsPageEvent::Confirm(request) = event {
-                    confirms.borrow_mut().push(request.clone());
+            let new_machine_dialogs = new_machine_dialogs.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| match event {
+                SettingsPageEvent::Confirm(request) => confirms.borrow_mut().push(request.clone()),
+                SettingsPageEvent::NewCloudMachine(_) => {
+                    new_machine_dialogs.set(new_machine_dialogs.get() + 1)
                 }
+                _ => {}
             })
             .detach();
         });
@@ -12447,7 +12447,74 @@ mod tests {
         assert!(saved.enabled);
         assert_eq!(saved.label, "scratch");
         assert!(saved.target.is_empty());
+
+        // The group makes computers; one being made shows by its name until it's listed.
+        click("cloud-new-machine-proton", cx);
+        assert_eq!(new_machine_dialogs.get(), 1);
+        client.update(cx, |client, cx| {
+            let mut cloud = client.cloud().clone();
+            if let Some(proton) = cloud
+                .providers
+                .iter_mut()
+                .find(|state| state.provider == Provider::Proton)
+            {
+                proton.changing.push(MachineChange {
+                    machine: "agents-9".into(),
+                    change: Change::Create,
+                });
+            }
+            client.set_cloud_for_test(cloud, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("cloud-creating-proton-agents-9").is_some());
+
+        // Remove… forgets it, and with the box ticked deletes it at Proton too, by the name it
+        // has there.
+        let profile = cx.update(|_, cx| {
+            AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .cloud_machine(Provider::Proton, "c-1")
+                .map(|profile| profile.id)
+        });
+        let profile = profile.expect("proton-cloud is saved");
+        page.update(cx, |page, cx| {
+            page.confirm_remove_cloud_machine(
+                Provider::Proton,
+                profile,
+                "proton-cloud".into(),
+                Some(("c-1".into(), "devbox-3".into())),
+                cx,
+            )
+        });
+        let confirm = confirms.borrow_mut().pop().expect("Remove… asks");
+        assert!(!confirm.is_charge);
+        assert_eq!(confirm.title.as_ref(), "Remove proton-cloud from agentZ?");
+        let checkbox = confirm
+            .checkbox
+            .clone()
+            .expect("it offers to delete it too");
+        assert_eq!(checkbox.type_to_confirm.as_deref(), Some("devbox-3"));
+        cx.update(|window, cx| {
+            (checkbox.on_confirm_ticked)(cx);
+            (confirm.on_confirm)(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(requests.borrow().contains(&Request::ChangeCloudMachine {
+            provider: Provider::Proton,
+            machine: "c-1".into(),
+            change: Lifecycle::Delete,
+        }));
+        let removed = cx.update(|_, cx| {
+            AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .cloud_machine(Provider::Proton, "c-1")
+                .is_none()
+        });
+        assert!(removed);
     }
+
     #[test]
     fn login_method_subjects() {
         assert_eq!(

@@ -802,7 +802,11 @@ pub enum Request {
         machine: String,
         change: cloud::Lifecycle,
     },
-    /// Makes a machine with the provider's CLI, answered once it's made.
+    /// What the provider's machines can start from, answered with
+    /// [`Response::CloudSources`].
+    CloudSources(cloud::Provider),
+    /// Makes a machine with the provider's CLI, answered with
+    /// [`Response::CloudMachineCreated`] once it's made.
     CreateCloudMachine {
         provider: cloud::Provider,
         machine: cloud::CreateMachine,
@@ -1080,6 +1084,8 @@ pub enum Response {
     /// The ids of the editors installed on the machine ([`Request::ListEditors`]).
     Editors(Vec<String>),
     SshOptions(cloud::SshOptions),
+    CloudSources(cloud::CloudSources),
+    CloudMachineCreated(cloud::CloudMachine),
     Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]

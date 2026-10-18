@@ -13,7 +13,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use agentz_protocol::cloud::{
-    CloudMachine, CloudUsage, CreateMachine, Lifecycle, Provider, ProviderStatus, SshOptions,
+    CloudMachine, CloudSources, CloudUsage, CreateMachine, Lifecycle, Provider, ProviderStatus,
+    SshOptions,
 };
 use anyhow::{Context as _, Result, anyhow};
 
@@ -90,13 +91,36 @@ impl Cli {
         parse(&stdout).with_context(|| format!("reading {}'s machines", self.name()))
     }
 
-    /// Makes a machine and waits until it's made.
-    pub async fn create(&self, machine: &CreateMachine) -> Result<()> {
+    /// What new machines can start from: the provider's templates and the account's snapshots.
+    pub async fn sources(&self) -> Result<CloudSources> {
+        match self.provider {
+            Provider::Instabox => {
+                let templates = self.run(&["templates", "--json"], READ_TIMEOUT).await?;
+                let snapshots = self
+                    .run(&["snapshot", "ls", "--json"], READ_TIMEOUT)
+                    .await?;
+                Ok(CloudSources {
+                    templates: instabox::parse_templates(&templates)?,
+                    snapshots: instabox::parse_snapshots(&snapshots)?,
+                })
+            }
+            Provider::Proton => Ok(CloudSources::default()),
+        }
+    }
+
+    /// Makes a machine and waits until it's made, then gives it as the CLI lists it: neither
+    /// CLI's `create` prints it.
+    pub async fn create(&self, machine: &CreateMachine) -> Result<CloudMachine> {
         let args = match self.provider {
             Provider::Instabox => instabox::create_args(machine),
             Provider::Proton => proton::create_args(machine)?,
         };
-        self.run(&args, CHANGE_TIMEOUT).await.map(|_| ())
+        self.run(&args, CHANGE_TIMEOUT).await?;
+        self.machines()
+            .await?
+            .into_iter()
+            .find(|listed| listed.name == machine.name)
+            .with_context(|| format!("{} doesn't list {} once made", self.name(), machine.name))
     }
 
     /// Changes a machine, by its id, and waits until it's done.
@@ -365,6 +389,69 @@ mod tests {
             .await
             .expect_err("can't pause");
         assert_eq!(error.to_string(), "Proton computers can't be paused");
+    }
+
+    #[tokio::test]
+    async fn creating_gives_the_machine_as_listed() {
+        let directory = tempfile::tempdir().expect("makes a folder");
+        let program = fake_cli(
+            &directory,
+            &[
+                ("create scratch --yes", "Creating scratch…\n", "", 0),
+                (
+                    "list --json",
+                    r#"[{"id": "c2", "name": "scratch", "state": "running"}]"#,
+                    "",
+                    0,
+                ),
+            ],
+        );
+        let cli = Cli::with_program(Provider::Proton, program);
+        let machine = cli
+            .create(&CreateMachine {
+                name: "scratch".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("creates");
+        assert_eq!(machine.id, "c2");
+        assert_eq!(
+            commands_run(&directory),
+            ["create scratch --yes", "list --json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn instabox_starts_from_templates_and_snapshots() {
+        let directory = tempfile::tempdir().expect("makes a folder");
+        let program = fake_cli(
+            &directory,
+            &[
+                (
+                    "templates --json",
+                    include_str!("instabox_outputs/templates.json"),
+                    "",
+                    0,
+                ),
+                (
+                    "snapshot ls --json",
+                    include_str!("instabox_outputs/snapshots.json"),
+                    "",
+                    0,
+                ),
+            ],
+        );
+        let sources = Cli::with_program(Provider::Instabox, program)
+            .sources()
+            .await
+            .expect("reads them");
+        assert_eq!(sources.templates.len(), 2);
+        assert_eq!(sources.snapshots.len(), 2);
+        let proton = Cli::with_program(Provider::Proton, "/nonexistent/agentz-test-proton");
+        assert_eq!(
+            proton.sources().await.expect("has none"),
+            CloudSources::default()
+        );
     }
 
     #[tokio::test]

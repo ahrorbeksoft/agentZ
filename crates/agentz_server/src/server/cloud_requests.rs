@@ -296,7 +296,20 @@ impl Server {
         });
     }
 
-    /// Makes a machine, answered once it's made; the machines are listed again after.
+    /// What the provider's new machines can start from.
+    pub(super) fn cloud_sources(&mut self, client: ClientId, id: u64, provider: Provider) {
+        let cli = self.cloud.cli(provider);
+        let ready = self.shell_environment_ready.clone();
+        let work = async move {
+            ready.await;
+            cli.sources().await.map_err(|error| anyhow!("{error:#}"))
+        };
+        self.spawn_then(work, move |server, sources| {
+            server.respond(client, id, sources.map(Response::CloudSources));
+        });
+    }
+
+    /// Makes a machine, answered with it once it's made; the machines are listed again after.
     pub(super) fn create_cloud_machine(
         &mut self,
         client: ClientId,
@@ -315,8 +328,16 @@ impl Server {
             cli.create(&machine).await
         };
         self.spawn_then(work, move |server, created| {
+            if let Ok(machine) = &created {
+                // Listed now, so the app finds it before the listing that follows.
+                server.cloud.update(|snapshot| {
+                    let state = CloudStore::provider(snapshot, provider);
+                    state.machines.retain(|listed| listed.id != machine.id);
+                    state.machines.push(machine.clone());
+                });
+            }
             server.end_cloud_change(provider, &name);
-            server.respond(client, id, created.map(|()| Response::Ok));
+            server.respond(client, id, created.map(Response::CloudMachineCreated));
         });
     }
 

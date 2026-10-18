@@ -37,7 +37,7 @@ use crate::project_info::render_project_icon;
 use crate::project_switcher::{ProjectSwitcher, render_machine_icons};
 use crate::save_layout_modal::{LayoutPane, SaveLayoutModal};
 use crate::server_client::MachineStatus;
-use crate::settings_page::{AccountDialog, SettingsPage, SettingsPageEvent};
+use crate::settings_page::{AccountDialog, NewCloudMachine, SettingsPage, SettingsPageEvent};
 use crate::shortcut_sheet::ShortcutSheet;
 use crate::sidebar::{AWAITING_INPUT_COLOR, SIDEBAR_WIDTH, Sidebar, SidebarEvent};
 use crate::snooze::CustomSnoozeModal;
@@ -199,6 +199,8 @@ pub struct Shell {
     worktree_modal: Option<(Entity<WorktreeModal>, Vec<Subscription>)>,
     machine_modal: Option<(Entity<MachineModal>, Subscription)>,
     confirm_dialog: Option<(Entity<ConfirmDialog>, Subscription)>,
+    /// A provider's New Machine dialog, which a confirmation can sit over.
+    cloud_machine_dialog: Option<(Entity<NewCloudMachine>, Subscription)>,
     /// An agent's account dialog, over Settings. A confirmation it asks for shows in its place.
     account_dialog: Option<(Entity<AccountDialog>, Subscription)>,
     overlay: Option<Overlay>,
@@ -426,6 +428,7 @@ impl Shell {
             add_project_modal: None,
             worktree_modal: None,
             machine_modal: None,
+            cloud_machine_dialog: None,
             confirm_dialog: None,
             account_dialog: None,
             overlay: None,
@@ -1050,6 +1053,9 @@ impl Shell {
                         SettingsPageEvent::EditMachine(profile) => {
                             this.open_machine_modal(profile.as_ref(), window, cx)
                         }
+                        SettingsPageEvent::NewCloudMachine(dialog) => {
+                            this.open_cloud_machine_dialog(dialog.clone(), window, cx)
+                        }
                         SettingsPageEvent::Confirm(request) => {
                             this.open_confirm_dialog(request.clone(), window, cx)
                         }
@@ -1374,8 +1380,15 @@ impl Shell {
     }
 
     fn dismiss_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A confirmation over the account dialog gives it back.
+        // A confirmation over the account dialog or a New Machine dialog gives it back.
         if let Some((dialog, _)) = &self.account_dialog
+            && self.confirm_dialog.take().is_some()
+        {
+            window.focus(&dialog.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
+        if let Some((dialog, _)) = &self.cloud_machine_dialog
             && self.confirm_dialog.take().is_some()
         {
             window.focus(&dialog.focus_handle(cx), cx);
@@ -1387,6 +1400,7 @@ impl Shell {
         let had_add_project_modal = self.add_project_modal.take().is_some();
         let had_worktree_modal = self.worktree_modal.take().is_some();
         let had_machine_modal = self.machine_modal.take().is_some();
+        let had_cloud_machine_dialog = self.cloud_machine_dialog.take().is_some();
         let had_confirm_dialog = self.confirm_dialog.take().is_some();
         let overlay = self.overlay.take();
         if let Some(focus) = overlay
@@ -1399,6 +1413,7 @@ impl Shell {
             || had_add_project_modal
             || had_worktree_modal
             || had_machine_modal
+            || had_cloud_machine_dialog
             || had_confirm_dialog
             || had_account_dialog
             || overlay.is_some()
@@ -1421,6 +1436,7 @@ impl Shell {
             || self.add_project_modal.is_some()
             || self.worktree_modal.is_some()
             || self.machine_modal.is_some()
+            || self.cloud_machine_dialog.is_some()
             || self.confirm_dialog.is_some()
             || self.account_dialog.is_some()
         {
@@ -1677,6 +1693,21 @@ impl Shell {
                 this.dismiss_modal(window, cx);
             });
         self.machine_modal = Some((modal, subscription));
+        cx.notify();
+    }
+
+    fn open_cloud_machine_dialog(
+        &mut self,
+        dialog: Entity<NewCloudMachine>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription =
+            cx.subscribe_in(&dialog, window, |this, _, _: &DismissEvent, window, cx| {
+                this.dismiss_modal(window, cx);
+            });
+        window.focus(&dialog.focus_handle(cx), cx);
+        self.cloud_machine_dialog = Some((dialog, subscription));
         cx.notify();
     }
 
@@ -2381,6 +2412,7 @@ impl Render for Shell {
         let main_background = cx.theme().colors().editor_background;
         let settings_page = self.settings_page.as_ref().map(|(page, _)| page.clone());
         let is_dialog = self.machine_modal.is_some()
+            || self.cloud_machine_dialog.is_some()
             || self.confirm_dialog.is_some()
             || self.account_dialog.is_some()
             || matches!(
@@ -2562,6 +2594,11 @@ impl Render for Shell {
                     })
                     .or_else(|| {
                         self.confirm_dialog
+                            .as_ref()
+                            .map(|(dialog, _)| AnyView::from(dialog.clone()))
+                    })
+                    .or_else(|| {
+                        self.cloud_machine_dialog
                             .as_ref()
                             .map(|(dialog, _)| AnyView::from(dialog.clone()))
                     })

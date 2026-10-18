@@ -860,6 +860,11 @@ impl Server {
             Input::Request {
                 client,
                 id,
+                request: Request::CloudSources(provider),
+            } => self.cloud_sources(client, id, provider),
+            Input::Request {
+                client,
+                id,
                 request: Request::CreateCloudMachine { provider, machine },
             } => self.create_cloud_machine(client, id, provider, machine),
             Input::Request {
@@ -1428,6 +1433,7 @@ impl Server {
             Request::CleanUpNow => Err(anyhow!("cleaning up is handled separately")),
             Request::CheckCloud
             | Request::ChangeCloudMachine { .. }
+            | Request::CloudSources(_)
             | Request::CreateCloudMachine { .. }
             | Request::CloudSshOptions { .. } => {
                 Err(anyhow!("cloud providers are handled separately"))
