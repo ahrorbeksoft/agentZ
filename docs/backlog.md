@@ -87,14 +87,6 @@ our existing automatic workspace cleanup plan in `docs/architecture.md`. Active 
 shared worktrees and the chosen local-change protection must be respected. Any new UI starts
 on the design board.
 
-### Update herdr's terminal attention detection rules
-
-Port the newer rules into `crates/agentz_server/src/detect/manifests/`: Claude questions in
-named sessions ([#5192](https://github.com/herdrdev/herdr/pull/5192)), Codex's startup update
-chooser ([#5174](https://github.com/herdrdev/herdr/pull/5174)), and newer Antigravity dialogs
-([#4959](https://github.com/herdrdev/herdr/pull/4959)). Our copied manifests lack these rules.
-Keep terminal detection distinct from ACP threads' reported work and background tasks.
-
 ### Bound server handshakes and recover SSH connections after wake
 
 Follow herdr's handshake deadlines

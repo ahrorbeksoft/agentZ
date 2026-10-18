@@ -1128,4 +1128,63 @@ contains = ["overlay-marker"]
         };
         assert_eq!(detect(Agent::Codex, codex_title).state, AgentState::Working);
     }
+
+    /// The dialogs herdr's newer rules read (#5192, #5174, #4959), from the screens in their
+    /// comments.
+    #[test]
+    fn bundled_manifests_read_newer_dialogs() {
+        let claude_named_question = "\
+ Enter to select · ↑/↓ to navigate · Esc to cancel
+──── my-session
+  3 tasks (1 done, 1 in progress, 1 open)
+  ◼ Port the picker
+  ◻ Write the tests
+  … +2 pending
+";
+        let detection = detect(Agent::Claude, input(claude_named_question));
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+        let answered = format!("{claude_named_question}● Done.\n❯ \n");
+        assert_ne!(
+            detect(Agent::Claude, input(&answered)).state,
+            AgentState::Blocked
+        );
+
+        let codex_update = "\
+  Update available · 0.160.0
+  1. Update now
+  2. Skip
+  enter continue · esc skip
+";
+        let detection = detect(Agent::Codex, input(codex_update));
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+        let later = format!("{codex_update}newer output\n");
+        assert_ne!(
+            detect(Agent::Codex, input(&later)).state,
+            AgentState::Blocked
+        );
+
+        let antigravity_question = "↑/↓ Navigate · enter Select · esc Skip\nesc to cancel\n";
+        let detection = detect(Agent::Antigravity, input(antigravity_question));
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+        let antigravity_permission =
+            "↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\nesc to cancel\n";
+        assert_eq!(
+            detect(Agent::Antigravity, input(antigravity_permission)).state,
+            AgentState::Blocked
+        );
+        let antigravity_slash_menu =
+            "↑/↓ Navigate · enter Select · tab Complete\n? for shortcuts\n";
+        assert_ne!(
+            detect(Agent::Antigravity, input(antigravity_slash_menu)).state,
+            AgentState::Blocked
+        );
+        let antigravity_working = "⠋ Reading files\n────────────\nesc to cancel\n";
+        assert_eq!(
+            detect(Agent::Antigravity, input(antigravity_working)).state,
+            AgentState::Working
+        );
+    }
 }
