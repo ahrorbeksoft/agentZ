@@ -57,6 +57,16 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
   starts it and loads its session. Each agent runs in its own process group, killed whole, so
   what it started stops with it (Zed's `util::process::Child`): Factory Droid's `acp-daemon`
   runs a worker per session.
+- **Keeping the machine awake** (`keep_awake.rs`, `Server::keep_awake`, Zed's
+  `prevent_idle_sleep`): while any of the machine's agents works (a turn that isn't waiting on
+  a permission or an answer, a background task, a command an agent started, or an agent CLI
+  working in a terminal thread or pane), the server holds off the machine's idle sleep, and
+  lets go once that work ends. The server holds it, so it lasts with the app closed and each
+  SSH machine keeps itself awake. macOS runs `caffeinate -i`; Linux runs `systemd-inhibit`
+  blocking idle and sleep, or idle alone where polkit refuses sleep (as it does over SSH).
+  Each runs `cat` on a pipe from the server, so a server that dies lets go too. A command
+  that can't hold is logged and dropped; with none left, the machine sleeps as it would. Zed's
+  setting to turn it off isn't ported.
 
 ### Protocol (`crates/agentz_protocol`)
 

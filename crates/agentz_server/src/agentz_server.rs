@@ -19,6 +19,7 @@ mod favicons;
 mod git;
 #[cfg(unix)]
 pub mod handoff;
+mod keep_awake;
 mod machine_kind;
 mod mcp_servers;
 mod pages;
@@ -52,6 +53,7 @@ pub use accounts::{
     AgentDescription, KeyLogin, LoggedIn, LoginCheck, Reader, ReaderCommand, StatusCommand,
 };
 pub use agent_settings::AgentSettingsStore;
+pub use keep_awake::KeepAwakeCommand;
 
 use crate::server::{Input, Server};
 
@@ -73,6 +75,9 @@ pub struct ServerConfig {
     /// The `PATH` the CLIs that write thread titles are looked for on and run with. `None` is
     /// the server's own.
     pub title_generation_path: Option<std::ffi::OsString>,
+    /// The commands that keep the machine awake while agents work, tried in order
+    /// ([`KeepAwakeCommand::system`]). Empty lets it sleep.
+    pub keep_awake: Vec<KeepAwakeCommand>,
     /// The socket clients connect to, handed with the terminals to a newer server
     /// ([`agentz_protocol::Request::HandOff`]). `None` can't hand off.
     #[cfg(unix)]

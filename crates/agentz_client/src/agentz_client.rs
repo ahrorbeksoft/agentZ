@@ -295,6 +295,7 @@ mod tests {
                 hands_pages_to_clients: false,
                 terminal_shell: None,
                 title_generation_path: None,
+                keep_awake: Vec::new(),
                 listener: None,
                 handed_over: None,
             },

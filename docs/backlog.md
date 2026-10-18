@@ -149,15 +149,6 @@ validation, Recommended tags, Other answers and multi-question navigation.
 The user explicitly approved implementing Zed's ChoiceCard without a design round. Implement
 the upstream component directly; no additional design-board approval is needed for this item.
 
-### Keep each machine awake while agents work
-
-Follow Zed's idle-sleep prevention
-([#53130](https://github.com/zed-industries/zed/pull/53130)). Hold the machine's sleep inhibition
-while its agents have active work, including background work, and release it when that work
-ends. Own it in the machine's background server so closing the app does not end it, and a
-remote machine inhibits its own sleep. Support macOS and Linux, with a graceful fallback
-where sleep inhibition is unavailable.
-
 ### Step reasoning effort with keyboard shortcuts
 
 Follow t3code's [#19928](https://github.com/pingdotgg/t3code/pull/19928): shortcuts step through

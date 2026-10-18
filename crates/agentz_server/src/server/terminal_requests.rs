@@ -886,6 +886,22 @@ impl Server {
         })
     }
 
+    /// Whether a command an agent started still runs (until the agent lets it go), or an agent
+    /// CLI in a terminal thread or pane works rather than waiting on the user.
+    pub(super) fn terminal_agents_work(&self) -> bool {
+        self.terminals
+            .running
+            .iter()
+            .any(|(key, running)| match key {
+                TerminalKey::Agent { .. } => !running.released && running.terminal.exit().is_none(),
+                _ => running
+                    .tracker
+                    .as_ref()
+                    .and_then(AgentTracker::state)
+                    .is_some_and(|state| state == AgentState::Working),
+            })
+    }
+
     pub(super) fn close_orphaned_terminals(&mut self) {
         let orphaned: Vec<TerminalKey> = self
             .terminals

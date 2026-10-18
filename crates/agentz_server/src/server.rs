@@ -69,6 +69,7 @@ use crate::artifacts::ArtifactStore;
 use crate::browser;
 use crate::checkpoints::Checkpoints;
 use crate::continuations;
+use crate::keep_awake::KeepAwake;
 use crate::machine_kind;
 use crate::mcp_servers;
 use crate::pages::{self, Pages};
@@ -302,6 +303,8 @@ pub(crate) struct Server {
     saved_transcripts: HashMap<ThreadId, u64>,
     /// Transcripts that changed are saved soon.
     transcript_save_scheduled: bool,
+    /// Holds the machine awake while agents work ([`Self::keep_awake`]).
+    keep_awake: KeepAwake,
     stopping: bool,
     /// Pass the stores' and threads' background results on to `inputs`.
     forwarders: JoinSet<()>,
@@ -455,6 +458,7 @@ impl Server {
             draft_sweep_at: None,
             saved_transcripts: HashMap::default(),
             transcript_save_scheduled: false,
+            keep_awake: KeepAwake::new(config.keep_awake),
             stopping: false,
             forwarders: JoinSet::new(),
         };
@@ -657,6 +661,7 @@ impl Server {
                 self.handle(input);
             }
             self.send_changes();
+            self.keep_awake();
             if self.stopping {
                 break;
             }
@@ -2079,6 +2084,33 @@ impl Server {
             .get(&thread_id)
             .is_some_and(AgentThread::is_waiting)
             || self.has_unannounced_tasks(thread_id)
+    }
+
+    /// Holds the machine awake while agents work, and lets it sleep once they're done.
+    fn keep_awake(&mut self) {
+        let working = self.agents_work();
+        if let Some((id, hold)) = self.keep_awake.update(working) {
+            self.spawn_then(hold, move |server, result| {
+                server.keep_awake.ended(id, result)
+            });
+        }
+    }
+
+    /// Whether any of this machine's agents works: in a turn, unless it waits on the user (as
+    /// Zed lets the machine sleep while a thread waits for a permission or an answer), in the
+    /// background, or as an agent CLI in a terminal. A task on another machine keeps that one
+    /// awake.
+    fn agents_work(&self) -> bool {
+        let threads_work = self.threads.iter().any(|(thread_id, thread)| {
+            let waits_on_user =
+                !thread.state.permission_requests.is_empty() || thread.is_awaiting_input();
+            ((thread.is_working() && !waits_on_user) || thread.is_waiting())
+                && self
+                    .projects
+                    .thread(*thread_id)
+                    .is_none_or(|thread| thread.runs_on().is_none())
+        });
+        threads_work || self.terminal_agents_work()
     }
 
     /// The command that starts the agent, with its description's variables and the environment

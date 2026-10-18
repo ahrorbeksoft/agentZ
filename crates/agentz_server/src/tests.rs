@@ -93,7 +93,7 @@ impl TestServer {
             command,
             description,
             agent_control,
-            None,
+            |_| {},
         )
     }
 
@@ -103,7 +103,7 @@ impl TestServer {
         command: AgentCommand,
         description: crate::AgentDescription,
         agent_control: Option<crate::AgentControl>,
-        title_generation_path: Option<std::ffi::OsString>,
+        configure: impl FnOnce(&mut ServerConfig),
     ) -> Option<Self> {
         let custom_agents = BTreeMap::from_iter([(
             AgentId::new("mock"),
@@ -114,23 +114,23 @@ impl TestServer {
                 accounts: Some(description),
             },
         )]);
-        let handle = crate::start(
-            tokio::runtime::Handle::current(),
-            ServerConfig {
-                data_dir: data_dir.path().to_path_buf(),
-                version: "0.0.0-test".into(),
-                http_client: Arc::new(http_client::BlockedHttpClient),
-                shell_environment_ready: futures::future::ready(()).boxed().shared(),
-                custom_agents,
-                agent_control,
-                hands_pages_to_clients: false,
-                terminal_shell: Some("/bin/sh".into()),
-                title_generation_path,
-                listener: None,
-                handed_over: None,
-            },
-        )
-        .expect("server starts");
+        let mut config = ServerConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            version: "0.0.0-test".into(),
+            http_client: Arc::new(http_client::BlockedHttpClient),
+            shell_environment_ready: futures::future::ready(()).boxed().shared(),
+            custom_agents,
+            agent_control,
+            hands_pages_to_clients: false,
+            terminal_shell: Some("/bin/sh".into()),
+            title_generation_path: None,
+            keep_awake: Vec::new(),
+            listener: None,
+            handed_over: None,
+        };
+        configure(&mut config);
+        let handle =
+            crate::start(tokio::runtime::Handle::current(), config).expect("server starts");
         Some(Self {
             handle,
             data_dir,
@@ -1329,6 +1329,103 @@ async fn threads_outlive_their_clients() {
             })
         })
         .await;
+}
+
+/// The server keeps the machine awake while an agent works (Zed's idle sleep prevention), and
+/// lets it sleep once the turn is over, or while it waits for the user.
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_the_machine_awake_while_agents_work() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let holds = tempfile::tempdir().expect("temp dir");
+    let log = holds.path().join("holds");
+    let hold = crate::KeepAwakeCommand::new(
+        "/bin/sh",
+        [
+            "-c".to_string(),
+            r#"echo start >> "$0"; cat; echo end >> "$0""#.to_string(),
+            log.display().to_string(),
+        ],
+    );
+    let Some(server) = TestServer::start_with_config(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+        mock_accounts(),
+        None,
+        move |config| config.keep_awake = vec![hold],
+    ) else {
+        return;
+    };
+    // How many holds were taken, and how many of them let go.
+    let holds = || {
+        let log = std::fs::read_to_string(&log).unwrap_or_default();
+        let count = |line: &str| log.lines().filter(|logged| *logged == line).count();
+        (count("start"), count("end"))
+    };
+
+    let mut client = server.connect().await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("slow"),
+        })
+        .await;
+    eventually("it's held", || {
+        let (started, ended) = holds();
+        started > ended
+    })
+    .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working() && agent_text(thread) == "One two three four five"
+        })
+        .await;
+    eventually("it's let go", || holds() == (1, 1)).await;
+
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("permission"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            !client
+                .thread(connection)
+                .state
+                .permission_requests
+                .is_empty()
+        })
+        .await;
+    eventually("it's let go while asking", || {
+        let (started, ended) = holds();
+        started == ended
+    })
+    .await;
+    // A hold taken before the question would have shown by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (started, ended) = holds();
+    assert_eq!(
+        started, ended,
+        "nothing holds the machine awake while the agent asks"
+    );
+}
+
+/// Waits until `done`, checking every 20 milliseconds.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(TIMEOUT, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting until {what}"));
 }
 
 /// A tool call the agent left running when its turn was stopped shows as stopped.
@@ -9240,7 +9337,7 @@ async fn regenerates_a_title_on_request() {
         command,
         mock_accounts(),
         None,
-        Some(search_path),
+        move |config| config.title_generation_path = Some(search_path),
     ) else {
         return;
     };
@@ -9301,7 +9398,7 @@ async fn titles_threads_their_agent_does_not_name() {
         command,
         mock_accounts(),
         None,
-        Some(search_path),
+        move |config| config.title_generation_path = Some(search_path),
     ) else {
         return;
     };
@@ -9476,7 +9573,7 @@ async fn new_workspaces_are_made_as_the_first_message_is_sent() {
         command,
         mock_accounts(),
         None,
-        Some(search_path),
+        move |config| config.title_generation_path = Some(search_path),
     ) else {
         return;
     };
