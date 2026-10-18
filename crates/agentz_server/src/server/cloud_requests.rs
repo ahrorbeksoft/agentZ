@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use agentz_protocol::Response;
@@ -17,7 +16,7 @@ use agentz_protocol::cloud::{
     ProviderStatus, hours_of_balance,
 };
 use anyhow::{Context as _, Result, anyhow};
-use cloud::{Cli, InstaboxApi};
+use cloud::Cli;
 use util::ResultExt as _;
 
 use super::{ClientId, Input, Server};
@@ -30,7 +29,7 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// A machine seen stopped this long after the listing before isn't told of (topic 12 D): it
 /// stopped while nothing was watching, maybe hours ago.
 const NOTICE_GAP: Duration = Duration::from_secs(5 * 60);
-/// How long after agentZ's own stop, pause, restart or delete is done the stop a listing shows
+/// How long after agentZ's own stop, restart or delete is done the stop a listing shows
 /// is taken as asked for.
 const ASKED_FOR: Duration = Duration::from_secs(10 * 60);
 /// A balance that lasts less than this at the running machines' rate is warned of (topic 12 C).
@@ -52,8 +51,6 @@ pub(super) struct CloudStore {
     status_checked_at: Option<Instant>,
     /// Providers being looked at now, so a refresh doesn't run beside another.
     reading: BTreeSet<Provider>,
-    /// For what Instabox's CLI doesn't do, with agentZ's key.
-    api: Arc<InstaboxApi>,
     /// What the app last said of each machine's use.
     uses: BTreeMap<MachineKey, MachineUse>,
     /// The client that reports it; once it's gone, nothing is open.
@@ -61,11 +58,9 @@ pub(super) struct CloudStore {
     /// Since when each machine has been listed running, so one started after a long stop isn't
     /// idle from before it.
     running_since: BTreeMap<MachineKey, Instant>,
-    /// When agentZ last stopped, paused, restarted or deleted each machine, so the stop a
-    /// listing then shows isn't told as unasked.
+    /// When agentZ last stopped, restarted or deleted each machine, so the stop a listing then
+    /// shows isn't told as unasked.
     asked: BTreeMap<MachineKey, Instant>,
-    /// Machines whose idle pause is being turned off or set back now (topic 12 A).
-    holding: BTreeSet<MachineKey>,
 }
 
 /// What the app last said of a machine's use (topic 12 B).
@@ -78,11 +73,7 @@ struct MachineUse {
 }
 
 impl CloudStore {
-    pub(super) fn load(
-        path: Option<PathBuf>,
-        cli_path: Option<OsString>,
-        api: InstaboxApi,
-    ) -> Self {
+    pub(super) fn load(path: Option<PathBuf>, cli_path: Option<OsString>) -> Self {
         let mut snapshot: CloudSnapshot = path
             .as_deref()
             .and_then(|path| read_json(path).log_err().flatten())
@@ -100,12 +91,10 @@ impl CloudStore {
             watching: false,
             status_checked_at: None,
             reading: BTreeSet::new(),
-            api: Arc::new(api),
             uses: BTreeMap::new(),
             reporter: None,
             running_since: BTreeMap::new(),
             asked: BTreeMap::new(),
-            holding: BTreeSet::new(),
         }
     }
 
@@ -149,7 +138,6 @@ impl CloudStore {
                 changing: Vec::new(),
                 stop_when_idle: BTreeMap::new(),
                 balance_low: false,
-                held_awake: BTreeMap::new(),
             });
             snapshot
                 .providers
@@ -300,71 +288,24 @@ impl CloudStore {
             .collect()
     }
 
-    /// The provider has a running machine it stops when idle, or one whose idle pause it holds
-    /// off, so it's listed with no app open.
+    /// The provider has a running machine it stops when idle, so it's listed with no app open.
     fn needs_listing(&self, provider: Provider) -> bool {
         self.snapshot.provider(provider).is_some_and(|state| {
-            !state.held_awake.is_empty()
-                || state.stop_when_idle.keys().any(|machine| {
-                    state
-                        .machines
-                        .iter()
-                        .any(|listed| listed.id == *machine && listed.state.is_running())
-                })
-        })
-    }
-
-    /// What holding off the provider's idle pause needs now (topic 12 A): the running machines
-    /// agents work on that aren't held yet, unless the account fixes the pause, and the held
-    /// ones nothing works on any more, with the pause each gets back.
-    fn awake_changes(&self, provider: Provider) -> (Vec<String>, Vec<(String, Duration)>) {
-        let Some(state) = self.snapshot.provider(provider) else {
-            return Default::default();
-        };
-        if !provider.description().capabilities.idle_pause {
-            return Default::default();
-        }
-        let working = |machine: &str| {
-            self.uses
-                .get(&(provider, machine.to_string()))
-                .is_some_and(|machine_use| !machine_use.working.is_empty())
-        };
-        let free = |machine: &str| !self.holding.contains(&(provider, machine.to_string()));
-        let can_hold = matches!(
-            &state.status,
-            ProviderStatus::SignedIn { rules, .. } if rules.fixed_idle_pause.is_none()
-        );
-        let hold = state
-            .machines
-            .iter()
-            .filter(|machine| {
-                can_hold
-                    && machine.state.is_running()
-                    && working(&machine.id)
-                    && free(&machine.id)
-                    && !state.held_awake.contains_key(&machine.id)
+            state.stop_when_idle.keys().any(|machine| {
+                state
+                    .machines
+                    .iter()
+                    .any(|listed| listed.id == *machine && listed.state.is_running())
             })
-            .map(|machine| machine.id.clone())
-            .collect();
-        let release = state
-            .held_awake
-            .iter()
-            .filter(|(machine, _)| free(machine) && !working(machine))
-            .map(|(machine, pause)| (machine.clone(), *pause))
-            .collect();
-        (hold, release)
+        })
     }
 }
 
-/// Paused, stopped or suspended, or on its way there.
+/// Stopped or suspended, or on its way there.
 fn is_stopped(state: &CloudState) -> bool {
     matches!(
         state,
-        CloudState::Pausing
-            | CloudState::Paused
-            | CloudState::Stopping
-            | CloudState::Stopped
-            | CloudState::Suspended
+        CloudState::Stopping | CloudState::Stopped | CloudState::Suspended
     )
 }
 
@@ -437,15 +378,14 @@ impl Server {
         });
     }
 
-    /// A server that stops idle machines, or holds off their idle pause, watches them from the
-    /// start, with no app open.
+    /// A server that stops idle machines watches them from the start, with no app open.
     pub(super) fn resume_cloud_watch(&mut self) {
         if self
             .cloud
             .snapshot()
             .providers
             .iter()
-            .any(|state| !state.stop_when_idle.is_empty() || !state.held_awake.is_empty())
+            .any(|state| !state.stop_when_idle.is_empty())
         {
             self.watch_cloud();
         }
@@ -601,7 +541,6 @@ impl Server {
             }
         });
         self.stop_idle_machines(provider);
-        self.keep_cloud_machines_awake();
     }
 
     /// Stops the provider's machines left idle as long as their Stop when idle says.
@@ -620,104 +559,6 @@ impl Server {
         for provider in Provider::ALL {
             self.stop_idle_machines(provider);
         }
-        self.keep_cloud_machines_awake();
-    }
-
-    /// Holds off the idle pause of machines agents work on, as the server holds off sleep
-    /// (topic 12 A): it's turned off, and set back once nothing works on them. An account
-    /// whose pause is fixed can't turn it off, and its machines' pages say so.
-    fn keep_cloud_machines_awake(&mut self) {
-        for provider in Provider::ALL {
-            let (hold, release) = self.cloud.awake_changes(provider);
-            for machine in hold {
-                self.hold_awake(provider, machine);
-            }
-            for (machine, pause) in release {
-                self.release_awake(provider, machine, pause);
-            }
-        }
-    }
-
-    /// Turns the machine's idle pause off, keeping the one it had.
-    fn hold_awake(&mut self, provider: Provider, machine: String) {
-        let key = (provider, machine.clone());
-        self.cloud.holding.insert(key.clone());
-        let cli = self.cloud.cli(provider);
-        let api = self.cloud.api.clone();
-        let ready = self.shell_environment_ready.clone();
-        let work = {
-            let machine = machine.clone();
-            async move {
-                ready.await;
-                let pause = cli.idle_pause(&machine).await?;
-                if pause.is_some() {
-                    let off = MachineAction::SetIdlePause(Duration::ZERO);
-                    cli.act(&machine, &off, &api).await?;
-                }
-                anyhow::Ok(pause.unwrap_or_default())
-            }
-        };
-        self.spawn_then(work, move |server, held| {
-            server.cloud.holding.remove(&key);
-            match held {
-                Ok(pause) => {
-                    server.cloud.update(|snapshot| {
-                        CloudStore::provider(snapshot, provider)
-                            .held_awake
-                            .insert(machine, pause);
-                    });
-                    // The work may have ended meanwhile.
-                    server.keep_cloud_machines_awake();
-                }
-                Err(error) => log::warn!("keeping {provider:?}'s {machine} awake: {error:#}"),
-            }
-        });
-    }
-
-    /// Sets the idle pause back on a machine nothing works on any more; one that had none, or
-    /// that's gone, is only forgotten.
-    fn release_awake(&mut self, provider: Provider, machine: String, pause: Duration) {
-        let listed = self
-            .cloud
-            .snapshot()
-            .provider(provider)
-            .is_some_and(|state| state.machines.iter().any(|listed| listed.id == machine));
-        let forget = move |server: &mut Server, machine: &str| {
-            server.cloud.update(|snapshot| {
-                CloudStore::provider(snapshot, provider)
-                    .held_awake
-                    .remove(machine);
-            });
-        };
-        if pause.is_zero() || !listed {
-            return forget(self, &machine);
-        }
-        let key = (provider, machine.clone());
-        self.cloud.holding.insert(key.clone());
-        let cli = self.cloud.cli(provider);
-        let api = self.cloud.api.clone();
-        let ready = self.shell_environment_ready.clone();
-        let work = {
-            let machine = machine.clone();
-            async move {
-                ready.await;
-                cli.act(&machine, &MachineAction::SetIdlePause(pause), &api)
-                    .await
-            }
-        };
-        self.spawn_then(work, move |server, set| {
-            server.cloud.holding.remove(&key);
-            match set {
-                Ok(_) => {
-                    forget(server, &machine);
-                    // Work may have started again meanwhile.
-                    server.keep_cloud_machines_awake();
-                }
-                Err(error) => {
-                    log::warn!("setting {provider:?}'s {machine}'s idle pause back: {error:#}")
-                }
-            }
-        });
     }
 
     pub(super) fn dismiss_cloud_notices(&mut self, up_to: u64) {
@@ -756,8 +597,8 @@ impl Server {
         Ok(())
     }
 
-    /// Starts, stops, pauses or deletes a machine, answered once its CLI is done; the machines
-    /// are listed again after.
+    /// Starts, stops, restarts or deletes a machine, answered once its CLI is done; the
+    /// machines are listed again after.
     pub(super) fn change_cloud_machine(
         &mut self,
         client: ClientId,
@@ -784,7 +625,7 @@ impl Server {
         }
         let stops = matches!(
             change,
-            Lifecycle::Stop | Lifecycle::Pause | Lifecycle::Restart | Lifecycle::Delete
+            Lifecycle::Stop | Lifecycle::Restart | Lifecycle::Delete
         );
         if stops {
             self.cloud
@@ -809,19 +650,6 @@ impl Server {
             }
             server.end_cloud_change(provider, &machine);
             then(server, changed);
-        });
-    }
-
-    /// What the provider's new machines can start from.
-    pub(super) fn cloud_sources(&mut self, client: ClientId, id: u64, provider: Provider) {
-        let cli = self.cloud.cli(provider);
-        let ready = self.shell_environment_ready.clone();
-        let work = async move {
-            ready.await;
-            cli.sources().await.map_err(|error| anyhow!("{error:#}"))
-        };
-        self.spawn_then(work, move |server, sources| {
-            server.respond(client, id, sources.map(Response::CloudSources));
         });
     }
 
@@ -920,11 +748,10 @@ impl Server {
         machine: String,
     ) {
         let cli = self.cloud.cli(provider);
-        let api = self.cloud.api.clone();
         let ready = self.shell_environment_ready.clone();
         let work = async move {
             ready.await;
-            cli.details(&machine, &api)
+            cli.details(&machine)
                 .await
                 .map_err(|error| anyhow!("{error:#}"))
         };
@@ -933,8 +760,8 @@ impl Server {
         });
     }
 
-    /// Does a page's action to a machine, answered once its CLI is done with what it gave for
-    /// the user. The machines and usage are listed again after one that changes something.
+    /// Does a page's action to a machine, answered once it's done; the machines are listed
+    /// again after one its CLI does.
     pub(super) fn cloud_machine_action(
         &mut self,
         client: ClientId,
@@ -948,38 +775,16 @@ impl Server {
             return self.respond(client, id, set.map(|()| Response::Ok));
         }
         let cli = self.cloud.cli(provider);
-        let api = self.cloud.api.clone();
         let ready = self.shell_environment_ready.clone();
-        let changes = !matches!(
-            action,
-            MachineAction::SshCommand | MachineAction::DesktopLink { .. }
-        );
-        let sets_idle_pause = matches!(action, MachineAction::SetIdlePause(_));
-        let work = {
-            let machine = machine.clone();
-            async move {
-                ready.await;
-                cli.act(&machine, &action, &api)
-                    .await
-                    .map_err(|error| anyhow!("{error:#}"))
-            }
+        let work = async move {
+            ready.await;
+            cli.act(&machine, &action)
+                .await
+                .map_err(|error| anyhow!("{error:#}"))
         };
-        self.spawn_then(work, move |server, output| {
-            if sets_idle_pause && output.is_ok() {
-                // The user's pause is the one to set back now, and it's turned off again while
-                // agents still work.
-                server.cloud.update(|snapshot| {
-                    CloudStore::provider(snapshot, provider)
-                        .held_awake
-                        .remove(&machine);
-                });
-                server.keep_cloud_machines_awake();
-            }
-            if changes {
-                server.list_cloud_machines(provider);
-            }
-            let response = output.map(|output| output.map_or(Response::Ok, Response::CloudOutput));
-            server.respond(client, id, response);
+        self.spawn_then(work, move |server, done| {
+            server.list_cloud_machines(provider);
+            server.respond(client, id, done.map(|()| Response::Ok));
         });
     }
 

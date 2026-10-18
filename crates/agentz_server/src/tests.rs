@@ -11343,7 +11343,7 @@ esac
     std::fs::write(&program, script).expect("writes the CLI");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
         .expect("makes it runnable");
-    // `sh`, `cat` and `printf` from the system, and no `instabox` anywhere.
+    // `sh`, `cat` and `printf` from the system.
     let path = std::ffi::OsString::from(format!("{}:/bin:/usr/bin", folder.path().display()));
     (folder, path)
 }
@@ -11357,11 +11357,10 @@ fn cloud_snapshot(client: &TestClient) -> Option<agentz_protocol::cloud::CloudSn
 }
 
 /// Once an app asks, this Mac's server looks for the providers' CLIs and runs them: Proton
-/// signed in, with its computer and balance, and Instabox not installed. It starts a computer
-/// through the CLI, skipping the CLI's own price question, lists it again after, and gives the
-/// computer's SSH options; a change the provider doesn't have is refused. It makes a computer
-/// and answers with it, and Proton has nothing to start one from. A computer's page reads when
-/// it started, and replaces its SSH keys.
+/// signed in, with its computer and balance. It starts a computer through the CLI, skipping the
+/// CLI's own price question, lists it again after, and gives the computer's SSH options. It
+/// makes a computer and answers with it. A computer's page reads when it started, and replaces
+/// its SSH keys.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn finds_cloud_providers_and_changes_their_machines() {
@@ -11389,15 +11388,12 @@ async fn finds_cloud_providers_and_changes_their_machines() {
     client.ok(Request::CheckCloud).await;
     let cloud = cloud_snapshot(&client).expect("the providers were sent");
     assert!(!cloud.checking);
-    let instabox = cloud.provider(Provider::Instabox).expect("Instabox");
-    assert_eq!(instabox.status, ProviderStatus::NotInstalled);
     let proton = cloud.provider(Provider::Proton).expect("Proton");
     assert_eq!(
         proton.status,
         ProviderStatus::SignedIn {
             version: "0.1.2".into(),
             account: "alex@example.com".into(),
-            rules: Default::default(),
         }
     );
     assert_eq!(proton.machines.len(), 1);
@@ -11424,15 +11420,6 @@ async fn finds_cloud_providers_and_changes_their_machines() {
                 .is_some_and(|machine| machine.state == CloudState::Running)
         })
         .await;
-    let error = client
-        .request(Request::ChangeCloudMachine {
-            provider: Provider::Proton,
-            machine: "c-1".into(),
-            change: Lifecycle::Pause,
-        })
-        .await
-        .expect_err("Proton can't pause");
-    assert!(error.message.contains("can't do that"), "{}", error.message);
     let options = client
         .ok(Request::CloudSshOptions {
             provider: Provider::Proton,
@@ -11448,10 +11435,6 @@ async fn finds_cloud_providers_and_changes_their_machines() {
             options: Vec::new(),
         })
     );
-    assert_eq!(
-        client.ok(Request::CloudSources(Provider::Proton)).await,
-        Response::CloudSources(Default::default())
-    );
     let Response::CloudMachineDetails(details) = client
         .ok(Request::CloudMachineDetails {
             provider: Provider::Proton,
@@ -11462,7 +11445,6 @@ async fn finds_cloud_providers_and_changes_their_machines() {
         panic!("not its details");
     };
     assert!(details.started_at.is_some());
-    assert_eq!(details.errors, Vec::<String>::new());
     let key = cli.path().join("id_ed25519.pub");
     assert_eq!(
         client
@@ -11474,21 +11456,11 @@ async fn finds_cloud_providers_and_changes_their_machines() {
             .await,
         Response::Ok
     );
-    let error = client
-        .request(Request::CloudMachineAction {
-            provider: Provider::Proton,
-            machine: "c-1".into(),
-            action: MachineAction::PushVault,
-        })
-        .await
-        .expect_err("Proton has no Vault");
-    assert!(error.message.contains("can't do that"), "{}", error.message);
     let Response::CloudMachineCreated(created) = client
         .ok(Request::CreateCloudMachine {
             provider: Provider::Proton,
             machine: CreateMachine {
                 name: "scratch".into(),
-                ..Default::default()
             },
         })
         .await
@@ -11576,15 +11548,6 @@ async fn stops_idle_cloud_machines_and_tells_of_what_their_provider_did() {
     let proton = cloud.provider(Provider::Proton).expect("Proton");
     assert_eq!(proton.stop_when_idle.get("c-1"), Some(&Duration::ZERO));
     assert_eq!(cloud.notices, Vec::new());
-    let error = client
-        .request(Request::CloudMachineAction {
-            provider: Provider::Instabox,
-            machine: "m-1".into(),
-            action: MachineAction::StopWhenIdle(Some(Duration::ZERO)),
-        })
-        .await
-        .expect_err("Instabox pauses its own");
-    assert!(error.message.contains("doesn't stop"), "{}", error.message);
 
     // Once nothing works on it, it's stopped, and that isn't told of.
     client.ok(working(&[])).await;
@@ -11656,136 +11619,4 @@ async fn stops_idle_cloud_machines_and_tells_of_what_their_provider_did() {
         cloud_snapshot(&client).expect("the providers").notices,
         Vec::new()
     );
-}
-
-/// A fake `instabox` CLI in a folder of its own: signed in as `me@example.com` (a `whoami`
-/// file there replaces what `whoami --json` prints), with one running machine whose idle pause,
-/// in seconds, is kept in a `pause` file, so `auto-suspend` changes what `get` says.
-#[cfg(unix)]
-fn fake_instabox_cli() -> (tempfile::TempDir, std::ffi::OsString) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let folder = tempfile::tempdir().expect("temp dir");
-    let pause = folder.path().join("pause");
-    std::fs::write(&pause, "1800").expect("writes the pause");
-    let script = format!(
-        r#"#!/bin/sh
-echo "$*" >> '{log}'
-case "$*" in
-  "--version") echo "instabox cbecf34a" ;;
-  "whoami --json") cat '{whoami}' 2>/dev/null || echo '{{"login": "me@example.com"}}' ;;
-  "ls --json") echo '[{{"id": "m-1", "name": "agents-1", "state": "running"}}]' ;;
-  "usage --json") echo '{{}}' ;;
-  "get m-1 --json") printf '{{"state": "running", "autoSuspendAfterSeconds": %s}}' "$(cat '{pause}')" ;;
-  "auto-suspend m-1 "*) set -- $*; echo "${{3%s}}" > '{pause}' ;;
-  *) echo "instabox: unknown command: $*" >&2; exit 1 ;;
-esac
-"#,
-        log = folder.path().join("log").display(),
-        whoami = folder.path().join("whoami").display(),
-        pause = pause.display(),
-    );
-    let program = folder.path().join("instabox");
-    std::fs::write(&program, script).expect("writes the CLI");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("makes it runnable");
-    let path = std::ffi::OsString::from(format!("{}:/bin:/usr/bin", folder.path().display()));
-    (folder, path)
-}
-
-/// While an agent works on an Instabox machine, this Mac's server turns its idle pause off, as
-/// it holds off sleep, and sets the one it had back once nothing works on it; one the user picks
-/// meanwhile is the one set back. An account whose pause is fixed can't turn it off, so it's
-/// left alone.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn holds_off_instabox_idle_pause_while_agents_work() {
-    use agentz_protocol::cloud::{CloudActivity, MachineAction, Provider};
-
-    let Some(command) = mock_agent() else {
-        return;
-    };
-    let (cli, path) = fake_instabox_cli();
-    let Some(server) = TestServer::start_with_config(
-        tempfile::tempdir().expect("temp dir"),
-        tempfile::tempdir().expect("temp dir"),
-        command,
-        mock_accounts(),
-        None,
-        move |config| config.cloud_path = Some(path),
-    ) else {
-        return;
-    };
-    let mut client = server.connect().await;
-    client.ok(Request::SubscribeSession).await;
-    let working = |working: &[&str]| {
-        Request::ReportCloudActivity(vec![CloudActivity {
-            provider: Provider::Instabox,
-            machine: "m-1".into(),
-            working: working.iter().map(|title| title.to_string()).collect(),
-            open: false,
-        }])
-    };
-    let held = |client: &TestClient| {
-        cloud_snapshot(client)
-            .and_then(|cloud| cloud.provider(Provider::Instabox).cloned())
-            .map(|state| state.held_awake.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default()
-    };
-    let pause = || std::fs::read_to_string(cli.path().join("pause")).expect("the pause");
-    let log = || std::fs::read_to_string(cli.path().join("log")).expect("the CLI ran");
-    client.ok(Request::CheckCloud).await;
-
-    // A thread works on it, so its pause is turned off, and the 30 minutes it had are kept.
-    client.ok(working(&["Fix the login bug"])).await;
-    client
-        .wait_until(|client| held(client) == [("m-1".to_string(), Duration::from_secs(1800))])
-        .await;
-    assert_eq!(pause().trim(), "0");
-
-    // The user picks an hour meanwhile: that's kept, and it stays off.
-    client
-        .ok(Request::CloudMachineAction {
-            provider: Provider::Instabox,
-            machine: "m-1".into(),
-            action: MachineAction::SetIdlePause(Duration::from_secs(3600)),
-        })
-        .await;
-    client
-        .wait_until(|client| held(client) == [("m-1".to_string(), Duration::from_secs(3600))])
-        .await;
-    assert_eq!(pause().trim(), "0");
-
-    // Once nothing works on it, the hour is set back.
-    client.ok(working(&[])).await;
-    client.wait_until(|client| held(client).is_empty()).await;
-    assert_eq!(pause().trim(), "3600");
-    assert!(
-        log().lines().any(|line| line == "auto-suspend m-1 3600s"),
-        "{}",
-        log()
-    );
-
-    // An account whose pause is fixed can't turn it off.
-    std::fs::write(
-        cli.path().join("whoami"),
-        r#"{"login": "me@example.com", "fixedAutoSuspendSeconds": 1800}"#,
-    )
-    .expect("writes whoami");
-    client.ok(Request::CheckCloud).await;
-    let turned_off = log()
-        .lines()
-        .filter(|line| *line == "auto-suspend m-1 0")
-        .count();
-    client.ok(working(&["Fix the login bug"])).await;
-    client.ok(Request::CheckCloud).await;
-    assert!(held(&client).is_empty());
-    assert_eq!(
-        log()
-            .lines()
-            .filter(|line| *line == "auto-suspend m-1 0")
-            .count(),
-        turned_off
-    );
-    assert_eq!(pause().trim(), "3600");
 }

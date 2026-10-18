@@ -93,11 +93,11 @@ pub(crate) fn parse_details(json: &str) -> Result<MachineDetails> {
     Ok(MachineDetails {
         started_at,
         last_activity: show.machine.last_activity.and_then(seconds_since_epoch),
-        ..MachineDetails::default()
     })
 }
 
-/// A page's action: only its SSH keys, which `keys` replaces on a running computer.
+/// A page's action: only its SSH keys, which `keys` replaces on a running computer. Stop when
+/// idle is agentZ's own.
 pub(crate) fn action_args(machine: &str, action: &MachineAction) -> Result<Vec<String>> {
     let MachineAction::ReplaceSshKeys(keys) = action else {
         return Err(anyhow!("Proton computers can't do that"));
@@ -135,7 +135,6 @@ fn machine(computer: Computer) -> CloudMachine {
             memory_ceiling_mib: computer.ceiling_mib,
             disk_gib: computer.disk_gib,
         },
-        template: None,
         ssh_address,
         created_at: computer.created.and_then(seconds_since_epoch),
         error: computer.error.filter(|error| !error.is_empty()),
@@ -161,25 +160,18 @@ fn state(state: &str) -> CloudState {
 
 /// `create` takes the user's own key (`~/.ssh/id_ed25519.pub` by default), which the computer
 /// is reached with.
-pub(crate) fn create_args(machine: &CreateMachine) -> Result<Vec<String>> {
-    anyhow::ensure!(
-        machine.source.is_none() && machine.timeout.is_none() && machine.auto_suspend.is_none(),
-        "Proton computers have no templates, snapshots or timeouts"
-    );
-    Ok(vec!["create".into(), machine.name.clone(), "--yes".into()])
+pub(crate) fn create_args(machine: &CreateMachine) -> Vec<String> {
+    vec!["create".into(), machine.name.clone(), "--yes".into()]
 }
 
-pub(crate) fn change_args(machine: &str, change: Lifecycle) -> Result<Vec<String>> {
+pub(crate) fn change_args(machine: &str, change: Lifecycle) -> Vec<String> {
     let args: &[&str] = match change {
         Lifecycle::Start => &["start", machine, "--yes"],
         Lifecycle::Restart => &["restart", machine, "--yes"],
         Lifecycle::Stop => &["stop", machine],
         Lifecycle::Delete => &["delete", machine, "--yes"],
-        Lifecycle::Pause | Lifecycle::Resume => {
-            return Err(anyhow!("Proton computers can't be paused"));
-        }
     };
-    Ok(args.iter().map(|arg| arg.to_string()).collect())
+    args.iter().map(|arg| arg.to_string()).collect()
 }
 
 /// `balance`'s text: "Shared Cube balance: $24.27" (or "No prepaid Cube balance…"), then
@@ -255,7 +247,6 @@ mod tests {
                     memory_ceiling_mib: Some(65536),
                     disk_gib: Some(50),
                 },
-                template: None,
                 ssh_address: Some(SshAddress {
                     host: "ssh.proton.computer".into(),
                     port: 22021,
@@ -316,7 +307,7 @@ mod tests {
             ]
         );
         assert!(action_args("devbox-3", &MachineAction::ReplaceSshKeys(Vec::new())).is_err());
-        assert!(action_args("devbox-3", &MachineAction::PushVault).is_err());
+        assert!(action_args("devbox-3", &MachineAction::StopWhenIdle(None)).is_err());
     }
 
     #[test]
@@ -368,11 +359,7 @@ mod tests {
     fn creating_takes_only_a_name() {
         let machine = CreateMachine {
             name: "scratch".into(),
-            ..Default::default()
         };
-        assert_eq!(
-            create_args(&machine).expect("has args"),
-            ["create", "scratch", "--yes"]
-        );
+        assert_eq!(create_args(&machine), ["create", "scratch", "--yes"]);
     }
 }

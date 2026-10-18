@@ -3,7 +3,6 @@
 //! entry per project) and the chosen section's rows on the right.
 
 mod accounts_menu;
-mod cloud_machine_dialog;
 mod cloud_machine_page;
 mod cloud_providers;
 mod mcp_servers;
@@ -119,7 +118,6 @@ actions!(
     ]
 );
 
-pub use cloud_machine_dialog::CloudMachineDialog;
 pub use new_cloud_machine::NewCloudMachine;
 
 pub fn init(cx: &mut App) {
@@ -127,16 +125,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseSettings, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(new_cloud_machine::KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(new_cloud_machine::KEY_CONTEXT)),
-        KeyBinding::new(
-            "enter",
-            menu::Confirm,
-            Some(cloud_machine_dialog::KEY_CONTEXT),
-        ),
-        KeyBinding::new(
-            "escape",
-            menu::Cancel,
-            Some(cloud_machine_dialog::KEY_CONTEXT),
-        ),
         KeyBinding::new("enter", menu::Confirm, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(ACCOUNT_DIALOG_KEY_CONTEXT)),
@@ -150,8 +138,6 @@ pub enum SettingsPageEvent {
     EditMachine(Option<MachineProfile>),
     /// Show a provider's New Machine dialog, in the shell's modal layer.
     NewCloudMachine(Entity<NewCloudMachine>),
-    /// Show a cloud machine's Save Snapshot… or Publish Port…, in the shell's modal layer.
-    CloudMachineDialog(Entity<CloudMachineDialog>),
     /// Ask before a destructive action, in the shell's modal layer.
     Confirm(ConfirmRequest),
     /// Leave settings for the thread, as an agent's Threads tab opens one.
@@ -281,9 +267,6 @@ pub struct SettingsPage {
     machine_page: Option<cloud_machine_page::MachinePage>,
     /// What's being done to cloud machines' extras, each once at a time.
     cloud_actions: Vec<(Provider, String, MachineAction)>,
-    /// An action whose output was just copied, whose button says so for a moment.
-    copied_action: Option<(Provider, String, MachineAction)>,
-    copied_action_reset: Option<Task<()>>,
     nav_scroll: ScrollHandle,
     /// The open section's rows, a list as Zed's settings pages are: laying out a page whole
     /// made each frame of a scroll slow (taffy measures every row again at each level of
@@ -400,8 +383,6 @@ impl SettingsPage {
             copied_reset: None,
             machine_page: None,
             cloud_actions: Vec::new(),
-            copied_action: None,
-            copied_action_reset: None,
             nav_scroll: ScrollHandle::new(),
             content_list: ListState::new(0, ListAlignment::Top, px(0.)).measure_all(),
             content_scroll_top: ListOffset::default(),
@@ -12257,7 +12238,6 @@ mod tests {
                 memory_ceiling_mib: Some(65536),
                 disk_gib: Some(50),
             },
-            template: None,
             ssh_address: None,
             created_at: None,
             error: None,
@@ -12275,14 +12255,12 @@ mod tests {
             changing: Vec::new(),
             stop_when_idle: Default::default(),
             balance_low: false,
-            held_awake: Default::default(),
         }
     }
 
     /// Settings › Machines lists SSH machines under This Mac and SSH, and each signed-in
     /// provider's machines under its account, saved or not (design/cloud topics 1 C, 6 B,
-    /// 10 B); the providers that aren't set up are under More Providers, with Check Again
-    /// (topic 2 A). Starting a machine that charges asks first, until the account says not to
+    /// 10 B). Starting a machine that charges asks first, until the account says not to
     /// (topic 5 C), and switching on one that isn't saved saves it. The group's New Computer
     /// opens Proton's dialog, a computer being made shows until it's listed (topic 4 C), and
     /// Remove… can delete the computer too, once its name is typed (topic 9 B).
@@ -12335,7 +12313,6 @@ mod tests {
                     ProviderStatus::SignedIn {
                         version: "0.4.0".into(),
                         account: account.into(),
-                        rules: Default::default(),
                     },
                 );
                 proton.machines = vec![
@@ -12349,10 +12326,7 @@ mod tests {
                 });
                 client.set_cloud_for_test(
                     CloudSnapshot {
-                        providers: vec![
-                            provider_state(Provider::Instabox, ProviderStatus::NotInstalled),
-                            proton,
-                        ],
+                        providers: vec![proton],
                         ..Default::default()
                     },
                     cx,
@@ -12438,15 +12412,6 @@ mod tests {
         assert!(ssh.top() < proton.top());
         assert!(proton.top() < devbox.top() && devbox.top() < scratch.top());
         assert!(scratch.top() < gone.top());
-
-        // Instabox isn't installed, so it's under More Providers, last.
-        assert!(cx.debug_bounds("cloud-provider-instabox").is_none());
-        let instabox = cx
-            .debug_bounds("cloud-setup-instabox")
-            .expect("Instabox is under More Providers");
-        assert!(gone.top() < instabox.top());
-        click("cloud-check-again", cx);
-        assert_eq!(checks(cx), 2);
 
         // Starting a Proton computer charges, so it asks first.
         click("cloud-main-proton-c-2", cx);
@@ -12553,16 +12518,70 @@ mod tests {
         assert!(removed);
     }
 
+    /// A provider that isn't set up is under More Providers, with how to set it up, and Check
+    /// Again looks for its CLI again (design/cloud topic 2 A).
+    #[gpui::test]
+    fn providers_not_set_up_are_under_more_providers(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| {
+                client.answer_for_test(|request| {
+                    matches!(request, Request::CheckCloud).then_some(Response::Ok)
+                });
+                client.set_cloud_for_test(
+                    CloudSnapshot {
+                        providers: vec![provider_state(
+                            Provider::Proton,
+                            ProviderStatus::NotInstalled,
+                        )],
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Machines, window, cx)
+        });
+        cx.run_until_parked();
+        let checks = |cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .iter()
+                    .filter(|request| matches!(request, Request::CheckCloud))
+                    .count()
+            })
+        };
+
+        assert!(cx.debug_bounds("cloud-provider-proton").is_none());
+        assert!(
+            cx.debug_bounds("cloud-setup-proton").is_some(),
+            "Proton is under More Providers"
+        );
+        assert_eq!(checks(cx), 1);
+        let check_again = cx
+            .debug_bounds("cloud-check-again")
+            .expect("Check Again is shown");
+        cx.simulate_click(check_again.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(checks(cx), 2);
+    }
+
     /// Settings › Usage has a Cloud section after the agents, even with no agent that reads
-    /// its limits: Instabox's counts as bars against their limits, and Proton's balance with
-    /// Add Credit (design/cloud topic 13 C). An account that's signed out isn't in it.
+    /// its limits: Proton's balance with Add Credit (design/cloud topic 13 C). An account
+    /// that's signed out isn't in it.
     #[gpui::test]
     fn the_usage_page_shows_each_cloud_account(cx: &mut TestAppContext) {
-        let signed_in = || ProviderStatus::SignedIn {
-            version: "1.0.0".into(),
-            account: "me@example.com".into(),
-            rules: Default::default(),
-        };
         let client = cx.update(|cx| {
             crate::init_for_test(cx);
             super::init(cx);
@@ -12573,16 +12592,13 @@ mod tests {
                 cx,
             );
             client.update(cx, |client, cx| {
-                let mut instabox = provider_state(Provider::Instabox, signed_in());
-                instabox.usage = Some(CloudUsage::Limits {
-                    machines: 4,
-                    max_machines: Some(5),
-                    snapshots: 1,
-                    max_snapshots: Some(10),
-                    stored_bytes: Some(14 << 30),
-                    max_stored_gib: Some(200),
-                });
-                let mut proton = provider_state(Provider::Proton, signed_in());
+                let mut proton = provider_state(
+                    Provider::Proton,
+                    ProviderStatus::SignedIn {
+                        version: "1.0.0".into(),
+                        account: "me@example.com".into(),
+                    },
+                );
                 proton.usage = Some(CloudUsage::Balance {
                     balance_micro_usd: Some(24_200_000),
                     running_hours: 29.35,
@@ -12590,7 +12606,7 @@ mod tests {
                 });
                 client.set_cloud_for_test(
                     CloudSnapshot {
-                        providers: vec![instabox, proton],
+                        providers: vec![proton],
                         ..Default::default()
                     },
                     cx,
@@ -12605,42 +12621,21 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let instabox = cx
-            .debug_bounds("usage-cloud-instabox")
-            .expect("Instabox's account is shown");
-        let proton = cx
-            .debug_bounds("usage-cloud-proton")
-            .expect("Proton's account is shown");
-        assert!(instabox.top() < proton.top());
-
-        // 4 of 5 machines fill four fifths of their bar.
-        let track = cx
-            .debug_bounds("usage-cloud-instabox-bar-0")
-            .expect("a bar for the machines");
-        let fill = cx
-            .debug_bounds("usage-cloud-instabox-bar-0-fill")
-            .expect("the machines used");
-        let share = fill.size.width / track.size.width;
-        assert!((share - 0.8).abs() < 0.01, "{share}");
         assert!(
-            cx.debug_bounds("usage-cloud-instabox-bar-2").is_some(),
-            "a bar for the storage"
+            cx.debug_bounds("usage-cloud-proton").is_some(),
+            "Proton's account is shown"
         );
-        // Only Proton bills a balance; it has no bars.
         assert!(cx.debug_bounds("usage-cloud-proton-add-credit").is_some());
-        assert!(cx.debug_bounds("usage-cloud-instabox-add-credit").is_none());
-        assert!(cx.debug_bounds("usage-cloud-proton-bar-0").is_none());
 
         client.update(cx, |client, cx| {
             let mut cloud = client.cloud().clone();
-            cloud.providers[1].status = ProviderStatus::SignedOut {
+            cloud.providers[0].status = ProviderStatus::SignedOut {
                 version: "1.0.0".into(),
             };
             client.set_cloud_for_test(cloud, cx);
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("usage-cloud-proton").is_none());
-        assert!(cx.debug_bounds("usage-cloud-instabox").is_some());
     }
 
     #[test]

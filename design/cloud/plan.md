@@ -1,5 +1,13 @@
 # Cloud machines: plan
 
+> **Instabox was dropped** (the user, 2026-10-19): its account pauses machines after 30 idle
+> minutes whatever they ask, so agentZ supports Proton only. What only Instabox had isn't
+> built: topic 8 (snapshots), 12 A (keeping it awake), its tabs in topic 7 (Snapshots, Ports,
+> Desktop, Vault, SSH), its templates and timeouts in topic 4, Pause when idle in 12 B and its
+> counts in 13. Topic 11 C's free start went with it, and a thread on a stopped computer
+> doesn't offer Start either: its offline notice says it's stopped, and it's started from
+> Settings › Machines. `progress.md` (item 10) has the details.
+
 Status: designed, being built. The UI was picked on the design board: `decisions.md` is its
 spec (topic numbers below are its sections), and `progress.md` tracks the build. Researched on 2026-10-18 from Instabox's
 docs (bundled in its site's script), its SDK (`@insforge/instabox-sdk` 0.5.3) and its CLI's help

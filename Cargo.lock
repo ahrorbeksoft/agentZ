@@ -1424,9 +1424,6 @@ version = "0.1.0"
 dependencies = [
  "agentz_protocol",
  "anyhow",
- "chrono",
- "futures",
- "http_client",
  "log",
  "serde",
  "serde_json",

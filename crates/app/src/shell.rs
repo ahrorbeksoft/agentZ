@@ -172,8 +172,6 @@ enum OverlayKind {
     ProjectIconFile,
     /// Custom… in a snooze menu, which asks for how long.
     CustomSnooze,
-    /// A cloud machine's Save Snapshot… or Publish Port…, from its settings.
-    CloudMachineAction,
 }
 
 struct Overlay {
@@ -406,7 +404,7 @@ impl Shell {
                 None => match PaneKey::from_notification_tag(&response.tag) {
                     Some(pane) => Some(Place::Pane(pane)),
                     None => {
-                        let Some((provider, machine)) =
+                        let Some((provider, _)) =
                             cloud_machines::notification_target(&response.tag)
                         else {
                             return;
@@ -418,7 +416,7 @@ impl Shell {
                             .as_deref()
                             .and_then(NoticeAction::from_id)
                         {
-                            cloud_machines::act_on_notification(provider, machine, action, cx);
+                            cloud_machines::act_on_notification(provider, action, cx);
                             return;
                         }
                         None
@@ -1080,13 +1078,7 @@ impl Shell {
                         SettingsPageEvent::NewCloudMachine(dialog) => {
                             this.open_cloud_machine_dialog(dialog.clone(), window, cx)
                         }
-                        SettingsPageEvent::CloudMachineDialog(dialog) => this
-                            .open_settings_overlay(
-                                OverlayKind::CloudMachineAction,
-                                dialog.clone(),
-                                window,
-                                cx,
-                            ),
+
                         SettingsPageEvent::Confirm(request) => {
                             this.open_confirm_dialog(request.clone(), window, cx)
                         }
@@ -2224,8 +2216,8 @@ impl Shell {
                     warning,
                     Color::Muted,
                 ),
-                // Proton suspends a computer whose balance ran out; stopped and paused ones
-                // were meant to be.
+                // Proton suspends a computer whose balance ran out; stopped ones were meant
+                // to be.
                 MachineStatus::NotRunning(state @ (CloudState::Suspended | CloudState::Failed)) => {
                     (
                         "Needs attention",
@@ -2464,10 +2456,7 @@ impl Render for Shell {
             || matches!(
                 self.overlay_kind(),
                 Some(
-                    OverlayKind::SaveLayout
-                        | OverlayKind::ProjectIcon
-                        | OverlayKind::CustomSnooze
-                        | OverlayKind::CloudMachineAction
+                    OverlayKind::SaveLayout | OverlayKind::ProjectIcon | OverlayKind::CustomSnooze
                 )
             );
         // Beside the thread, or filling its area when full screen.

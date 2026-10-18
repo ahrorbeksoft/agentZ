@@ -138,7 +138,7 @@ runs in `agentz-server`, not the app.
 | `agentz_server` | The `agentz-server` binary (`main.rs`: `run`, `start`, `proxy`, `stop`, `mcp-bridge`, `tools`, `call`, and the hidden `open-url`). |
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), the editors a folder opens in (`editors.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`), cloud providers and their machines (`cloud.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
-| `cloud` | Cloud providers' CLIs: finding each one, running it and reading what it prints (`instabox.rs`, `proton.rs`, `ssh_config.rs`), and Instabox's HTTP API (`instabox_api.rs`). |
+| `cloud` | Cloud providers' CLIs: finding each one, running it and reading what it prints (`proton.rs`, `ssh_config.rs`). |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
@@ -197,8 +197,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `skills.json` | server | The accounts each of agentZ's skills is kept off (its accounts menu) |
 | `mcp-servers.json` | server | agentZ's MCP servers (Settings › MCP Servers), given to every session, with the accounts each is kept off, and whether agentZ's own `agentz` server is on |
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
-| `cloud.json` | server | The cloud providers found, their machines and usage as last listed, each machine's Stop when idle, the idle pauses held off, and the notices not yet shown |
-| `cloud/instabox/api-key` | server | The Instabox API key agentZ made with its CLI, for what the CLI doesn't do |
+| `cloud.json` | server | The cloud providers found, their machines and usage as last listed, each machine's Stop when idle, and the notices not yet shown |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
@@ -2260,21 +2259,18 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
 
 ### Cloud machines
 
-Machines a provider's CLI makes, starts, stops and pauses, which agentZ then reaches over SSH
-like any other (`design/cloud/`: `decisions.md` is the spec, `plan.md` has each provider's
-commands, `progress.md` what's built). Instabox (`instabox`) and Proton (`proton`) are the
-first. A provider is a `ProviderDescription` (`agentz_protocol/src/cloud.rs`: its program,
-install and sign-in commands, links, price, lifecycle changes and `Capabilities`) plus its
-CLI's commands and parsers in the `cloud` crate; another provider follows the same two steps.
+Machines a provider's CLI makes, starts and stops, which agentZ then reaches over SSH like any
+other (`design/cloud/`: `decisions.md` is the spec, `plan.md` has each provider's commands,
+`progress.md` what's built). Proton (`proton`) is the one provider; Instabox was dropped, since
+its account pauses machines after 30 idle minutes whatever they ask. A provider is a
+`ProviderDescription` (`agentz_protocol/src/cloud.rs`: its program, install and sign-in
+commands, links, price, lifecycle changes and `Capabilities`) plus its CLI's commands and
+parsers in the `cloud` crate; another provider follows the same two steps.
 
 - **The CLIs** (`crates/cloud`, `Cli`): the user installs each CLI and signs in with it, and
   agentZ only runs it, with the login shell's environment, never reading its login. Each is
-  found on `PATH` (`--version`, then `whoami`; Instabox's `whoami --json` also gives the
-  account's rules: a fixed idle pause and the longest timeout). What each command prints is
-  parsed and tested against outputs captured from the CLIs (`instabox_outputs/`,
-  `proton_outputs/`). Instabox's HTTP API, with a key agentZ makes through its CLI
-  (`cloud/instabox/api-key`), gives desktop links, CPU and memory, and running time
-  (`InstaboxApi`).
+  found on `PATH` (`--version`, then `whoami`). What each command prints is parsed and tested
+  against outputs captured from the CLI (`proton_outputs/`).
 - **This Mac's server runs them** (`server/cloud_requests.rs`): only this Mac's app asks
   (`Request::CheckCloud`), so other machines never run the CLIs. The providers are looked for
   on the first ask and every 5 minutes while an app is open, and the signed-in ones' machines
@@ -2284,44 +2280,35 @@ CLI's commands and parsers in the `cloud` crate; another provider follows the sa
   after each.
 - **Reaching one** (`MachineProfile::cloud`, `Transport::Cloud`, `Ssh::with_options`): a saved
   machine linked to a provider's machine connects with the options the provider's
-  `ssh-config` gives (`CloudSshOptions`; Instabox's certificate is renewed first). An SSH
-  machine whose address matches a provider's machine is linked to it
-  (`Machines::link_cloud_machines`). One that isn't running isn't dialed and shows its
-  provider's state (`MachineStatus::NotRunning`).
+  `ssh-config` gives (`CloudSshOptions`). An SSH machine whose address matches a provider's
+  machine is linked to it (`Machines::link_cloud_machines`). One that isn't running isn't
+  dialed and shows its provider's state (`MachineStatus::NotRunning`); a thread on it says so
+  in its offline notice, and it's started from Settings › Machines.
 - **Settings › Machines** (`settings_page/cloud_providers.rs`, `cloud_machines.rs` for the
   words and marks): machines grouped by provider, each with a state badge, one action and a
   menu. A provider that isn't set up is a row with Learn More, its install command and Check
-  Again. Add Machine's menu opens each provider's dialog (`settings_page/new_cloud_machine.rs`),
-  and Remove has a box to delete the machine at the provider too. Starting or making a machine
-  that costs money asks first, until the account says not to
-  (`AppSettings::charges_without_asking`, `cloud_machines::charge_question`).
-- **A machine's page** (`settings_page/cloud_machine_page.rs`, its dialogs in
-  `cloud_machine_dialog.rs`; `Request::CloudMachineDetails`): the tabs its provider has. An
-  Instabox machine's are Overview (size, CPU and memory, running time, timeout, idle pause,
-  Vault, labels), Snapshots, Ports, Desktop, Vault and SSH; a Proton computer's are Overview
-  (with Stop when idle) and SSH Keys.
-- **Opening a thread on one that's off** (`ServerClient::start_cloud_machine`, the thread's
-  notice in `agent_view.rs`): a free start (resuming an Instabox machine) happens at once,
-  with Cancel. One that charges (a Proton computer) says so, with Start and its price.
+  Again. Add Machine's menu opens each provider's dialog (`settings_page/new_cloud_machine.rs`:
+  the account, a name, and what a computer is and costs), and Remove has a box to delete the
+  machine at the provider too. Starting or making a machine that costs money asks first, until
+  the account says not to (`AppSettings::charges_without_asking`,
+  `cloud_machines::charge_question`).
+- **A machine's page** (`settings_page/cloud_machine_page.rs`; `Request::CloudMachineDetails`):
+  the tabs its provider has. A Proton computer's are Overview (size, running time and what it
+  cost, last activity, and Stop when idle) and SSH Keys.
 - **Idle machines and costs** (topic 12): the app tells this Mac's server what works on each
   provider machine (its threads that work or wait on the user, and the agents in its
   workspaces) and whether a thread, terminal or workspace of it is open
   (`Request::ReportCloudActivity`, from `Machines::sync_cloud_activity` and
   `Shell::sync_open_machines`). From that the server, with the app closed too:
-  - holds off Instabox's idle pause while agents work, as it holds off sleep: it runs
-    `auto-suspend <machine> 0`, and sets the pause the machine had back once the work ends
-    (`ProviderState::held_awake`). An account whose pause is fixed
-    (`fixedAutoSuspendSeconds`) can't turn it off, and the machine's page says turns may stop
-    when Instabox pauses it;
   - stops a Proton computer once it has been idle as long as its Stop when idle says
     (`ProviderState::stop_when_idle`);
-  - tells of a machine that paused or stopped without agentZ asking, naming what was working
-    on it, and of a balance that runs out within a day (`CloudSnapshot::notices`). The app
-    shows each as a system notification, with Resume, Start or Add Credit where that's free
-    (`cloud_machines::notification`), and dismisses them (`DismissCloudNotices`).
-- **Usage** (Settings › Usage, `cloud_providers::render_cloud_usage`): each account's limits or
-  balance, yellow from 80% of a limit.
-
+  - tells of a machine that stopped without agentZ asking (suspended for its balance, or
+    stopped outside agentZ), naming what was working on it, and of a balance that runs out
+    within a day (`CloudSnapshot::notices`). The app shows each as a system notification,
+    with Add Credit for a balance (`cloud_machines::notification`), and dismisses them
+    (`DismissCloudNotices`).
+- **Usage** (Settings › Usage, `cloud_providers::render_cloud_usage`): each account's balance,
+  how long it runs a computer, and what its computers ran.
 ### Workspaces view
 
 herdr's model (`concepts.mdx`, `src/layout.rs`, `src/workspace/`). Called *spaces* in code,

@@ -13,33 +13,19 @@ Notes for whoever continues:
   may be run against it (`whoami`, `list`, `show`, `balance`, `ssh-config`): starting,
   stopping, creating or deleting a computer costs money or loses work. Test those with a fake
   `proton` on `PATH`.
-- Instabox's CLI is installed and signed in on this Mac too (`instabox`, in `~/.local/bin`),
-  with one machine, `devbox5`, paused. Only read-only commands may be run against it
-  (`whoami`, `ls`, `get`, `templates`, `snapshot ls`, `usage`, `port ls`, `vault ls`,
-  `keys ls`, `ssh-config`): the account has 5 machines and 10 snapshots in all, and its
-  machines hold the user's work. Its fixtures are captured from it, except snapshots' (it has
-  none). Its account pauses machines after 30 idle minutes whatever they ask
-  (`fixedAutoSuspendSeconds` in `whoami --json`), and allows timeouts up to 4 hours.
-- Instabox's HTTP API (desktop links, CPU and memory, running time) is read from its SDK,
-  `@insforge/instabox-sdk` 0.5.3: `GET /v1/machines/{id}/metrics`, `…/usage`, `POST
-  …/desktop` (`{"action": "start"}`) and `POST …/desktop/stream` (`{"viewOnly", "ttlSeconds"}`),
-  with `X-API-Key`.
+- **Instabox was dropped** (the user, 2026-10-19; item 10): its account pauses machines after
+  30 idle minutes whatever they ask (`fixedAutoSuspendSeconds` in `whoami --json`, and
+  `auto-suspend <machine> 0` doesn't change it), and allows timeouts up to 4 hours. On three
+  test machines, only a process printing to a terminal of its own on the machine held the
+  pause off; an open SSH session, web requests and `instabox get` didn't. agentZ supports
+  Proton only. Its CLI is still installed on this Mac, with `devbox5` paused, but agentZ
+  doesn't run it.
 - Never sign in or out of a provider's CLI: the user does that (topic 3's note).
-- What holds off Instabox's idle pause, tried on three test machines with the user's leave
-  (2026-10-19, then deleted): a machine paused 30 to 33 minutes after it was made, resumed
-  or last signed in to over SSH (Instabox checks every 2 minutes or so), whatever ran on it.
-  An open SSH session, silent, printing every 30 seconds, or with a terminal and nothing in
-  it, didn't hold it off, and neither did a process making a web request every 20 seconds,
-  nor `instabox get` reading it. A process printing to a terminal of its own on the machine
-  every minute, with no SSH session, did: the guest's `instabox-guest-agent` reads terminals
-  (PTYs), a herdr session and CPU. On the user's account `auto-suspend <machine> 0` says the
-  pause is fixed and still exits 0, so the server goes by `fixedAutoSuspendSeconds` rather
-  than the exit code. SSH to a machine paused for being idle is refused by Instabox's gateway
-  ("machine … is suspended; run: instabox start …"), so it doesn't wake by itself as topic
-  11's "Today" says; `instabox wake` or `resume` wakes it.
 
 ## Items
 
+Items 1–9 were built for Instabox and Proton. Item 10 removed Instabox and what only it used,
+so the Instabox parts they name are gone.
 1. **The `cloud` crate**: provider descriptions (Instabox, Proton), detection (on `PATH`,
    `--version`, `whoami`), and each CLI's commands with parsers against captured outputs.
    Status: done in its own commit ("Add the cloud crate…"). Proton's fixtures are captured
@@ -120,3 +106,12 @@ Notes for whoever continues:
 9. **Docs**: `docs/architecture.md`'s feature section and `AGENTS.md`'s testing notes. Status:
    done in its own commit ("Document cloud machines…"): the Cloud machines feature section, the
    `cloud` crate, `cloud.json` and the Instabox key in the data table, and the fake CLIs.
+10. **Drop Instabox** (the user, 2026-10-19), and what only it used: its CLI, API and fixtures
+    in the `cloud` crate; templates, snapshots, timeouts and idle pause in the protocol and the
+    New Machine dialog; holding off its idle pause in the server; the Snapshots, Ports,
+    Desktop, Vault and SSH tabs and their dialogs on a machine's page; its limits on the Usage
+    page; and the thread's free start with Cancel (topic 11 C). With the user, the thread's
+    Start went too, since Proton's start charges and a stopped computer's threads are only
+    reachable while the app stays open: a thread on a stopped computer has the usual offline
+    notice, which says it's stopped, and a stopped computer's notification has no button.
+    Status: done in its own commit ("Drop Instabox…").

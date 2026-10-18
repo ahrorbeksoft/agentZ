@@ -4,11 +4,10 @@
 use std::rc::Rc;
 use std::time::SystemTime;
 
-use agentz_protocol::Request;
 pub use agentz_protocol::cloud::hours_of_balance;
 use agentz_protocol::cloud::{
-    Change, CloudMachine, CloudNotice, CloudState, CloudUsage, Lifecycle, MachineSize, NoticeKind,
-    Provider, ProviderState, ProviderStatus,
+    Change, CloudNotice, CloudState, CloudUsage, Lifecycle, MachineSize, NoticeKind, Provider,
+    ProviderState, ProviderStatus,
 };
 use gpui::{App, SystemNotification, SystemNotificationAction, Window};
 use ui::{Color, IconName};
@@ -25,9 +24,6 @@ pub fn state_label(state: &CloudState) -> &str {
         CloudState::Running => "Running",
         CloudState::Stopping => "Stopping",
         CloudState::Stopped => "Stopped",
-        CloudState::Pausing => "Pausing",
-        CloudState::Paused => "Paused",
-        CloudState::Resuming => "Resuming",
         CloudState::Deleting => "Deleting",
         CloudState::Suspended => "Suspended",
         CloudState::Failed => "Failed",
@@ -41,11 +37,8 @@ pub fn state_color(state: &CloudState) -> Color {
         CloudState::Running => Color::Success,
         CloudState::Creating
         | CloudState::Starting
-        | CloudState::Resuming
         | CloudState::Stopping
-        | CloudState::Pausing
         | CloudState::Deleting => Color::Accent,
-        CloudState::Paused => Color::Warning,
         CloudState::Suspended | CloudState::Failed => Color::Error,
         CloudState::Stopped | CloudState::Other(_) => Color::Muted,
     }
@@ -57,8 +50,6 @@ pub fn lifecycle_label(change: Lifecycle) -> &'static str {
         Lifecycle::Start => "Start",
         Lifecycle::Stop => "Stop",
         Lifecycle::Restart => "Restart",
-        Lifecycle::Pause => "Pause",
-        Lifecycle::Resume => "Resume",
         Lifecycle::Delete => "Delete",
     }
 }
@@ -70,8 +61,6 @@ pub fn change_label(change: Change) -> &'static str {
         Change::Lifecycle(Lifecycle::Start) => "Starting",
         Change::Lifecycle(Lifecycle::Stop) => "Stopping",
         Change::Lifecycle(Lifecycle::Restart) => "Restarting",
-        Change::Lifecycle(Lifecycle::Pause) => "Pausing",
-        Change::Lifecycle(Lifecycle::Resume) => "Resuming",
         Change::Lifecycle(Lifecycle::Delete) => "Deleting",
     }
 }
@@ -93,9 +82,7 @@ pub fn main_action(provider: Provider, state: &CloudState) -> Option<MainAction>
             .then_some(MainAction::Change(change))
     };
     match state {
-        // Pausing keeps what's running and costs less to come back from.
-        CloudState::Running => offers(Lifecycle::Pause).or_else(|| offers(Lifecycle::Stop)),
-        CloudState::Paused => offers(Lifecycle::Resume),
+        CloudState::Running => offers(Lifecycle::Stop),
         CloudState::Stopped => offers(Lifecycle::Start),
         CloudState::Suspended => description.add_credit.map(MainAction::AddCredit),
         _ => None,
@@ -105,8 +92,7 @@ pub fn main_action(provider: Provider, state: &CloudState) -> Option<MainAction>
 /// The changes a machine's menu offers besides its button's.
 pub fn other_changes(provider: Provider, state: &CloudState) -> Vec<Lifecycle> {
     let candidates: &[Lifecycle] = match state {
-        CloudState::Running => &[Lifecycle::Pause, Lifecycle::Stop, Lifecycle::Restart],
-        CloudState::Paused => &[Lifecycle::Stop],
+        CloudState::Running => &[Lifecycle::Stop, Lifecycle::Restart],
         _ => &[],
     };
     let main = main_action(provider, state);
@@ -214,22 +200,11 @@ pub fn balance_left(usage: &CloudUsage) -> Option<String> {
 
 pub fn provider_icon(provider: Provider) -> IconName {
     match provider {
-        Provider::Instabox => IconName::CloudInstabox,
         Provider::Proton => IconName::CloudProton,
     }
 }
 
-/// What a machine is: its template and size ("universal · 4 vCPUs · 8 GB · 20 GB disk").
-pub fn machine_summary(machine: &CloudMachine) -> String {
-    [machine.template.clone(), Some(size_summary(&machine.size))]
-        .into_iter()
-        .flatten()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// A machine's size ("4 vCPUs · 8 GB · 20 GB disk").
+/// A machine's size ("8 vCPUs · 2–64 GB · 50 GB disk").
 pub fn size_summary(size: &MachineSize) -> String {
     let memory = match (size.memory_mib, size.memory_ceiling_mib) {
         (Some(floor), Some(ceiling)) if ceiling > floor => {
@@ -265,8 +240,7 @@ fn gib(mib: u64) -> String {
     }
 }
 
-/// An account's usage in a line: Proton's balance and hours, or Instabox's counts against its
-/// limits.
+/// An account's usage in a line: Proton's balance and hours.
 pub fn usage_summary(usage: &CloudUsage) -> String {
     match usage {
         CloudUsage::Balance {
@@ -280,90 +254,8 @@ pub fn usage_summary(usage: &CloudUsage) -> String {
             };
             format!("{balance} · {running_hours:.0} h running")
         }
-        CloudUsage::Limits { .. } => limit_uses(usage)
-            .into_iter()
-            .map(|limit| limit.summary)
-            .collect::<Vec<_>>()
-            .join(" · "),
         CloudUsage::NotBilled => "Billing isn't on".to_string(),
     }
-}
-
-/// From this share of a limit used, it's shown in the warning color (topic 13 A).
-pub const NEAR_LIMIT: f32 = 0.8;
-
-/// One of Instabox's counts against its limit.
-#[derive(Debug, PartialEq)]
-pub struct LimitUse {
-    pub label: &'static str,
-    /// "2 of 5", "14 of 200 GB".
-    pub used: String,
-    /// "2 of 5 machines".
-    pub summary: String,
-    /// The share used, without a limit or with a limit of nothing.
-    pub fraction: Option<f32>,
-}
-
-/// Instabox's machines, snapshots and storage against their limits; nothing for other usage.
-pub fn limit_uses(usage: &CloudUsage) -> Vec<LimitUse> {
-    let CloudUsage::Limits {
-        machines,
-        max_machines,
-        snapshots,
-        max_snapshots,
-        stored_bytes,
-        max_stored_gib,
-    } = usage
-    else {
-        return Vec::new();
-    };
-    let share = |used: f64, max: f64| (max > 0.).then(|| (used / max) as f32);
-    let count = |label, noun: &str, used: u32, max: Option<u32>| {
-        let used_text = match max {
-            Some(max) => format!("{used} of {max}"),
-            None => used.to_string(),
-        };
-        LimitUse {
-            label,
-            summary: format!("{used_text} {noun}"),
-            used: used_text,
-            fraction: max.and_then(|max| share(f64::from(used), f64::from(max))),
-        }
-    };
-    let mut uses = vec![
-        count("Machines", "machines", *machines, *max_machines),
-        count("Snapshots", "snapshots", *snapshots, *max_snapshots),
-    ];
-    if let Some(bytes) = stored_bytes {
-        // Instabox counts storage in GiB (`maxStoredGiB`).
-        let gb = *bytes as f64 / f64::from(1u32 << 30);
-        // Under 10 GB, a whole number would say a few megabytes are nothing.
-        let stored = if gb < 10. {
-            format!("{gb:.1}")
-        } else {
-            format!("{gb:.0}")
-        };
-        let used = match max_stored_gib {
-            Some(max) => format!("{stored} of {max} GB"),
-            None => format!("{stored} GB"),
-        };
-        uses.push(LimitUse {
-            label: "Storage",
-            summary: used.clone(),
-            used,
-            fraction: max_stored_gib.and_then(|max| share(gb, max as f64)),
-        });
-    }
-    uses
-}
-
-/// Whether any of the account's limits is nearly used up.
-pub fn near_limit(usage: &CloudUsage) -> bool {
-    limit_uses(usage).iter().any(|limit| {
-        limit
-            .fraction
-            .is_some_and(|fraction| fraction >= NEAR_LIMIT)
-    })
 }
 
 /// Roughly how long, in hours: "about 37 days", "about 5 hours", "less than an hour".
@@ -385,18 +277,6 @@ pub fn duration_label(seconds: u64) -> String {
         0 => format!("{minutes} min"),
         hours => format!("{hours} h {minutes} min"),
     }
-}
-
-/// A size in Instabox's gigabytes, of 10⁹ bytes ("3.1 GB").
-pub fn gigabytes(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
-}
-
-/// Memory used of a machine's, in the gigabytes of 2³⁰ bytes its size is given in ("2.1 of
-/// 8 GB").
-pub fn memory_label(used_bytes: u64, total_bytes: u64) -> String {
-    let used = used_bytes as f64 / f64::from(1u32 << 30);
-    format!("{used:.1} of {} GB", gib(total_bytes >> 20))
 }
 
 /// When something happened or happens: the time today, or the day and time ("Oct 19, 14:02").
@@ -421,22 +301,14 @@ pub fn dollars(micro_usd: i64) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeAction {
     AddCredit,
-    Resume,
-    Start,
 }
 
 impl NoticeAction {
-    const ALL: [NoticeAction; 3] = [
-        NoticeAction::AddCredit,
-        NoticeAction::Resume,
-        NoticeAction::Start,
-    ];
+    const ALL: [NoticeAction; 1] = [NoticeAction::AddCredit];
 
     fn id(self) -> &'static str {
         match self {
             NoticeAction::AddCredit => "add-credit",
-            NoticeAction::Resume => "resume",
-            NoticeAction::Start => "start",
         }
     }
 
@@ -444,26 +316,19 @@ impl NoticeAction {
         Self::ALL.into_iter().find(|action| action.id() == id)
     }
 
-    /// The machine's change it asks for.
-    pub fn change(self) -> Option<Lifecycle> {
-        match self {
-            NoticeAction::AddCredit => None,
-            NoticeAction::Resume => Some(Lifecycle::Resume),
-            NoticeAction::Start => Some(Lifecycle::Start),
-        }
-    }
-
     fn button(self) -> SystemNotificationAction {
         SystemNotificationAction {
             id: self.id().into(),
-            label: self.change().map_or("Add Credit", lifecycle_label).into(),
+            label: match self {
+                NoticeAction::AddCredit => "Add Credit".into(),
+            },
         }
     }
 }
 
 /// The notification for what this Mac's server noticed of a provider's machines (topic 12 C
-/// and D): "Instabox paused devbox5", naming what was working on it, with Resume. Starting a
-/// machine that charges is asked about first, so only a free one's notification starts it.
+/// and D): "Proton stopped devbox-3", naming what was working on it. Starting it charges, which
+/// is asked about first in Settings, so a stopped machine's notification has no button.
 pub fn notification(notice: &CloudNotice) -> SystemNotification {
     let description = notice.provider.description();
     let slug = description.program;
@@ -475,22 +340,17 @@ pub fn notification(notice: &CloudNotice) -> SystemNotification {
             state,
             working,
         } => {
-            let (verb, back) = match state {
-                CloudState::Pausing | CloudState::Paused => ("paused", NoticeAction::Resume),
-                CloudState::Suspended => ("suspended", NoticeAction::AddCredit),
-                _ => ("stopped", NoticeAction::Start),
-            };
             let working = match working.as_slice() {
                 [] => "Nothing was working on it.".to_string(),
                 working => format!("Working on it: {}", working.join(", ")),
             };
-            let (body, action) = match back.change() {
-                Some(change) => {
-                    let offers = description.lifecycle.contains(&change)
-                        && charges(notice.provider, change).is_none();
-                    (working, offers.then_some(back))
-                }
-                None => (format!("Its balance ran out. {working}"), add_credit),
+            let (verb, body, action) = match state {
+                CloudState::Suspended => (
+                    "suspended",
+                    format!("Its balance ran out. {working}"),
+                    add_credit,
+                ),
+                _ => ("stopped", working, None),
             };
             (
                 format!("cloud-{slug}-{machine}"),
@@ -526,25 +386,10 @@ pub fn notification(notice: &CloudNotice) -> SystemNotification {
     }
 }
 
-/// Does what a cloud notification's button says: Add Credit opens the provider's billing page,
-/// Resume and Start change the machine through this Mac's server.
-pub fn act_on_notification(
-    provider: Provider,
-    machine: Option<String>,
-    action: NoticeAction,
-    cx: &mut App,
-) {
-    match (action.change(), machine) {
-        (Some(change), Some(machine)) => Machines::local(cx).read(cx).send(
-            Request::ChangeCloudMachine {
-                provider,
-                machine,
-                change,
-            },
-            cx,
-        ),
-        (Some(_), None) => {}
-        (None, _) => {
+/// Does what a cloud notification's button says: Add Credit opens the provider's billing page.
+pub fn act_on_notification(provider: Provider, action: NoticeAction, cx: &mut App) {
+    match action {
+        NoticeAction::AddCredit => {
             if let Some(url) = provider.description().add_credit {
                 cx.open_url(url);
             }
@@ -571,26 +416,15 @@ mod tests {
 
     #[test]
     fn summarizes_a_machine_and_its_account() {
-        let machine = CloudMachine {
-            id: "c-1".into(),
-            name: "devbox-3".into(),
-            state: CloudState::Running,
-            size: MachineSize {
-                vcpus: Some(8),
-                memory_mib: Some(2048),
-                memory_ceiling_mib: Some(65536),
-                disk_gib: Some(50),
-            },
-            template: None,
-            ssh_address: None,
-            created_at: None,
-            error: None,
+        let size = MachineSize {
+            vcpus: Some(8),
+            memory_mib: Some(2048),
+            memory_ceiling_mib: Some(65536),
+            disk_gib: Some(50),
         };
-        assert_eq!(machine_summary(&machine), "8 vCPUs · 2–64 GB · 50 GB disk");
+        assert_eq!(size_summary(&size), "8 vCPUs · 2–64 GB · 50 GB disk");
         assert_eq!(duration_label(31 * 3600 + 12 * 60 + 5), "31 h 12 min");
         assert_eq!(duration_label(240), "4 min");
-        assert_eq!(gigabytes(3_140_000_000), "3.1 GB");
-        assert_eq!(memory_label(2_254_857_830, 8 << 30), "2.1 of 8 GB");
         assert_eq!(
             usage_summary(&CloudUsage::Balance {
                 balance_micro_usd: Some(24_270_000),
@@ -599,56 +433,6 @@ mod tests {
             }),
             "$24.27 left · 27 h running"
         );
-        assert_eq!(
-            usage_summary(&CloudUsage::Limits {
-                machines: 2,
-                max_machines: Some(5),
-                snapshots: 1,
-                max_snapshots: Some(10),
-                stored_bytes: Some(14 << 30),
-                max_stored_gib: Some(200),
-            }),
-            "2 of 5 machines · 1 of 10 snapshots · 14 of 200 GB"
-        );
-    }
-
-    #[test]
-    fn measures_an_account_against_its_limits_and_balance() {
-        let usage = CloudUsage::Limits {
-            machines: 4,
-            max_machines: Some(5),
-            snapshots: 3,
-            max_snapshots: None,
-            stored_bytes: Some(6_643_454),
-            max_stored_gib: Some(200),
-        };
-        let uses = limit_uses(&usage);
-        let used: Vec<(&str, &str, Option<f32>)> = uses
-            .iter()
-            .map(|limit| (limit.label, limit.used.as_str(), limit.fraction))
-            .collect();
-        assert_eq!(
-            used,
-            [
-                ("Machines", "4 of 5", Some(0.8)),
-                ("Snapshots", "3", None),
-                (
-                    "Storage",
-                    "0.0 of 200 GB",
-                    Some(6_643_454. / (200. * 1_073_741_824.))
-                ),
-            ]
-        );
-        assert!(near_limit(&usage));
-        assert!(!near_limit(&CloudUsage::Limits {
-            machines: 3,
-            max_machines: Some(5),
-            snapshots: 0,
-            max_snapshots: Some(0),
-            stored_bytes: None,
-            max_stored_gib: None,
-        }));
-        assert!(limit_uses(&CloudUsage::NotBilled).is_empty());
 
         // $24.20 at $20 per 730 hours.
         let hours = hours_of_balance(24_200_000, 27_397);
@@ -663,15 +447,6 @@ mod tests {
 
     #[test]
     fn offers_the_change_a_machine_most_likely_needs() {
-        // Instabox pauses what's running; Proton, which can't, stops it.
-        assert_eq!(
-            main_action(Provider::Instabox, &CloudState::Running),
-            Some(MainAction::Change(Lifecycle::Pause))
-        );
-        assert_eq!(
-            other_changes(Provider::Instabox, &CloudState::Running),
-            [Lifecycle::Stop]
-        );
         assert_eq!(
             main_action(Provider::Proton, &CloudState::Running),
             Some(MainAction::Change(Lifecycle::Stop))
@@ -681,12 +456,8 @@ mod tests {
             [Lifecycle::Restart]
         );
         assert_eq!(
-            main_action(Provider::Instabox, &CloudState::Paused),
-            Some(MainAction::Change(Lifecycle::Resume))
-        );
-        assert_eq!(
-            other_changes(Provider::Instabox, &CloudState::Paused),
-            [Lifecycle::Stop]
+            main_action(Provider::Proton, &CloudState::Stopped),
+            Some(MainAction::Change(Lifecycle::Start))
         );
         assert_eq!(main_action(Provider::Proton, &CloudState::Starting), None);
 
@@ -697,7 +468,6 @@ mod tests {
         );
         assert!(charges(Provider::Proton, Lifecycle::Start).is_some());
         assert!(charges(Provider::Proton, Lifecycle::Restart).is_none());
-        assert!(charges(Provider::Instabox, Lifecycle::Start).is_none());
         assert_eq!(
             charge_message(
                 "$20 per 730 running hours",
@@ -712,26 +482,23 @@ mod tests {
         assert_eq!(noun_title(Provider::Proton), "Computer");
     }
 
-    /// A notification names the machine, what was working on it, and offers what brings it
-    /// back, unless that charges; a suspended computer and a low balance offer Add Credit.
+    /// A notification names the machine and what was working on it; a suspended computer and a
+    /// low balance offer Add Credit.
     #[test]
     fn tells_of_what_happened_to_a_cloud_machine() {
-        let notice = |provider: Provider, kind: NoticeKind| CloudNotice {
+        let notice = |kind: NoticeKind| CloudNotice {
             id: 1,
-            provider,
+            provider: Provider::Proton,
             kind,
             at: SystemTime::UNIX_EPOCH,
         };
-        let stopped = |provider: Provider, state: CloudState, working: &[&str]| {
-            notice(
-                provider,
-                NoticeKind::Stopped {
-                    machine: "m-1".into(),
-                    name: "devbox5".into(),
-                    state,
-                    working: working.iter().map(|title| title.to_string()).collect(),
-                },
-            )
+        let stopped = |state: CloudState, working: &[&str]| {
+            notice(NoticeKind::Stopped {
+                machine: "c-1".into(),
+                name: "devbox-3".into(),
+                state,
+                working: working.iter().map(|title| title.to_string()).collect(),
+            })
         };
         let shown = |notice: CloudNotice| {
             let notification = notification(&notice);
@@ -757,53 +524,31 @@ mod tests {
         };
         assert_eq!(
             shown(stopped(
-                Provider::Instabox,
-                CloudState::Paused,
+                CloudState::Stopped,
                 &["Fix the login bug", "Claude Code"]
             )),
             expect(
-                "cloud-instabox-m-1",
-                "Instabox paused devbox5",
+                "cloud-proton-c-1",
+                "Proton stopped devbox-3",
                 "Working on it: Fix the login bug, Claude Code",
-                &["Resume"]
-            )
-        );
-        assert_eq!(
-            shown(stopped(Provider::Instabox, CloudState::Stopped, &[])),
-            expect(
-                "cloud-instabox-m-1",
-                "Instabox stopped devbox5",
-                "Nothing was working on it.",
-                &["Start"]
-            )
-        );
-        assert_eq!(
-            shown(stopped(Provider::Proton, CloudState::Stopped, &[])),
-            expect(
-                "cloud-proton-m-1",
-                "Proton stopped devbox5",
-                "Nothing was working on it.",
                 &[]
             )
         );
         assert_eq!(
-            shown(stopped(Provider::Proton, CloudState::Suspended, &[])),
+            shown(stopped(CloudState::Suspended, &[])),
             expect(
-                "cloud-proton-m-1",
-                "Proton suspended devbox5",
+                "cloud-proton-c-1",
+                "Proton suspended devbox-3",
                 "Its balance ran out. Nothing was working on it.",
                 &["Add Credit"]
             )
         );
         assert_eq!(
-            shown(notice(
-                Provider::Proton,
-                NoticeKind::LowBalance {
-                    balance_micro_usd: 300_000,
-                    hours_left: 10.9,
-                    running: vec!["devbox-3".into()],
-                }
-            )),
+            shown(notice(NoticeKind::LowBalance {
+                balance_micro_usd: 300_000,
+                hours_left: 10.9,
+                running: vec!["devbox-3".into()],
+            })),
             expect(
                 "cloud-proton",
                 "Proton's balance runs out in about 11 hours",
@@ -822,7 +567,10 @@ mod tests {
         );
         assert_eq!(notification_target("cloud-cube-c-1"), None);
         assert_eq!(notification_target("thread-local-5"), None);
-        assert_eq!(NoticeAction::from_id("resume"), Some(NoticeAction::Resume));
+        assert_eq!(
+            NoticeAction::from_id("add-credit"),
+            Some(NoticeAction::AddCredit)
+        );
         assert_eq!(NoticeAction::from_id("open"), None);
     }
 }

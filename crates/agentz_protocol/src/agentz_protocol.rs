@@ -795,16 +795,13 @@ pub enum Request {
     /// done (Check Again), and every minute after while an app is open. Only this Mac's
     /// server is asked: the providers' CLIs are installed here.
     CheckCloud,
-    /// Starts, stops, pauses or deletes a provider's machine, by its id, answered once its CLI
-    /// is done.
+    /// Starts, stops, restarts or deletes a provider's machine, by its id, answered once its
+    /// CLI is done.
     ChangeCloudMachine {
         provider: cloud::Provider,
         machine: String,
         change: cloud::Lifecycle,
     },
-    /// What the provider's machines can start from, answered with
-    /// [`Response::CloudSources`].
-    CloudSources(cloud::Provider),
     /// Makes a machine with the provider's CLI, answered with
     /// [`Response::CloudMachineCreated`] once it's made.
     CreateCloudMachine {
@@ -812,7 +809,6 @@ pub enum Request {
         machine: cloud::CreateMachine,
     },
     /// How SSH reaches a running provider machine, answered with [`Response::SshOptions`].
-    /// Instabox's certificate is renewed first.
     CloudSshOptions {
         provider: cloud::Provider,
         machine: String,
@@ -822,7 +818,7 @@ pub enum Request {
         provider: cloud::Provider,
         machine: String,
     },
-    /// Does something with a provider machine's extras, answered once it's done.
+    /// Changes a provider machine's settings, answered once it's done.
     CloudMachineAction {
         provider: cloud::Provider,
         machine: String,
@@ -1101,11 +1097,8 @@ pub enum Response {
     /// The ids of the editors installed on the machine ([`Request::ListEditors`]).
     Editors(Vec<String>),
     SshOptions(cloud::SshOptions),
-    CloudSources(cloud::CloudSources),
     CloudMachineCreated(cloud::CloudMachine),
     CloudMachineDetails(cloud::MachineDetails),
-    /// What a provider's action gave: an SSH command, or a desktop's link.
-    CloudOutput(String),
     Artifact(ArtifactReply),
     /// From a newer version.
     #[serde(untagged)]

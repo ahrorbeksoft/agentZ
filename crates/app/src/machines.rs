@@ -1799,14 +1799,14 @@ mod tests {
 
     /// This Mac's server hears what's working on each provider machine and whether anything of
     /// it is open, each time that changes. Each of its cloud notices is shown once and then
-    /// dismissed, and a notification's buttons add credit or bring the machine back.
+    /// dismissed, and a notification's Add Credit opens the provider's billing page.
     #[gpui::test]
     fn tells_this_macs_server_of_cloud_machines_and_shows_its_notices(
         cx: &mut gpui::TestAppContext,
     ) {
         use agentz_protocol::Request;
         use agentz_protocol::cloud::{
-            CloudActivity, CloudNotice, CloudSnapshot, CloudState, Lifecycle, NoticeKind, Provider,
+            CloudActivity, CloudNotice, CloudSnapshot, CloudState, NoticeKind, Provider,
         };
         use agentz_protocol::layout::{Node, PaneId};
         use agentz_protocol::spaces::{
@@ -1868,8 +1868,8 @@ mod tests {
             devbox.update(cx, |devbox, _| {
                 devbox.set_transport_for_test(Transport::Cloud {
                     link: CloudLink {
-                        provider: Provider::Instabox,
-                        machine: "m-1".into(),
+                        provider: Provider::Proton,
+                        machine: "c-1".into(),
                     },
                     target: None,
                 })
@@ -1889,8 +1889,8 @@ mod tests {
         };
         let activity = |working: &[&str], open: bool| {
             vec![CloudActivity {
-                provider: Provider::Instabox,
-                machine: "m-1".into(),
+                provider: Provider::Proton,
+                machine: "c-1".into(),
                 working: working.iter().map(|name| name.to_string()).collect(),
                 open,
             }]
@@ -1921,11 +1921,11 @@ mod tests {
 
         let notice = |id: u64| CloudNotice {
             id,
-            provider: Provider::Instabox,
+            provider: Provider::Proton,
             kind: NoticeKind::Stopped {
-                machine: "m-1".into(),
+                machine: "c-1".into(),
                 name: "devbox5".into(),
-                state: CloudState::Paused,
+                state: CloudState::Stopped,
                 working: vec![format!("Thread {id}")],
             },
             at: std::time::SystemTime::UNIX_EPOCH,
@@ -1965,20 +1965,7 @@ mod tests {
         );
         assert_eq!(dismissed(cx), [1, 2]);
 
-        cx.update(|cx| {
-            act_on_notification(
-                Provider::Instabox,
-                Some("m-1".into()),
-                NoticeAction::Resume,
-                cx,
-            );
-            act_on_notification(Provider::Proton, None, NoticeAction::AddCredit, cx);
-        });
-        assert!(sent(cx).contains(&Request::ChangeCloudMachine {
-            provider: Provider::Instabox,
-            machine: "m-1".into(),
-            change: Lifecycle::Resume,
-        }));
+        cx.update(|cx| act_on_notification(Provider::Proton, NoticeAction::AddCredit, cx));
         assert_eq!(
             cx.opened_url().as_deref(),
             Some("https://app.cube.computer/billing")
