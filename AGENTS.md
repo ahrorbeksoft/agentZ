@@ -89,6 +89,11 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   before long build sessions, and run `cargo clean --profile dev` whenever `target` is over
   10 GB or less than 20 GB is free. It's safe (a running app or server keeps working), and a
   full `cargo build` takes about 2 minutes (4 GB).
+- **proton-cloud's disk is 48 GB.** The user's agentZ machine `proton-cloud` (SSH host `proton`,
+  Ubuntu x86_64) works in its clone at `~/projects/agentZ`. Its `target/debug` grew to 37 GB
+  there and filled the disk, and every agent on that machine then failed ("ENOSPC: no space left
+  on device"). On it, check `df -h ~` and `du -sh target` before each build, and run
+  `cargo clean --profile dev` whenever `target` is over 15 GB or less than 15 GB is free.
 
 ## Rules from the user
 
