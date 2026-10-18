@@ -96,13 +96,6 @@ app and its machine servers still update together. Coordinate the ACP work with 
 protocol update above. Verify behavior with the mock agent; installed adapters' support has
 not been verified.
 
-### Use SDK session builders for session setup and restoration
-
-Replace the corresponding handwritten new/load/resume and routing plumbing with the SDK's
-session builders. Stable v1 load/resume helpers are already available
-([API](https://docs.rs/agent-client-protocol/3.4.0/agent_client_protocol/struct.ConnectionTo.html#method.load_session)).
-Keep agentZ's application policy for login, defaults, retained transcripts and server handoff.
-Select load/resume operations according to the agent's capabilities and preserve replay order.
 
 ### Use reported ACP v2 state with a fallback for inferred activity
 

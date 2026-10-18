@@ -158,7 +158,8 @@ From Zed's guidelines, which this code follows:
   `MOCK_SESSIONS_FILE` (a JSON array of ACP session infos, each with an optional `history` to
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
   With `MOCK_FORK` it forks sessions (`session/fork`; `fail` fails them), and `recall` names
-  the messages the fork's source had ("Remembered: hello"), from the history path. Its
+  the messages the fork's source had ("Remembered: hello"), from the history path. With
+  `MOCK_RESUME` it resumes sessions (`session/resume`, no replay; `fail` fails them). Its
   `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
   linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones. With
   `MOCK_MCP_ACP` it takes MCP servers on its ACP connection (MCP-over-ACP), and its `mcp`

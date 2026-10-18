@@ -665,8 +665,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   of a long session when it loads (Factory Droid about the last 100 messages), so the server keeps
   each thread's conversation in `transcripts/`, saved at most 2 seconds after it changes, when
   its agent stops, and before the server exits or hands off. A thread starts from it, and while
-  its session loads the replayed messages, tool calls and plan are dropped. Reload Agent keeps
-  the conversation too. Deleting the thread deletes its transcript. A save encodes the thread's
+  its session loads the replayed messages, tool calls and plan are dropped. The session opens
+  with the SDK's session builders (`agent_thread::open_session`): `session/load` when the agent
+  advertises `loadSession`, else `session/resume` with no replay
+  (`SessionRestore::ResumedWithoutHistory`), as Zed does, and `session/new` when neither works.
+  What the agent sends the session still goes through the connection's handlers, in one order
+  with the wire's markers, so the route the SDK gives the session is let go at once
+  (`release_session_route`). Forks are sent by hand: the SDK builds them only for protocol v2.
+  Reload Agent keeps the conversation too. Deleting the thread deletes its transcript. A save encodes the thread's
   own entries straight into the file (`TranscriptRef`), without copying the conversation or
   holding its JSON in memory: with a copy of a long conversation every 2 seconds, the server
   held many times its size, and grew to gigabytes over a day of work.

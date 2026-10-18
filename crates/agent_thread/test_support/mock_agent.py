@@ -142,6 +142,9 @@ With MOCK_FORK set, it forks sessions (`session/fork`), as Claude Agent does: th
 "<session>-fork", knows the messages of the session it forks from its recorded history, which
 "recall" names ("Remembered: hello, build the page"). With MOCK_FORK=fail, forking fails.
 
+With MOCK_RESUME set, it resumes sessions (`session/resume`) without replaying them, as agents
+that can't load sessions do. With MOCK_RESUME=fail, resuming fails.
+
 With MOCK_SCRIPTS set to a JSON object of prompts and the prompts above they stand for, such
 as {"Add a checkout page": "demo"}, those prompts run their scripts, so a demo thread shows a
 real-looking prompt.
@@ -1052,6 +1055,8 @@ for line in sys.stdin:
             session_capabilities["list"] = {}
         if os.environ.get("MOCK_FORK"):
             session_capabilities["fork"] = {}
+        if os.environ.get("MOCK_RESUME"):
+            session_capabilities["resume"] = {}
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"protocolVersion": 1,
                          "_meta": ({"steering": {"supported": True}}
@@ -1076,11 +1081,12 @@ for line in sys.stdin:
             os.remove(LOGIN_FILE)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
         send_auth_status()
-    elif (method in ("session/new", "session/load", "session/fork", "session/list")
+    elif (method in ("session/new", "session/load", "session/resume", "session/fork",
+                     "session/list")
           and not logged_in() and not os.environ.get("MOCK_OPENS_LOGGED_OUT")):
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32000, "message": "\n\nYour code: MOCK-1234\n\nClick Log In."}})
-    elif (method in ("session/new", "session/load", "session/fork")
+    elif (method in ("session/new", "session/load", "session/resume", "session/fork")
           and os.environ.get("MOCK_REJECT_MCP") and message["params"].get("mcpServers")):
         send({"jsonrpc": "2.0", "id": message["id"],
               "error": {"code": -32603, "message": "Internal error", "data": {
@@ -1110,6 +1116,13 @@ for line in sys.stdin:
         for payload in load_history(session_id):
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": session_id, "update": payload}})
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
+    elif method == "session/resume" and os.environ.get("MOCK_RESUME") == "fail":
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32002, "message": "Resource not found"}})
+    elif method == "session/resume":
+        mcp_servers = message["params"].get("mcpServers", [])
+        session_cwd = message["params"].get("cwd", session_cwd)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/fork" and os.environ.get("MOCK_FORK") == "fail":
         send({"jsonrpc": "2.0", "id": message["id"],

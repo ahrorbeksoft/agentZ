@@ -4851,9 +4851,9 @@ struct SessionSetup {
     restore: SessionRestore,
 }
 
-/// Opens the thread's session: loads or resumes `previous_session` when the agent supports it
-/// (in that order, like Zed), or else forks `fork_source` when the agent can, otherwise starts
-/// a new one.
+/// Opens the thread's session with the SDK's session builders: loads or resumes
+/// `previous_session` when the agent supports it (in that order, like Zed), or else forks
+/// `fork_source` when the agent can, otherwise starts a new one.
 ///
 /// If the agent can't open a session with the given MCP servers, it is opened without them.
 /// Factory Droid 0.233.0's `acp-daemon` fails every session that has any: it passes them on to
@@ -4944,15 +4944,17 @@ async fn open_session_with(
     let had_previous_session = previous_session.is_some();
     if let Some(session_id) = previous_session {
         if capabilities.load_session {
-            match connection
-                .send_request(
+            let loading = connection
+                .load_session_from(
                     acp::LoadSessionRequest::new(session_id.clone(), cwd.clone())
                         .mcp_servers(mcp_servers.clone()),
                 )
                 .block_task()
-                .await
-            {
-                Ok(response) => {
+                .start_session();
+            match loading.await {
+                Ok(restored) => {
+                    let (session, response) = restored.into_parts();
+                    release_session_route(session);
                     return Ok(SessionSetup {
                         session_id,
                         config_options: response.config_options.unwrap_or_default(),
@@ -4969,15 +4971,17 @@ async fn open_session_with(
                 }
             }
         } else if capabilities.session_capabilities.resume.is_some() {
-            match connection
-                .send_request(
+            let resuming = connection
+                .resume_session_from(
                     acp::ResumeSessionRequest::new(session_id.clone(), cwd.clone())
                         .mcp_servers(mcp_servers.clone()),
                 )
                 .block_task()
-                .await
-            {
-                Ok(response) => {
+                .start_session();
+            match resuming.await {
+                Ok(restored) => {
+                    let (session, response) = restored.into_parts();
+                    release_session_route(session);
                     return Ok(SessionSetup {
                         session_id,
                         config_options: response.config_options.unwrap_or_default(),
@@ -4997,6 +5001,7 @@ async fn open_session_with(
     } else if let Some(source) = fork_source
         && capabilities.session_capabilities.fork.is_some()
     {
+        // The SDK builds forks only for protocol v2 sessions.
         match connection
             .send_request(
                 acp::ForkSessionRequest::new(source.clone(), cwd.clone())
@@ -5022,9 +5027,16 @@ async fn open_session_with(
         }
     }
 
+    // Not `start_session`: it opens the session in a task of the connection's, where a refusal
+    // (a login the agent asks for) would end the connection, and comes back without the error.
     let new_session = connection
-        .send_request(acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+        .build_session_from(acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
         .block_task()
+        .run_until(async |session| {
+            let response = session.response();
+            release_session_route(session);
+            Ok(response)
+        })
         .await?;
     Ok(SessionSetup {
         session_id: new_session.session_id,
@@ -5036,6 +5048,28 @@ async fn open_session_with(
             SessionRestore::New
         },
     })
+}
+
+/// Lets go of the route the SDK's session builders give the session they open. The SDK routes
+/// to it only what the connection's handlers turn down, and those take everything the thread
+/// reads, in one order with the wire's markers, so it can hold only a request no handler
+/// answers. That's refused, as the connection refuses one otherwise.
+fn release_session_route(mut session: agent_client_protocol::ActiveSession<'_, Agent>) {
+    while let Some(Ok(message)) = session.read_update().now_or_never() {
+        if let agent_client_protocol::SessionMessage::SessionMessage(
+            agent_client_protocol::Dispatch::Request(request, responder),
+        ) = message
+        {
+            let error =
+                agent_client_protocol::Error::method_not_found().data(request.method().to_string());
+            if let Err(error) = responder.respond_with_error(error) {
+                log::warn!(
+                    "couldn't refuse the agent's {}: {error:?}",
+                    request.method()
+                );
+            }
+        }
+    }
 }
 
 fn is_auth_required(error: &agent_client_protocol::Error) -> bool {
@@ -7068,6 +7102,85 @@ mod tests {
             .await;
         assert_eq!(unforked.thread.session_restore(), Some(SessionRestore::New));
     }
+
+    /// An agent that resumes sessions but can't load them goes on in the previous session,
+    /// which it doesn't replay; one that does both loads it, which replays it. When resuming
+    /// fails, a new session opens without the conversation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumes_the_previous_session_when_the_agent_cant_load_it() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        command.env.insert("MOCK_RESUME".into(), "1".into());
+        let session = Some(acp::SessionId::new("session-1"));
+        let mut resumed = start(command.clone(), session.clone());
+        resumed
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            resumed.thread.session_restore(),
+            Some(SessionRestore::ResumedWithoutHistory)
+        );
+        // It goes on in the session it had rather than starting another.
+        assert!(
+            !resumed
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentThreadEvent::SessionStarted(_)))
+        );
+        assert!(resumed.thread.entries().is_empty());
+        resumed.update(|thread| thread.send("hello".into()));
+        resumed
+            .wait_until(|thread| !thread.is_working() && last_agent_message(thread).is_some())
+            .await;
+        assert_eq!(
+            last_agent_message(&resumed.thread).as_deref(),
+            Some("Echo: hello")
+        );
+        drop(resumed);
+
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(mut recording) = mock_agent(&[history_file]) else {
+            return;
+        };
+        recording.env = command.env.clone();
+        let mut first = start(recording.clone(), None);
+        first
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        first.update(|thread| thread.send("hello".into()));
+        first
+            .wait_until(|thread| !thread.is_working() && thread.entries().len() >= 3)
+            .await;
+        let mut loaded = start(recording, session.clone());
+        loaded
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            loaded.thread.session_restore(),
+            Some(SessionRestore::Loaded)
+        );
+        assert_eq!(
+            loaded.thread.entries()[0],
+            Entry::UserMessage("hello".into())
+        );
+
+        command.env.insert("MOCK_RESUME".into(), "fail".into());
+        let mut unresumed = start(command, session);
+        unresumed
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert_eq!(
+            unresumed.thread.session_restore(),
+            Some(SessionRestore::Unavailable)
+        );
+    }
+
     /// A session that doesn't load leaves the new one without the conversation: messages fail
     /// rather than go to an agent that doesn't know it, until the user sends one anyway. When
     /// the agent is logged in to another account than the session ran on, the thread says so.
