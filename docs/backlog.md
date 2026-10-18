@@ -87,15 +87,6 @@ our existing automatic workspace cleanup plan in `docs/architecture.md`. Active 
 shared worktrees and the chosen local-change protection must be respected. Any new UI starts
 on the design board.
 
-### Bound server handshakes and recover SSH connections after wake
-
-Follow herdr's handshake deadlines
-([#5242](https://github.com/herdrdev/herdr/pull/5242)), recovery of stuck shared SSH connections
-([#5252](https://github.com/herdrdev/herdr/pull/5252)), and prompt recovery after wake
-([#5249](https://github.com/herdrdev/herdr/pull/5249)). Our initial server welcome read in
-`crates/agentz_client/src/agentz_client.rs` has no deadline, despite timeouts elsewhere in the
-SSH startup path. Review the connection and reconnection paths without ending remote agents.
-
 ### Make state and transcript saves durable before replacing files
 
 Follow herdr's [#5152](https://github.com/herdrdev/herdr/pull/5152): sync temporary file contents
@@ -114,9 +105,6 @@ copying its fixed pool list.
 Update the Codex usage page in `crates/agentz_server/src/accounts/codex.rs` from
 `https://chatgpt.com/codex/settings/usage` to `https://chatgpt.com/settings/usage`, following
 OpenUsage's [#1364](https://github.com/robinebers/openusage/pull/1364).
-
-Within this group, prioritize delegated-task questions, title isolation, terminal detection
-and handshake deadlines.
 
 ## Approved upstream features and replacements
 

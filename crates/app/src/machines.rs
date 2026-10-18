@@ -200,6 +200,7 @@ pub struct Machines {
     clients: Vec<Entity<ServerClient>>,
     subscriptions: HashMap<MachineId, Vec<Subscription>>,
     _settings_subscription: Subscription,
+    _wake_subscription: Subscription,
 }
 
 impl EventEmitter<MachinesEvent> for Machines {}
@@ -224,6 +225,7 @@ pub fn init(cx: &mut App) {
             subscriptions: HashMap::default(),
             _settings_subscription: cx
                 .observe(&settings, |this: &mut Machines, _, cx| this.sync(cx)),
+            _wake_subscription: Machines::observe_wake(cx),
         };
         let local = ServerClient::new(
             MachineId::Local,
@@ -249,6 +251,7 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
             _settings_subscription: cx.observe(&settings, |this: &mut Machines, _, cx| {
                 this.sync_servers(cx)
             }),
+            _wake_subscription: Machines::observe_wake(cx),
         };
         for client in clients {
             this.add(client, cx);
@@ -263,6 +266,18 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
 impl Machines {
     pub fn global(cx: &App) -> Entity<Self> {
         cx.global::<GlobalMachines>().0.clone()
+    }
+
+    fn observe_wake(cx: &mut Context<Self>) -> Subscription {
+        let this = cx.weak_entity();
+        cx.on_system_wake(move |cx| {
+            this.update(cx, |this, cx| {
+                for client in &this.clients {
+                    client.update(cx, |client, _| client.system_woke());
+                }
+            })
+            .ok();
+        })
     }
 
     /// This Mac's server.

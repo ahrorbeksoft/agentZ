@@ -1325,6 +1325,7 @@ impl Server {
                 Err(anyhow!("listing image files is handled separately"))
             }
 
+            Request::Ping => Ok(Response::Ok),
             Request::Shutdown => {
                 self.stopping = true;
                 Ok(Response::Ok)

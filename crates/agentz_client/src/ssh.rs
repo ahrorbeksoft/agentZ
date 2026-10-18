@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -28,6 +29,20 @@ const OUTPUT_READY_MARKER: &str = "agentz-remote-output-ready:1";
 /// Runs this instead of `ssh`, for tests.
 const SSH_PROGRAM_ENV_VAR: &str = "AGENTZ_SSH";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// For `ssh -G` and asking a master to stop, which answer at once when they work (herdr's
+/// `SSH_CONTROL_TIMEOUT`).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+/// herdr's options for background commands: never prompt, check host keys strictly, and give
+/// up on a dead network.
+const BATCH_OPTIONS: [&str; 7] = [
+    "BatchMode=yes",
+    "NumberOfPasswordPrompts=0",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+    "ConnectionAttempts=1",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=4",
+];
 /// How long uploading the server may go without ssh taking more of it. A slow link takes as
 /// long as it takes; one that stopped moving is given up.
 const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -278,15 +293,7 @@ impl Ssh {
                 .arg(format!("ControlPath={}", control_path.display()))
                 .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=600"]);
         }
-        for option in [
-            "BatchMode=yes",
-            "NumberOfPasswordPrompts=0",
-            "StrictHostKeyChecking=yes",
-            "ConnectTimeout=10",
-            "ConnectionAttempts=1",
-            "ServerAliveInterval=15",
-            "ServerAliveCountMax=4",
-        ] {
+        for option in BATCH_OPTIONS {
             command.arg("-o").arg(option);
         }
         command
@@ -297,6 +304,155 @@ impl Ssh {
             .env_remove("SSH_ASKPASS")
             .kill_on_drop(true);
         command
+    }
+
+    /// `ssh` through the given control socket only, never starting a master of its own, or
+    /// over a connection of its own with `none` (herdr's `shared_control_command`).
+    fn control_command(&self, control_path: &Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .arg("-C")
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .args(["-o", "ControlMaster=no", "-o", "ControlPersist=no"]);
+        for option in BATCH_OPTIONS {
+            command.arg("-o").arg(option);
+        }
+        command
+            .env("SSH_ASKPASS_REQUIRE", "never")
+            .env_remove("SSH_ASKPASS");
+        command
+    }
+
+    /// What a local `ssh` command printed, once it ended within `timeout`.
+    async fn output(
+        &self,
+        mut command: tokio::process::Command,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        let output = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output();
+        tokio::time::timeout(timeout, output)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "ssh {} didn't answer within {} seconds",
+                    self.target,
+                    timeout.as_secs()
+                )
+            })?
+            .with_context(|| format!("running {}", self.program.display()))
+    }
+
+    /// herdr's `prepare_shared_transport`. A master whose network went away, as when the Mac
+    /// slept or changed networks, keeps its socket, and every command sent through it waits
+    /// out its timeout. This checks the master still answers. When it doesn't but a
+    /// connection of its own does, the master is asked to stop taking sessions (`-O stop`;
+    /// `-O exit` would also cut those it still carries), and the next command starts a new
+    /// one. True when it will.
+    async fn prepare_shared_connection(&self) -> Result<bool> {
+        let Some(control_path) = &self.control_path else {
+            return Ok(false);
+        };
+        let Some(socket) = self.expanded_control_path(control_path).await else {
+            return Ok(false);
+        };
+        if socket.parent() != control_path.parent() {
+            return Ok(false);
+        }
+        let pinned = match PinnedControlSocket::new(&socket) {
+            Ok(pinned) => pinned,
+            // No master: the next command starts one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                log::warn!(
+                    "couldn't check the shared SSH connection to {}: {error}",
+                    self.target
+                );
+                return Ok(false);
+            }
+        };
+        if self.check(&pinned.alias, true).await.is_ok() {
+            return Ok(false);
+        }
+        if !pinned.is_current()? {
+            return Ok(true);
+        }
+        // The same allowance as the master's check, so a slow login shell doesn't count
+        // against the master.
+        let fresh = self.check(Path::new("none"), false).await;
+        if !pinned.is_current()? {
+            return Ok(true);
+        }
+        fresh?;
+        log::info!(
+            "stopping the shared SSH connection to {}, which stopped answering",
+            self.target
+        );
+        let mut command = self.control_command(&pinned.alias);
+        command.args(["-O", "stop"]).arg(&self.target);
+        let output = self.output(command, CONTROL_TIMEOUT).await;
+        if !pinned.is_current()? {
+            return Ok(true);
+        }
+        let output = output?;
+        if !output.status.success() {
+            bail!(
+                "couldn't stop the shared SSH connection to {}: {}",
+                self.target,
+                failure_message(&output.status, &output.stderr)
+            );
+        }
+        Ok(true)
+    }
+
+    /// Runs `exit` on the machine through the control socket. With `master_only`, a master
+    /// that refuses the session fails it, rather than ssh falling back to a connection of its
+    /// own, which would prove nothing about the master.
+    async fn check(&self, control_path: &Path, master_only: bool) -> Result<()> {
+        let mut command = self.control_command(control_path);
+        if master_only {
+            command.args(["-o", "ProxyCommand=false"]);
+        }
+        command.arg("-T").arg(&self.target).arg("exit");
+        let output = self.output(command, COMMAND_TIMEOUT).await?;
+        if !output.status.success() {
+            bail!("{}", failure_message(&output.status, &output.stderr));
+        }
+        Ok(())
+    }
+
+    /// Where the master's socket is once ssh expands `%C` for the machine (`ssh -G`).
+    async fn expanded_control_path(&self, control_path: &Path) -> Option<PathBuf> {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .arg("-o")
+            .arg(format!("ControlPath={}", control_path.display()))
+            .arg("-G")
+            .arg(&self.target);
+        let output = match self.output(command, CONTROL_TIMEOUT).await {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                log::warn!(
+                    "ssh -G {} failed: {}",
+                    self.target,
+                    failure_message(&output.status, &output.stderr)
+                );
+                return None;
+            }
+            Err(error) => {
+                log::warn!("ssh -G {} failed: {error:#}", self.target);
+                return None;
+            }
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("controlpath "))
+            .map(PathBuf::from)
     }
 
     /// Runs the script under `/bin/sh` on the machine, whatever the user's login shell, and
@@ -683,6 +839,8 @@ async fn connect_inner(
     client_kind: ClientKind,
     on_upload_progress: &(dyn Fn(UploadProgress) + Send + Sync),
 ) -> Result<Connected> {
+    // A master left from before the Mac slept would hold every command until it timed out.
+    ssh.prepare_shared_connection().await?;
     let (platform, installed) = ssh.probe().await?;
     let path = server_binary(platform)?;
     let binary = tokio::fs::read(&path)
@@ -703,6 +861,7 @@ async fn connect_inner(
         stream,
         client_kind,
         version.to_string(),
+        crate::REMOTE_WELCOME_TIMEOUT,
     )
     .await?;
     let is_outdated = connection.welcome().build.as_deref() != Some(hash.as_str());
@@ -802,6 +961,78 @@ fn control_directory() -> Result<PathBuf> {
         );
     }
     Ok(directory)
+}
+
+/// A second name for a master's socket (herdr's `PinnedSshControlSocket`). A command sent to
+/// it reaches the master that was checked even once a new master has taken the socket's
+/// name, so stopping a stale master can't stop its replacement.
+struct PinnedControlSocket {
+    alias: PathBuf,
+    original: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl PinnedControlSocket {
+    fn new(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _};
+
+        static NEXT_PIN: AtomicU64 = AtomicU64::new(0);
+        let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        // SAFETY: geteuid has no preconditions and can't fail.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.file_type().is_socket() || metadata.uid() != uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} isn't a socket of this user", path.display()),
+            ));
+        }
+        let directory = parent.join(format!(
+            "r-{}-{}",
+            std::process::id(),
+            NEXT_PIN.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let pinned = Self {
+            alias: directory.join("ctl"),
+            original: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        std::fs::hard_link(path, &pinned.alias)?;
+        let linked = std::fs::symlink_metadata(&pinned.alias)?;
+        if (linked.dev(), linked.ino()) != (pinned.device, pinned.inode) {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        Ok(pinned)
+    }
+
+    /// Whether the socket's name still belongs to the master that was pinned.
+    fn is_current(&self) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match std::fs::symlink_metadata(&self.original) {
+            Ok(metadata) => Ok((metadata.dev(), metadata.ino()) == (self.device, self.inode)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for PinnedControlSocket {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.alias) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!("removing {}: {error}", self.alias.display()),
+        }
+        if let Some(directory) = self.alias.parent()
+            && let Err(error) = std::fs::remove_dir(directory)
+        {
+            log::warn!("removing {}: {error}", directory.display());
+        }
+    }
 }
 
 /// The proxy's stdout and stdin as one stream. ssh is killed when it's dropped.
@@ -909,5 +1140,113 @@ mod tests {
         assert!(host_key.needs_attention);
         assert!(host_key.hint.expect("hint").contains("ssh devbox1"));
         assert!(classify("unsupported remote platform: FreeBSD amd64").needs_attention);
+    }
+
+    const ANSWERS: &str = "exit 0";
+    const BROKEN_MASTER: &str =
+        "echo 'mux_client_request_session: read from master failed: Broken pipe' >&2; exit 255";
+    const LOCKED: &str = "echo 'me@devbox: Permission denied (publickey).' >&2; exit 255";
+
+    /// Runs [`Ssh::prepare_shared_connection`] with a stand-in for `ssh` that records what it's
+    /// asked, a master that answers its check with `master`, and a connection of its own with
+    /// `fresh`.
+    async fn prepare_with(
+        scratch: &Path,
+        name: &str,
+        master: &str,
+        fresh: &str,
+        has_master: bool,
+    ) -> (Result<bool>, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let socket = control_directory()
+            .expect("control directory")
+            .join(format!("test-{}-{name}", std::process::id()));
+        let listener = has_master
+            .then(|| std::os::unix::net::UnixListener::bind(&socket).expect("binds the socket"));
+        let log = scratch.join(format!("{name}.log"));
+        let program = scratch.join(format!("ssh-{name}"));
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case " $* " in
+  *" -G "*) echo 'controlpath {socket}' ;;
+  *" -O "*) ;;
+  *ControlPath=none*) {fresh} ;;
+  *ProxyCommand=false*) {master} ;;
+esac
+"#,
+            log = log.display(),
+            socket = socket.display(),
+        );
+        std::fs::write(&program, script).expect("writes the fake ssh");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let ssh = Ssh::with_program(program, "devbox").expect("valid target");
+        let prepared = ssh.prepare_shared_connection().await;
+        drop(listener);
+        if has_master {
+            std::fs::remove_file(&socket).expect("removes the socket");
+        }
+        let calls = std::fs::read_to_string(&log)
+            .expect("ssh ran")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (prepared, calls)
+    }
+
+    fn control_path_of(call: &str) -> PathBuf {
+        call.split_whitespace()
+            .find_map(|argument| argument.strip_prefix("ControlPath="))
+            .map(PathBuf::from)
+            .expect("names a control path")
+    }
+
+    /// herdr's recovery of a stuck shared connection: a master that answers is kept, one that
+    /// doesn't is stopped (never exited) once a connection of its own works, and a machine
+    /// that can't be reached at all is reported as such.
+    #[tokio::test]
+    async fn retires_a_shared_connection_that_stopped_answering() {
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let pins = control_directory()
+            .expect("control directory")
+            .join(format!("r-{}-", std::process::id()));
+        let pins = pins.to_string_lossy();
+        let is_pinned = |path: &Path| path.to_string_lossy().starts_with(&*pins);
+
+        let (prepared, calls) =
+            prepare_with(scratch.path(), "healthy", ANSWERS, LOCKED, true).await;
+        assert!(!prepared.expect("checks"));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains(" -G devbox"), "{calls:?}");
+        assert!(calls[1].contains("ProxyCommand=false"), "{calls:?}");
+        assert!(calls[1].ends_with("-T devbox exit"), "{calls:?}");
+        assert!(is_pinned(&control_path_of(&calls[1])), "{calls:?}");
+
+        let (prepared, calls) =
+            prepare_with(scratch.path(), "stale", BROKEN_MASTER, ANSWERS, true).await;
+        assert!(prepared.expect("recovers"));
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(control_path_of(&calls[2]), Path::new("none"));
+        assert!(calls[3].ends_with("-O stop devbox"), "{calls:?}");
+        let alias = control_path_of(&calls[3]);
+        assert!(is_pinned(&alias), "{calls:?}");
+        assert!(!alias.exists());
+        assert!(!alias.parent().expect("pin directory").exists());
+        assert!(!calls.iter().any(|call| call.contains("-O exit")));
+
+        let (prepared, calls) =
+            prepare_with(scratch.path(), "locked", BROKEN_MASTER, LOCKED, true).await;
+        let error = prepared.expect_err("can't connect");
+        assert!(
+            format!("{error:#}").contains("Permission denied"),
+            "{error:#}"
+        );
+        assert!(!calls.iter().any(|call| call.contains(" -O ")), "{calls:?}");
+
+        let (prepared, calls) =
+            prepare_with(scratch.path(), "no-master", BROKEN_MASTER, LOCKED, false).await;
+        assert!(prepared.expect("checks"));
+        assert_eq!(calls.len(), 1, "{calls:?}");
     }
 }

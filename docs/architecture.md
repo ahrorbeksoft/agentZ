@@ -1962,6 +1962,16 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   off to the binary at its own path (skipped when the SHA-256 matches; streamed in chunks with
   its progress shown on the machine's row, and given up only when it stops moving for a minute); `proxy` over stdio. States:
   Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
+- **Stuck connections** (herdr's handshake deadlines, shared-connection recovery and wake
+  recovery): the server's welcome must come within 5 seconds on this Mac and a minute over
+  SSH (`Connection::new`), or the connection is closed and tried again. Before connecting,
+  a shared master that no longer answers (its network went away while the Mac slept) is
+  checked against a connection of its own and, if that works, asked to stop taking sessions
+  (`-O stop` through a hard link to its socket, so a new master isn't stopped instead, and
+  never `-O exit`, which would cut what it still carries; `Ssh::prepare_shared_connection`).
+  When the Mac wakes (`Machines::observe_wake`, `ServerClient::system_woke`), a machine
+  over SSH waiting to reconnect is tried at once and for 30 seconds every 2 seconds at most,
+  and a connected one must answer a `Request::Ping` within 10 seconds or is reconnected.
 - **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).
 - **Updates**: an older server keeps running beside the new binary (over SSH told by the
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and

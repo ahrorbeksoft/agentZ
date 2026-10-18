@@ -28,7 +28,7 @@ use agentz_protocol::{
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::channel::{mpsc, oneshot};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Fuse, LocalBoxFuture};
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use projects::ThreadId;
@@ -50,6 +50,13 @@ const REMOTE_MIN_RETRY_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_MAX_RETRY_DELAY: Duration = Duration::from_secs(120);
 const ATTENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 const STABLE_CONNECTION_PERIOD: Duration = Duration::from_secs(60);
+/// herdr's wake recovery: for a while after the Mac wakes, a machine that fails to connect is
+/// tried again every couple of seconds, as Wi-Fi comes back.
+const WAKE_RECOVERY_PERIOD: Duration = Duration::from_secs(30);
+const WAKE_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// How long a connection has to answer a ping after the Mac wakes (herdr's
+/// `HEARTBEAT_TIMEOUT`).
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 const SERVER_BINARY_ENV_VAR: &str = "AGENTZ_SERVER_BIN";
 /// A directory of `agentz-server-<rust target>` binaries for other machines.
 const REMOTE_SERVERS_ENV_VAR: &str = "AGENTZ_REMOTE_SERVERS";
@@ -74,6 +81,15 @@ pub enum MachineStatus {
         error: SharedString,
         hint: Option<SharedString>,
     },
+}
+
+/// Why the wait before reconnecting was cut short.
+#[derive(Debug, PartialEq)]
+enum Retry {
+    /// The user fixed what needed attention: the backoff starts over.
+    Asked,
+    /// The Mac woke: the network may need a moment, and the backoff stays.
+    Woke,
 }
 
 /// What came of asking a server to update.
@@ -152,7 +168,11 @@ pub struct ServerClient {
     /// How far installing the server on the machine is, while connecting.
     upload_progress: Option<UploadProgress>,
     /// Cuts the wait before the next attempt short.
-    retry_now: Option<oneshot::Sender<()>>,
+    retry_now: Option<oneshot::Sender<Retry>>,
+    /// Asks the connection to show it still works.
+    check_connection: Option<mpsc::UnboundedSender<()>>,
+    /// When the Mac last woke from sleep.
+    woke_at: Option<Instant>,
     /// What the server was last told of the other machines, this connection.
     peers_sent: Option<Peers>,
     /// The design defaults the server was last given, this connection.
@@ -208,6 +228,8 @@ impl ServerClient {
                 queued_session_events: None,
                 upload_progress: None,
                 retry_now: None,
+                check_connection: None,
+                woke_at: None,
                 peers_sent: None,
                 design_settings_sent: None,
                 auto_archive_sent: None,
@@ -358,7 +380,23 @@ impl ServerClient {
     /// attention.
     pub fn retry(&mut self) {
         if let Some(retry_now) = self.retry_now.take() {
-            retry_now.send(()).ok();
+            retry_now.send(Retry::Asked).ok();
+        }
+    }
+
+    /// herdr's wake recovery. An SSH connection may have died while the Mac slept, which ssh's
+    /// keepalives notice only a minute later, so a connection is asked to answer now, and a
+    /// machine waiting to reconnect is tried now. A socket on this Mac doesn't go stale.
+    pub fn system_woke(&mut self) {
+        if self.transport == Transport::Local {
+            return;
+        }
+        self.woke_at = Some(Instant::now());
+        if let Some(check_connection) = &self.check_connection {
+            check_connection.unbounded_send(()).ok();
+        }
+        if let Some(retry_now) = self.retry_now.take() {
+            retry_now.send(Retry::Woke).ok();
         }
     }
 
@@ -938,6 +976,7 @@ impl ServerClient {
 
     fn disconnected(&mut self, status: MachineStatus, cx: &mut Context<Self>) {
         self.connection = None;
+        self.check_connection = None;
         self.status = status;
         self.upload_progress = None;
         self.queued_session_events = None;
@@ -1104,8 +1143,12 @@ async fn maintain_connection(
             Ok((connection, mut events, is_outdated)) => {
                 let connected_at = Instant::now();
                 let session = connection.request(Request::SubscribeSession);
+                let (check_connection, mut check_requests) = mpsc::unbounded();
                 if this
-                    .update(cx, |this, cx| this.connected(connection, is_outdated, cx))
+                    .update(cx, |this, cx| {
+                        this.check_connection = Some(check_connection);
+                        this.connected(connection.clone(), is_outdated, cx)
+                    })
                     .is_err()
                 {
                     return;
@@ -1118,14 +1161,41 @@ async fn maintain_connection(
                         .ok();
                 })
                 .detach();
-                while let Some(event) = events.next().await {
-                    if this
-                        .update(cx, |this, cx| this.handle_event(event, cx))
-                        .is_err()
-                    {
-                        return;
+                let mut ping: Fuse<LocalBoxFuture<'static, bool>> = Fuse::terminated();
+                let status = loop {
+                    // The ping's answer arrives through the events, so they're taken meanwhile.
+                    futures::select_biased! {
+                        event = events.next().fuse() => {
+                            let Some(event) = event else {
+                                break "the connection to agentz-server closed";
+                            };
+                            if this
+                                .update(cx, |this, cx| this.handle_event(event, cx))
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        _ = check_requests.next() => {
+                            let answer = connection.request(Request::Ping);
+                            let timeout = cx.background_executor().timer(PING_TIMEOUT);
+                            ping = async move {
+                                futures::select_biased! {
+                                    answer = answer.fuse() => answer.is_ok(),
+                                    _ = timeout.fuse() => false,
+                                }
+                            }
+                            .boxed_local()
+                            .fuse();
+                        }
+                        answered = ping => {
+                            if !answered {
+                                connection.close();
+                                break "agentz-server stopped answering";
+                            }
+                        }
                     }
-                }
+                };
                 // Brief connections don't reset the backoff, so a server that keeps dropping
                 // isn't hammered.
                 if connected_at.elapsed() >= STABLE_CONNECTION_PERIOD
@@ -1133,7 +1203,7 @@ async fn maintain_connection(
                 {
                     delay = min_delay;
                 }
-                MachineStatus::Reconnecting("the connection to agentz-server closed".into())
+                MachineStatus::Reconnecting(status.into())
             }
             Err(error) => {
                 if error.needs_attention {
@@ -1147,22 +1217,26 @@ async fn maintain_connection(
             }
         };
         let (retry_now, retry_requested) = oneshot::channel();
-        if this
-            .update(cx, |this, cx| {
-                this.retry_now = Some(retry_now);
-                this.disconnected(status.clone(), cx);
-            })
-            .is_err()
-        {
+        let Ok(woke_recently) = this.update(cx, |this, cx| {
+            this.retry_now = Some(retry_now);
+            this.disconnected(status.clone(), cx);
+            this.woke_at
+                .is_some_and(|woke_at| woke_at.elapsed() < WAKE_RECOVERY_PERIOD)
+        }) else {
             return;
-        }
+        };
         let wait = match &status {
             MachineStatus::Attention { .. } => ATTENTION_RETRY_DELAY,
+            _ if woke_recently => delay.min(WAKE_RETRY_DELAY),
             _ => delay,
         };
         log::warn!("{status:?}; retrying in {wait:?}");
         futures::select_biased! {
-            _ = retry_requested.fuse() => delay = min_delay,
+            retry = retry_requested.fuse() => {
+                if retry != Ok(Retry::Woke) {
+                    delay = min_delay;
+                }
+            }
             _ = cx.background_executor().timer(wait).fuse() => {
                 delay = (delay * 2).min(max_delay);
             }
@@ -1413,6 +1487,31 @@ mod tests {
                 current: None,
             }],
         }
+    }
+
+    /// herdr's wake recovery: a machine over SSH that waits to reconnect is tried now, keeping
+    /// its backoff, and a connected one is asked to answer. This Mac's own socket is left alone.
+    #[gpui::test]
+    fn waking_retries_and_checks_machines_over_ssh(cx: &mut TestAppContext) {
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            ServerClient::new_for_test(MachineId::Local, "devbox".into(), spaces(None), cx)
+        });
+        let (retry_now, mut retry_requested) = oneshot::channel();
+        let (check_connection, mut check_requests) = mpsc::unbounded();
+        client.update(cx, |client, _| {
+            client.retry_now = Some(retry_now);
+            client.check_connection = Some(check_connection);
+            client.system_woke();
+            assert!(client.retry_now.is_some());
+            assert!(client.woke_at.is_none());
+
+            client.set_transport_for_test(Transport::Ssh("devbox".into()));
+            client.system_woke();
+            assert!(client.woke_at.is_some());
+        });
+        assert_eq!(retry_requested.try_recv(), Ok(Some(Retry::Woke)));
+        assert_eq!(check_requests.try_recv(), Ok(()));
     }
 
     #[gpui::test]

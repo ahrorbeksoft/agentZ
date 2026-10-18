@@ -772,6 +772,9 @@ pub enum Request {
     /// [`Request::RemoveWorkspace`].
     ClearStorage(StorageCache),
 
+    /// Answers [`Response::Ok`] at once, to show the connection still carries messages, as
+    /// herdr's heartbeat does after the Mac wakes.
+    Ping,
     /// Ends the server, its agents and terminals.
     Shutdown,
     /// Starts the server binary installed now and hands it the terminals, which keep running

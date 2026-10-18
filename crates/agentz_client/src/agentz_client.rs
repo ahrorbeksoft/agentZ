@@ -9,6 +9,7 @@ pub mod ssh;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use agentz_protocol::{
     ClientHello, ClientKind, ClientMessage, ErrorResponse, Event, PROTOCOL_VERSION, Request,
@@ -20,6 +21,12 @@ use futures::channel::{mpsc, oneshot};
 use futures::{FutureExt as _, StreamExt as _};
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// How long a server has to answer hello, as herdr bounds its handshakes. One on this machine
+/// is already listening; one over SSH may first be started, which loads the login shell's
+/// environment.
+pub const LOCAL_WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
+pub const REMOTE_WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
 enum Incoming {
     Event(Event),
@@ -71,16 +78,19 @@ pub struct Connection {
     /// `None` once the connection has closed.
     pending: PendingResponses,
     next_id: Arc<AtomicU64>,
+    /// The reading and writing tasks, which hold the stream.
+    tasks: Arc<[tokio::task::AbortHandle]>,
 }
 
 impl Connection {
-    /// Says hello over the stream and, if the server accepts, starts reading and writing on the
-    /// runtime.
+    /// Says hello over the stream and, if the server accepts within `welcome_timeout`, starts
+    /// reading and writing on the runtime.
     pub async fn new(
         runtime: &tokio::runtime::Handle,
         stream: impl AsyncRead + AsyncWrite + Send + 'static,
         client_kind: ClientKind,
         client_version: String,
+        welcome_timeout: Duration,
     ) -> Result<(Self, Events)> {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let hello = ClientHello {
@@ -90,10 +100,23 @@ impl Connection {
         };
         let welcome = runtime
             .spawn(async move {
-                write_message(&mut writer, &hello).await?;
-                let welcome: ServerWelcome = read_message(&mut reader)
-                    .await?
-                    .context("the server closed the connection")?;
+                let handshake = async {
+                    write_message(&mut writer, &hello).await?;
+                    let welcome: ServerWelcome = read_message(&mut reader)
+                        .await?
+                        .context("the server closed the connection")?;
+                    anyhow::Ok(welcome)
+                };
+                // The whole answer, not each read: a server that sends part of it and stalls
+                // would otherwise hold the connection forever.
+                let welcome = tokio::time::timeout(welcome_timeout, handshake)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "agentz-server didn't answer within {} seconds",
+                            welcome_timeout.as_secs()
+                        )
+                    })??;
                 anyhow::Ok((welcome, reader, writer))
             })
             .await
@@ -106,7 +129,7 @@ impl Connection {
         let (outgoing, mut outgoing_messages) = mpsc::unbounded::<ClientMessage>();
         let (incoming, incoming_receiver) = mpsc::unbounded();
         let pending: PendingResponses = Arc::new(Mutex::new(Some(HashMap::default())));
-        runtime.spawn(async move {
+        let writing = runtime.spawn(async move {
             while let Some(message) = outgoing_messages.next().await {
                 if let Err(error) = write_message(&mut writer, &message).await {
                     log::warn!("failed to write to the server: {error:#}");
@@ -114,7 +137,7 @@ impl Connection {
                 }
             }
         });
-        runtime.spawn(async move {
+        let reading = runtime.spawn(async move {
             loop {
                 let message = match read_message::<ServerMessage>(&mut reader).await {
                     Ok(Some(ServerMessage::Response { id, result })) => {
@@ -146,12 +169,22 @@ impl Connection {
             outgoing,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
+            tasks: Arc::new([writing.abort_handle(), reading.abort_handle()]),
         };
         Ok((connection, events))
     }
 
     pub fn welcome(&self) -> &ServerWelcome {
         &self.welcome
+    }
+
+    /// Drops the connection now, as when it went quiet: the events end, waiting requests fail
+    /// and the stream closes (over SSH, ssh is stopped). The server and its agents keep
+    /// running.
+    pub fn close(&self) {
+        for task in self.tasks.iter() {
+            task.abort();
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -202,7 +235,14 @@ pub async fn connect_local(
         .await
         .context("the connection task ended")?
         .with_context(|| format!("connecting to {}", socket.display()))?;
-    Connection::new(runtime, stream, client_kind, client_version).await
+    Connection::new(
+        runtime,
+        stream,
+        client_kind,
+        client_version,
+        LOCAL_WELCOME_TIMEOUT,
+    )
+    .await
 }
 
 /// Runs `agentz-server start`, which returns once a server is listening.
@@ -270,9 +310,73 @@ mod tests {
             client_stream,
             ClientKind::App,
             "0.0.0-test".into(),
+            TIMEOUT,
         )
         .await
         .expect("connects")
+    }
+
+    /// herdr's handshake deadline: a server that says nothing, sends part of its answer, or
+    /// trickles it in a byte at a time is given up on once the deadline passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_doesnt_answer_hello_is_given_up_on() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let deadline = Duration::from_millis(200);
+        for (prefix, trickles) in [
+            (vec![], false),
+            (vec![100, 0], false),
+            (vec![100, 0, 0, 0, b'{'], false),
+            (vec![100, 0, 0, 0], true),
+        ] {
+            let (client_stream, mut server_stream) = tokio::io::duplex(1 << 16);
+            let server = tokio::spawn(async move {
+                server_stream.write_all(&prefix).await.ok();
+                for _ in 0..if trickles { 50 } else { 0 } {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    if server_stream.write_all(b" ").await.is_err() {
+                        return;
+                    }
+                }
+                // Keeps the stream open past the deadline.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+            let started = std::time::Instant::now();
+            let result = Connection::new(
+                &tokio::runtime::Handle::current(),
+                client_stream,
+                ClientKind::App,
+                "0.0.0-test".into(),
+                deadline,
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let Err(error) = result else {
+                panic!("connected to a server that never answered");
+            };
+            assert!(
+                format!("{error:#}").contains("didn't answer within"),
+                "{error:#}"
+            );
+            assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_a_connection_ends_its_events_and_requests() {
+        let data_dir = tempfile::tempdir().expect("temp dir");
+        let server = start_server(data_dir.path(), BTreeMap::new());
+        let (connection, mut events) = connect(&server).await;
+        connection.close();
+        assert!(
+            tokio::time::timeout(TIMEOUT, events.next())
+                .await
+                .expect("in time")
+                .is_none()
+        );
+        assert!(connection.is_closed());
+        assert!(connection.request(Request::SubscribeSession).await.is_err());
     }
 
     /// `None` without python3 to run the mock agent.

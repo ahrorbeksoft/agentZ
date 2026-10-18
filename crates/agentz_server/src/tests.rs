@@ -4051,6 +4051,7 @@ async fn shuts_down_on_request() {
         .request(Request::Unknown(serde_json::json!({"FromTheFuture": 1})))
         .await;
     assert!(unknown.is_err());
+    client.ok(Request::Ping).await;
     client.ok(Request::Shutdown).await;
     tokio::time::timeout(TIMEOUT, server.handle.stopped())
         .await
