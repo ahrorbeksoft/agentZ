@@ -1,0 +1,118 @@
+{
+  "topics": {
+    "place": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "sign-in": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {},
+      "note": "we don't need sign ins, they just set it up, and in app it just shows up, maybe we should check availablity button or refresh button or soething though",
+      "also": []
+    },
+    "add": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "providers": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "cost": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "row": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": ""
+      },
+      "note": "",
+      "also": []
+    },
+    "page": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "snapshots": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "delete": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "existing": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "stopped": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "C": "we gotta talk about this, fundamentally we gotta store their threads on the main machine too, so new message should start these or ask you to start you know"
+      },
+      "note": "",
+      "also": []
+    },
+    "idle": {
+      "pick": null,
+      "picks": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "usage": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-18T15:56:00.601Z"
+}
