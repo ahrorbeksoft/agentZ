@@ -1508,7 +1508,10 @@ pub struct ParsedMarkdown {
     pub(crate) code_block_highlights: Arc<CodeBlockHighlights>,
 }
 
-pub(crate) type CodeBlockHighlights = HashMap<usize, ResolvedHighlights>;
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MarkdownEventIndex(usize);
+
+pub(crate) type CodeBlockHighlights = HashMap<MarkdownEventIndex, ResolvedHighlights>;
 
 impl ParsedMarkdown {
     pub fn source(&self) -> &SharedString {
@@ -1632,13 +1635,14 @@ impl ParsedMarkdown {
 
 struct PendingCodeBlock<'a> {
     language: Arc<Language>,
-    texts: Vec<(Range<usize>, &'a str)>,
+    texts: Vec<(MarkdownEventIndex, &'a str)>,
 }
 
 fn compute_code_block_highlights(parsed: &ParsedMarkdown) -> CodeBlockHighlights {
     let mut code_block_highlights = CodeBlockHighlights::default();
     let mut pending_block: Option<PendingCodeBlock> = None;
-    for (range, event) in parsed.events.iter() {
+    for (event_index, (range, event)) in parsed.events.iter().enumerate() {
+        let event_index = MarkdownEventIndex(event_index);
         match event {
             MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, .. }) => {
                 if parsed.mermaid_diagrams.contains_key(&range.start) {
@@ -1661,12 +1665,12 @@ fn compute_code_block_highlights(parsed: &ParsedMarkdown) -> CodeBlockHighlights
                 if let Some(block) = &mut pending_block {
                     block
                         .texts
-                        .push((range.clone(), &parsed.source[range.clone()]));
+                        .push((event_index, &parsed.source[range.clone()]));
                 }
             }
             MarkdownEvent::SubstitutedText(text) => {
                 if let Some(block) = &mut pending_block {
-                    block.texts.push((range.clone(), text.as_str()));
+                    block.texts.push((event_index, text.as_str()));
                 }
             }
             _ => {}
@@ -1688,12 +1692,12 @@ fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut Cod
     if resolved.runs.is_empty() {
         return;
     }
-    if let [(source_range, _)] = block.texts.as_slice() {
-        code_block_highlights.insert(source_range.start, resolved);
+    if let [(event_index, _)] = block.texts.as_slice() {
+        code_block_highlights.insert(*event_index, resolved);
         return;
     }
     let mut runs = resolved.runs.iter().peekable();
-    for ((source_range, text), text_offset) in block.texts.iter().zip(text_offsets) {
+    for ((event_index, text), text_offset) in block.texts.iter().zip(text_offsets) {
         let text_end = text_offset + text.len();
         let mut text_runs = Vec::new();
         while let Some((run_range, highlight_id)) = runs.peek() {
@@ -1712,7 +1716,7 @@ fn highlight_code_block(block: PendingCodeBlock, code_block_highlights: &mut Cod
         }
         if !text_runs.is_empty() {
             code_block_highlights.insert(
-                source_range.start,
+                *event_index,
                 ResolvedHighlights {
                     sources: resolved.sources.clone(),
                     runs: text_runs.into(),
@@ -2670,7 +2674,6 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
             highlights,
-            parsed_markdown.code_block_highlights.clone(),
         );
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
@@ -2684,6 +2687,7 @@ impl Element for MarkdownElement {
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
+            let event_index = MarkdownEventIndex(index);
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
                 && current_img_block_range.end > range.end
@@ -3299,10 +3303,18 @@ impl Element for MarkdownElement {
                     _ => log::debug!("unsupported markdown tag end: {:?}", tag),
                 },
                 MarkdownEvent::Text => {
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    builder.push_highlighted_text(
+                        &parsed_markdown.source[range.clone()],
+                        range.clone(),
+                        parsed_markdown.code_block_highlights.get(&event_index),
+                    );
                 }
                 MarkdownEvent::SubstitutedText(text) => {
-                    builder.push_text(text, range.clone());
+                    builder.push_highlighted_text(
+                        text,
+                        range.clone(),
+                        parsed_markdown.code_block_highlights.get(&event_index),
+                    );
                 }
                 MarkdownEvent::Code => {
                     self.push_markdown_code_span(
@@ -3798,7 +3810,6 @@ struct MarkdownElementBuilder {
     base_text_style: TextStyle,
     text_style_stack: Vec<TextStyleRefinement>,
     code_block_stack: Vec<Option<Arc<Language>>>,
-    code_block_highlights: Arc<CodeBlockHighlights>,
     link_depth: usize,
     /// Set while inside a link drawn as a chip, whose text its label has replaced.
     skips_link_text: bool,
@@ -3911,7 +3922,6 @@ impl MarkdownElementBuilder {
         base_text_style: TextStyle,
         syntax_theme: Arc<SyntaxTheme>,
         highlights: MarkdownHighlights,
-        code_block_highlights: Arc<CodeBlockHighlights>,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -3930,7 +3940,6 @@ impl MarkdownElementBuilder {
             base_text_style,
             text_style_stack: Vec::new(),
             code_block_stack: Vec::new(),
-            code_block_highlights,
             link_depth: 0,
             skips_link_text: false,
             list_stack: Vec::new(),
@@ -4193,6 +4202,15 @@ impl MarkdownElementBuilder {
     }
 
     fn push_text(&mut self, text: &str, source_range: Range<usize>) {
+        self.push_highlighted_text(text, source_range, None);
+    }
+
+    fn push_highlighted_text(
+        &mut self,
+        text: &str,
+        source_range: Range<usize>,
+        highlights: Option<&ResolvedHighlights>,
+    ) {
         if self.skips_link_text {
             return;
         }
@@ -4207,7 +4225,7 @@ impl MarkdownElementBuilder {
         let text_style = self.text_style();
 
         if let Some(language) = self.code_block_stack.last().and_then(Option::as_ref)
-            && let Some(resolved) = self.code_block_highlights.get(&source_range.start)
+            && let Some(resolved) = highlights
         {
             let runs = if resolved.is_current() {
                 resolved.runs.clone()

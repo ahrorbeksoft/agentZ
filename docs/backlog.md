@@ -57,21 +57,6 @@ Follow Zed's developing v2 session lifecycle, including resume/replay and metada
 [#65709](https://github.com/zed-industries/zed/pull/65709). Treat this as a deliberate protocol
 update, separate from the smaller copied-crate fixes. Test with the mock agent.
 
-### Port the Markdown, Linux font and macOS blur fixes
-
-Our copied crates still contain the affected code for all three:
-
-- **Tab-indented Markdown code blocks can crash:** port
-  [#65398](https://github.com/zed-industries/zed/pull/65398) in `crates/markdown/src/markdown.rs`.
-  Zed keys cached highlights by event indices rather than colliding source offsets.
-- **Linux fallback fonts can disappear:** port
-  [#65269](https://github.com/zed-industries/zed/pull/65269) in
-  `crates/gpui_wgpu/src/cosmic_text_system.rs`. Fonts without an `m` glyph must remain in the
-  font database for emoji, symbols and non-Latin fallback.
-- **Blurred windows are only transparent on macOS 27:** port
-  [#65361](https://github.com/zed-industries/zed/pull/65361) in
-  `crates/gpui_macos/src/window.rs`, using the material that retains backdrop blur.
-
 ### Port GPUI's focus cleanup performance fix
 
 Follow [#65177](https://github.com/zed-industries/zed/pull/65177): queue final focus-handle drops
