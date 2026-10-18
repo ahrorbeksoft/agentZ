@@ -273,6 +273,14 @@ pub(crate) fn without_image_links(text: &str) -> Cow<'_, str> {
     Cow::Owned(rest.trim().to_string())
 }
 
+/// Where a message's image links are, which show as chips rather than as their text.
+pub(crate) fn image_link_ranges(text: &str) -> Vec<Range<usize>> {
+    image_links(text)
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect()
+}
+
 /// The images a message links, in order.
 pub(crate) fn message_images(text: &str) -> Vec<AttachmentId> {
     image_links(text).into_iter().map(|(_, id)| id).collect()

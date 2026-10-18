@@ -38,10 +38,10 @@ use collections::{HashMap, HashSet};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Bounds, ClickEvent, ClipboardEntry,
     ClipboardItem, Context, DismissEvent, DragMoveEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, FollowMode, FontWeight, Hsla, ImageSource, KeyBinding, ListAlignment,
-    ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel, ScrollHandle,
-    Stateful, Subscription, Task, WeakEntity, Window, anchored, canvas, container_query, deferred,
-    img, list, pulsating_between,
+    FocusHandle, Focusable, FollowMode, FontWeight, HighlightStyle, Hsla, ImageSource, KeyBinding,
+    ListAlignment, ListOffset, ListState, MouseMoveEvent, ObjectFit, Pixels, Point, PromptLevel,
+    ScrollHandle, Stateful, StyledText, Subscription, Task, WeakEntity, Window, anchored, canvas,
+    container_query, deferred, img, list, point, pulsating_between,
 };
 use markdown::{
     Markdown, MarkdownElement, MarkdownFont, MarkdownImage, MarkdownOptions, MarkdownStyle,
@@ -70,8 +70,9 @@ use crate::agent_login::{
 use crate::artifacts_list::{ShowInList, artifact_icon, render_design_state, thread_group};
 use crate::attachment_image::{
     AttachmentImage, FileImage, ImagePreviewTooltip, ImageViewer, MarkdownImageSource,
-    MessagePiece, ViewedImage, classify_markdown_image, image_chip, is_loading, message_images,
-    message_pieces, render_hover_preview, web_image, with_image_names, without_image_links,
+    MessagePiece, ViewedImage, classify_markdown_image, image_chip, image_link_ranges, is_loading,
+    message_images, message_pieces, render_hover_preview, web_image, with_image_names,
+    without_image_links,
 };
 use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::confirm_dialog::ConfirmRequest;
@@ -93,6 +94,10 @@ use crate::terminal_element::TerminalMode;
 use crate::terminal_entity::Terminal;
 use crate::terminal_view::TerminalView;
 use crate::thread_entity::AgentThread;
+use crate::thread_find::{
+    FindOptions, FindTarget, MATCH_TOP_OFFSET, RESCAN_DELAY, Searched, ThreadFind, find_matches,
+    find_query, merge_ranges,
+};
 use crate::tool_calls::{
     self, ActionLabel, AgentAction, CallState, Grep, GrepFile, LabelPart, OwnPart, OwnResult,
     OwnTool, Sentence, SpanStyle, SubagentCall, SubjectStyle, ThreadLine, ThreadState,
@@ -107,7 +112,9 @@ use crate::{NewChat, OpenFolder, OpenInEditor, ToggleDiff, ToggleTerminalDrawer}
 pub(crate) const KEY_CONTEXT: &str = "AgentComposer";
 const RENAME_KEY_CONTEXT: &str = "ThreadHeaderRename";
 /// The whole thread view, so a subthread's keys work wherever its focus is.
-const THREAD_KEY_CONTEXT: &str = "AgentThread";
+pub(crate) const THREAD_KEY_CONTEXT: &str = "AgentThread";
+/// The find bar's, around its query.
+pub(crate) const FIND_KEY_CONTEXT: &str = "AgentThreadFind";
 
 gpui::actions!(
     agent,
@@ -127,6 +134,20 @@ gpui::actions!(
         /// Lowers the agent's reasoning effort to its previous level, from the lowest to the
         /// highest.
         DecreaseEffort,
+        /// Finds text in the conversation, or, with find open, selects its query to type over.
+        FindInThread,
+        /// Goes to the next match in the conversation.
+        SelectNextThreadMatch,
+        /// Goes to the previous match in the conversation.
+        SelectPreviousThreadMatch,
+        /// Closes find and puts the cursor back in the message editor.
+        DismissThreadSearch,
+        /// Matches only text in the query's case, or any case.
+        ToggleCaseSensitive,
+        /// Matches only whole words, or any text.
+        ToggleWholeWord,
+        /// Reads the query as a regular expression, or as typed.
+        ToggleRegex,
     ]
 );
 /// Matches Zed's default `agent.max_content_width`.
@@ -299,7 +320,41 @@ pub fn init(cx: &mut App) {
         // Zed's Go Back in its agent thread, which leaves a subagent for its parent. Ctrl on
         // macOS too, as in Zed.
         KeyBinding::new("ctrl--", OpenParentThread, Some(THREAD_KEY_CONTEXT)),
+        // Zed's thread search bar's keys.
+        KeyBinding::new("enter", SelectNextThreadMatch, Some(FIND_KEY_CONTEXT)),
+        KeyBinding::new(
+            "shift-enter",
+            SelectPreviousThreadMatch,
+            Some(FIND_KEY_CONTEXT),
+        ),
+        KeyBinding::new("escape", DismissThreadSearch, Some(FIND_KEY_CONTEXT)),
     ]);
+    // Zed's keys for its thread search, from anywhere in the thread. A terminal keeps its own
+    // Find; on Linux the shell keeps these keys too, as Zed's terminal does.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-f", FindInThread, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("cmd-g", SelectNextThreadMatch, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new(
+                "cmd-shift-g",
+                SelectPreviousThreadMatch,
+                Some(THREAD_KEY_CONTEXT),
+            ),
+            KeyBinding::new("alt-cmd-c", ToggleCaseSensitive, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("alt-cmd-w", ToggleWholeWord, Some(THREAD_KEY_CONTEXT)),
+            KeyBinding::new("alt-cmd-x", ToggleRegex, Some(THREAD_KEY_CONTEXT)),
+        ]);
+    } else {
+        let context = Some("AgentThread && !Terminal");
+        cx.bind_keys([
+            KeyBinding::new("ctrl-f", FindInThread, context),
+            KeyBinding::new("f3", SelectNextThreadMatch, context),
+            KeyBinding::new("shift-f3", SelectPreviousThreadMatch, context),
+            KeyBinding::new("alt-c", ToggleCaseSensitive, context),
+            KeyBinding::new("alt-w", ToggleWholeWord, context),
+            KeyBinding::new("alt-r", ToggleRegex, context),
+        ]);
+    }
     // Zed's keys for answering a permission request.
     if cfg!(target_os = "macos") {
         cx.bind_keys([
@@ -522,6 +577,8 @@ pub struct AgentView {
     /// The compactions whose summary is open.
     expanded_compactions: HashSet<usize>,
     plan_expanded: bool,
+    /// The find bar, while it's open.
+    find: Option<ThreadFind>,
     /// What each of the composer's chips mentions.
     mentions: HashMap<ChipId, Mention>,
     /// Files of this Mac being sent to another machine's thread, by their chips, which mention
@@ -662,6 +719,7 @@ impl AgentView {
                 this.sync_entries(cx);
                 sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
                 this.sync_composer_placeholder(cx);
+                this.schedule_find_rescan(cx);
                 cx.notify();
             }),
             // The agent's display name and icon come from the registry, which may load later.
@@ -785,6 +843,7 @@ impl AgentView {
             toggled_thoughts: HashSet::default(),
             expanded_compactions: HashSet::default(),
             plan_expanded: false,
+            find: None,
             mentions: HashMap::default(),
             uploads: HashMap::default(),
             send_after_uploads: false,
@@ -2313,13 +2372,568 @@ impl AgentView {
                 // there's any text to show. A row measured above the view keeps that height
                 // until it's drawn, and the conversation jumps as it scrolls into view.
                 let row = key.0 + 1;
-                self._markdown_subscriptions
-                    .push(cx.observe(&markdown, move |this, _, _| {
+                self._markdown_subscriptions.push(cx.observe(
+                    &markdown,
+                    move |this, markdown, cx| {
                         this.list_state.remeasure_items(row..row + 1);
-                    }));
+                        if this
+                            .find
+                            .as_ref()
+                            .is_some_and(|find| find.unparsed.contains(&key))
+                            && !markdown.read(cx).is_parsing()
+                        {
+                            this.schedule_find_rescan(cx);
+                        }
+                    },
+                ));
                 self.markdowns.insert(key, markdown);
             }
         }
+    }
+
+    /// Opens find, or with find open selects its query to type over (t3code's ⌘F).
+    fn find_in_thread(&mut self, _: &FindInThread, window: &mut Window, cx: &mut Context<Self>) {
+        let input = match &self.find {
+            Some(find) => find.input.clone(),
+            None => {
+                let input = cx.new(|cx| TextInput::new("Search this thread…", cx));
+                let subscription = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| {
+                    if matches!(event, TextInputEvent::Changed) {
+                        this.search_thread(cx);
+                    }
+                });
+                // While find is open the conversation stays where its matches take it, rather
+                // than following what the agent writes.
+                self.list_state.set_follow_mode(FollowMode::Normal);
+                self.find = Some(ThreadFind::new(input.clone(), subscription));
+                input
+            }
+        };
+        input.update(cx, |input, cx| input.select_all_text(cx));
+        window.focus(&input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn dismiss_thread_search(
+        &mut self,
+        _: &DismissThreadSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_find(window, cx);
+    }
+
+    /// Closes find, clearing its matches, and puts the cursor back in the composer. Whether it
+    /// was open.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(find) = self.find.take() else {
+            return false;
+        };
+        for markdown in find.highlighted.iter().filter_map(WeakEntity::upgrade) {
+            markdown.update(cx, |markdown, cx| markdown.clear_search_highlights(cx));
+        }
+        // It follows the end again once it's scrolled there, from where find left it.
+        let top = self.list_state.logical_scroll_top();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.list_state.scroll_to(top);
+        window.focus(&Focusable::focus_handle(self, cx), cx);
+        cx.notify();
+        true
+    }
+
+    fn select_next_thread_match(
+        &mut self,
+        _: &SelectNextThreadMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_find_match(true, cx);
+    }
+
+    fn select_previous_thread_match(
+        &mut self,
+        _: &SelectPreviousThreadMatch,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_find_match(false, cx);
+    }
+
+    /// Goes to the next or previous match, wrapping around as Zed's do.
+    fn step_find_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let Some(index) = find.step(forward) else {
+            return;
+        };
+        find.active = Some(index);
+        self.paint_find_matches(cx);
+        self.reveal_find_match(cx);
+        cx.notify();
+    }
+
+    fn toggle_find_option(
+        &mut self,
+        toggle: impl FnOnce(&mut FindOptions),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        toggle(&mut find.options);
+        self.search_thread(cx);
+    }
+
+    /// Searches the conversation for the query, as Zed's thread search does: the current match
+    /// stays current where it still is; otherwise the one in its place, or the first, becomes
+    /// current and is shown.
+    fn search_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        find.rescan = None;
+        let query = find.input.read(cx).text().to_string();
+        let query = match find_query(&query, find.options) {
+            Ok(query) => {
+                find.error = None;
+                query
+            }
+            Err(error) => {
+                find.error = Some(error.into());
+                None
+            }
+        };
+        let (matches, unparsed) = match &query {
+            Some(query) => {
+                let (searched, unparsed) = self.find_sources(cx);
+                (find_matches(&searched, query), unparsed)
+            }
+            None => (Vec::new(), HashSet::default()),
+        };
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let previous_index = find.active;
+        let previous = find.active_match().cloned();
+        find.matches = matches;
+        find.unparsed = unparsed;
+        let kept =
+            previous.and_then(|previous| find.matches.iter().position(|found| *found == previous));
+        find.active = kept.or_else(|| {
+            (!find.matches.is_empty())
+                .then(|| previous_index.filter(|index| *index < find.matches.len()))
+                .map(|index| index.unwrap_or(0))
+        });
+        let shows_match = kept.is_none() && find.active.is_some();
+        self.paint_find_matches(cx);
+        if shows_match {
+            self.reveal_find_match(cx);
+        }
+        cx.notify();
+    }
+
+    /// Searches again a moment after the thread changed, at most that often while it streams in.
+    fn schedule_find_rescan(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        if find.rescan.is_some() {
+            return;
+        }
+        find.rescan = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESCAN_DELAY).await;
+            this.update(cx, |this, cx| this.search_thread(cx)).log_err();
+        }));
+    }
+
+    /// What find looks through, in the order it shows from the top: each message, each tool
+    /// call's line and the plan it proposes, then the plan section's steps. With the markdowns
+    /// not parsed yet, whose hidden parts aren't known.
+    fn find_sources(&self, cx: &App) -> (Vec<Searched>, HashSet<MarkdownKey>) {
+        let mut searched = Vec::new();
+        let mut unparsed = HashSet::default();
+        let mut add_markdown = |key: MarkdownKey, searched: &mut Vec<Searched>, images: bool| {
+            let Some(markdown) = self.markdowns.get(&key) else {
+                return;
+            };
+            let markdown = markdown.read(cx);
+            // What of it doesn't show is known once it's parsed.
+            if markdown.is_parsing() {
+                unparsed.insert(key);
+            }
+            let mut hidden = markdown.non_rendered_source_ranges();
+            // An image's link shows as a chip, not as its text.
+            if images {
+                hidden.extend(image_link_ranges(markdown.source()));
+            }
+            searched.push(Searched {
+                target: FindTarget::Markdown(key),
+                text: markdown.source().clone(),
+                hidden: merge_ranges(hidden),
+            });
+        };
+        let thread = self.thread.read(cx);
+        for (index, entry) in thread.entries().iter().enumerate() {
+            match entry {
+                Entry::UserMessage(_) if thread.is_task_notice(index) => {}
+                Entry::UserMessage(_) => add_markdown((index, 0), &mut searched, true),
+                Entry::AgentMessage(text) => {
+                    for (part, piece) in message_pieces(text).into_iter().enumerate() {
+                        if let MessagePiece::Text(_) = piece {
+                            add_markdown((index, part), &mut searched, false);
+                        }
+                    }
+                }
+                Entry::ToolCall(tool_call) => {
+                    if let Some(line) = self.tool_call_line_of(index, tool_call, cx) {
+                        searched.extend(line_pieces(&line).into_iter().enumerate().map(
+                            |(piece, text)| Searched {
+                                target: FindTarget::Title {
+                                    entry: index,
+                                    piece,
+                                },
+                                text: text.into(),
+                                hidden: Vec::new(),
+                            },
+                        ));
+                    }
+                    if is_plan(tool_call) {
+                        for part in 0..tool_call.text.len() {
+                            add_markdown((index, part + 1), &mut searched, false);
+                        }
+                    }
+                }
+                Entry::AgentThought(_) | Entry::Compaction(_) | Entry::Plan => {}
+            }
+        }
+        searched.extend(
+            thread
+                .plan()
+                .iter()
+                .enumerate()
+                .map(|(index, item)| Searched {
+                    target: FindTarget::PlanItem(index),
+                    text: item.content.clone().into(),
+                    hidden: Vec::new(),
+                }),
+        );
+        (searched, unparsed)
+    }
+
+    /// Paints the matches in the messages and plans that have them, the current one in its
+    /// own color, and clears those that no longer have any.
+    fn paint_find_matches(&mut self, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        // A markdown's matches are found together, so they're side by side.
+        let mut painted: Vec<(MarkdownKey, Vec<Range<usize>>, Option<usize>)> = Vec::new();
+        for (index, found) in find.matches.iter().enumerate() {
+            let FindTarget::Markdown(key) = found.target else {
+                continue;
+            };
+            if painted.last().is_none_or(|(last, _, _)| *last != key) {
+                painted.push((key, Vec::new(), None));
+            }
+            if let Some((_, ranges, active)) = painted.last_mut() {
+                if Some(index) == find.active {
+                    *active = Some(ranges.len());
+                }
+                ranges.push(found.range.clone());
+            }
+        }
+        let previous = std::mem::take(&mut find.highlighted);
+        for (key, ranges, active) in painted {
+            let Some(markdown) = self.markdowns.get(&key) else {
+                continue;
+            };
+            find.highlighted.push(markdown.downgrade());
+            markdown.update(cx, |markdown, cx| {
+                if markdown.search_highlights() == ranges.as_slice() {
+                    markdown.set_active_search_highlight(active, cx);
+                } else {
+                    markdown.set_search_highlights(ranges, active, cx);
+                }
+            });
+        }
+        for markdown in previous {
+            let still_painted = find
+                .highlighted
+                .iter()
+                .any(|painted| painted.entity_id() == markdown.entity_id());
+            if !still_painted && let Some(markdown) = markdown.upgrade() {
+                markdown.update(cx, |markdown, cx| markdown.clear_search_highlights(cx));
+            }
+        }
+    }
+
+    /// Shows the current match, as t3code does: what holds it opens (a folded run, a plan's
+    /// card, the plan section) and it's scrolled to about 96 px below the top.
+    fn reveal_find_match(&mut self, cx: &mut Context<Self>) {
+        let Some(found) = self
+            .find
+            .as_ref()
+            .and_then(ThreadFind::active_match)
+            .cloned()
+        else {
+            return;
+        };
+        let entry = match found.target {
+            FindTarget::PlanItem(item) => {
+                self.plan_expanded = true;
+                if let Some(find) = &self.find {
+                    find.scroll_to_line.set(None);
+                    find.scroll_to_plan_item.set(Some(item));
+                }
+                cx.notify();
+                return;
+            }
+            FindTarget::Markdown((entry, _)) | FindTarget::Title { entry, .. } => entry,
+        };
+        self.open_run_for_find(entry, cx);
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry + 1,
+            offset_in_item: px(0.),
+        });
+        let view_height = self.list_state.viewport_bounds().size.height;
+        match found.target {
+            FindTarget::Markdown(key) => {
+                self.open_plan_for_find(entry, cx);
+                if let Some(find) = &self.find {
+                    find.scroll_to_line.set(None);
+                }
+                if let Some(markdown) = self.markdowns.get(&key) {
+                    markdown.update(cx, |markdown, cx| {
+                        markdown.request_autoscroll_to_source_index_at_top(
+                            found.range.start,
+                            MATCH_TOP_OFFSET,
+                            view_height,
+                            cx,
+                        )
+                    });
+                }
+            }
+            // The line asks for the scroll once it's laid out.
+            _ => {
+                if let Some(find) = &self.find {
+                    find.scroll_to_line.set(Some(view_height));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens the folded run, or the running turn's live line, that `entry` is in.
+    fn open_run_for_find(&mut self, entry: usize, cx: &mut Context<Self>) {
+        let run = match self.live_line(cx).filter(|line| line.run.contains(&entry)) {
+            Some(line) => Some(line.run),
+            None => self.folded_run(entry, cx),
+        };
+        if let Some(run) = run
+            && !self.opened_runs.contains(&run.start)
+        {
+            self.toggle_run(run, cx);
+        }
+    }
+
+    /// Opens the card of a plan the agent proposed, at `entry`.
+    fn open_plan_for_find(&mut self, entry: usize, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        let Some(Entry::ToolCall(tool_call)) = thread.entries().get(entry) else {
+            return;
+        };
+        if !is_plan(tool_call) || thread.permission_request(&tool_call.id).is_some() {
+            return;
+        }
+        if self.toggled_tool_calls.insert(tool_call.id.clone()) {
+            self.list_state.remeasure_items(entry + 1..entry + 2);
+        }
+    }
+
+    /// The line a tool call's row shows, when it has one of its own: subagents' and published
+    /// artifacts' cards, a delegated task's card, a hidden call and one whose card asks its
+    /// questions have none.
+    fn tool_call_line_of(
+        &self,
+        index: usize,
+        tool_call: &ToolCall,
+        cx: &App,
+    ) -> Option<ActionLabel> {
+        let needs_confirmation = self
+            .thread
+            .read(cx)
+            .permission_request(&tool_call.id)
+            .is_some();
+        if tool_calls::is_subagent(tool_call)
+            || self.is_asking_questions(tool_call, cx)
+            || (!needs_confirmation
+                && (self.delegated_subthreads.contains_key(&index)
+                    || tool_calls::published_artifact(tool_call).is_some()
+                    || tool_calls::is_hidden(tool_call)))
+        {
+            return None;
+        }
+        let tool_call = named_tool_call(tool_call, needs_confirmation);
+        let names_questions = tool_call
+            .answer
+            .as_ref()
+            .and_then(ToolAnswer::asked)
+            .is_some();
+        let (kind, sentence) = self.tool_call_kind(&tool_call, cx);
+        let action = tool_call_action(&tool_call, &kind, names_questions);
+        Some(self.tool_call_line(&tool_call, &kind, sentence.as_ref(), &action, cx))
+    }
+
+    /// Zed's thread search bar: a strip under the header with the query and its options, ‹ ›,
+    /// the count and ×, and why the query isn't a regular expression under them.
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let find = self.find.as_ref()?;
+        let colors = cx.theme().colors();
+        let query = find.input.read(cx).text().clone();
+        let has_matches = !find.matches.is_empty();
+        let is_invalid = find.error.is_some() || (!query.is_empty() && !has_matches);
+        let focus = find.input.focus_handle(cx);
+        // Zed's: a click puts the cursor in the query, and acts as the key would there.
+        let button = |id: &'static str,
+                      icon: IconName,
+                      tooltip: &'static str,
+                      action: &'static dyn gpui::Action,
+                      toggled: bool,
+                      enabled: bool| {
+            let focus_for_click = focus.clone();
+            let focus = focus.clone();
+            div().debug_selector(move || id.into()).child(
+                IconButton::new(id, icon)
+                    .shape(ui::IconButtonShape::Square)
+                    .toggle_state(toggled)
+                    .disabled(!enabled)
+                    .on_click(move |_, window, cx| {
+                        if !focus_for_click.is_focused(window) {
+                            window.focus(&focus_for_click, cx);
+                        }
+                        window.dispatch_action(action.boxed_clone(), cx);
+                    })
+                    .tooltip(move |_, cx| Tooltip::for_action_in(tooltip, action, &focus, cx)),
+            )
+        };
+        let options = find.options;
+        Some(
+            v_flex()
+                .debug_selector(|| "thread-find".into())
+                .key_context(FIND_KEY_CONTEXT)
+                .flex_none()
+                .w_full()
+                .p_1p5()
+                .bg(colors.panel_background)
+                .border_b_1()
+                .border_color(colors.border.opacity(0.6))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .min_h_8()
+                                .min_w_32()
+                                .flex_1()
+                                .px_1p5()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .rounded_md()
+                                .child(
+                                    div()
+                                        .debug_selector(|| "thread-find-query".into())
+                                        .px_1()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .when(is_invalid, |this| {
+                                            this.text_color(Color::Error.color(cx))
+                                        })
+                                        .child(find.input.clone()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_none()
+                                        .gap_1()
+                                        .child(button(
+                                            "thread-find-case",
+                                            IconName::CaseSensitive,
+                                            "Match Case Sensitivity",
+                                            &ToggleCaseSensitive,
+                                            options.case_sensitive,
+                                            true,
+                                        ))
+                                        .child(button(
+                                            "thread-find-word",
+                                            IconName::WholeWord,
+                                            "Match Whole Words",
+                                            &ToggleWholeWord,
+                                            options.whole_word,
+                                            true,
+                                        ))
+                                        .child(button(
+                                            "thread-find-regex",
+                                            IconName::Regex,
+                                            "Use Regular Expressions",
+                                            &ToggleRegex,
+                                            options.regex,
+                                            true,
+                                        )),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(button(
+                                    "thread-find-previous",
+                                    IconName::ChevronLeft,
+                                    "Previous Match",
+                                    &SelectPreviousThreadMatch,
+                                    false,
+                                    has_matches,
+                                ))
+                                .child(button(
+                                    "thread-find-next",
+                                    IconName::ChevronRight,
+                                    "Next Match",
+                                    &SelectNextThreadMatch,
+                                    false,
+                                    has_matches,
+                                ))
+                                .child(
+                                    div()
+                                        .debug_selector(|| "thread-find-count".into())
+                                        .ml_1()
+                                        .min_w(rems(2.5))
+                                        .child(
+                                            Label::new(find.count(&query))
+                                                .size(LabelSize::Small)
+                                                .when(!has_matches, |this| {
+                                                    this.color(Color::Muted)
+                                                }),
+                                        ),
+                                )
+                                .child(button(
+                                    "thread-find-close",
+                                    IconName::Close,
+                                    "Close Search",
+                                    &DismissThreadSearch,
+                                    false,
+                                    true,
+                                )),
+                        ),
+                )
+                .children(find.error.clone().map(|error| {
+                    div()
+                        .debug_selector(|| "thread-find-error".into())
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Agent commands matching a `/name` being typed at the start of the message.
@@ -2552,7 +3166,7 @@ impl AgentView {
         self.thread.update(cx, |thread, cx| thread.send(prompt, cx));
     }
 
-    fn stop(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn stop(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(query) = &self.mention_query {
             self.mention_dismissed_at = Some(query.at);
             self.mention_query = None;
@@ -2562,6 +3176,10 @@ impl AgentView {
         if !self.matching_commands(cx).is_empty() {
             self.command_menu_dismissed_for = Some(self.composer.read(cx).text().clone());
             cx.notify();
+            return;
+        }
+        // Zed's: Escape in the message editor closes the search before it stops the turn.
+        if self.close_find(window, cx) {
             return;
         }
         self.thread.update(cx, |thread, cx| thread.cancel(cx));
@@ -3952,11 +4570,13 @@ impl AgentView {
             })
             // A full-screen terminal hides the conversation and the composer.
             .when(!is_drawer_full_screen && !shows_new_thread_screen, |this| {
-                this.children(self.render_restore_notice(cx))
+                this.children(self.render_find_bar(cx))
+                    .children(self.render_restore_notice(cx))
                     .child(
                         // Only the rows in view are drawn, so long threads stay quick (Zed's list).
                         v_flex()
                             .id("agent-conversation")
+                            .debug_selector(|| "agent-conversation".into())
                             .flex_1()
                             .min_h_0()
                             // A link scrolled from under the mouse no longer shows its image.
@@ -6652,34 +7272,13 @@ impl AgentView {
         let is_running = tool_call.is_running();
         let denied = !is_running && tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
         let is_plan = is_plan(tool_call);
-        // Once answered, a row that asked questions names them, and an approved plan says so.
         let names_questions = tool_call
             .answer
             .as_ref()
             .and_then(ToolAnswer::asked)
             .is_some();
-        let is_approved_plan = is_plan
-            && !needs_confirmation
-            && !denied
-            && (tool_call.answer.is_some() || tool_call.mode_switch.is_some());
-        let renamed;
-        let tool_call = match tool_call.answer.as_ref().and_then(ToolAnswer::asked) {
-            Some(questions) => {
-                renamed = ToolCall {
-                    title: format!("Asked: {questions}"),
-                    ..tool_call.clone()
-                };
-                &renamed
-            }
-            None if is_approved_plan => {
-                renamed = ToolCall {
-                    title: "Approved the plan".to_string(),
-                    ..tool_call.clone()
-                };
-                &renamed
-            }
-            None => tool_call,
-        };
+        let named = named_tool_call(tool_call, needs_confirmation);
+        let tool_call = named.as_ref();
         let is_stopped =
             tool_call.stopped && !matches!(tool_call.status, acp::ToolCallStatus::Completed);
         let failed = did_fail(tool_call);
@@ -6833,7 +7432,14 @@ impl AgentView {
                         tool_call_icon(tool_call, &kind, &action, cx)
                     }),
             )
-            .child(self.render_tool_call_label(tool_call, &kind, sentence.as_ref(), &action, cx))
+            .child(self.render_tool_call_label(
+                Some(index),
+                tool_call,
+                &kind,
+                sentence.as_ref(),
+                &action,
+                cx,
+            ))
             .children(stat.map(|stat| div().flex_none().child(stat)))
             .when_some(result, |this, result| {
                 let element = div()
@@ -8279,7 +8885,7 @@ impl AgentView {
                     .justify_center()
                     .child(tool_call_icon(step, &kind, &action, cx)),
             )
-            .child(self.render_tool_call_label(step, &kind, sentence.as_ref(), &action, cx))
+            .child(self.render_tool_call_label(None, step, &kind, sentence.as_ref(), &action, cx))
             .when(is_running, |this| {
                 this.child(
                     Icon::new(IconName::LoadCircle)
@@ -8500,16 +9106,17 @@ impl AgentView {
     /// roundTotal in src", `tool_calls::AgentAction`); agentZ's own tools as what they did
     /// ("Started a subthread:" and its title), a ToolSearch as the tools it loaded, another MCP
     /// tool in words with what it acted on and its server; otherwise the agent's own title.
-    /// Paths in the thread's folder read relative to it.
+    /// Paths in the thread's folder read relative to it. Find's matches in the line of the
+    /// conversation's `entry` are painted in it.
     fn render_tool_call_label(
         &self,
+        entry: Option<usize>,
         tool_call: &ToolCall,
         kind: &ToolCallKind,
         sentence: Option<&Sentence>,
         action: &AgentAction,
         cx: &App,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
         // One dim gray for the whole row, so rows read apart from the agent's messages; the
         // command keeps the code font.
         let label = h_flex()
@@ -8518,128 +9125,169 @@ impl AgentView {
             .gap_1()
             .text_size(rems_from_px(13_f32))
             .text_color(work_row_color(cx));
-        let dim = |text: String| {
-            div()
-                .flex_none()
-                .text_size(rems_from_px(12_f32))
-                .text_color(colors.text_placeholder)
-                .child(text)
+        let line = self.tool_call_line(tool_call, kind, sentence, action, cx);
+        let find = entry.and(self.find.as_ref());
+        let found = |piece: usize| match (entry, find) {
+            (Some(entry), Some(find)) => find.found_in(&FindTarget::Title { entry, piece }),
+            _ => Vec::new(),
         };
-        let state = CallState::of_call(tool_call);
-        let folder = self.store.read(cx).thread_folder(self.thread_id);
-        match (kind, sentence) {
-            (ToolCallKind::Own { .. }, Some(sentence)) => {
-                let Some(subject) = &sentence.subject else {
-                    return label
-                        .child(div().min_w_0().truncate().child(sentence.verb.clone()))
-                        .into_any_element();
-                };
-                let subject_element = |subject: &tool_calls::Subject| {
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .map(|this| match subject.style {
-                            SubjectStyle::Title => this.text_color(colors.text_muted),
-                            SubjectStyle::Code => {
-                                this.font_buffer(cx).text_size(rems_from_px(12_f32))
-                            }
-                            SubjectStyle::Plain => this,
-                        })
-                        .child(one_line(&subject.text))
-                };
-                label
-                    .child(div().flex_none().child(sentence.verb.clone()))
-                    .child(subject_element(subject))
-                    .when_some(sentence.object.as_ref(), |this, (joint, object)| {
-                        this.child(div().flex_none().child(joint.clone()))
-                            .child(subject_element(object))
-                    })
-                    .into_any_element()
-            }
-            (ToolCallKind::ToolSearch(search), _) => label
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(one_line(&search.label(state))),
+        // The line of the current match scrolls it into place once it's laid out.
+        let scroll = find
+            .filter(|find| {
+                find.active_match().is_some_and(|found| {
+                    matches!(found.target, FindTarget::Title { entry: matched, .. }
+                        if Some(matched) == entry)
+                })
+            })
+            .map(|find| find.scroll_to_line.clone());
+        let label = match scroll {
+            Some(scroll) => label.relative().child(
+                canvas(
+                    move |bounds, window, _| {
+                        if let Some(view_height) = scroll.take() {
+                            window.request_autoscroll(scroll_bounds_at_top(
+                                bounds.origin,
+                                view_height,
+                            ));
+                        }
+                    },
+                    |_, _, _, _| {},
                 )
-                .children(search.server().map(dim))
-                .into_any_element(),
-            (ToolCallKind::Mcp(name), _) => {
-                let subject = tool_calls::mcp_subject(tool_call);
-                label
-                    .child(
-                        div()
-                            .min_w_0()
-                            .when(subject.is_some(), |this| this.flex_none())
-                            .truncate()
-                            .child(name.words()),
-                    )
-                    .children(subject.map(|subject| {
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(colors.text_muted)
-                            .child(one_line(&subject))
-                    }))
-                    .child(dim(name.server.clone()))
-                    .into_any_element()
-            }
-            _ => {
-                if let Some(action_label) = action.label(tool_call, state, folder.as_deref()) {
-                    return render_action_label(label, action_label, cx);
-                }
-                let folder = folder.map(|folder| format!("{}/", folder.display()));
-                let relative = |text: &str| -> String {
-                    match &folder {
-                        Some(folder) => text.replace(folder.as_str(), ""),
-                        None => text.to_string(),
-                    }
-                };
-                let denied = tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
-                let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
-                    let verb = if tool_call.is_running() {
-                        "Running"
-                    } else if denied {
-                        "Run"
-                    } else {
-                        "Ran"
-                    };
-                    (Some(verb), Some(command_text(tool_call)))
-                } else if let [diff] = tool_call.diffs.as_slice() {
-                    (
-                        Some(if denied { "Edit" } else { "Edited" }),
-                        Some(relative(&diff.path.display().to_string())),
-                    )
-                } else if tool_call.diffs.len() > 1 {
-                    (
-                        None,
-                        Some(format!(
-                            "{} {} files",
-                            if denied { "Edit" } else { "Edited" },
-                            tool_call.diffs.len()
-                        )),
-                    )
-                } else {
-                    (None, Some(relative(&tool_call.title)))
-                };
-                let subject = one_line(&subject.unwrap_or_default());
-                label
-                    .children(verb.map(|verb| div().flex_none().child(verb)))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .when(verb.is_some(), |this| {
-                                this.font_buffer(cx).text_size(rems_from_px(12_f32))
-                            })
-                            .child(subject),
-                    )
-                    .into_any_element()
-            }
-        }
+                .absolute()
+                .size_full(),
+            ),
+            None => label,
+        };
+        render_action_label(label, line, &found, cx)
     }
 
+    /// The words of a tool call's line, as [`Self::render_tool_call_label`] draws them and find
+    /// searches them, each in the text it shows.
+    fn tool_call_line(
+        &self,
+        tool_call: &ToolCall,
+        kind: &ToolCallKind,
+        sentence: Option<&Sentence>,
+        action: &AgentAction,
+        cx: &App,
+    ) -> ActionLabel {
+        let state = CallState::of_call(tool_call);
+        let folder = self.store.read(cx).thread_folder(self.thread_id);
+        let line = match (kind, sentence) {
+            (ToolCallKind::Own { .. }, Some(sentence)) => {
+                let Some(subject) = &sentence.subject else {
+                    return ActionLabel {
+                        parts: vec![LabelPart::Name(one_line(&sentence.verb))],
+                        detail: None,
+                    };
+                };
+                let subject_part = |subject: &tool_calls::Subject| {
+                    let text = one_line(&subject.text);
+                    match subject.style {
+                        SubjectStyle::Title => LabelPart::Title(text),
+                        SubjectStyle::Code => LabelPart::Code(text),
+                        SubjectStyle::Plain => LabelPart::Name(text),
+                    }
+                };
+                let mut parts = vec![
+                    LabelPart::Words(sentence.verb.to_string()),
+                    subject_part(subject),
+                ];
+                if let Some((joint, object)) = &sentence.object {
+                    parts.push(LabelPart::Words(joint.to_string()));
+                    parts.push(subject_part(object));
+                }
+                ActionLabel {
+                    parts,
+                    detail: None,
+                }
+            }
+            (ToolCallKind::ToolSearch(search), _) => ActionLabel {
+                parts: vec![LabelPart::Name(one_line(&search.label(state)))],
+                detail: search.server(),
+            },
+            (ToolCallKind::Mcp(name), _) => {
+                let subject = tool_calls::mcp_subject(tool_call);
+                let words = one_line(&name.words());
+                let mut parts = vec![match subject {
+                    // Its words keep their width beside what it acted on.
+                    Some(_) => LabelPart::Words(words),
+                    None => LabelPart::Name(words),
+                }];
+                parts.extend(subject.map(|subject| LabelPart::Title(one_line(&subject))));
+                ActionLabel {
+                    parts,
+                    detail: Some(name.server.clone()),
+                }
+            }
+            _ => match action.label(tool_call, state, folder.as_deref()) {
+                Some(action_label) => action_label,
+                None => {
+                    let folder = folder.map(|folder| format!("{}/", folder.display()));
+                    let relative = |text: &str| -> String {
+                        match &folder {
+                            Some(folder) => text.replace(folder.as_str(), ""),
+                            None => text.to_string(),
+                        }
+                    };
+                    let denied = tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
+                    let (verb, subject) = if matches!(tool_call.kind, acp::ToolKind::Execute) {
+                        let verb = if tool_call.is_running() {
+                            "Running"
+                        } else if denied {
+                            "Run"
+                        } else {
+                            "Ran"
+                        };
+                        (Some(verb), Some(command_text(tool_call)))
+                    } else if let [diff] = tool_call.diffs.as_slice() {
+                        (
+                            Some(if denied { "Edit" } else { "Edited" }),
+                            Some(relative(&diff.path.display().to_string())),
+                        )
+                    } else if tool_call.diffs.len() > 1 {
+                        (
+                            None,
+                            Some(format!(
+                                "{} {} files",
+                                if denied { "Edit" } else { "Edited" },
+                                tool_call.diffs.len()
+                            )),
+                        )
+                    } else {
+                        (None, Some(relative(&tool_call.title)))
+                    };
+                    let subject = one_line(&subject.unwrap_or_default());
+                    let mut parts: Vec<LabelPart> = verb
+                        .map(|verb| LabelPart::Words(verb.to_string()))
+                        .into_iter()
+                        .collect();
+                    parts.push(match verb {
+                        Some(_) => LabelPart::Code(subject),
+                        None => LabelPart::Name(subject),
+                    });
+                    ActionLabel {
+                        parts,
+                        detail: None,
+                    }
+                }
+            },
+        };
+        // As drawn: names, paths and titles on one line.
+        ActionLabel {
+            parts: line
+                .parts
+                .into_iter()
+                .map(|part| match part {
+                    LabelPart::Name(text) => LabelPart::Name(one_line(&text)),
+                    LabelPart::Code(text) => LabelPart::Code(one_line(&text)),
+                    LabelPart::Title(text) => LabelPart::Title(one_line(&text)),
+                    part => part,
+                })
+                .collect(),
+            detail: line.detail,
+        }
+    }
     /// A permission request's choices. In a card, a line above them sets them off from what's
     /// over them (`bordered`).
     fn render_permission_buttons(
@@ -8881,6 +9529,7 @@ impl AgentView {
                                 )
                             })
                             .child(self.render_tool_call_label(
+                                None,
                                 &tool_call,
                                 &kind,
                                 sentence.as_ref(),
@@ -9800,7 +10449,13 @@ impl AgentView {
             v_flex()
                 .child(summary)
                 .when(plan_expanded, |this| {
-                    this.child(render_plan_entries(&plan, window, cx))
+                    let find = self.find.as_ref();
+                    let found = |index: usize| {
+                        find.map(|find| find.found_in(&FindTarget::PlanItem(index)))
+                            .unwrap_or_default()
+                    };
+                    let scroll_to = find.and_then(|find| find.scroll_to_plan_item.take());
+                    this.child(render_plan_entries(&plan, &found, scroll_to, window, cx))
                 })
                 .into_any_element(),
         )
@@ -13562,7 +14217,24 @@ fn chip_content(icon: Icon, label: SharedString) -> Div {
         )
 }
 
-fn render_plan_entries(plan: &[PlanItem], window: &mut Window, cx: &mut App) -> AnyElement {
+/// The plan section's steps. `found` gives find's matches in each, and the one to
+/// `scroll_to` is scrolled into view.
+fn render_plan_entries(
+    plan: &[PlanItem],
+    found: &dyn Fn(usize) -> Vec<(Range<usize>, bool)>,
+    scroll_to: Option<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    if let Some(index) = scroll_to {
+        // The handle `with_scrollbar` keeps for these steps.
+        window
+            .use_keyed_state(ElementId::Name("plan-entries-scroll".into()), cx, |_, _| {
+                ScrollHandle::new()
+            })
+            .read(cx)
+            .scroll_to_item(index);
+    }
     let colors = cx.theme().colors();
     let entry_bg = colors.editor_background;
     let count = plan.len();
@@ -13609,7 +14281,7 @@ fn render_plan_entries(plan: &[PlanItem], window: &mut Window, cx: &mut App) -> 
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .child(content.clone()),
+                                .child(found_text(content.clone(), found(index), cx)),
                         ),
                 )
                 .tooltip(Tooltip::element(move |_, _| {
@@ -13761,6 +14433,27 @@ impl Render for AgentView {
             .on_action(cx.listener(|this, _: &RejectOnce, _, cx| {
                 this.answer_first_request(acp::PermissionOptionKind::RejectOnce, cx)
             }))
+            .on_action(cx.listener(Self::find_in_thread))
+            .when(self.find.is_some(), |this| {
+                this.on_action(cx.listener(Self::dismiss_thread_search))
+                    .on_action(cx.listener(Self::select_next_thread_match))
+                    .on_action(cx.listener(Self::select_previous_thread_match))
+                    .on_action(cx.listener(|this, _: &ToggleCaseSensitive, _, cx| {
+                        this.toggle_find_option(
+                            |options| options.case_sensitive = !options.case_sensitive,
+                            cx,
+                        )
+                    }))
+                    .on_action(cx.listener(|this, _: &ToggleWholeWord, _, cx| {
+                        this.toggle_find_option(
+                            |options| options.whole_word = !options.whole_word,
+                            cx,
+                        )
+                    }))
+                    .on_action(cx.listener(|this, _: &ToggleRegex, _, cx| {
+                        this.toggle_find_option(|options| options.regex = !options.regex, cx)
+                    }))
+            })
             .size_full()
             .bg(panel_background)
             .when(!self.is_in_pane, |this| {
@@ -14608,45 +15301,59 @@ fn command_text(tool_call: &ToolCall) -> String {
 
 /// A row's words from `tool_calls::ActionLabel`: words that never shrink, names cut short
 /// with "…", paths and patterns in the code font, links that open in the browser, and dim
-/// words after them.
-fn render_action_label(label: Div, action_label: ActionLabel, cx: &App) -> AnyElement {
+/// words after them. `found` gives find's matches in each piece, by its place in the line.
+fn render_action_label(
+    label: Div,
+    action_label: ActionLabel,
+    found: &dyn Fn(usize) -> Vec<(Range<usize>, bool)>,
+    cx: &App,
+) -> AnyElement {
     let colors = cx.theme().colors();
-    let parts = action_label.parts.into_iter().map(|part| match part {
-        LabelPart::Words(text) => div().flex_none().child(text).into_any_element(),
-        LabelPart::Name(text) => div()
-            .min_w_0()
-            .truncate()
-            .child(one_line(&text))
-            .into_any_element(),
-        LabelPart::Code(text) => div()
-            .min_w_0()
-            .truncate()
-            .font_buffer(cx)
-            .text_size(rems_from_px(12_f32))
-            .child(one_line(&text))
-            .into_any_element(),
-        LabelPart::Title(text) => div()
-            .min_w_0()
-            .truncate()
-            .text_color(colors.text_muted)
-            .child(one_line(&text))
-            .into_any_element(),
-        LabelPart::Link { text, url } => div()
-            .id(ElementId::Name(format!("tool-call-link-{url}").into()))
-            .debug_selector(|| "tool-call-link".into())
-            .min_w_0()
-            .truncate()
-            .text_color(colors.text_accent)
-            .cursor_pointer()
-            .hover(|style| style.underline())
-            .child(text)
-            .on_click(move |_, _, cx| {
-                // The row behind it opens and closes on a click.
-                cx.stop_propagation();
-                cx.open_url(&url);
-            })
-            .into_any_element(),
-    });
+    let piece_count = action_label.parts.len();
+    let parts = action_label
+        .parts
+        .into_iter()
+        .enumerate()
+        .map(|(piece, part)| match part {
+            LabelPart::Words(text) => div()
+                .flex_none()
+                .child(found_text(text, found(piece), cx))
+                .into_any_element(),
+            LabelPart::Name(text) => div()
+                .min_w_0()
+                .truncate()
+                .child(found_text(one_line(&text), found(piece), cx))
+                .into_any_element(),
+            LabelPart::Code(text) => div()
+                .min_w_0()
+                .truncate()
+                .font_buffer(cx)
+                .text_size(rems_from_px(12_f32))
+                .child(found_text(one_line(&text), found(piece), cx))
+                .into_any_element(),
+            LabelPart::Title(text) => div()
+                .min_w_0()
+                .truncate()
+                .text_color(colors.text_muted)
+                .child(found_text(one_line(&text), found(piece), cx))
+                .into_any_element(),
+            LabelPart::Link { text, url } => div()
+                .id(ElementId::Name(format!("tool-call-link-{url}").into()))
+                .debug_selector(|| "tool-call-link".into())
+                .min_w_0()
+                .truncate()
+                .text_color(colors.text_accent)
+                .cursor_pointer()
+                .hover(|style| style.underline())
+                .child(found_text(text, found(piece), cx))
+                .on_click(move |_, _, cx| {
+                    // The row behind it opens and closes on a click.
+                    cx.stop_propagation();
+                    cx.open_url(&url);
+                })
+                .into_any_element(),
+        })
+        .collect::<Vec<_>>();
     label
         .children(parts)
         .children(action_label.detail.map(|detail| {
@@ -14654,11 +15361,87 @@ fn render_action_label(label: Div, action_label: ActionLabel, cx: &App) -> AnyEl
                 .flex_none()
                 .text_size(rems_from_px(12_f32))
                 .text_color(colors.text_placeholder)
-                .child(detail)
+                .child(found_text(detail, found(piece_count), cx))
         }))
         .into_any_element()
 }
 
+/// The text of each piece of a tool call's line as it's drawn, its parts and then the dim
+/// words after them, for find.
+fn line_pieces(line: &ActionLabel) -> Vec<String> {
+    line.parts
+        .iter()
+        .map(|part| match part {
+            LabelPart::Words(text) | LabelPart::Link { text, .. } => text.clone(),
+            LabelPart::Name(text) | LabelPart::Code(text) | LabelPart::Title(text) => {
+                one_line(text)
+            }
+        })
+        .chain(line.detail.clone())
+        .collect()
+}
+
+/// Text with find's matches in it in the theme's search color, the current one in its active
+/// color, as Zed paints them.
+fn found_text(
+    text: impl Into<SharedString>,
+    found: Vec<(Range<usize>, bool)>,
+    cx: &App,
+) -> AnyElement {
+    let text = text.into();
+    if found.is_empty() {
+        return text.into_any_element();
+    }
+    let colors = cx.theme().colors();
+    StyledText::new(text)
+        .with_highlights(found.into_iter().map(|(range, is_active)| {
+            let color = if is_active {
+                colors.search_active_match_background
+            } else {
+                colors.search_match_background
+            };
+            (
+                range,
+                HighlightStyle {
+                    background_color: Some(color),
+                    ..Default::default()
+                },
+            )
+        }))
+        .into_any_element()
+}
+
+/// Bounds for a list's autoscroll that leave `position` `MATCH_TOP_OFFSET` below the top of
+/// its view, which is `view_height` tall: the list scrolls the least that brings them into
+/// view, so bounds as tall as the view put their top at its top.
+fn scroll_bounds_at_top(position: Point<Pixels>, view_height: Pixels) -> Bounds<Pixels> {
+    Bounds::from_corners(
+        point(position.x, position.y - MATCH_TOP_OFFSET),
+        point(position.x, position.y - MATCH_TOP_OFFSET + view_height),
+    )
+}
+
+/// The tool call as its row names it: once answered, one that asked questions names them
+/// ("Asked: Approach"), and an approved plan says so.
+fn named_tool_call(tool_call: &ToolCall, needs_confirmation: bool) -> Cow<'_, ToolCall> {
+    let denied =
+        !tool_call.is_running() && tool_call.answer.as_ref().is_some_and(ToolAnswer::is_denied);
+    let is_approved_plan = is_plan(tool_call)
+        && !needs_confirmation
+        && !denied
+        && (tool_call.answer.is_some() || tool_call.mode_switch.is_some());
+    match tool_call.answer.as_ref().and_then(ToolAnswer::asked) {
+        Some(questions) => Cow::Owned(ToolCall {
+            title: format!("Asked: {questions}"),
+            ..tool_call.clone()
+        }),
+        None if is_approved_plan => Cow::Owned(ToolCall {
+            title: "Approved the plan".to_string(),
+            ..tool_call.clone()
+        }),
+        None => Cow::Borrowed(tool_call),
+    }
+}
 /// The line under an approved plan's row marking the change of mode it made: "Plan →
 /// Default".
 fn render_mode_switch(index: usize, switch: &ModeSwitch, cx: &App) -> AnyElement {
@@ -21675,6 +22458,248 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert!(cx.debug_bounds("plan-entry-tooltip-0").is_some());
+    }
+
+    fn find_state(
+        view: &Entity<AgentView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<(usize, Option<usize>)> {
+        view.read_with(cx, |view, _| {
+            view.find
+                .as_ref()
+                .map(|find| (find.matches.len(), find.active))
+        })
+    }
+
+    fn active_target(view: &Entity<AgentView>, cx: &mut VisualTestContext) -> Option<FindTarget> {
+        view.read_with(cx, |view, _| {
+            view.find
+                .as_ref()
+                .and_then(ThreadFind::active_match)
+                .map(|found| found.target.clone())
+        })
+    }
+
+    fn focus_composer(view: &Entity<AgentView>, cx: &mut VisualTestContext) {
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+    }
+
+    fn composer_is_focused(view: &Entity<AgentView>, cx: &mut VisualTestContext) -> bool {
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, _| focus.is_focused(window))
+    }
+
+    /// Zed's thread search with t3code's keys: ⌘F opens it, matches are found in the messages
+    /// and the tool calls' lines as they show, Enter and ⇧Enter go between them (opening the
+    /// folded run that has one), and Esc closes it, back to the composer.
+    #[gpui::test]
+    fn find_goes_through_the_conversations_matches(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Fix the checkout page".into()),
+                    work("npm test checkout", acp::ToolKind::Execute, None),
+                    work("npm run build", acp::ToolKind::Execute, None),
+                    Entry::AgentMessage("The **checkout** total was wrong.".into()),
+                    // The link's address doesn't show.
+                    Entry::AgentMessage("See [the docs](https://example.com/checkout).".into()),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("work-run-1").is_some());
+        assert!(cx.debug_bounds("tool-call-row-1").is_none());
+
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thread-find").is_some());
+        assert!(!composer_is_focused(&view, cx));
+        cx.simulate_input("checkout");
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), Some((3, Some(0))));
+        assert_eq!(active_target(&view, cx), Some(FindTarget::Markdown((0, 0))));
+        // The message's match is painted, the current one too.
+        let highlights = |key: MarkdownKey, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| {
+                view.markdowns
+                    .get(&key)
+                    .map(|markdown| markdown.read(cx).search_highlights().to_vec())
+                    .unwrap_or_default()
+            })
+        };
+        assert_eq!(highlights((0, 0), cx), [8..16]);
+        assert_eq!(highlights((3, 0), cx), [6..14]);
+        assert!(highlights((4, 0), cx).is_empty());
+
+        // The next is in the folded run's command, which opens.
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            active_target(&view, cx),
+            Some(FindTarget::Title { entry: 1, piece: 1 })
+        );
+        assert!(cx.debug_bounds("tool-call-row-1").is_some());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(find_state(&view, cx), Some((3, Some(2))));
+        // It wraps around, both ways.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(find_state(&view, cx), Some((3, Some(0))));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(find_state(&view, cx), Some((3, Some(2))));
+
+        // What streams in is searched too, the current match staying current.
+        thread.update(cx, |thread, cx| {
+            thread.push_entry_for_test(Entry::AgentMessage("Checkout works now.".into()), cx)
+        });
+        cx.executor().advance_clock(RESCAN_DELAY);
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), Some((4, Some(2))));
+
+        // From the composer, ⌘G goes on.
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes(crate::platform_keys("cmd-g", "f3"));
+        assert_eq!(find_state(&view, cx), Some((4, Some(3))));
+        // ⌘F again puts the cursor back in the query, selected, to type over.
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.simulate_input("total");
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), Some((1, Some(0))));
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), None);
+        assert!(cx.debug_bounds("thread-find").is_none());
+        assert!(composer_is_focused(&view, cx));
+        assert!(highlights((3, 0), cx).is_empty());
+    }
+
+    /// Zed's options, from their buttons or keys, and an invalid expression saying why.
+    #[gpui::test]
+    fn finds_options_change_the_matches(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Checkout the checkouts".into()),
+                    Entry::AgentMessage("Done.".into()),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.simulate_input("checkout");
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), Some((2, Some(0))));
+        click_on("thread-find-case", cx);
+        assert_eq!(find_state(&view, cx), Some((1, Some(0))));
+        cx.simulate_keystrokes(crate::platform_keys("alt-cmd-c", "alt-c"));
+        cx.simulate_keystrokes(crate::platform_keys("alt-cmd-w", "alt-w"));
+        assert_eq!(find_state(&view, cx), Some((1, Some(0))));
+        click_on("thread-find-word", cx);
+        click_on("thread-find-regex", cx);
+        view.update(cx, |view, cx| {
+            if let Some(find) = &view.find {
+                find.input
+                    .update(cx, |input, cx| input.set_text("check(", cx));
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), Some((0, None)));
+        assert!(cx.debug_bounds("thread-find-error").is_some());
+    }
+
+    /// Escape in the composer closes find before it would stop the turn, as in Zed.
+    #[gpui::test]
+    fn escape_in_the_composer_closes_find_first(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Hello".into())], cx);
+        });
+        cx.run_until_parked();
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.run_until_parked();
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(find_state(&view, cx), None);
+        assert!(composer_is_focused(&view, cx));
+    }
+
+    /// t3code's: going to a match far up scrolls it into view, in a message or a folded run's
+    /// line, and one in the plan section opens it.
+    #[gpui::test]
+    fn find_shows_matches_out_of_view_and_in_the_plan(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let mut entries = vec![
+            Entry::UserMessage("Start".into()),
+            Entry::AgentMessage("The needle is here.".into()),
+            work("cargo test haystack", acp::ToolKind::Execute, None),
+        ];
+        entries.extend((0..300).map(|index| Entry::AgentMessage(format!("Message {index}"))));
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(entries, cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.plan = vec![
+                        PlanItem {
+                            content: "Stage 1".into(),
+                            status: acp::PlanEntryStatus::Completed,
+                        },
+                        PlanItem {
+                            content: "Thread a needle".into(),
+                            status: acp::PlanEntryStatus::Pending,
+                        },
+                    ]
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("conversation-row-2").is_none());
+        assert!(cx.debug_bounds("plan-entry-1").is_none());
+
+        focus_composer(&view, cx);
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        assert_eq!(active_target(&view, cx), Some(FindTarget::Markdown((1, 0))));
+        let conversation = cx
+            .debug_bounds("agent-conversation")
+            .expect("the conversation");
+        let row = cx
+            .debug_bounds("conversation-row-2")
+            .expect("the match's row");
+        assert!(row.top() >= conversation.top());
+        assert!(row.top() < conversation.top() + MATCH_TOP_OFFSET + px(40.));
+        assert!(cx.debug_bounds("conversation-row-303").is_none());
+
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(active_target(&view, cx), Some(FindTarget::PlanItem(1)));
+        assert!(cx.debug_bounds("plan-entry-1").is_some());
+
+        cx.simulate_keystrokes("escape");
+        cx.simulate_keystrokes(crate::platform_keys("cmd-f", "ctrl-f"));
+        cx.simulate_input("haystack");
+        cx.run_until_parked();
+        assert_eq!(
+            active_target(&view, cx),
+            Some(FindTarget::Title { entry: 2, piece: 1 })
+        );
+        let line = cx.debug_bounds("tool-call-row-2").expect("the run's line");
+        assert!(line.top() >= conversation.top());
+        assert!(line.bottom() <= conversation.bottom());
     }
 
     /// Claude Agent's two questions, as it asks them for JetBrains AIR.

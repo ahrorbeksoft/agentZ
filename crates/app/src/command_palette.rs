@@ -17,6 +17,13 @@ const KEY_CONTEXT: &str = "CommandPalette";
 /// their own.
 const HIDDEN_NAMESPACES: &[&str] = &["menu", "text_input"];
 
+/// t3code's search terms: words that find a command besides its name, as "messages" finds
+/// t3code's "Find in current thread".
+const SEARCH_TERMS: &[(&str, &[&str])] = &[(
+    "agent::FindInThread",
+    &["find", "search", "messages", "plans"],
+)];
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("up", menu::SelectPrevious, Some(KEY_CONTEXT)),
@@ -29,6 +36,7 @@ pub fn init(cx: &mut App) {
 struct Command {
     name: SharedString,
     action: Box<dyn Action>,
+    search_terms: &'static [&'static str],
 }
 
 pub struct CommandPalette {
@@ -63,6 +71,7 @@ impl CommandPalette {
             })
             .map(|action| Command {
                 name: humanize_action_name(action.name()).into(),
+                search_terms: search_terms(action.name()),
                 action,
             })
             .collect();
@@ -93,7 +102,7 @@ impl CommandPalette {
             .iter()
             .enumerate()
             .filter_map(|(index, command)| {
-                match_name(&query, &command.name).map(|positions| (index, positions))
+                match_command(&query, command).map(|positions| (index, positions))
             })
             .collect();
         self.selected_index = self
@@ -230,6 +239,26 @@ impl Render for CommandPalette {
     }
 }
 
+fn search_terms(action_name: &str) -> &'static [&'static str] {
+    SEARCH_TERMS
+        .iter()
+        .find(|(name, _)| *name == action_name)
+        .map(|(_, terms)| *terms)
+        .unwrap_or_default()
+}
+
+/// Where `query` (lowercase) matches the command's name, or, matching none of it, nowhere in
+/// the name when one of its search terms holds the query.
+fn match_command(query: &str, command: &Command) -> Option<Vec<usize>> {
+    match_name(query, &command.name).or_else(|| {
+        command
+            .search_terms
+            .iter()
+            .any(|term| term.contains(query))
+            .then(Vec::new)
+    })
+}
+
 /// Where `query` (lowercase) matches `name`: as a whole where it appears, so "split right"
 /// lights up there rather than letter by letter from the namespace on, or else in order.
 fn match_name(query: &str, name: &str) -> Option<Vec<usize>> {
@@ -329,7 +358,7 @@ fn humanize_action_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{humanize_action_name, match_name, normalize_action_query};
+    use super::{Command, humanize_action_name, match_command, match_name, normalize_action_query};
 
     #[test]
     fn a_query_lights_up_where_it_appears_whole() {
@@ -337,6 +366,24 @@ mod tests {
         assert_eq!(match_name("split", name), Some(vec![12, 13, 14, 15, 16]));
         assert_eq!(match_name("wsr", name), Some(vec![0, 4, 18]));
         assert_eq!(match_name("diff", name), None);
+    }
+
+    #[test]
+    fn a_command_is_found_by_its_search_terms_too() {
+        let command = |name: &str| Command {
+            name: humanize_action_name(name).into(),
+            action: Box::new(menu::Confirm),
+            search_terms: super::search_terms(name),
+        };
+        let find = command("agent::FindInThread");
+        assert_eq!(find.name.as_ref(), "agent: find in thread");
+        assert_eq!(match_command("messages", &find), Some(Vec::new()));
+        assert_eq!(match_command("plan", &find), Some(Vec::new()));
+        assert!(match_command("find", &find).is_some_and(|positions| !positions.is_empty()));
+        assert_eq!(
+            match_command("messages", &command("agentz::NewThread")),
+            None
+        );
     }
 
     #[test]

@@ -12,7 +12,11 @@ use gpui::{
 use text_input::{TextInput, TextInputEvent};
 use ui::{WithScrollbar as _, prelude::*};
 
-use crate::agent_view::{self, AcceptSlashCommand, DecreaseEffort, IncreaseEffort};
+use crate::agent_view::{
+    self, AcceptSlashCommand, DecreaseEffort, DismissThreadSearch, FindInThread, IncreaseEffort,
+    SelectNextThreadMatch, SelectPreviousThreadMatch, ToggleCaseSensitive, ToggleRegex,
+    ToggleWholeWord,
+};
 use crate::spaces_view::{
     self, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivateTab,
     ClosePane, NewTab, NewWorkspace, NextTab, PreviousTab, SplitDown, SplitRight, ToggleZoom,
@@ -158,6 +162,20 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
                 entry("Complete Slash Command", &AcceptSlashCommand),
                 entry("Increase Effort", &IncreaseEffort),
                 entry("Decrease Effort", &DecreaseEffort),
+                entry("Find in Thread", &FindInThread),
+            ],
+        ));
+    }
+    if has(agent_view::FIND_KEY_CONTEXT) {
+        groups.push((
+            "Find in Thread",
+            vec![
+                entry("Select Next Match", &SelectNextThreadMatch),
+                entry("Select Previous Match", &SelectPreviousThreadMatch),
+                entry("Match Case Sensitivity", &ToggleCaseSensitive),
+                entry("Match Whole Words", &ToggleWholeWord),
+                entry("Use Regular Expressions", &ToggleRegex),
+                entry("Close Search", &DismissThreadSearch),
             ],
         ));
     }
@@ -465,7 +483,7 @@ mod tests {
             init(cx);
             agent_view::init(cx);
         });
-        let in_thread = stack(&["Shell", "AgentComposer", "TextInput"]);
+        let in_thread = stack(&["Shell", "AgentThread", "AgentComposer", "TextInput"]);
         let (sheet, cx) =
             cx.add_window_view(|window, cx| ShortcutSheet::new(in_thread, window, cx));
         assert_eq!(titles(&sheet, cx), ["Thread", "General"]);
@@ -473,8 +491,19 @@ mod tests {
         assert!(all.contains(&"Send Message"));
         assert!(all.contains(&"Increase Effort"));
         assert!(all.contains(&"Decrease Effort"));
+        assert!(all.contains(&"Find in Thread"));
         assert!(all.contains(&"Toggle Changes"));
         assert!(!all.contains(&"Split Right"));
+
+        // In the find bar, its own keys.
+        let in_find = stack(&["Shell", "AgentThread", "AgentThreadFind", "TextInput"]);
+        let find_titles: Vec<&str> = cx.update(|_, cx| {
+            shortcut_groups(&in_find, cx)
+                .iter()
+                .map(|group| group.title)
+                .collect()
+        });
+        assert_eq!(find_titles, ["Find in Thread", "General"]);
     }
 
     /// Cmd-W closes a terminal thread; a thread's drawer terminal has no such key.

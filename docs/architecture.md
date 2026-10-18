@@ -104,7 +104,10 @@ for no more, animated images hold the frame they show, and the rows and tabs tha
 for a dragged one (`SlideDrag::offset`) are in their places at once. Any new motion the app
 draws itself should check `App::reduce_motion` too.
 `markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way,
-and `MarkdownStyle::link_chip` draws chosen links as chips (see Images). `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
+and `MarkdownStyle::link_chip` draws chosen links as chips (see Images).
+`Markdown::request_autoscroll_to_source_index_at_top` scrolls the list holding a markdown so a
+place in it sits a given distance below the view's top (see Find in a thread), where Zed's
+autoscroll only brings it into view. `gpui`'s scrolling `div` also takes a scroll while it moves along the scroll's axis, and passes it
 on only at its end, as Zed's editor does; in Zed both it and the list around it scroll at once,
 so an open tool call's output raced the conversation.
 `gpui` has Zed's hot reloading through Dioxus's Subsecond (zed-industries/zed#65738): in a
@@ -680,6 +683,29 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   mouse. A gutter narrower than 48 pixels shows the rail only under the mouse, one too narrow
   for the buttons leaves them out, and one with no room hides it. The rail is drawn again once
   the rows laid out after a jump put other turns in view.
+- **Find in a thread** (`thread_find.rs`, `AgentView::{find_in_thread, search_thread,
+  reveal_find_match, render_find_bar}`; Zed's thread search with t3code's keys, picked in
+  `design/thread-search/`): ⌘F (Ctrl-F on Linux; a focused terminal keeps its own) opens a
+  strip under the header: "Search this thread…" with Zed's Match Case Sensitivity, Match Whole
+  Words and Use Regular Expressions in the box (⌥⌘C, ⌥⌘W, ⌥⌘X; Alt-C, Alt-W, Alt-R on Linux),
+  then ‹ ›, the count and ×, and an invalid expression's error under them. Pressed again, it
+  selects the query. It searches what shows: the user's messages (not a task's notices, nor
+  an image's link), the agent's messages and the plans it proposes, without what Markdown
+  doesn't draw (`Markdown::non_rendered_source_ranges`, so not a link's address; a message
+  still parsing is searched again once parsed), each tool call's line as drawn
+  (`AgentView::tool_call_line`), and the plan section's steps. Matches are painted in the
+  theme's search colors, the current one in its active color (Markdown's search highlights,
+  `StyledText` in lines and steps). Enter and ⇧Enter, or ⌘G and ⌘⇧G (F3 and Shift-F3) from
+  anywhere in the thread, go between them, wrapping. Going to one opens what holds it (a folded
+  run, the live line, a proposed plan's card, the plan section) and scrolls it 96 px below the
+  top (`MATCH_TOP_OFFSET`; a line asks the list itself once it's laid out). While find is
+  open the conversation doesn't follow the end, and the thread is searched again at most every
+  150 ms as it changes, keeping the current match. Esc, in the bar or in the composer (before
+  it would stop the turn), closes it and puts the cursor in the composer; the conversation
+  follows the end again once scrolled there. Find belongs to the view, so opening another
+  thread drops it. The command palette's "agent: find in thread" is also found by "search",
+  "messages" and "plans" (`command_palette.rs`'s `SEARCH_TERMS`, t3code's search terms), and
+  the shortcut sheet lists its keys.
 - **Mermaid diagrams** (`markdown/src/mermaid.rs`, `mermaid_render`; Zed's, with
   `MarkdownOptions::render_mermaid_diagrams` set in `AgentView::sync_markdown` as Zed's
   `create_markdown` does): a ` ```mermaid ` block in a message, the agent's or the user's, is

@@ -97,7 +97,6 @@ app and its machine servers still update together. Coordinate the ACP work with 
 protocol update above. Verify behavior with the mock agent; installed adapters' support has
 not been verified.
 
-
 ### Use reported ACP v2 state with a fallback for inferred activity
 
 Use explicit state updates for foreground activity when available, replacing the matching
@@ -106,13 +105,6 @@ inference about autonomous work starting and ending
 Keep the existing inference for agents without those reports and keep background work tracked
 separately: v2 idle describes foreground state and does not mean all work ended. Preserve
 steering and AIR functionality where agents still provide them only on v1.
-
-### Search the conversation in a thread
-
-Add in-thread message and plan search, beyond title search, following
-[t3code's chat find](https://github.com/pingdotgg/t3code/blob/main/docs/user/keybindings.md).
-Search the retained conversation, navigate between matches and reveal the matching message
-in the virtualized conversation with its match highlighted.
 
 ### Snooze threads until later
 

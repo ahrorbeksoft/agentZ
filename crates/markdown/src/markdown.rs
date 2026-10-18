@@ -496,6 +496,9 @@ pub struct Markdown {
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
+    /// Where an autoscroll to this source index puts it in a list, rather than just inside
+    /// the view: this far below the top of a view this tall.
+    autoscroll_placement: Option<(usize, Pixels, Pixels)>,
     pending_heading_scroll: Option<SharedString>,
     pending_autoscroll: Option<usize>,
     active_root_block: Option<usize>,
@@ -696,6 +699,7 @@ impl Markdown {
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
+            autoscroll_placement: None,
             pending_heading_scroll: None,
             pending_autoscroll: None,
             active_root_block: None,
@@ -1018,6 +1022,19 @@ impl Markdown {
         cx.refresh_windows();
     }
 
+    /// Asks the list holding this markdown to scroll so the source index sits `top` below the
+    /// top of its view, which is `view_height` tall, wherever it was.
+    pub fn request_autoscroll_to_source_index_at_top(
+        &mut self,
+        source_index: usize,
+        top: Pixels,
+        view_height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.autoscroll_placement = Some((source_index, top, view_height));
+        self.request_autoscroll_to_source_index(source_index, cx);
+    }
+
     fn footnote_definition_content_start(&self, label: &SharedString) -> Option<usize> {
         self.parsed_markdown
             .footnote_definitions
@@ -1059,6 +1076,7 @@ impl Markdown {
         self.source = source;
         self.selection = Selection::default();
         self.autoscroll_request = None;
+        self.autoscroll_placement = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
         self.should_reparse = false;
@@ -2557,9 +2575,15 @@ impl MarkdownElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<()> {
-        let autoscroll_index = self
-            .markdown
-            .update(cx, |markdown, _| markdown.autoscroll_request.take())?;
+        let (autoscroll_index, placement) = self.markdown.update(cx, |markdown, _| {
+            let index = markdown.autoscroll_request.take()?;
+            let placement = markdown
+                .autoscroll_placement
+                .take()
+                .filter(|(placed, _, _)| *placed == index)
+                .map(|(_, top, view_height)| (top, view_height));
+            Some((index, placement))
+        })?;
         let (position, line_height) = rendered_text.position_for_source_index(autoscroll_index)?;
 
         match &self.autoscroll {
@@ -2583,16 +2607,24 @@ impl MarkdownElement {
                     new_offset_y.clamp(-scroll_handle.max_offset().y, Pixels::ZERO),
                 ));
             }
-            AutoscrollBehavior::Propagate => {
-                let text_style = self.style.base_text_style.clone();
-                let font_id = window.text_system().resolve_font(&text_style.font());
-                let font_size = text_style.font_size.to_pixels(window.rem_size());
-                let em_width = window.text_system().em_width(font_id, font_size).unwrap();
-                window.request_autoscroll(Bounds::from_corners(
-                    point(position.x - 3. * em_width, position.y - 3. * line_height),
-                    point(position.x + 3. * em_width, position.y + 3. * line_height),
-                ));
-            }
+            // A list scrolls the least that brings the bounds into view, so bounds as tall as
+            // its view, starting `top` above the position, leave the position there.
+            AutoscrollBehavior::Propagate => match placement {
+                Some((top, view_height)) => window.request_autoscroll(Bounds::from_corners(
+                    point(position.x, position.y - top),
+                    point(position.x, position.y - top + view_height),
+                )),
+                None => {
+                    let text_style = self.style.base_text_style.clone();
+                    let font_id = window.text_system().resolve_font(&text_style.font());
+                    let font_size = text_style.font_size.to_pixels(window.rem_size());
+                    let em_width = window.text_system().em_width(font_id, font_size).unwrap();
+                    window.request_autoscroll(Bounds::from_corners(
+                        point(position.x - 3. * em_width, position.y - 3. * line_height),
+                        point(position.x + 3. * em_width, position.y + 3. * line_height),
+                    ));
+                }
+            },
         }
         Some(())
     }

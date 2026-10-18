@@ -44,6 +44,7 @@ mod terminal_mouse;
 mod terminal_thread_view;
 mod terminal_view;
 mod thread_entity;
+mod thread_find;
 mod tool_calls;
 mod usage_limits;
 mod usage_timeline;
