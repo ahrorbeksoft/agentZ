@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use agentz_protocol::accounts::{AccountStatus, LimitPool, LimitWindow};
 use agentz_protocol::agents::AgentCommand;
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use http_client::{
     AsyncBody, HttpClient, HttpRequestExt as _, Method, RedirectPolicy, Request, StatusCode,
@@ -461,7 +461,8 @@ fn plan(body: &[u8]) -> Result<Option<String>> {
 }
 
 /// `retrieveUserQuotaSummary`'s answer: groups of models ("Gemini Models", "Claude and GPT
-/// models"), each with its own 5-hour and weekly window.
+/// models"), each with its own 5-hour and weekly window, and on some plans "Gemini 4 Argon",
+/// with a weekly window of its own.
 #[derive(Deserialize)]
 struct QuotaSummary {
     #[serde(default)]
@@ -471,9 +472,12 @@ struct QuotaSummary {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QuotaGroup {
-    display_name: String,
+    /// Read as it comes, so a name that isn't text leaves out its group alone.
     #[serde(default)]
-    buckets: Vec<QuotaBucket>,
+    display_name: serde_json::Value,
+    /// Read one at a time, so a bucket in a shape it doesn't expect leaves out its window alone.
+    #[serde(default)]
+    buckets: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -483,33 +487,53 @@ struct QuotaBucket {
     window: Option<String>,
     reset_time: Option<String>,
     remaining_fraction: Option<f64>,
+    /// Proto3's JSON leaves a false flag out. One that isn't true, false or null fails the
+    /// bucket, since it can't say the window is open.
+    disabled: Option<bool>,
 }
 
-/// The first group's windows, as the account's pool, and the other groups as its other pools.
+/// The first group with a 5-hour window as the account's pool, and the other groups as its
+/// other pools. Argon's group, which has only a weekly window, may come first.
 fn quota_summary(body: &[u8]) -> Result<AccountStatus> {
     let summary: QuotaSummary = serde_json::from_slice(body)
         .context("Google's quota summary isn't in the expected shape")?;
-    let mut pools = summary.groups.into_iter().map(|group| {
-        let mut windows: Vec<LimitWindow> =
-            group.buckets.into_iter().filter_map(quota_window).collect();
-        windows.sort_by_key(|window| window.length.unwrap_or(Duration::MAX));
-        LimitPool {
-            label: group.display_name,
-            windows,
-        }
-    });
-    let first = pools
-        .next()
-        .context("Google's quota summary has no groups")?;
+    let mut pools: Vec<LimitPool> = summary
+        .groups
+        .into_iter()
+        .filter_map(|group| {
+            let label = group.display_name.as_str()?.to_string();
+            let mut windows: Vec<LimitWindow> =
+                group.buckets.into_iter().filter_map(quota_window).collect();
+            windows.sort_by_key(|window| window.length.unwrap_or(Duration::MAX));
+            // A group whose windows are all disabled or unreadable has nothing to show.
+            (!windows.is_empty()).then_some(LimitPool { label, windows })
+        })
+        .collect();
+    ensure!(!pools.is_empty(), "Google's quota summary has no quotas");
+    let main = pools
+        .iter()
+        .position(|pool| {
+            pool.windows
+                .iter()
+                .any(|window| window.length == Some(FIVE_HOURS))
+        })
+        .unwrap_or(0);
+    let main = pools.remove(main);
     Ok(AccountStatus {
-        windows: first.windows,
-        pool: Some(first.label),
-        other_pools: pools.collect(),
+        windows: main.windows,
+        pool: Some(main.label),
+        other_pools: pools,
         ..AccountStatus::default()
     })
 }
 
-fn quota_window(bucket: QuotaBucket) -> Option<LimitWindow> {
+fn quota_window(bucket: serde_json::Value) -> Option<LimitWindow> {
+    let bucket: QuotaBucket = serde_json::from_value(bucket)
+        .inspect_err(|error| log::warn!("skipping an Antigravity quota: {error}"))
+        .ok()?;
+    if bucket.disabled == Some(true) {
+        return None;
+    }
     let (label, length) = match bucket.window.as_deref() {
         Some("5h") => ("5-hour".to_string(), Some(FIVE_HOURS)),
         Some("weekly") => ("Weekly".to_string(), Some(WEEK)),
@@ -550,6 +574,9 @@ mod tests {
     /// What Google answered a login with Google AI Pro, some of the Claude and GPT models'
     /// weekly window used.
     const QUOTA_SUMMARY_ANSWER: &str = include_str!("antigravity_reads/quota-summary.json");
+    /// Argon's group, with its separate weekly quota on Google AI Pro, as reported to OpenUsage.
+    const QUOTA_SUMMARY_ARGON_ANSWER: &str =
+        include_str!("antigravity_reads/quota-summary-argon.json");
     const LOAD_CODE_ASSIST_ANSWER: &str = include_str!("antigravity_reads/load-code-assist.json");
     const USER_INFO_ANSWER: &str = include_str!("antigravity_reads/userinfo.json");
 
@@ -629,6 +656,92 @@ mod tests {
         assert!(quota_summary(br#"{"groups": []}"#).is_err());
     }
 
+    #[test]
+    fn argons_weekly_quota_is_a_pool_of_its_own() {
+        let weekly = |used_percent, resets_at| LimitWindow {
+            label: "Weekly".into(),
+            used_percent,
+            resets_at,
+            length: Some(WEEK),
+        };
+        let status = quota_summary(QUOTA_SUMMARY_ARGON_ANSWER.as_bytes()).expect("parse");
+        assert_eq!(status.pool.as_deref(), Some("Gemini 4 Argon"));
+        assert_eq!(status.windows, [weekly(0.0, None)]);
+        assert!(status.other_pools.is_empty());
+
+        let argon = json(QUOTA_SUMMARY_ARGON_ANSWER)["groups"][0].clone();
+        // The other answer, with `group` ahead of its groups.
+        let with_argon = |group: serde_json::Value| {
+            let mut answer = json(QUOTA_SUMMARY_ANSWER);
+            answer["groups"]
+                .as_array_mut()
+                .expect("groups")
+                .insert(0, group);
+            let status = quota_summary(answer.to_string().as_bytes()).expect("parse");
+            let labels: Vec<String> = status
+                .other_pools
+                .iter()
+                .map(|pool| pool.label.clone())
+                .collect();
+            (status, labels)
+        };
+        let with_bucket = |bucket: serde_json::Value| {
+            let mut group = argon.clone();
+            group["buckets"] = serde_json::Value::Array(vec![bucket]);
+            with_argon(group)
+        };
+        let bucket = argon["buckets"][0].clone();
+        let changed = |fields: &[(&str, serde_json::Value)]| {
+            let mut bucket = bucket.clone();
+            for (key, value) in fields {
+                bucket[*key] = value.clone();
+            }
+            bucket
+        };
+
+        // The groups that have a 5-hour window come first.
+        let (status, labels) = with_bucket(bucket.clone());
+        assert_eq!(status.pool.as_deref(), Some("Gemini Models"));
+        assert_eq!(labels, ["Gemini 4 Argon", "Claude and GPT models"]);
+
+        let half_used = [("remainingFraction", 0.5.into())];
+        for open in [
+            changed(&half_used),
+            changed(&[half_used[0].clone(), ("disabled", false.into())]),
+            changed(&[half_used[0].clone(), ("disabled", serde_json::Value::Null)]),
+        ] {
+            let (status, _) = with_bucket(open.clone());
+            assert_eq!(
+                status.other_pools[0].windows,
+                [weekly(50.0, at("2026-10-22T23:24:33Z"))],
+                "{open}"
+            );
+        }
+
+        // A disabled window, or one it can't read, leaves out Argon's group and nothing else.
+        let mut no_fraction = bucket.clone();
+        let fields = no_fraction.as_object_mut().expect("bucket");
+        fields.remove("remainingFraction");
+        fields.remove("resetTime");
+        fields.insert("remainingAmount".into(), 100.into());
+        for closed in [
+            changed(&[("disabled", true.into())]),
+            changed(&[("disabled", "false".into())]),
+            changed(&[("disabled", 0.into())]),
+            changed(&[("remainingFraction", "unknown".into())]),
+            no_fraction,
+            42.into(),
+        ] {
+            let (status, labels) = with_bucket(closed.clone());
+            assert_eq!(status.pool.as_deref(), Some("Gemini Models"), "{closed}");
+            assert_eq!(labels, ["Claude and GPT models"], "{closed}");
+        }
+
+        let mut unnamed = argon.clone();
+        unnamed["displayName"] = 42.into();
+        let (_, labels) = with_argon(unnamed);
+        assert_eq!(labels, ["Claude and GPT models"]);
+    }
     #[test]
     fn the_plan_is_the_paid_tier_first() {
         assert_eq!(

@@ -1353,7 +1353,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   `acp_token.json` to Google for an access token (the one login agentZ renews: Google keeps
   the refresh token as it is, and nothing is written back), then asks Cloud Code's
   `retrieveUserQuotaSummary` (each model group's 5-hour and Weekly windows, the first group
-  as the account's pool and the rest as other pools), `loadCodeAssist` (the plan) and
+  with a 5-hour window as the account's pool and the rest, Gemini 4 Argon's weekly one
+  among them, as other pools; a disabled window, one it can't read and a group left with
+  none are left out), `loadCodeAssist` (the plan) and
   Google's user info (the email and name); a login Google refuses reads logged out. The
   External account's ACP login is in a keychain entry only the ACP server may read, so it
   reads the `agy` CLI's entry instead, and with under a minute left on that token runs

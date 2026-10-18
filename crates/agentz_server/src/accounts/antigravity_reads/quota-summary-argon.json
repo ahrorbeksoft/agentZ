@@ -1,0 +1,17 @@
+{
+  "groups": [
+    {
+      "displayName": "Gemini 4 Argon",
+      "description": "For paid Pro plans, Argon quota is separate. Higher Argon quota (included as part of the larger Gemini quota bucket) is available on Ultra plans.",
+      "buckets": [
+        {
+          "bucketId": "gemini-argon-wtu-weekly",
+          "displayName": "Gemini 4 Argon Weekly Limit",
+          "window": "weekly",
+          "remainingFraction": 1.0,
+          "resetTime": "2026-10-22T23:24:33Z"
+        }
+      ]
+    }
+  ]
+}

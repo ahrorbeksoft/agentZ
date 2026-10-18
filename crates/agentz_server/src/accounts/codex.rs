@@ -59,7 +59,7 @@ pub(super) fn description() -> AgentDescription {
         reader: Some(Reader::CodexAppServer),
         // Its API Key login takes the key in `authenticate`, and Codex keeps it in the home.
         key_login: None,
-        usage_page: Some("https://chatgpt.com/codex/settings/usage".into()),
+        usage_page: Some("https://chatgpt.com/settings/usage".into()),
         extra_usage_page: None,
     }
 }

@@ -87,18 +87,6 @@ our existing automatic workspace cleanup plan in `docs/architecture.md`. Active 
 shared worktrees and the chosen local-change protection must be respected. Any new UI starts
 on the design board.
 
-### Check Antigravity's Argon quota and correct the Codex usage link
-
-OpenUsage added Antigravity's separate Argon weekly quota
-([#1395](https://github.com/robinebers/openusage/pull/1395)). Our generic group parser already
-handles additional quota groups, and we already use the production endpoint it now prefers;
-add coverage for the reported Argon payload and check disabled or invalid buckets rather than
-copying its fixed pool list.
-
-Update the Codex usage page in `crates/agentz_server/src/accounts/codex.rs` from
-`https://chatgpt.com/codex/settings/usage` to `https://chatgpt.com/settings/usage`, following
-OpenUsage's [#1364](https://github.com/robinebers/openusage/pull/1364).
-
 ## Approved upstream features and replacements
 
 Requested October 18, 2026: support all of the following, with fallbacks where necessary.
