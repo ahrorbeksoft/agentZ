@@ -4,6 +4,7 @@
 //!
 //! Agent settings belong to each machine's server; its client keeps the app's copy.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -470,7 +471,9 @@ fn write_settings(path: &std::path::Path, settings: &AppSettings) -> Result<()> 
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(settings)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
 }
 
 /// Whether Cmd-B hid the sidebar.

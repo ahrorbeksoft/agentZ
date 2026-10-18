@@ -2,6 +2,7 @@
 //! sent one at a time as each turn ends. The server keeps them, so they outlive the app, and
 //! saves them in `queues.json` in the data directory, so they outlive the server too.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -68,11 +69,9 @@ impl Queues {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
         // Written beside it first, so a crash doesn't leave half the queues.
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, json)
-            .with_context(|| format!("writing {}", temporary.display()))?;
-        std::fs::rename(&temporary, &self.path)
-            .with_context(|| format!("writing {}", self.path.display()))
+        projects::write_durably(&self.path, &self.path.with_extension("json.tmp"), |file| {
+            file.write_all(&json)
+        })
     }
 
     fn queue(&self, thread_id: ThreadId) -> Option<&Queue> {

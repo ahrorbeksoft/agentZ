@@ -2,6 +2,7 @@
 //! the server's data directory. Images are named by their [`AttachmentId`]; files keep their
 //! names, in a folder named by their hash, since the agent reads them by path.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -138,9 +139,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id(),
         NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&temporary, bytes)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(path, &temporary, |file| file.write_all(bytes))
 }
 
 #[cfg(test)]

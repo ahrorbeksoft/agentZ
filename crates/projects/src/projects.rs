@@ -7,6 +7,7 @@
 pub mod order_key;
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -2397,17 +2398,85 @@ fn write_state(path: &Path, state: &impl Serialize) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let json = serde_json::to_vec_pretty(state)?;
-    let temporary_path = path.with_extension("json.tmp");
-    std::fs::write(&temporary_path, json)
-        .with_context(|| format!("writing {}", temporary_path.display()))?;
-    std::fs::rename(&temporary_path, path)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    write_durably(path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
+}
+
+/// Replaces `path` as herdr saves its state: `write` fills `temporary`, beside it, which is
+/// synced to disk before it's renamed into place, and the folder is synced after. A crash or
+/// power loss then leaves the old file or the whole new one, never a rename whose contents
+/// weren't written yet. A failed write removes `temporary`.
+pub fn write_durably(
+    path: &Path,
+    temporary: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    let written = std::fs::File::create(temporary)
+        .and_then(|mut file| {
+            write(&mut file)?;
+            file.sync_all()
+        })
+        .with_context(|| format!("writing {}", temporary.display()))
+        .and_then(|()| {
+            std::fs::rename(temporary, path)
+                .with_context(|| format!("replacing {}", path.display()))
+        });
+    if let Err(error) = written {
+        match std::fs::remove_file(temporary) {
+            Ok(()) => {}
+            Err(removing) if removing.kind() == std::io::ErrorKind::NotFound => {}
+            Err(removing) => log::warn!("removing {}: {removing}", temporary.display()),
+        }
+        return Err(error);
+    }
+    sync_folder_of(path)
+}
+
+/// Syncs the folder `path` is in, so what was renamed into it is on disk too.
+pub fn sync_folder_of(path: &Path) -> Result<()> {
+    let Some(folder) = path.parent() else {
+        return Ok(());
+    };
+    match std::fs::File::open(folder).and_then(|folder| folder.sync_all()) {
+        Ok(()) => Ok(()),
+        // Some file systems can't sync a folder (herdr's `directory_sync_unsupported`).
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("syncing {}", folder.display())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_writes_replace_the_file_or_leave_it() {
+        let folder = tempfile::tempdir().expect("temp dir");
+        let path = folder.path().join("state.json");
+        let temporary = path.with_extension("json.tmp");
+        write_durably(&path, &temporary, |file| file.write_all(b"one")).expect("writes");
+        write_durably(&path, &temporary, |file| file.write_all(b"two")).expect("replaces");
+        assert_eq!(std::fs::read(&path).expect("reads"), b"two");
+        assert!(!temporary.exists());
+
+        let failed = write_durably(&path, &temporary, |file| {
+            file.write_all(b"thr")?;
+            Err(std::io::Error::other("the disk is full"))
+        });
+        assert!(format!("{:#}", failed.expect_err("fails")).contains("the disk is full"));
+        assert_eq!(std::fs::read(&path).expect("reads"), b"two");
+        assert!(!temporary.exists());
+    }
 
     #[test]
     fn monograms() {

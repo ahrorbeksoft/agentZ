@@ -2,6 +2,7 @@
 //! that machine's server, and come back as a new snapshot.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -731,9 +732,9 @@ fn write_viewed(path: &std::path::Path, viewed: &BTreeMap<u64, SystemTime>) -> R
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let json = serde_json::to_vec(viewed)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+    projects::write_durably(path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
 }
 
 #[cfg(test)]

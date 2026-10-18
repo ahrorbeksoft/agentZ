@@ -5,6 +5,7 @@
 //!
 //! [`ThreadState::pending_handoffs`]: agentz_protocol::thread::ThreadState::pending_handoffs
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use agentz_protocol::thread::PendingHandoff;
@@ -32,7 +33,9 @@ pub(crate) fn save(
             .with_context(|| format!("creating {}", directory.display()))?;
     }
     let json = serde_json::to_vec(handoffs).context("encoding the handoffs")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(&path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
 }
 
 pub(crate) fn load(data_dir: &Path, thread_id: ThreadId) -> Result<Vec<PendingHandoff>> {

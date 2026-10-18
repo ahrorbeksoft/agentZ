@@ -87,13 +87,6 @@ our existing automatic workspace cleanup plan in `docs/architecture.md`. Active 
 shared worktrees and the chosen local-change protection must be respected. Any new UI starts
 on the design board.
 
-### Make state and transcript saves durable before replacing files
-
-Follow herdr's [#5152](https://github.com/herdrdev/herdr/pull/5152): sync temporary file contents
-to disk before replacing the saved file, then sync its parent directory. Our transcript saves
-flush their buffers but do not sync to disk. Review the same pattern in project state and
-other persisted files so a hard crash cannot leave a successful rename with unwritten contents.
-
 ### Check Antigravity's Argon quota and correct the Codex usage link
 
 OpenUsage added Antigravity's separate Argon weekly quota

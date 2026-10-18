@@ -26,18 +26,13 @@ pub(crate) fn save(
             .with_context(|| format!("creating {}", directory.display()))?;
     }
     // Written beside it first, so a crash doesn't leave half a conversation.
-    let temporary = path.with_extension("json.tmp");
-    let file = std::fs::File::create(&temporary)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    // Encoded into the file as it goes rather than whole in memory first, for the same reason
-    // as `TranscriptRef`.
-    let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer(&mut writer, &transcript).context("encoding the transcript")?;
-    writer
-        .flush()
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    drop(writer);
-    std::fs::rename(&temporary, &path).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(&path, &path.with_extension("json.tmp"), |file| {
+        // Encoded into the file as it goes rather than whole in memory first, for the same
+        // reason as `TranscriptRef`.
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &transcript)?;
+        writer.flush()
+    })
 }
 
 pub(crate) fn load(data_dir: &Path, thread_id: ThreadId) -> Result<Option<Transcript>> {

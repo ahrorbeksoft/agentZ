@@ -2,6 +2,7 @@
 //! Settings › Agents as with Zed's Add Custom Agent. They live in `agents/custom.json`.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::v1 as acp;
@@ -189,10 +190,10 @@ fn write_custom_agents(data_dir: &Path, agents: &BTreeMap<AgentId, CustomAgent>)
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(agents)?)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("writing {}", path.display()))
+    let json = serde_json::to_vec_pretty(agents)?;
+    projects::write_durably(&path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
 }
 
 /// People type `~/…` as in a shell, which the agent's process wouldn't expand.

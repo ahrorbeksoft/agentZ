@@ -166,6 +166,10 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
 
+Both sides replace a file as herdr saves its state (`projects::write_durably`): written beside
+it, synced to disk, renamed into place, then the folder synced, so a crash or power loss leaves
+the old file or the whole new one.
+
 ## Features
 
 Each entry: what it does, where it lives, and where it comes from.

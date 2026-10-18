@@ -53,13 +53,12 @@ pub fn install(directory: &Path, executable: &Path) -> Result<()> {
 }
 
 pub(crate) fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, contents)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("making {} executable", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(path, &path.with_extension("tmp"), |file| {
+        file.write_all(contents.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+    })
 }
 
 /// The environment that puts the programs first for an agent of `connection`, or its login

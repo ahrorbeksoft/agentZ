@@ -2,6 +2,7 @@
 //! same ones.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use agentz_protocol::agents::{AgentId, AgentSettings};
@@ -101,9 +102,9 @@ pub(crate) fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<(
     }
     let json = serde_json::to_vec_pretty(value)?;
     // Renamed into place, so a reader never sees it half written.
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, json).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, path).with_context(|| format!("writing {}", path.display()))
+    projects::write_durably(path, &path.with_extension("json.tmp"), |file| {
+        file.write_all(&json)
+    })
 }
 
 #[cfg(test)]

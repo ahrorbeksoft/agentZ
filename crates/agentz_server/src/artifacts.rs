@@ -6,6 +6,7 @@
 //! the artifact removes the folder.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -1181,9 +1182,7 @@ fn write(folder: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
     let path = folder.join(name);
     let staged = folder.join(format!(".{name}.tmp"));
-    std::fs::write(&staged, bytes).with_context(|| format!("writing {}", path.display()))?;
-    std::fs::rename(&staged, &path).with_context(|| format!("renaming {}", path.display()))?;
-    Ok(())
+    projects::write_durably(&path, &staged, |file| file.write_all(bytes))
 }
 
 fn key() -> String {
