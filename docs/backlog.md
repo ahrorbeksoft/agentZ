@@ -1,7 +1,7 @@
 # Backlog
 
-Features and bugs to implement, in the order they were given. Each entry is the user's request
-as given, not yet researched. Remove an entry once it's built.
+Features and bugs to implement, in the order they were given. Keep the user's request and any
+findings with each entry. Remove an entry once it's built.
 
 ## Bugs
 
@@ -38,3 +38,61 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
+
+## Zed upstream updates
+
+Requested October 18, 2026: add all five groups from the upstream review. The review compared
+our October 1 Zed reference (`57bfce2945`) with upstream through October 17 (`56934ec056`),
+245 newer commits. These are source findings; the failures have not been reproduced in agentZ.
+
+### Update rustls for the TLS handshake security fix
+
+Update rustls to at least 0.23.45, as Zed did in
+[#65221](https://github.com/zed-industries/zed/pull/65221). Our lockfile has 0.23.40, within the
+affected range for a moderate TLS 1.3 handshake vulnerability
+([advisory](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)). Prioritize
+this before the other upstream work.
+
+### Update ACP and support session notices, compaction and v2 sessions
+
+Upstream uses SDK 3.4.0
+([#65706](https://github.com/zed-industries/zed/pull/65706)); agentZ uses 2.2.0 and initializes
+with protocol v1. Port stable session notices and context compaction, which agentZ doesn't
+handle yet, following [#65414](https://github.com/zed-industries/zed/pull/65414).
+
+Follow Zed's developing v2 session lifecycle, including resume/replay and metadata handling:
+[#65698](https://github.com/zed-industries/zed/pull/65698) and
+[#65709](https://github.com/zed-industries/zed/pull/65709). Treat this as a deliberate protocol
+update, separate from the smaller copied-crate fixes. Test with the mock agent.
+
+### Port the Markdown, Linux font and macOS blur fixes
+
+Our copied crates still contain the affected code for all three:
+
+- **Tab-indented Markdown code blocks can crash:** port
+  [#65398](https://github.com/zed-industries/zed/pull/65398) in `crates/markdown/src/markdown.rs`.
+  Zed keys cached highlights by event indices rather than colliding source offsets.
+- **Linux fallback fonts can disappear:** port
+  [#65269](https://github.com/zed-industries/zed/pull/65269) in
+  `crates/gpui_wgpu/src/cosmic_text_system.rs`. Fonts without an `m` glyph must remain in the
+  font database for emoji, symbols and non-Latin fallback.
+- **Blurred windows are only transparent on macOS 27:** port
+  [#65361](https://github.com/zed-industries/zed/pull/65361) in
+  `crates/gpui_macos/src/window.rs`, using the material that retains backdrop blur.
+
+### Port GPUI's focus cleanup performance fix
+
+Follow [#65177](https://github.com/zed-industries/zed/pull/65177): queue final focus-handle drops
+instead of scanning the entire registry before every app effect. Upstream fixed hangs when
+restoring large conversations with subagents; check its benefit to agentZ's thread views.
+
+### Add GPUI hot reloading and headless windowing support
+
+Bring in optional debug hot reloading of view and component render functions through
+Subsecond ([#65738](https://github.com/zed-industries/zed/pull/65738)), and evaluate the
+cross-platform headless windowing API and Linux implementation
+([#64969](https://github.com/zed-industries/zed/pull/64969)) for UI iteration and testing.
+
+For all copied-crate updates, preserve agentZ's Metal drawable handling, nested scrolling,
+Markdown image rendering and link chips, and animation frame limits, documented under
+Crates in `docs/architecture.md`.
