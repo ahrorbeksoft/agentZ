@@ -34,7 +34,10 @@ prompt as input, that completes with the report after half a second (or the seco
 "droid-task background" sends it to the background, so it ends at once with Droid's notice
 that it was launched. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
-word at a time, 500 ms apart, then replies. "write <path> <text>"
+word at a time, 500 ms apart, then replies. To a client that takes ACP's notices, "notice" sends
+a warning and a notice of a severity of its own, then replies; to one that takes compaction
+updates, "/compact" (its compact command) compacts the context, streaming a summary, and
+"compact-fail" fails to. "write <path> <text>"
 writes the text and a newline to the file, relative to the session's folder, and
 "delete <path>" removes it. "terminal <command>" runs the command in a client
 terminal (ACP's terminal/create), shows it in a tool call, waits for it to exit,
@@ -373,6 +376,10 @@ async_tasks = False
 native_subagents = False
 # Whether the client takes ACP's subagent sessions (`clientCapabilities.subagents`).
 standard_subagents = False
+# Whether the client takes ACP's notices and compaction updates (`clientCapabilities.session`).
+takes_notices = False
+takes_compaction = False
+compaction_count = 0
 # The subagent of the "subagent-stop" prompt, which works until it's stopped: its session, the
 # session it runs under, and the prompt's request id.
 stoppable_subagent = None
@@ -1035,6 +1042,9 @@ for line in sys.stdin:
         async_tasks = "asyncTasks" in (air.get("capabilities") or [])
         native_subagents = "nativeSubagentSessions" in (air.get("capabilities") or [])
         standard_subagents = capabilities.get("subagents") is not None
+        session_capabilities = capabilities.get("session") or {}
+        takes_notices = session_capabilities.get("notices") is not None
+        takes_compaction = session_capabilities.get("compaction") is not None
         if capabilities.get("auth", {}).get("terminal"):
             auth_methods.append({"id": "mock-terminal-login", "name": "Log in in a terminal",
                                  "type": "terminal", "args": ["--login"]})
@@ -1406,6 +1416,32 @@ for line in sys.stdin:
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
             seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
             run_droid_task(message["id"], params["sessionId"], seconds)
+        elif prompt_text == "notice" and takes_notices:
+            session_id = params["sessionId"]
+            update(session_id, {"sessionUpdate": "notice", "severity": "warning",
+                                "title": "MCP server unavailable",
+                                "description": "Continuing without it."})
+            update(session_id, {"sessionUpdate": "notice", "severity": "maintenance",
+                                "title": "Scheduled maintenance"})
+            finish_prompt(message["id"], session_id, prompt_text)
+        elif prompt_text in ("/compact", "compact-fail") and takes_compaction:
+            session_id = params["sessionId"]
+            compaction_count += 1
+            compaction = {"sessionUpdate": "compaction_update",
+                          "compactionId": f"compaction-{compaction_count}"}
+            update(session_id, {**compaction, "status": "in_progress"})
+            time.sleep(0.2)
+            if prompt_text == "compact-fail":
+                update(session_id, {**compaction, "status": "failed",
+                                    "error": "The summary didn't fit in the context."})
+            else:
+                for piece in ["The user wants a checkout page.", " The cart summary is done."]:
+                    update(session_id, {"sessionUpdate": "compaction_summary_chunk",
+                                        "compactionId": compaction["compactionId"],
+                                        "content": {"type": "text", "text": piece}})
+                    time.sleep(0.2)
+                update(session_id, {**compaction, "status": "completed"})
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
         elif prompt_text == "slow":
             for word in ["One", " two", " three", " four", " five"]:
                 update(params["sessionId"], text_chunk("agent_message_chunk", word))

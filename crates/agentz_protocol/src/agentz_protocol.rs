@@ -562,6 +562,11 @@ pub enum Request {
         connection: ConnectionId,
         elicitation: u64,
     },
+    /// Removes one of the agent's notices. The agent hears nothing, as in Zed.
+    DismissNotice {
+        connection: ConnectionId,
+        notice: u64,
+    },
     /// Runs one of the agent's terminal login methods in [`TerminalKey::Login`] on the server's
     /// machine, where the agent keeps its login. The agent restarts once the login exits
     /// successfully.

@@ -27,11 +27,11 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Responder};
 use agentz_protocol::agents::select_offers;
 use agentz_protocol::attachments::AttachmentId;
 pub use agentz_protocol::thread::{
-    AuthStatus, BackgroundTask, ConnectionStatus, ContextUsage, DiffLineKind, Elicitation, Entry,
-    FailedMessage, FileDiff, HandoffMark, HandoffSource, ImageSize, LoginIdentity, LostHistory,
-    ModeSwitch, PendingHandoff, PermissionOption, PermissionRequest, PlanItem, QueuedMessage,
-    SessionDefaults, SessionRestore, ThreadAgent, ThreadState, ThreadView, ToolAnswer, ToolCall,
-    TurnOutcome, TurnTime,
+    AuthStatus, BackgroundTask, Compaction, ConnectionStatus, ContextUsage, DiffLineKind,
+    Elicitation, Entry, FailedMessage, FileDiff, HandoffMark, HandoffSource, ImageSize,
+    LoginIdentity, LostHistory, ModeSwitch, PendingHandoff, PermissionOption, PermissionRequest,
+    PlanItem, QueuedMessage, SessionDefaults, SessionNotice, SessionRestore, ThreadAgent,
+    ThreadState, ThreadView, ToolAnswer, ToolCall, TurnOutcome, TurnTime,
 };
 use agentz_protocol::thread::{form_answer, login_code};
 use anyhow::{Context as _, Result, anyhow};
@@ -388,6 +388,7 @@ pub struct AgentThread {
     permission_responders: Vec<(acp::ToolCallId, Responder<acp::RequestPermissionResponse>)>,
     elicitation_responders: Vec<ElicitationResponder>,
     next_elicitation_id: u64,
+    next_notice_id: u64,
     /// Set once the agent is initialized; kept so a session can be (re)opened after logging in.
     connection: Option<ConnectionTo<Agent>>,
     previous_session: Option<acp::SessionId>,
@@ -822,6 +823,7 @@ impl AgentThread {
             permission_responders: Vec::new(),
             elicitation_responders: Vec::new(),
             next_elicitation_id: 0,
+            next_notice_id: 0,
             connection: None,
             previous_session: None,
             fork_source: None,
@@ -2688,6 +2690,7 @@ impl AgentThread {
             self.set_working(false);
         }
         self.cancel_permission_requests();
+        self.cancel_compactions();
         // No prompt's answer will end it. An agent that works on anyway (Factory Droid ignores
         // a cancel when it has no prompt) is restarted, once it's had time to stop.
         if self.working_on_its_own {
@@ -3222,6 +3225,10 @@ impl AgentThread {
             .retain(|elicitation| !(elicitation.id == id && elicitation.opened));
     }
 
+    pub fn dismiss_notice(&mut self, id: u64) {
+        self.view.state.notices.retain(|notice| notice.id != id);
+    }
+
     /// Cancels the elicitations that match, and hides them.
     fn cancel_elicitations(&mut self, matches: impl Fn(&Elicitation) -> bool) {
         let mut cancelled = Vec::new();
@@ -3745,7 +3752,100 @@ impl AgentThread {
                     self.pending_title = Some(title);
                 }
             }
+            acp::SessionUpdate::Notice(notice) => {
+                let id = self.next_notice_id;
+                self.next_notice_id += 1;
+                self.view.state.notices.push(SessionNotice {
+                    id,
+                    severity: notice.severity,
+                    title: notice.title,
+                    description: notice.description,
+                });
+            }
+            acp::SessionUpdate::CompactionUpdate(update) => self.apply_compaction_update(update),
+            acp::SessionUpdate::CompactionSummaryChunk(chunk) => {
+                self.append_compaction_summary(chunk)
+            }
             _ => {}
+        }
+    }
+
+    /// Zed's upsert: the first update places the compaction, later ones patch it. A summary
+    /// or error left out stays as it was, and `null` clears it.
+    fn apply_compaction_update(&mut self, update: acp::CompactionUpdate) {
+        use agent_client_protocol::schema::MaybeUndefined;
+        let summary = match update.summary {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(String::new()),
+            MaybeUndefined::Value(blocks) => Some(
+                blocks
+                    .into_iter()
+                    .filter_map(|block| self.content_markdown(block))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+        };
+        let index = self.compaction_index(&update.compaction_id);
+        let mut compaction = match index {
+            Some(index) => match &self.view.entries[index] {
+                Entry::Compaction(compaction) => compaction.clone(),
+                _ => return,
+            },
+            None => Compaction::new(update.compaction_id),
+        };
+        compaction.status = update.status;
+        if let Some(summary) = summary {
+            compaction.summary = summary;
+        }
+        match update.error {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => compaction.error = None,
+            MaybeUndefined::Value(error) => compaction.error = Some(error),
+        }
+        match index {
+            Some(index) => {
+                self.view.entries[index] = Entry::Compaction(compaction);
+                self.entry_changed(index);
+            }
+            None => self.push_entry(Entry::Compaction(compaction)),
+        }
+    }
+
+    /// A piece of a compaction's summary, appended while it runs. An id seen for the first
+    /// time starts a compaction there.
+    fn append_compaction_summary(&mut self, chunk: acp::CompactionSummaryChunk) {
+        let Some(text) = self.content_markdown(chunk.content) else {
+            return;
+        };
+        let Some(index) = self.compaction_index(&chunk.compaction_id) else {
+            let mut compaction = Compaction::new(chunk.compaction_id);
+            compaction.summary = text;
+            self.push_entry(Entry::Compaction(compaction));
+            return;
+        };
+        if let Entry::Compaction(compaction) = &mut self.view.entries[index]
+            && compaction.status == acp::CompactionStatus::InProgress
+        {
+            compaction.summary.push_str(&text);
+            self.entry_changed(index);
+        }
+    }
+
+    fn compaction_index(&self, id: &acp::CompactionId) -> Option<usize> {
+        self.view.entries.iter().rposition(
+            |entry| matches!(entry, Entry::Compaction(compaction) if &compaction.id == id),
+        )
+    }
+
+    /// A stopped turn stops its compaction, as Zed marks it canceled.
+    fn cancel_compactions(&mut self) {
+        for index in 0..self.view.entries.len() {
+            if let Entry::Compaction(compaction) = &mut self.view.entries[index]
+                && compaction.status == acp::CompactionStatus::InProgress
+            {
+                compaction.status = acp::CompactionStatus::Cancelled;
+                self.entry_changed(index);
+            }
         }
     }
 
@@ -4056,6 +4156,8 @@ fn is_conversation_update(update: &acp::SessionUpdate) -> bool {
             | acp::SessionUpdate::ToolCall(_)
             | acp::SessionUpdate::ToolCallUpdate(_)
             | acp::SessionUpdate::Plan(_)
+            | acp::SessionUpdate::CompactionUpdate(_)
+            | acp::SessionUpdate::CompactionSummaryChunk(_)
     )
 }
 
@@ -4523,11 +4625,15 @@ fn client_capabilities(supports_terminals: bool) -> acp::ClientCapabilities {
                 .terminal(true)
                 .meta(acp::Meta::from_iter([("gateway".to_string(), true.into())])),
         )
+        // Notices and compaction updates, which Zed shows behind its ACP beta setting.
         .session(
-            acp::ClientSessionCapabilities::new().config_options(
-                acp::SessionConfigOptionsCapabilities::new()
-                    .boolean(acp::BooleanConfigOptionCapabilities::new()),
-            ),
+            acp::ClientSessionCapabilities::new()
+                .config_options(
+                    acp::SessionConfigOptionsCapabilities::new()
+                        .boolean(acp::BooleanConfigOptionCapabilities::new()),
+                )
+                .notices(acp::NoticeCapabilities::new())
+                .compaction(acp::CompactionCapabilities::new()),
         )
         .elicitation(
             acp::ElicitationCapabilities::new()
@@ -7630,5 +7736,110 @@ mod tests {
             other => panic!("expected a tool call, got {other:?}"),
         }
         assert_eq!(thread.entries()[2], Entry::AgentMessage("Done".into()));
+    }
+
+    /// The agent's notices stay, repeats included, until each is dismissed.
+    #[test]
+    fn keeps_notices_until_dismissed() {
+        let mut thread = AgentThread::failed("Test".into(), "not started");
+        let notice = |title: &str| {
+            acp::SessionUpdate::Notice(acp::Notice::new(acp::NoticeSeverity::Warning, title))
+        };
+        thread.apply_update(notice("MCP server unavailable"));
+        thread.apply_update(notice("MCP server unavailable"));
+        assert_eq!(thread.notices().len(), 2);
+        let first = thread.notices()[0].id;
+        thread.dismiss_notice(first);
+        assert_eq!(thread.notices().len(), 1);
+        assert_ne!(thread.notices()[0].id, first);
+        assert!(thread.entries().is_empty());
+    }
+
+    /// A compaction stays where its first update came; later updates and summary pieces patch
+    /// it, and a stop cancels it.
+    #[test]
+    fn compaction_updates_patch_their_entry() {
+        let mut thread = AgentThread::failed("Test".into(), "not started");
+        let text = |text: &str| acp::ContentBlock::Text(acp::TextContent::new(text));
+        thread.apply_update(acp::SessionUpdate::CompactionUpdate(
+            acp::CompactionUpdate::new("compaction-1", acp::CompactionStatus::InProgress),
+        ));
+        assert!(thread.is_compacting());
+        thread.apply_update(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(text("Done")),
+        ));
+        for piece in ["Kept ", "the plan."] {
+            thread.apply_update(acp::SessionUpdate::CompactionSummaryChunk(
+                acp::CompactionSummaryChunk::new("compaction-1", text(piece)),
+            ));
+        }
+        thread.apply_update(acp::SessionUpdate::CompactionUpdate(
+            acp::CompactionUpdate::new("compaction-1", acp::CompactionStatus::Completed),
+        ));
+        assert!(!thread.is_compacting());
+        assert_eq!(thread.entries().len(), 2);
+        match &thread.entries()[0] {
+            Entry::Compaction(compaction) => {
+                assert_eq!(compaction.status, acp::CompactionStatus::Completed);
+                assert_eq!(compaction.summary, "Kept the plan.");
+                assert_eq!(compaction.error, None);
+            }
+            other => panic!("expected a compaction, got {other:?}"),
+        }
+
+        thread.apply_update(acp::SessionUpdate::CompactionUpdate(
+            acp::CompactionUpdate::new("compaction-2", acp::CompactionStatus::InProgress),
+        ));
+        thread.cancel_compactions();
+        assert!(matches!(
+            &thread.entries()[2],
+            Entry::Compaction(compaction) if compaction.status == acp::CompactionStatus::Cancelled
+        ));
+    }
+
+    /// An agent that's told agentZ takes notices and compaction updates sends them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shows_the_agents_notices_and_compactions() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("notice".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && thread.notices().len() == 2)
+            .await;
+        let notices = thread.thread.notices();
+        assert_eq!(notices[0].title, "MCP server unavailable");
+        assert_eq!(
+            notices[1].severity,
+            acp::NoticeSeverity::Other("maintenance".into())
+        );
+
+        thread.update(|thread| thread.send("/compact".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && thread.entries().iter().any(|entry| {
+                        matches!(entry, Entry::Compaction(compaction)
+                            if compaction.status == acp::CompactionStatus::Completed)
+                    })
+            })
+            .await;
+        let compaction = thread
+            .thread
+            .entries()
+            .iter()
+            .find_map(|entry| match entry {
+                Entry::Compaction(compaction) => Some(compaction.clone()),
+                _ => None,
+            })
+            .expect("a compaction");
+        assert_eq!(
+            compaction.summary,
+            "The user wants a checkout page. The cart summary is done."
+        );
     }
 }

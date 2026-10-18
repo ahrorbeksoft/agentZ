@@ -37,6 +37,8 @@ pub enum Entry {
     ToolCall(ToolCall),
     /// Where the plan first appeared; the plan itself is kept up to date in [`ThreadView::plan`].
     Plan,
+    /// Where the agent compacted its context, or is compacting it.
+    Compaction(Compaction),
 }
 
 impl Entry {
@@ -45,7 +47,7 @@ impl Entry {
             Entry::UserMessage(text) | Entry::AgentMessage(text) | Entry::AgentThought(text) => {
                 Some(text)
             }
-            Entry::ToolCall(_) | Entry::Plan => None,
+            Entry::ToolCall(_) | Entry::Plan | Entry::Compaction(_) => None,
         }
     }
 
@@ -66,6 +68,43 @@ impl Entry {
         }
         text.strip_prefix(old.as_str())
     }
+}
+
+/// A compaction of the agent's context (ACP's `compaction_update`), at the place its first
+/// update came.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    pub id: acp::CompactionId,
+    pub status: acp::CompactionStatus,
+    /// What the agent kept of the conversation, as Markdown.
+    #[serde(default)]
+    pub summary: String,
+    /// Why it failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl Compaction {
+    pub fn new(id: acp::CompactionId) -> Self {
+        Self {
+            id,
+            status: acp::CompactionStatus::InProgress,
+            summary: String::new(),
+            error: None,
+        }
+    }
+}
+
+/// Something the agent tells the user about its session (ACP's `notice`), shown until they
+/// dismiss it. Notices aren't part of the conversation and aren't saved.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionNotice {
+    /// The thread's own id for it, to dismiss it with.
+    pub id: u64,
+    pub severity: acp::NoticeSeverity,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -725,6 +764,9 @@ pub struct ThreadState {
     pub auth_status: Option<AuthStatus>,
     /// Requests for input from the agent, oldest first.
     pub elicitations: Vec<Elicitation>,
+    /// The agent's notices that haven't been dismissed, oldest first.
+    #[serde(default)]
+    pub notices: Vec<SessionNotice>,
     /// The command the agent was started with, for its terminal login methods.
     pub command: Option<AgentCommand>,
     pub cwd: PathBuf,
@@ -1087,6 +1129,18 @@ impl ThreadView {
 
     pub fn elicitations(&self) -> &[Elicitation] {
         &self.state.elicitations
+    }
+
+    pub fn notices(&self) -> &[SessionNotice] {
+        &self.state.notices
+    }
+
+    /// Whether the agent is compacting its context, which is its work while it does.
+    pub fn is_compacting(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(entry, Entry::Compaction(compaction)
+                if compaction.status == acp::CompactionStatus::InProgress)
+        })
     }
 
     /// What happened on the last log in or out of a login session.
@@ -1642,7 +1696,7 @@ fn handoff_messages(view: &ThreadView, since: usize, default_agent: &str) -> Vec
                 }
                 ("", Some(tool))
             }
-            Entry::AgentThought(_) | Entry::Plan => continue,
+            Entry::AgentThought(_) | Entry::Plan | Entry::Compaction(_) => continue,
         };
         let outcome = view
             .turn_record(index)

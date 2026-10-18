@@ -953,6 +953,7 @@ impl OwnTool {
                         Some("agent_message") => ("Agent", text_in(item.get("text"))),
                         Some("plan") => ("Plan", text_in(item.get("text"))),
                         Some("thought") => ("Thought", text_in(item.get("text"))),
+                        Some("compaction") => ("Compaction", text_in(item.get("text"))),
                         _ => ("Tool call", text_in(item.get("title"))),
                     };
                     if let Some(text) = text {

@@ -1174,6 +1174,10 @@ impl Server {
                 self.update_thread(connection, |thread| thread.dismiss_elicitation(elicitation))?;
                 Ok(Response::Ok)
             }
+            Request::DismissNotice { connection, notice } => {
+                self.update_thread(connection, |thread| thread.dismiss_notice(notice))?;
+                Ok(Response::Ok)
+            }
             Request::TerminalLogin {
                 connection,
                 method_id,

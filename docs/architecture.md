@@ -724,6 +724,27 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   another account in a terminal. A session that loads on the other account (Claude Agent and
   Codex continue them) goes on as before, and keeps that login from then on. Agents that
   report no login get the notice without the reason.
+- **Session notices and compaction** (`AgentThread::{apply_compaction_update,
+  append_compaction_summary, cancel_compactions, dismiss_notice}`, `ThreadState::notices`,
+  `Entry::Compaction`, `Request::DismissNotice`, `agent_view.rs`'s `render_session_notices`,
+  `render_compaction` and `render_context_usage`; Zed's `SessionNotice` and context compaction
+  entry, [#65414](https://github.com/zed-industries/zed/pull/65414); design round
+  `design/session-notices/`): agentZ tells agents it takes ACP's notices and compaction
+  updates (`ClientSessionCapabilities::{notices, compaction}`). Each notice is a callout above
+  the composer, after agentZ's own notices and before its errors, oldest first, repeats
+  included, in a list that scrolls past 192 px; Info, Warning and Error have their icons and
+  another severity none. × ("Dismiss Notice") removes it on the server and tells the agent
+  nothing; notices aren't saved, and a thread in the background keeps its notices until it's
+  opened, with nothing on its card. A compaction is an entry where its first update came,
+  patched by later ones and its summary's pieces: a divider around a small button, "Compacting
+  Context…" with a spinner (the "Working for…" row hides meanwhile), then "Context Compacted",
+  "Compaction Failed" or "Compaction Canceled" (a stopped turn cancels it). With a summary or an
+  error, the button opens it in place in a bordered box, the summary rendered like a tool's
+  output and the error in red, with a bar at its foot that closes it; opening it stops the
+  conversation following the end. When the agent has a `compact` command, a click on the
+  context ring opens a menu with its numbers and Compact Context, which sends `/compact`; the
+  ring otherwise only has its tooltip. `agentz_thread_read` reports compactions with the
+  activity.
 - **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
   Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's

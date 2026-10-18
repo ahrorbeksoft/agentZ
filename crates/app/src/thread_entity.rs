@@ -406,6 +406,13 @@ impl AgentThread {
         )
     }
 
+    pub fn dismiss_notice(&mut self, notice: u64, cx: &mut Context<Self>) {
+        self.request(
+            |connection| Request::DismissNotice { connection, notice },
+            cx,
+        )
+    }
+
     /// The server's id for the connection, once it's open.
     pub fn connection(&self) -> Option<ConnectionId> {
         self.connection

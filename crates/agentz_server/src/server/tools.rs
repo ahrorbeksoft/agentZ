@@ -999,7 +999,13 @@ impl Server {
                     item["kind"] = serde_json::to_value(&tool_call.kind).unwrap_or_default();
                     item
                 }
-                Entry::AgentThought(_) | Entry::ToolCall(_) => continue,
+                Entry::Compaction(compaction) if activity => {
+                    let mut item =
+                        text_item(position, "compaction", &compaction.summary, max_chars);
+                    item["status"] = serde_json::to_value(&compaction.status).unwrap_or_default();
+                    item
+                }
+                Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Compaction(_) => continue,
             };
             if items.len() == limit {
                 has_more = true;

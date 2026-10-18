@@ -139,7 +139,8 @@ From Zed's guidelines, which this code follows:
   never answers its prompt, even once stopped, as Factory Droid loses a turn. `question` and
   `questions` ask as Claude Agent's AskUserQuestion does, `plan` asks to approve a plan (and
   leaves plan mode once approved), `run-tests` asks to run a command, and `page` asks to open
-  a page. `background-task [seconds]` leaves a command running
+  a page. `notice` sends ACP notices, and `/compact` compacts the context with a summary
+  (`compact-fail` fails to). `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
   once it ends (`background-task 4 limit` uses the account's limit up as its turn ends, the
   command still running). `subagents [seconds]` runs two subagents at once in sessions of their own, as

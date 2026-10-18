@@ -24,9 +24,9 @@ use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
-    ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource, LostHistory,
-    ModeSwitch, PendingHandoff, PermissionOption, PlanItem, SessionRestore, ThreadAgent,
-    ToolAnswer, ToolCall, TurnTime, without_handoff,
+    Compaction, ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource,
+    LostHistory, ModeSwitch, PendingHandoff, PermissionOption, PlanItem, SessionRestore,
+    ThreadAgent, ToolAnswer, ToolCall, TurnTime, without_handoff,
 };
 use agentz_protocol::workspace::{
     PastureSupport, ProjectGit, SetupStepKind, SetupStepState, WorkspaceChoice, WorkspaceSetup,
@@ -519,6 +519,8 @@ pub struct AgentView {
     /// Settings › General's "Show thinking", as the rows were last measured with it.
     synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
+    /// The compactions whose summary is open.
+    expanded_compactions: HashSet<usize>,
     plan_expanded: bool,
     /// What each of the composer's chips mentions.
     mentions: HashMap<ChipId, Mention>,
@@ -781,6 +783,7 @@ impl AgentView {
                 .settings()
                 .show_thinking,
             toggled_thoughts: HashSet::default(),
+            expanded_compactions: HashSet::default(),
             plan_expanded: false,
             mentions: HashMap::default(),
             uploads: HashMap::default(),
@@ -2266,6 +2269,12 @@ impl AgentView {
                         }
                     }
                 }
+                Entry::Compaction(compaction) => {
+                    self.sync_markdown((index, 1), &compaction.summary, cx);
+                    if let Some(error) = &compaction.error {
+                        self.sync_markdown((index, 2), error, cx);
+                    }
+                }
                 Entry::Plan => {}
             }
         }
@@ -2512,6 +2521,18 @@ impl AgentView {
             .update(cx, |composer, cx| composer.set_text("", cx));
         self.mentions.clear();
         self.attachment_error = None;
+        self.send_prompt(prompt, cx);
+    }
+
+    /// Sends the agent's own compact command, as typing `/compact` does.
+    fn compact_context(&mut self, cx: &mut Context<Self>) {
+        if self.is_archived || !self.client.read(cx).is_online() || self.needs_login(cx) {
+            return;
+        }
+        self.send_prompt(PromptPart::text("/compact"), cx);
+    }
+
+    fn send_prompt(&mut self, prompt: Vec<PromptPart>, cx: &mut Context<Self>) {
         // Messages typed while the agent works wait in the queue the server keeps, which
         // sends them one at a time as each turn ends, like Zed's.
         let thread = self.thread.read(cx);
@@ -4024,6 +4045,7 @@ impl AgentView {
                     .children(self.render_limit_notice(cx))
                     .children(self.render_login_notice(has_rows, cx))
                     .children(self.render_lost_history_notice(cx))
+                    .children(self.render_session_notices(cx))
                     .children(self.render_errors(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
@@ -5875,12 +5897,139 @@ impl AgentView {
             Entry::ToolCall(tool_call) if !is_work(entry) => {
                 self.render_tool_call(index, tool_call, None, window, cx)
             }
+            Entry::Compaction(compaction) => self.render_compaction(index, compaction, window, cx),
             Entry::AgentThought(_) | Entry::ToolCall(_) | Entry::Plan => {
                 self.render_work_entry(index, entry, is_last, window, cx)
             }
         }
     }
 
+    /// Zed's compaction entry, where its first update came: a divider around a button, which
+    /// opens what the agent kept, or why it failed, in place.
+    fn render_compaction(
+        &self,
+        index: usize,
+        compaction: &Compaction,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_compacting = compaction.status == acp::CompactionStatus::InProgress;
+        let has_details = !compaction.summary.is_empty() || compaction.error.is_some();
+        let is_expanded = self.expanded_compactions.contains(&index);
+        let label = match compaction.status {
+            acp::CompactionStatus::InProgress => "Compacting Context…",
+            acp::CompactionStatus::Completed => "Context Compacted",
+            acp::CompactionStatus::Failed => "Compaction Failed",
+            acp::CompactionStatus::Cancelled => "Compaction Canceled",
+            _ => "Context Compaction",
+        };
+        let chevron = if is_expanded {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        };
+        let header = h_flex()
+            .gap_1()
+            .w_full()
+            .child(ui::Divider::horizontal())
+            .child(
+                div().flex_none().child(
+                    Button::new(("context-compaction", index), label)
+                        .label_size(LabelSize::Small)
+                        .loading(is_compacting)
+                        .disabled(!has_details)
+                        .start_icon(
+                            Icon::new(IconName::Compact)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when(has_details, |this| {
+                            this.end_icon(
+                                Icon::new(chevron)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.toggle_compaction(index, cx);
+                                },
+                            ))
+                        }),
+                ),
+            )
+            .child(ui::Divider::horizontal());
+        let border = Self::tool_card_border_color(cx);
+        div()
+            .debug_selector(move || format!("compaction-{index}"))
+            .px_5()
+            .w_full()
+            .child(
+                v_flex()
+                    .pt_1p5()
+                    .mb_1p5()
+                    .gap_1p5()
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .rounded_sm()
+                    .child(header)
+                    .when(is_expanded && has_details, |this| {
+                        let mut error_style =
+                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                        error_style.base_text_style.color = Color::Error.color(cx);
+                        this.border_color(border)
+                            .bg(cx.theme().colors().editor_background.opacity(0.2))
+                            .when(!compaction.summary.is_empty(), |this| {
+                                this.child(
+                                    v_flex()
+                                        .id(("compaction-summary", index))
+                                        .p_2()
+                                        .gap_2()
+                                        .text_ui(cx)
+                                        .children(self.markdown(
+                                            (index, 1),
+                                            tool_output_style(false, window, cx),
+                                            cx,
+                                        )),
+                                )
+                            })
+                            .when(compaction.error.is_some(), |this| {
+                                this.child(
+                                    div()
+                                        .id(("compaction-error", index))
+                                        .p_2()
+                                        .children(self.markdown((index, 2), error_style, cx)),
+                                )
+                            })
+                            .child(
+                                h_flex().border_t_1().border_color(border).child(
+                                    IconButton::new(
+                                        ("compaction-summary-collapse", index),
+                                        IconName::ChevronUp,
+                                    )
+                                    .full_width()
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.toggle_compaction(index, cx);
+                                        },
+                                    )),
+                                ),
+                            )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_compaction(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.expanded_compactions.remove(&index) {
+            // Following the end would scroll to the summary's foot, and it's read from the top.
+            if self.list_state.is_following_tail() {
+                self.list_state.pause_following_tail();
+            }
+            self.expanded_compactions.insert(index);
+        }
+        self.list_state.remeasure_items(index + 1..index + 2);
+        cx.notify();
+    }
     /// A tool call, thought or the plan's marker. Once a message follows it, a run of them
     /// folds into one line, as t3code folds a work group: the line draws at the run's first
     /// entry, and the rest draw nothing until it's opened. While the turn runs, its last run
@@ -8747,6 +8896,10 @@ impl AgentView {
     fn render_generating(&self, cx: &App) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let started_at = thread.turn_started_at()?;
+        // The compaction's divider says it's working meanwhile, as in Zed.
+        if thread.is_compacting() {
+            return None;
+        }
         // Any permission request, whether its tool call is shown or not.
         let awaiting_confirmation = !thread.state.permission_requests.is_empty();
         // t3code's "Working for 1m 12s".
@@ -9377,6 +9530,75 @@ impl AgentView {
         )
     }
 
+    /// Zed's session notices: each of the agent's notices as a callout, oldest first, until
+    /// it's dismissed. Past 192px the list scrolls.
+    fn render_session_notices(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notices = self.thread.read(cx).notices();
+        if notices.is_empty() {
+            return None;
+        }
+        let callouts: Vec<AnyElement> = notices
+            .iter()
+            .map(|notice| {
+                let id = notice.id;
+                let (severity, icon) = match notice.severity {
+                    acp::NoticeSeverity::Info => (Severity::Info, Some(IconName::Info)),
+                    acp::NoticeSeverity::Warning => (Severity::Warning, Some(IconName::Warning)),
+                    acp::NoticeSeverity::Error => (Severity::Error, Some(IconName::XCircle)),
+                    _ => (Severity::Info, None),
+                };
+                let callout = Callout::new()
+                    .severity(severity)
+                    .title(notice.title.clone())
+                    .when_some(icon, Callout::icon)
+                    .when_some(notice.description.clone(), Callout::description)
+                    .scrollable_description(false)
+                    .dismiss_action(
+                        div()
+                            .debug_selector(move || format!("dismiss-session-notice-{id}"))
+                            .child(
+                                IconButton::new(("dismiss-session-notice", id), IconName::Close)
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .aria_label(format!("Dismiss notice: {}", notice.title))
+                                    .tooltip(Tooltip::text("Dismiss Notice"))
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            this.thread.update(cx, |thread, cx| {
+                                                thread.dismiss_notice(id, cx)
+                                            });
+                                            if event.is_keyboard() {
+                                                window.focus(&this.composer.focus_handle(cx), cx);
+                                            }
+                                        },
+                                    )),
+                            ),
+                    );
+                div()
+                    .id(("session-notice", id))
+                    .w_full()
+                    .flex_none()
+                    .child(callout)
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            div()
+                .px_2()
+                .pb_2()
+                .child(
+                    v_flex()
+                        .id("session-notices")
+                        .debug_selector(|| "session-notices".into())
+                        .w_full()
+                        .flex_shrink_0()
+                        .max_h(rems_from_px(192_f32))
+                        .overflow_y_scroll()
+                        .children(callouts),
+                )
+                .into_any_element(),
+        )
+    }
     /// The account the thread logs in, named in its login while the agent has more than one.
     fn login_account(&self, cx: &App) -> Option<SharedString> {
         let agent_id = self.agent_id.as_ref()?;
@@ -10554,7 +10776,7 @@ impl AgentView {
     }
 
     /// Zed's context ring: how full the agent's context window is, with details on hover.
-    fn render_context_usage(&self, cx: &App) -> Option<AnyElement> {
+    fn render_context_usage(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.thread.read(cx);
         let usage = thread.context_usage()?;
         let ratio = if usage.size > 0 {
@@ -10578,59 +10800,101 @@ impl AgentView {
         } else {
             cx.theme().colors().text_muted
         };
+        let can_compact = thread
+            .available_commands()
+            .iter()
+            .any(|command| command.name == "compact");
+        let menu_header =
+            SharedString::from(format!("Context {percentage} \u{2022} {used} / {size}"));
+        let ring = ui::CircularProgress::new(usage.used as f32, usage.size as f32, px(16.), cx)
+            .stroke_width(px(2.))
+            .progress_color(progress_color);
+        let tooltip = move |window: &mut Window, cx: &mut App| {
+            let percentage = percentage.clone();
+            let used = used.clone();
+            let size = size.clone();
+            let cost_label = cost_label.clone();
+            Tooltip::element(move |_, cx| {
+                let separator = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
+                v_flex()
+                    .min_w_40()
+                    .child(
+                        Label::new("Context")
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(Label::new(percentage.clone()))
+                            .child(Label::new("\u{2022}").color(separator).mx_1())
+                            .child(Label::new(used.clone()))
+                            .child(Label::new("/").color(separator))
+                            .child(Label::new(size.clone()).color(Color::Muted)),
+                    )
+                    .when_some(cost_label.clone(), |this, cost_label| {
+                        this.child(
+                            v_flex()
+                                .mt_1p5()
+                                .pt_1p5()
+                                .gap_0p5()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    Label::new("Cost")
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small),
+                                )
+                                .child(Label::new(cost_label)),
+                        )
+                    })
+                    .into_any_element()
+            })(window, cx)
+        };
+        if !can_compact {
+            return Some(
+                h_flex()
+                    .id("context-usage")
+                    .mt_px()
+                    .mr_1()
+                    .child(ring)
+                    .tooltip(tooltip)
+                    .into_any_element(),
+            );
+        }
+        // With the agent's own compact command, the ring opens a menu that sends it.
+        let view = cx.weak_entity();
         Some(
-            h_flex()
-                .id("context-usage")
-                .mt_px()
+            div()
+                .debug_selector(|| "context-usage".into())
                 .mr_1()
                 .child(
-                    ui::CircularProgress::new(usage.used as f32, usage.size as f32, px(16.), cx)
-                        .stroke_width(px(2.))
-                        .progress_color(progress_color),
-                )
-                .tooltip(move |window, cx| {
-                    let percentage = percentage.clone();
-                    let used = used.clone();
-                    let size = size.clone();
-                    let cost_label = cost_label.clone();
-                    Tooltip::element(move |_, cx| {
-                        let separator =
-                            Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
-                        v_flex()
-                            .min_w_40()
-                            .child(
-                                Label::new("Context")
-                                    .color(Color::Muted)
-                                    .size(LabelSize::Small),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .child(Label::new(percentage.clone()))
-                                    .child(Label::new("\u{2022}").color(separator).mx_1())
-                                    .child(Label::new(used.clone()))
-                                    .child(Label::new("/").color(separator))
-                                    .child(Label::new(size.clone()).color(Color::Muted)),
-                            )
-                            .when_some(cost_label.clone(), |this, cost_label| {
-                                this.child(
-                                    v_flex()
-                                        .mt_1p5()
-                                        .pt_1p5()
-                                        .gap_0p5()
-                                        .border_t_1()
-                                        .border_color(cx.theme().colors().border_variant)
-                                        .child(
-                                            Label::new("Cost")
-                                                .color(Color::Muted)
-                                                .size(LabelSize::Small),
-                                        )
-                                        .child(Label::new(cost_label)),
+                    PopoverMenu::new("context-usage-menu")
+                        .trigger_with_tooltip(
+                            ButtonLike::new("context-usage")
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .child(ring),
+                            tooltip,
+                        )
+                        .menu(move |window, cx| {
+                            let view = view.clone();
+                            let menu_header = menu_header.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.header(menu_header).item(
+                                    ContextMenuEntry::new("Compact Context")
+                                        .icon(IconName::Compact)
+                                        .icon_color(Color::Muted)
+                                        .handler(move |_, cx| {
+                                            view.update(cx, |view, cx| view.compact_context(cx))
+                                                .log_err();
+                                        }),
                                 )
-                            })
-                            .into_any_element()
-                    })(window, cx)
-                })
+                            }))
+                        })
+                        .anchor(Anchor::BottomRight)
+                        .offset(gpui::point(px(0.), px(-4.))),
+                )
                 .into_any_element(),
         )
     }
@@ -14846,7 +15110,7 @@ fn is_work(entry: &Entry) -> bool {
                 && tool_calls::published_artifact(tool_call).is_none()
         }
         Entry::AgentThought(_) | Entry::Plan => true,
-        Entry::UserMessage(_) | Entry::AgentMessage(_) => false,
+        Entry::UserMessage(_) | Entry::AgentMessage(_) | Entry::Compaction(_) => false,
     }
 }
 
@@ -15934,6 +16198,101 @@ mod tests {
         assert!(!at_limit(&view, cx));
     }
 
+    /// The agent's notices stack above the composer until each is dismissed, which only the
+    /// server hears. A compaction is a divider that opens what the agent kept in place, and
+    /// hides "Working for…" while it runs. The context ring sends the agent's compact command.
+    #[gpui::test]
+    fn shows_the_agents_notices_and_compactions(cx: &mut TestAppContext) {
+        use agentz_protocol::thread::{Compaction, ContextUsage, SessionNotice};
+
+        let (view, cx) = open(1, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx);
+            thread.update_state_for_test(
+                |state| {
+                    state.notices = vec![
+                        SessionNotice {
+                            id: 3,
+                            severity: acp::NoticeSeverity::Warning,
+                            title: "MCP server unavailable".into(),
+                            description: Some("Continuing without it.".into()),
+                        },
+                        SessionNotice {
+                            id: 4,
+                            severity: acp::NoticeSeverity::Other("maintenance".into()),
+                            title: "Scheduled maintenance".into(),
+                            description: None,
+                        },
+                    ]
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-notices").is_some());
+        click_on("dismiss-session-notice-3", cx);
+        assert!(
+            sent(&client, cx)
+                .iter()
+                .any(|request| matches!(request, Request::DismissNotice { notice: 3, .. }))
+        );
+
+        let mut compaction = Compaction::new(acp::CompactionId::new("compaction-1"));
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("/compact".into()),
+                    Entry::Compaction(compaction.clone()),
+                ],
+                cx,
+            );
+            thread.set_working_for_test(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("compaction-1").is_some());
+        assert!(view.read_with(cx, |view, cx| view.render_generating(cx).is_none()));
+
+        compaction.status = acp::CompactionStatus::Completed;
+        compaction.summary = "Kept the plan.".into();
+        thread.update(cx, |thread, cx| {
+            thread.set_working_for_test(false, cx);
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("/compact".into()),
+                    Entry::Compaction(compaction),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        click_on("compaction-1", cx);
+        assert!(view.read_with(cx, |view, _| view.expanded_compactions.contains(&1)));
+
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.usage = Some(ContextUsage {
+                        used: 174_000,
+                        size: 200_000,
+                    });
+                    state.available_commands = vec![acp::AvailableCommand::new(
+                        "compact",
+                        "Summarize the conversation",
+                    )];
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        click_on("context-usage", cx);
+        click_on("MENU_ITEM-Compact Context", cx);
+        assert!(sent(&client, cx).iter().any(|request| matches!(
+            request,
+            Request::Prompt { prompt, .. } if *prompt == PromptPart::text("/compact")
+        )));
+    }
     /// The limit notice offers to continue at the reset, and once the server waits for it, to
     /// cancel that.
     #[gpui::test]
