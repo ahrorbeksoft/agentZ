@@ -38,6 +38,35 @@ thread to another machine yet (Continue with Another Agent, workspace handoff an
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
 
+### Smaller release downloads
+
+The release downloads are too big: 101 MB for macOS and 47 MB for Linux (v0.3.0). Bring them
+down.
+
+Findings (October 19, 2026), measured from v0.3.0's assets and release builds on this Mac:
+
+- Most of each download is servers. The macOS zip has the universal app (41 MB compressed),
+  the universal server (21 MB), the same two Mac servers again one per chip in `Resources`
+  (21 MB, an exact duplicate) and both Linux servers (21 MB). The Linux tarball has the app
+  (27 MB), its server (11 MB) and the arm64 Linux server (10 MB).
+- One download per platform, each with only its own app and server (zip/tar.gz as now):
+  Apple silicon 29.7 MB, Intel 32.1 MB, Linux x86_64 38.0 MB, Linux arm64 about 36 MB (no
+  Linux arm64 app is built yet; estimated). An SSH machine of another kind would then need its
+  server downloaded, for example from the release, as Zed downloads its remote server.
+- xz in place of deflate takes a third off with no code change: Apple silicon 20.0 MB, Linux
+  x86_64 about 26 MB. On macOS that would be a DMG with LZMA compression, as Zed ships a DMG
+  (not measured); on Linux `.tar.xz`. `site/install.sh` changes with either.
+- Build settings, Apple silicon, xz, app + server + icon: fat LTO 19.2 MB; fat LTO with
+  `opt-level = "s"` 16.0 MB (the code is slower; likely fine for the server, untried for the
+  app's drawing and terminals); plus `panic = "abort"` 13.5 MB, but a panic in any server task
+  would then end the whole server and every running turn, so not for the server.
+- In the app, Mermaid rendering (`merman`, Zed's feature) is about 8 MB of its 42.6 MB. Unused
+  image formats (exr, tiff, dds, …) are about 0.5 MB per binary; the two crypto libraries
+  (aws-lc, ring) under 1 MB together.
+
+Suggested: one download per platform, xz/DMG, fat LTO and `opt-level = "s"` for the server
+(about 18 MB for Apple silicon), then try `"s"` on the app.
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
