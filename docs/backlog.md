@@ -71,6 +71,12 @@ Suggested: one download per platform, xz/DMG, fat LTO and `opt-level = "s"` for 
 
 Image annotation when an image is opened from the input composer.
 
+### Warn agents that give pictures instead of live pages
+
+Maybe warn agents when they give pictures instead of live pages. A setting, global or per
+project (the project's setting overrides the global one), decides whether they're warned that
+this is happening.
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
