@@ -20,6 +20,13 @@ method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane
 terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
 which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
 
+### Links in terminals aren't clickable
+
+In any terminal, links aren't clickable, and the mouse pointer is an I-beam (text cursor) all
+the time, even over a link (here `http://localhost:5173/` from `vite dev`).
+
+![A terminal running vite dev, its localhost link not clickable](backlog/terminal-links-not-clickable.png)
+
 
 ## Features
 
