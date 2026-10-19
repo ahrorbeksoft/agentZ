@@ -67,6 +67,10 @@ Findings (October 19, 2026), measured from v0.3.0's assets and release builds on
 Suggested: one download per platform, xz/DMG, fat LTO and `opt-level = "s"` for the server
 (about 18 MB for Apple silicon), then try `"s"` on the app.
 
+### Annotate an image opened from the composer
+
+Image annotation when an image is opened from the input composer.
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
