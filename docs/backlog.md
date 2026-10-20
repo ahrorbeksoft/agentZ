@@ -37,6 +37,111 @@ Droid), one turn ends ("The round 7 pages are built…", 17m 23s) and the next s
 
 The account's email in the composer is covered in the screenshot.
 
+### Claude's background dev server keeps its thread Working
+
+Requested October 21, 2026: "sometimes claude runs a background task and forget about it and
+it shows it is still working … like a dev server". Asked whether to follow t3code, the user
+said: "t3-code implement their own thing we use acp, we gotta find acp way of doing".
+
+Findings, from "Mock and practice result pages" (thread 535), local time:
+
+- Claude started `bun run dev --port 5188` in the background at 00:00 on October 20 and
+  finished its turn at 00:24:33. The thread stayed Working until the user stopped the server
+  from the background-task panel at 00:46:08 (Claude's record: "stopped by the user").
+- Any running background task counts as reported work (`is_reported` in `AgentThread`'s
+  `OwnWorkQuiet` handling), which is waited for with no limit. While it runs, the machine is
+  also kept awake, the agent isn't stopped when idle, and the finished sound waits. This was
+  built for bug 3 of `design/feedback/plan.md`: a build Claude said it would wait for.
+- The ACP way is v2's `state_update` session update. The agent reports its foreground work as
+  `running`, `requires_action` and `idle`, including work it starts by itself, "for example
+  to … follow up on a completed background task". Background activity goes on while `idle`
+  and doesn't change it. So a dev server leaves the thread idle, and Claude's follow-up once a
+  task ends shows as running. Claude Agent 0.94.0 sends these on v2 (`v2Foreground` in its
+  `dist/v2/prompt.js`), with its own model cycles after a background subagent as work of their
+  own. Codex ACP 2.2.2 has `state_update` too (not read in detail).
+- v1 has no state for a session, only for subagent sessions (`StateUpdate`, unstable). There
+  the prompt's answer is the only end of foreground work the agent reports, and what agentZ
+  does after it is inference.
+- For comparison, t3code doesn't let background commands hold a thread, but does let
+  subagents and monitors hold it (`backgroundWorkHoldsCompletion`).
+
+Waits for "Use reported ACP v2 state with a fallback for inferred activity" below, which waits
+until Zed enables ACP v2. Still to decide: what agents without v2 state do meanwhile.
+
+### Factory Droid's background subagents are forgotten after its first report
+
+Requested October 21, 2026: "droid spuns agents but they never kept track of while the main
+agent is waiting for them, it shows it's done".
+
+Findings, from "Migrating mobile UI to React Native…" (thread 547, a fluency.uz thread),
+October 21, local time:
+
+- At 00:15 Droid sent three workers to the background (Task with `await: false`) and ended
+  its turn. The thread rightly stayed Working.
+- At 00:27 one reported, Droid woke and sent another off, and at 00:29 agentZ marked the
+  thread Completed with three still running. After that, each report showed Working for about
+  a minute, then Completed. The worker Droid started at 01:00 was never waited for.
+- From 00:59 to 01:00 agentZ ended a wake halfway: Droid sent nothing for about 45 seconds
+  while it wrote its next Task call.
+- Causes, in `agent_thread.rs`: `detached_subagents` is one flag for all of them, cleared by
+  any update during the wait ("The agent woke, with the subagents' reports"). It's set only
+  when a prompt's answer arrives (`turn_goes_on_in_background`), so a Task sent off during a
+  wake isn't counted. Once it's cleared, 30 seconds without updates (`OWN_WORK_QUIET`) ends
+  the work.
+- A background Task's row says "In the background" for good. Droid writes "Background task
+  completed. task_id: …" only into its session file (`~/.factory/sessions/<cwd>/<session>.jsonl`),
+  not over ACP, so agentZ can't tell which worker ended. Each worker is a Droid session of its
+  own, its id the task_id, in a file beside it.
+- The mock's `droid-task background` runs one subagent and is stopped. Nothing tests a wake
+  with a report, several subagents, or one sent off during a wake.
+
+Possible fix: track each background Task by the task_id in its launch notice, including those
+started during a wake, count each wake as one report (in thread 547 Droid woke once per
+report), and keep the 20-minute give-up. Reading the notices from Droid's session file would
+be exact, but reads Droid's files. On v2 Droid would report its wakes itself, but Droid 0.245.0
+only speaks v1 (it answers `initialize` for version 2 with 1). A change to the row goes
+through the design board.
+
+### Factory Droid's background commands aren't waited for
+
+Found October 21, 2026, behind the report in the next entry: Droid had woken by itself, and
+agentZ didn't know it would.
+
+Findings, from "Mock and practice result pages" (thread 535), October 20, local time: at 15:39
+Droid ended its turn with "Run round 7 click-through" left running (an Execute with
+`fireAndForget`, answered "Background process started (PID: …)"), and agentZ marked the thread
+Completed. At 16:08:51 the command finished and Droid woke by itself. Waiting after a turn
+counts only Claude's background tasks (AIR's `asyncTasks`) and Droid's background Tasks, not
+this.
+
+Possible fix: treat such an Execute the way a background subagent is treated, and keep the thread
+Working until the command ends. The server runs on the agent's machine, so it can check that
+the PID is still alive.
+
+### A message sent while Factory Droid wakes by itself is never answered
+
+Requested October 21, 2026: "sometimes i am seeing not stopping after finishing everyting it
+shows working".
+
+Findings, from the same thread (535), October 20, local time:
+
+- Droid woke at 16:08:51, when its background command finished (entry above), but its first
+  update reached agentZ only at 16:10:39. At 16:09:40 the user sent "are you here?" while the
+  thread looked idle, so agentZ sent it as a prompt.
+- Droid folded it into the work it was doing, as steering ("A follow-up user message arrived
+  while you were working"), answered "Yes, I'm here", and finished at 16:19:23. It never
+  answered the prompt.
+- The thread stayed Working until the user pressed Stop at 19:03 (server log: "Factory Droid
+  didn't answer the stop of its turn in 5s; restarting it"). Only a stopped turn has a timeout
+  (`STOP_TIMEOUT`, `end_unanswered_turn`).
+- The same can happen whenever Droid wakes while agentZ shows it idle, for example after a
+  background subagent agentZ stopped waiting for (entries above).
+
+Not verified: the raw ACP messages weren't captured. This comes from Droid's session file,
+agentZ's transcript (`transcripts/535.json`) and the server log, which agree. It can't be
+reproduced with the real Droid, since that means sending it prompts; the mock's `lost-turn`
+loses a turn as Droid does.
+
 
 ## Features
 
