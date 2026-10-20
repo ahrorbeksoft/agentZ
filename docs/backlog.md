@@ -77,6 +77,10 @@ Maybe warn agents when they give pictures instead of live pages. A setting, glob
 project (the project's setting overrides the global one), decides whether they're warned that
 this is happening.
 
+### Redesign the thread composer
+
+Redesign the composer in threads.
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
