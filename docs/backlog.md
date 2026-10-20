@@ -27,6 +27,16 @@ the time, even over a link (here `http://localhost:5173/` from `vite dev`).
 
 ![A terminal running vite dev, its localhost link not clickable](backlog/terminal-links-not-clickable.png)
 
+### Turns split without user messages
+
+Still the same issue: turns are splitting without user messages. In the screenshot (Factory
+Droid), one turn ends ("The round 7 pages are built…", 17m 23s) and the next starts below it
+("Ran 1 command", "Thought") with no user message between them.
+
+![A Factory Droid thread with two turns in a row and no user message between them](backlog/turns-split-without-user-messages.png)
+
+The account's email in the composer is covered in the screenshot.
+
 
 ## Features
 
