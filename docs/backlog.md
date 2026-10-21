@@ -142,6 +142,11 @@ agentZ's transcript (`transcripts/535.json`) and the server log, which agree. It
 reproduced with the real Droid, since that means sending it prompts; the mock's `lost-turn`
 loses a turn as Droid does.
 
+### Factory Droid threads don't get an automatic title
+
+Auto title generation is not working on Droid, but Regenerate Title renames the thread
+correctly. Maybe enable it for every agent when it's enabled in the settings.
+
 
 ## Features
 
@@ -195,6 +200,12 @@ this is happening.
 ### Redesign the thread composer
 
 Redesign the composer in threads.
+
+### Show whether an agent or account is in use, and every agent's usage
+
+When picking agents or accounts, show an indicator of whether each is being used (whether
+it's working). Also show usage for agents with a single account: the usage percentage is
+shown only for accounts, not for agents.
 
 ## Zed upstream updates
 
