@@ -419,11 +419,11 @@ pub enum AgentViewEvent {
     /// The header's project was clicked: a new thread in it, as in t3code.
     NewThreadInProject(ProjectId),
     /// The new thread was made again with another agent, account, checkout or machine, or as
-    /// a terminal: show `thread` in its place, with `text` in its composer. This one is
+    /// a terminal: show `thread` in its place, with `draft` in its composer. This one is
     /// deleted right after.
     Replaced {
         thread: ThreadKey,
-        text: SharedString,
+        draft: ComposerDraft,
     },
     /// Manage Agents, from the new thread's agent picker: Settings › Agents.
     OpenAgentSettings,
@@ -3126,31 +3126,8 @@ impl AgentView {
         let upload = cx.spawn(async move |this, cx| {
             let result = async {
                 let source = source.context("the machine it was copied on is gone")?;
-                let response = source
-                    .read_with(cx, |client, _| {
-                        client.request(Request::Attachment {
-                            thread_id,
-                            id,
-                            thumbnail: false,
-                        })
-                    })
-                    .await?;
-                let Response::AttachmentData(data) = response else {
-                    anyhow::bail!("unexpected response: {response:?}");
-                };
-                let response = client
-                    .read_with(cx, |client, _| {
-                        client.request(Request::AddAttachment {
-                            thread_id: this_thread,
-                            mime_type: data.mime_type,
-                            data: data.data,
-                        })
-                    })
-                    .await?;
-                match response {
-                    Response::Attachment(id) => Ok(Mention::Image(id)),
-                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
-                }
+                let id = copy_image(&source, thread_id, &client, this_thread, id, cx).await?;
+                Ok(Mention::Image(id))
             }
             .await;
             this.update(cx, |this, cx| {
@@ -14811,6 +14788,8 @@ impl AgentView {
             .thread(self.thread_id)
             .filter(|thread| thread.in_workspaces())
             .and_then(|thread| thread.starting_folder().cloned());
+        // A terminal has no composer to carry the draft to.
+        let carries_draft = matches!(starter, Starter::Agent(_));
         self.replacing = Some("Starting…".into());
         self.replace_error = None;
         cx.notify();
@@ -14829,18 +14808,30 @@ impl AgentView {
             ),
         });
         self._replacing = cx.spawn(async move |this, cx| {
-            let created = created.await;
+            // This thread's images are deleted with it, so they're copied first.
+            let created = match created.await {
+                Ok(thread) if carries_draft => {
+                    let Ok(copying) = this.update(cx, |this, cx| {
+                        this.copy_composer_images(project.machine, thread, cx)
+                    }) else {
+                        return;
+                    };
+                    Ok((thread, copying.await))
+                }
+                Ok(thread) => Ok((thread, HashMap::default())),
+                Err(error) => Err(error),
+            };
             this.update(cx, |this, cx| {
                 this.replacing = None;
                 match created {
-                    Ok(thread) => {
-                        let text = this.composer.read(cx).text().clone();
+                    Ok((thread, copied)) => {
+                        let draft = this.carried_draft(project.machine, &copied, cx);
                         cx.emit(AgentViewEvent::Replaced {
                             thread: ThreadKey {
                                 machine: project.machine,
                                 thread,
                             },
-                            text,
+                            draft,
                         });
                         // After the event: a workspace pane shows the new thread before this
                         // one is deleted, which would close the pane.
@@ -14862,10 +14853,116 @@ impl AgentView {
         });
     }
 
-    /// What was typed in a thread this one replaced.
-    pub(crate) fn set_composer_text(&mut self, text: SharedString, cx: &mut Context<Self>) {
-        self.composer
-            .update(cx, |composer, cx| composer.set_text(text, cx));
+    /// Copies the composer's images to `thread` on `machine`, made in this one's place, and
+    /// gives each copy's id by the image's here.
+    fn copy_composer_images(
+        &self,
+        machine: MachineId,
+        thread: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Task<HashMap<AttachmentId, AttachmentId>> {
+        let images: HashSet<AttachmentId> = self
+            .composer
+            .read(cx)
+            .chips()
+            .iter()
+            .filter_map(|chip| match self.mentions.get(&chip.id) {
+                Some(Mention::Image(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let source = self.client.clone();
+        let from = self.thread_id;
+        let target = Machines::global(cx).read(cx).client(machine, cx);
+        cx.spawn(async move |_, cx| {
+            let mut copied = HashMap::default();
+            let Some(target) = target else {
+                return copied;
+            };
+            for id in images {
+                match copy_image(&source, from, &target, thread, id.clone(), cx).await {
+                    Ok(copy) => {
+                        copied.insert(id, copy);
+                    }
+                    Err(error) => {
+                        log::error!("couldn't copy an image to the new thread: {error:#}")
+                    }
+                }
+            }
+            copied
+        })
+    }
+
+    /// The composer's message and marks for the thread made in this one's place on `machine`:
+    /// its images as their `copied` ones there, and its files and threads, on another machine,
+    /// as their text.
+    fn carried_draft(
+        &self,
+        machine: MachineId,
+        copied: &HashMap<AttachmentId, AttachmentId>,
+        cx: &App,
+    ) -> ComposerDraft {
+        let same_machine = machine == self.client.read(cx).machine();
+        let composer = self.composer.read(cx);
+        let text = composer.text();
+        let mut draft = ComposerDraft::default();
+        let mut index = 0;
+        for chip in composer.chips() {
+            if chip.range.start > index {
+                draft
+                    .prompt
+                    .push(PromptPart::Text(text[index..chip.range.start].to_string()));
+            }
+            index = chip.range.end;
+            let part = match self.mentions.get(&chip.id) {
+                Some(Mention::Image(id)) => {
+                    let Some(copy) = copied.get(id) else {
+                        continue;
+                    };
+                    if let Some(marked) = self.marked_chips.get(&chip.id) {
+                        draft.marks.push((copy.clone(), marked.marks.clone()));
+                    }
+                    PromptPart::Image(copy.clone())
+                }
+                Some(Mention::Path(_) | Mention::Thread(_)) if !same_machine => {
+                    PromptPart::Text(chip.copy_text.to_string())
+                }
+                Some(mention) => mention.prompt_part(),
+                // Still uploading here, so there's nothing to carry yet.
+                None if self.uploads.contains_key(&chip.id) => continue,
+                None => PromptPart::Text(chip.copy_text.to_string()),
+            };
+            draft.prompt.push(part);
+        }
+        if index < text.len() {
+            draft
+                .prompt
+                .push(PromptPart::Text(text[index..].to_string()));
+        }
+        draft
+    }
+
+    /// What was typed in a thread this one replaced, with its chips and their marks.
+    pub(crate) fn set_composer_draft(&mut self, draft: ComposerDraft, cx: &mut Context<Self>) {
+        self.restore_prompt(&draft.prompt, cx);
+        if draft.marks.is_empty() {
+            return;
+        }
+        let images: Vec<(ChipId, AttachmentId)> = self
+            .composer
+            .read(cx)
+            .chips()
+            .iter()
+            .filter_map(|chip| match self.mentions.get(&chip.id) {
+                Some(Mention::Image(id)) => Some((chip.id, id.clone())),
+                _ => None,
+            })
+            .collect();
+        for (chip, id) in images {
+            if let Some((_, marks)) = draft.marks.iter().find(|(marked, _)| *marked == id) {
+                self.apply_marks(chip, id, marks.clone(), cx);
+            }
+        }
     }
 
     /// What's typed: the text with each chip as what copying it gives, and what the chips
@@ -14953,6 +15050,62 @@ impl AgentView {
     fn forget_unsent_text(&mut self, cx: &App) {
         self._save_unsent_text = Task::ready(());
         self.saved_unsent = self.typed_draft(cx);
+    }
+}
+
+/// What a new thread's composer held, for the thread made in its place
+/// ([`AgentViewEvent::Replaced`]): its message, with images copied to that thread, and the
+/// marks still to be drawn on them.
+#[derive(Clone, Debug, Default)]
+pub struct ComposerDraft {
+    prompt: Vec<PromptPart>,
+    marks: Vec<(AttachmentId, Vec<Mark>)>,
+}
+
+#[cfg(test)]
+impl ComposerDraft {
+    pub(crate) fn text(text: &str) -> Self {
+        Self {
+            prompt: PromptPart::text(text),
+            marks: Vec::new(),
+        }
+    }
+}
+
+/// Copies an image kept for thread `from` on `source`'s machine to thread `to` on `target`'s,
+/// and gives the copy's id.
+async fn copy_image(
+    source: &Entity<ServerClient>,
+    from: ThreadId,
+    target: &Entity<ServerClient>,
+    to: ThreadId,
+    id: AttachmentId,
+    cx: &mut gpui::AsyncApp,
+) -> anyhow::Result<AttachmentId> {
+    let response = source
+        .read_with(cx, |client, _| {
+            client.request(Request::Attachment {
+                thread_id: from,
+                id,
+                thumbnail: false,
+            })
+        })
+        .await?;
+    let Response::AttachmentData(data) = response else {
+        anyhow::bail!("unexpected response: {response:?}");
+    };
+    let response = target
+        .read_with(cx, |client, _| {
+            client.request(Request::AddAttachment {
+                thread_id: to,
+                mime_type: data.mime_type,
+                data: data.data,
+            })
+        })
+        .await?;
+    match response {
+        Response::Attachment(id) => Ok(id),
+        response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
     }
 }
 
@@ -22932,6 +23085,115 @@ mod tests {
         assert_eq!(prompt(cx), expected);
     }
 
+    /// Changing a new thread's agent makes it again: what's in its composer goes to the new
+    /// one, its images copied there first, since they're deleted with this thread, and their
+    /// marks still to be drawn.
+    #[gpui::test]
+    fn changing_the_agent_keeps_the_composers_images_and_mentions(cx: &mut TestAppContext) {
+        use crate::image_markup::{MarkupColor, Shape};
+
+        let (view, cx) = open(1, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        client.update(cx, |client, _| {
+            let requests = requests.clone();
+            client.answer_for_test(move |request| {
+                requests.borrow_mut().push(request.clone());
+                match request {
+                    Request::CreateThread { .. } => Some(Response::ThreadCreated(ThreadId(9))),
+                    Request::Attachment { .. } => Some(Response::AttachmentData(
+                        agentz_protocol::attachments::AttachmentData {
+                            mime_type: "image/png".into(),
+                            data: TINY_PNG.into(),
+                        },
+                    )),
+                    Request::AddAttachment { .. } => Some(Response::Attachment(image_id())),
+                    _ => None,
+                }
+            })
+        });
+        accept_images(&view, cx);
+        let marks = vec![Mark::new(
+            Shape::Rectangle {
+                from: point(1., 1.),
+                to: point(2., 2.),
+            },
+            MarkupColor::Red,
+            1.,
+        )];
+        let written = view.update(cx, |view, cx| {
+            view.restore_prompt(
+                &[
+                    PromptPart::Text("Fix ".into()),
+                    PromptPart::Image(image_id()),
+                    PromptPart::Text(" in ".into()),
+                    PromptPart::Path("/tmp/demo/src/login.rs".into()),
+                ],
+                cx,
+            );
+            let chip = view.composer.read(cx).chips()[0].id;
+            view.apply_marks(chip, image_id(), marks.clone(), cx);
+            view.composer_prompt(cx)
+        });
+        let replaced: Rc<RefCell<Option<ComposerDraft>>> = Rc::default();
+        cx.update(|_, cx| {
+            let replaced = replaced.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::Replaced { draft, .. } = event {
+                    *replaced.borrow_mut() = Some(draft.clone());
+                }
+            })
+            .detach();
+        });
+        requests.borrow_mut().clear();
+
+        view.update(cx, |view, cx| {
+            view.change_new_thread_starter(Starter::Agent(AgentId::new("other")), cx)
+        });
+        cx.run_until_parked();
+        let copied = |thread: u64| {
+            requests.borrow().iter().any(|request| match request {
+                Request::Attachment {
+                    thread_id,
+                    thumbnail: false,
+                    ..
+                } => *thread_id == ThreadId(thread),
+                _ => false,
+            })
+        };
+        assert!(copied(1), "the image is read from this thread");
+        assert!(requests.borrow().iter().any(|request| matches!(
+            request,
+            Request::AddAttachment {
+                thread_id: ThreadId(9),
+                ..
+            }
+        )));
+        let draft = replaced
+            .borrow_mut()
+            .take()
+            .expect("the thread was replaced");
+        assert_eq!(draft.prompt, written);
+        assert_eq!(draft.marks, [(image_id(), marks.clone())]);
+
+        // The new thread's composer gets it all back, the image's marks with it.
+        view.update(cx, |view, cx| {
+            view.composer
+                .update(cx, |composer, cx| composer.set_text("", cx));
+            view.set_composer_draft(draft, cx);
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.composer_prompt(cx), written);
+            let marked: Vec<&MarkedImage> = view.marked_chips.values().collect();
+            assert_eq!(
+                marked,
+                [&MarkedImage {
+                    original: image_id(),
+                    marks
+                }]
+            );
+        });
+    }
     /// The agent takes images.
     fn accept_images(view: &Entity<AgentView>, cx: &mut VisualTestContext) {
         let thread = view.read_with(cx, |view, _| view.thread.clone());

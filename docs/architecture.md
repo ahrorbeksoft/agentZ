@@ -1423,7 +1423,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   onto more lines, so nothing is cut off. Changing anything
   else replaces the draft with a new one, and the old one leaves the store at once
   (`ProjectStore::delete_thread`), so its row doesn't flash in the thread list until the
-  server answers. The account picker (`AgentView::render_account_picker`,
+  server answers. The composer goes with it (`AgentView::carried_draft`, a `ComposerDraft`
+  in `AgentViewEvent::Replaced`): its images are copied to the new thread first, as the old
+  one's are deleted with it (`AgentView::copy_composer_images`), with the marks not yet drawn
+  on them, and its mentions stay chips, a file's or thread's as its text on another machine.
+  The account picker (`AgentView::render_account_picker`,
   §12 of the accounts round) shows only while the agent lists more than one account: the
   draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
   out") and the window the usage setting picks (`usage_limits::shown_window`), the draft's

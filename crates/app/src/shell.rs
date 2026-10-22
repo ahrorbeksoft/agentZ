@@ -1370,15 +1370,15 @@ impl Shell {
                 AgentViewEvent::OpenAgentAccounts { agent_id } => {
                     this.open_agent_accounts(key.machine, agent_id, window, cx)
                 }
-                AgentViewEvent::Replaced { thread, text } => {
+                AgentViewEvent::Replaced { thread, draft } => {
                     this.open_thread(*thread, window, cx);
                     if let Some(OpenThread {
                         view: ThreadView::Agent(view),
                         ..
                     }) = this.open_threads.get(thread)
                     {
-                        let text = text.clone();
-                        view.update(cx, |view, cx| view.set_composer_text(text, cx));
+                        let draft = draft.clone();
+                        view.update(cx, |view, cx| view.set_composer_draft(draft, cx));
                     }
                 }
             },
@@ -3340,7 +3340,9 @@ mod modal_tests {
             else {
                 panic!("the draft is open");
             };
-            view.update(cx, |view, cx| view.set_composer_text("Fix it".into(), cx));
+            view.update(cx, |view, cx| {
+                view.set_composer_draft(crate::agent_view::ComposerDraft::text("Fix it"), cx)
+            });
         });
         shell.update_in(cx, |shell, window, cx| {
             shell.new_thread(&NewThread, window, cx)

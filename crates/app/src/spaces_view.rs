@@ -32,7 +32,7 @@ use ui::{
 };
 
 use crate::agent_icons::agent_icon;
-use crate::agent_view::{AgentView, AgentViewEvent, TOOLBAR_HEIGHT};
+use crate::agent_view::{AgentView, AgentViewEvent, ComposerDraft, TOOLBAR_HEIGHT};
 use crate::app_settings::AppSettingsStore;
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::AgentIcon;
@@ -635,7 +635,7 @@ pub struct SpacesView {
     panes: HashMap<PaneKey, OpenPane>,
     /// What was typed in a new thread that another replaced in its pane, for the
     /// replacement's composer once the pane shows it.
-    replaced_composer_texts: HashMap<ThreadKey, SharedString>,
+    replaced_composer_drafts: HashMap<ThreadKey, ComposerDraft>,
     /// A pane the server is making, focused once it arrives.
     pending_focus: Option<PaneKey>,
     split_override: Option<SplitOverride>,
@@ -702,7 +702,7 @@ impl SpacesView {
             layouts: HashMap::default(),
             zoomed: HashSet::default(),
             panes: HashMap::default(),
-            replaced_composer_texts: HashMap::default(),
+            replaced_composer_drafts: HashMap::default(),
             pending_focus: None,
             split_override: None,
             pane_drag: None,
@@ -1114,7 +1114,7 @@ impl SpacesView {
                     let agent_thread = AgentThread::shared(&client, thread_id, cx);
                     let is_archived = thread.archived_at.is_some();
                     let machine = key.machine;
-                    let composer_text = self.replaced_composer_texts.remove(&ThreadKey {
+                    let composer_draft = self.replaced_composer_drafts.remove(&ThreadKey {
                         machine,
                         thread: thread_id,
                     });
@@ -1128,8 +1128,8 @@ impl SpacesView {
                         );
                         view.set_archived(is_archived, cx);
                         view.show_in_pane(cx);
-                        if let Some(text) = composer_text {
-                            view.set_composer_text(text, cx);
+                        if let Some(draft) = composer_draft {
+                            view.set_composer_draft(draft, cx);
                         }
                         view
                     });
@@ -1161,8 +1161,8 @@ impl SpacesView {
                         // A pane shows its own header, without the thread's project.
                         AgentViewEvent::NewThreadInProject(_) => {}
                         // A pane holds threads of its own machine only.
-                        AgentViewEvent::Replaced { thread, text } if thread.machine == machine => {
-                            this.replaced_composer_texts.insert(*thread, text.clone());
+                        AgentViewEvent::Replaced { thread, draft } if thread.machine == machine => {
+                            this.replaced_composer_drafts.insert(*thread, draft.clone());
                             this.show_thread_in_pane(key, thread.thread, cx);
                         }
                         AgentViewEvent::Replaced { thread, .. } => {

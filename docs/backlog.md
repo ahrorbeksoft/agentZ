@@ -39,10 +39,6 @@ session, so what agentZ does after the prompt's answer is inference. For compari
 doesn't let background commands hold a thread, but does let subagents and monitors hold it
 (`backgroundWorkHoldsCompletion`).
 
-### Changing the agent drops the composer's screenshots and mentions
-
-When the user changes the agent, any screenshots and mentions in the composer are gone.
-
 ### A steering prompt to Claude shows up only after a delay
 
 When a prompt is sent to Claude mid-turn and the user presses Steer, it doesn't show for a
