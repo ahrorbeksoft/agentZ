@@ -601,6 +601,10 @@ pub struct AgentThread {
     runs_in_parent: bool,
     /// The agent's foreground work as it last reported it, on ACP v2.
     agent_state: Option<AgentState>,
+    /// The states the agent reported, by session, while the session opened: `session/new`'s
+    /// session is known only once it's answered, and v2 reports a resumed session's state
+    /// before its answer (Zed's `PendingSessionUpdates`).
+    opening_states: HashMap<String, AgentState>,
     /// Messages sent into the turn on ACP v2, oldest first, until the agent answers them.
     steered_prompts: VecDeque<SteeredPrompt>,
     next_steered_prompt: u64,
@@ -1021,6 +1025,7 @@ impl AgentThread {
             subagent_messages: HashMap::new(),
             runs_in_parent: false,
             agent_state: None,
+            opening_states: HashMap::new(),
             steered_prompts: VecDeque::new(),
             next_steered_prompt: 0,
         };
@@ -2120,6 +2125,7 @@ impl AgentThread {
         self.stoppable_subagents.clear();
         self.subagent_messages.clear();
         self.dropping_replay = self.has_conversation && self.previous_session.is_some();
+        self.opening_states.clear();
         let opening = open_session(
             connection.clone(),
             self.view.state.capabilities.clone(),
@@ -2142,8 +2148,11 @@ impl AgentThread {
         result: std::result::Result<SessionSetup, agent_client_protocol::Error>,
     ) {
         self.dropping_replay = false;
+        let mut opening_states = std::mem::take(&mut self.opening_states);
         match result {
             Ok(setup) => {
+                let session = setup.session_id.0.to_string();
+                let reported_state = opening_states.remove(&session);
                 self.has_conversation = true;
                 self.fork_source = None;
                 self.view.state.config_options = setup.config_options;
@@ -2183,6 +2192,24 @@ impl AgentThread {
                     self.fail_queued_prompts(FailedMessage::LostHistory);
                     self.set_working(false);
                     return;
+                }
+                // As in Zed's resume, the state isn't a turn's end: it says what the agent is
+                // doing now. Without it the agent's work is unknown, though none of it can have
+                // begun in a process started for this thread.
+                match reported_state {
+                    Some(state) => self.agent_state_reported(session, state),
+                    None if self.is_v2()
+                        && matches!(
+                            setup.restore,
+                            SessionRestore::Loaded | SessionRestore::ResumedWithoutHistory
+                        ) =>
+                    {
+                        log::warn!(
+                            "{} resumed session {session} without reporting its current state",
+                            self.view.state.agent_name
+                        );
+                    }
+                    None => {}
                 }
                 for prompt in std::mem::take(&mut self.queued_prompts) {
                     self.send_to_agent(prompt);
@@ -3559,6 +3586,12 @@ impl AgentThread {
     /// once a background task ended) is its own, and ends at `idle`. A turn whose prompt was
     /// answered goes on while the agent works on, or has a message sent into the turn to take.
     fn agent_state_reported(&mut self, session: String, state: AgentState) {
+        if self.session.is_none() {
+            if self.view.state.status == ConnectionStatus::Connecting {
+                self.opening_states.insert(session, state);
+            }
+            return;
+        }
         if !self.is_own_session(&session) {
             return;
         }
@@ -6626,6 +6659,11 @@ mod tests {
         assert!(thread.thread.state.supports_steering);
         assert!(thread.thread.supports_logout());
         assert_eq!(thread.thread.config_options().len(), 4);
+        assert_eq!(
+            thread.thread.agent_state,
+            Some(AgentState::Idle),
+            "the state it reported before `session/new` named the session is kept"
+        );
 
         thread.update(|thread| thread.send("hello".into()));
         thread
@@ -6814,6 +6852,10 @@ mod tests {
         assert!(thread.thread.is_v2());
         assert_eq!(user_messages(&thread.thread), ["hello"]);
         assert_eq!(agent_text(&thread.thread), "Echo: hello");
+        // The state it reports before the resume's answer, which isn't a turn's end.
+        assert_eq!(thread.thread.agent_state, Some(AgentState::Idle));
+        assert!(!thread.thread.is_working());
+        assert!(thread.thread.state.finished_turns.is_empty());
         thread.update(|thread| thread.send("next".into()));
         thread
             .wait_until(|thread| {

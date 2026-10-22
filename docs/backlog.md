@@ -29,30 +29,3 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
-
-## Zed upstream updates
-
-Requested October 18, 2026: add all five groups from the upstream review. The review compared
-our October 1 Zed reference (`57bfce2945`) with upstream through October 17 (`56934ec056`),
-245 newer commits. These are source findings; the failures have not been reproduced in agentZ.
-
-### Follow Zed's v2 session lifecycle
-
-agentZ is on SDK 3.4.0, as upstream is
-([#65706](https://github.com/zed-industries/zed/pull/65706)). Session notices and context
-compaction are built, and so is ACP v2 (October 22, 2026, `agent_thread/src/acp_v2.rs`): a
-load is `session/resume` with a replay, sessions close and list as on v1, and a permission
-request about a tool call shows in its card.
-
-Left from Zed's v2 lifecycle, not checked against agentZ: keeping updates that arrive before
-`session/new` answers ([#65822](https://github.com/zed-industries/zed/pull/65822)), resume
-snapshots and unconfirmed state
-([#65724](https://github.com/zed-industries/zed/pull/65724)), and shutting connections down
-([#65873](https://github.com/zed-industries/zed/pull/65873)). Zed's `session/delete`
-([#65921](https://github.com/zed-industries/zed/pull/65921)) deletes sessions from its
-history list, which agentZ doesn't have. Read Zed's `agent_servers/src/acp/v2.rs` as it is
-when this is built, and test with the mock agent (`MOCK_ACP_V2`).
-
-For all copied-crate updates, preserve agentZ's Metal drawable handling, nested scrolling,
-Markdown image rendering and link chips, and animation frame limits, documented under
-Crates in `docs/architecture.md`.

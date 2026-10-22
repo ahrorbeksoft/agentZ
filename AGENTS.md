@@ -175,7 +175,8 @@ From Zed's guidelines, which this code follows:
   the messages the fork's source had ("Remembered: hello"), from the history path. With
   `MOCK_RESUME` it resumes sessions (`session/resume`, no replay; `fail` fails them). With
   `MOCK_ACP_V2` it speaks ACP v2 to a client that asks for it, as Claude Agent's v2 surface
-  does (`reject` refuses v2 with `-32022`, as an agent of v1 only does). Its
+  does, reporting its state before it answers `session/new` or `session/resume` (`reject`
+  refuses v2 with `-32022`, as an agent of v1 only does). Its
   `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
   linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones. With
   `MOCK_MCP_ACP` it takes MCP servers on its ACP connection (MCP-over-ACP), and its `mcp`

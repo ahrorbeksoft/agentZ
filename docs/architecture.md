@@ -1150,6 +1150,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   hold the turn (the inference above is off), so a dev server left running leaves the thread
   idle. `AgentThread::is_waiting` is then false, while
   `has_background_work` still keeps the agent from being stopped and the machine awake.
+  A state reported while the session opens (before `session/new` answers, which names the
+  session, and the snapshot v2 asks of a resume before its answer) is kept
+  (`AgentThread::opening_states`, Zed's `PendingSessionUpdates`) and applied once the session
+  opens, as what the agent is doing, not a turn's end. A resume without one is logged, as in
+  Zed, which then shows the work as unconfirmed; agentZ doesn't, since the agent's process
+  started for the thread and none of the session's work can have begun in it. Other updates
+  before the answer apply as they come, and the answer's config options and commands replace
+  theirs. The connection ends with the agent's process, as on v1 (Zed gave its own v2 runtime
+  a shutdown in #65873).
   Steer shows for every agent on v2 and sends the message as a prompt of its own, marked for
   the wire (`agentz/steered`); it shows in the thread once the agent takes it in (its
   `user_message`, which the wire reports as `_agentz/prompt_taken`), and the thread works on

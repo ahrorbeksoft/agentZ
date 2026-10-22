@@ -164,7 +164,9 @@ Agent's v2 surface does (with CLAUDE_AGENT_ACP_EXPERIMENTAL_V2): `auth/login` an
 config options by `configId`, a prompt answered with its message id as it's taken in (after its
 `user_message`, and followed by `running`) and its turn ended by an `idle` `state_update`,
 tool calls as `tool_call_update`s, plans as `plan_update`s and permission requests about their
-`subject`. A prompt sent while a turn runs waits for it to end, as Claude Agent queues one, and
+`subject`. It reports its state (`idle`) before it answers `session/new` or `session/resume`,
+as v2 asks of a resume (and Claude Agent does), so before the client knows a new session's id.
+A prompt sent while a turn runs waits for it to end, as Claude Agent queues one, and
 a cancel ends it with -32800. Its work once a background task ended is `running` until its
 `idle`. With MOCK_ACP_V2=reject, it refuses v2 with -32022, as an agent of v1 only does.
 """
@@ -1345,6 +1347,7 @@ for message in incoming():
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
         session_is_new = True
+        send_state("session-1", "idle")
         send({"jsonrpc": "2.0", "id": message["id"],
               "result": {"sessionId": "session-1", "configOptions": config_options()}})
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "session-1", "update": {
@@ -1366,6 +1369,7 @@ for message in incoming():
         for payload in load_history(session_id):
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": session_id, "update": payload}})
+        send_state(session_id, "idle")
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/resume" and os.environ.get("MOCK_RESUME") == "fail":
         send({"jsonrpc": "2.0", "id": message["id"],
@@ -1373,6 +1377,7 @@ for message in incoming():
     elif method == "session/resume":
         mcp_servers = message["params"].get("mcpServers", [])
         session_cwd = message["params"].get("cwd", session_cwd)
+        send_state(message["params"]["sessionId"], "idle")
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"configOptions": config_options()}})
     elif method == "session/fork" and os.environ.get("MOCK_FORK") == "fail":
         send({"jsonrpc": "2.0", "id": message["id"],
