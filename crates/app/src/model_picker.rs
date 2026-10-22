@@ -58,6 +58,14 @@ pub(crate) fn is_model_setting(option: &acp::SessionConfigOption) -> bool {
         )
 }
 
+/// Whether a setting is Fast mode, which Claude Agent and Codex name so, and which the model's
+/// chip and menu mark with a bolt.
+pub(crate) fn is_fast_mode(option: &acp::SessionConfigOption) -> bool {
+    is_model_setting(option)
+        && matches!(option.kind, acp::SessionConfigKind::Boolean(_))
+        && option.name.to_lowercase().starts_with("fast")
+}
+
 /// Whether an agent's setting is left out of the composer and its defaults. Claude Agent's
 /// Agent setting picks a persona for the main thread, and its adapter offers Claude Code's
 /// own `web-fetch` agent there, which Claude Code then refuses ("Agent \"web-fetch\" not
@@ -138,7 +146,7 @@ enum SettingKind {
         current: acp::SessionConfigValueId,
     },
     /// On or off, with a switch.
-    Switch(bool),
+    Switch { is_on: bool, is_fast: bool },
 }
 
 impl Setting {
@@ -151,7 +159,10 @@ impl Setting {
                     .collect(),
                 current: select.current_value.clone(),
             },
-            acp::SessionConfigKind::Boolean(boolean) => SettingKind::Switch(boolean.current_value),
+            acp::SessionConfigKind::Boolean(boolean) => SettingKind::Switch {
+                is_on: boolean.current_value,
+                is_fast: is_fast_mode(option),
+            },
             _ => return None,
         };
         Some(Self {
@@ -427,7 +438,7 @@ impl ModelPicker {
                         }),
                 )
                 .into_any_element(),
-            SettingKind::Switch(is_on) => {
+            SettingKind::Switch { is_on, is_fast } => {
                 let toggle = cx.listener({
                     let id = id.clone();
                     move |this, _, _, cx| {
@@ -443,6 +454,14 @@ impl ModelPicker {
                         ListItem::new(SharedString::from(format!("model-setting-{}", id.0)))
                             .inset(true)
                             .spacing(ListItemSpacing::Sparse)
+                            // The bolt the chip shows while it's on.
+                            .when(is_fast, |item| {
+                                item.start_slot(
+                                    Icon::new(IconName::BoltFilled)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            })
                             .child(div().min_w_0().child(Label::new(name).truncate()))
                             .end_slot(Switch::new(
                                 SharedString::from(format!("model-setting-{}-switch", id.0)),

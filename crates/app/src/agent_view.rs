@@ -86,8 +86,8 @@ use crate::image_markup::{
 };
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::model_picker::{
-    ModelPicker, current_choice_name, is_hidden_option, is_model_setting, model_and_effort,
-    select_choices,
+    ModelPicker, current_choice_name, is_fast_mode, is_hidden_option, is_model_setting,
+    model_and_effort, select_choices,
 };
 use crate::open_in_editor::{self, Choices, OpenWith};
 use crate::project_copies::{CopyRow, render_copy_aside, render_copy_row};
@@ -12322,7 +12322,11 @@ impl AgentView {
         effort: Option<&acp::SessionConfigOption>,
         options: &[acp::SessionConfigOption],
     ) -> AnyElement {
-        let label = model_chip_label(model, effort, options);
+        let ModelChipLabel {
+            model_name,
+            fast,
+            rest,
+        } = model_chip_label(model, effort, options);
         let tooltip_title: SharedString = match effort {
             Some(effort) => format!("{} and {}", model.name, effort.name).into(),
             None => model.name.clone().into(),
@@ -12340,14 +12344,34 @@ impl AgentView {
                         Some(cx.new(|cx| ModelPicker::new(thread, model_option, window, cx)))
                     })
                     .trigger_with_tooltip(
-                        Button::new("session-model-trigger", label)
-                            .label_size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .end_icon(
-                                Icon::new(IconName::ChevronDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                        ButtonLike::new("session-model-trigger").child(
+                            h_flex()
+                                .gap_1()
+                                .when(fast, |chip| {
+                                    chip.child(
+                                        div().debug_selector(|| "session-model-fast".into()).child(
+                                            Icon::new(IconName::BoltFilled)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                    )
+                                })
+                                .child(
+                                    Label::new(model_name)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .when_some(rest, |chip, rest| {
+                                    chip.child(
+                                        Label::new(rest).size(LabelSize::Small).color(Color::Muted),
+                                    )
+                                })
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
                         setting_tooltip(tooltip_title, tooltip_description),
                     )
                     .anchor(gpui::Anchor::BottomRight),
@@ -15221,24 +15245,42 @@ fn account_phrase(entry: &AccountEntry, starts_sentence: bool) -> String {
     }
 }
 
-/// The model chip's label: the model, its effort, and the model's settings that are on, which
-/// show nowhere else once they're in its menu ("Opus 5.5 · High · Fast mode").
+/// The model chip's label: a bolt while Fast mode is on (the user's pick over its name), the
+/// model, then "· High" and any other of the model's settings that are on, which show nowhere
+/// else once they're in its menu.
+struct ModelChipLabel {
+    model_name: SharedString,
+    fast: bool,
+    rest: Option<SharedString>,
+}
+
 fn model_chip_label(
     model: &acp::SessionConfigOption,
     effort: Option<&acp::SessionConfigOption>,
     options: &[acp::SessionConfigOption],
-) -> SharedString {
-    let switched_on = options.iter().filter(|option| {
-        is_model_setting(option)
-            && matches!(&option.kind, acp::SessionConfigKind::Boolean(boolean) if boolean.current_value)
-    });
-    current_choice_name(model)
+) -> ModelChipLabel {
+    let switched_on: Vec<&acp::SessionConfigOption> = options
+        .iter()
+        .filter(|option| {
+            is_model_setting(option)
+                && matches!(&option.kind, acp::SessionConfigKind::Boolean(boolean) if boolean.current_value)
+        })
+        .collect();
+    let rest: Vec<SharedString> = effort
+        .and_then(current_choice_name)
         .into_iter()
-        .chain(effort.and_then(current_choice_name))
-        .chain(switched_on.map(|option| option.name.clone().into()))
-        .collect::<Vec<_>>()
-        .join(" · ")
-        .into()
+        .chain(
+            switched_on
+                .iter()
+                .filter(|option| !is_fast_mode(option))
+                .map(|option| option.name.clone().into()),
+        )
+        .collect();
+    ModelChipLabel {
+        model_name: current_choice_name(model).unwrap_or_default(),
+        fast: switched_on.iter().any(|option| is_fast_mode(option)),
+        rest: (!rest.is_empty()).then(|| format!("· {}", rest.join(" · ")).into()),
+    }
 }
 
 /// Which composer a picker is in: a new thread's, made again with what's picked, or a sent
@@ -21707,25 +21749,43 @@ mod tests {
         assert_eq!(last_set("model", cx).as_deref(), Some("opus"));
         assert!(cx.debug_bounds("model-picker").is_none());
 
-        // Once on, the chip says so.
+        // Once on, the chip has a bolt before the model.
         let label = |cx: &mut VisualTestContext| {
             view.read_with(cx, |view, cx| {
                 let options = view.thread.read(cx).config_options();
                 let (model, effort) = model_and_effort(options);
-                model_chip_label(model.expect("a model"), effort, options)
+                let label = model_chip_label(model.expect("a model"), effort, options);
+                (
+                    label.model_name.to_string(),
+                    label.fast,
+                    label.rest.map(|rest| rest.to_string()),
+                )
             })
         };
         thread.update(cx, |thread, cx| {
             thread.update_state_for_test(|state| state.config_options = options.clone(), cx)
         });
-        assert_eq!(label(cx), "Sonnet 4.6 · Medium");
+        assert_eq!(
+            label(cx),
+            ("Sonnet 4.6".into(), false, Some("· Medium".into()))
+        );
+        assert!(cx.debug_bounds("session-model-fast").is_none());
         let mut fast = options;
         fast[2] = acp::SessionConfigOption::boolean("fast", "Fast mode", true)
             .category(acp::SessionConfigOptionCategory::ModelConfig);
         thread.update(cx, |thread, cx| {
             thread.update_state_for_test(|state| state.config_options = fast, cx)
         });
-        assert_eq!(label(cx), "Sonnet 4.6 · Medium · Fast mode");
+        cx.run_until_parked();
+        assert_eq!(
+            label(cx),
+            ("Sonnet 4.6".into(), true, Some("· Medium".into()))
+        );
+        let bolt = cx
+            .debug_bounds("session-model-fast")
+            .expect("the bolt is shown");
+        let chip = cx.debug_bounds("session-model").expect("the chip is shown");
+        assert!(bolt.left() - chip.left() < px(12.));
     }
 
     /// Claude Agent's Agent setting is hidden: its adapter offers Claude Code's web-fetch

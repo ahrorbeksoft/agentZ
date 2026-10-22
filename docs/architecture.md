@@ -876,8 +876,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   them (the user's word, in place of a row of segments that cut names short), which set it
   and leave the menu open. The model's other settings, ACP's `model_config` category (Claude
   Agent's and Codex's Fast mode), follow in the menu rather than the footer: a switch row for
-  on/off, a list for choices (`model_picker::is_model_setting`); one that's on is named on the
-  chip ("Opus 5.5 · High · Fast mode"). An agent without effort keeps the model alone, one
+  on/off, a list for choices (`model_picker::is_model_setting`). While Fast mode is on, the chip
+  starts with a bolt ("⚡ Opus 5.5 · High", the user's pick over its name), which its menu row
+  has too; another on/off setting that's on is named after the effort. An agent without effort keeps the model alone, one
   without a model its effort's and model settings' own controls, and the mode stays its own
   menu. Claude Agent's Agent setting (a persona for the main thread) is hidden, in the
   composer and in Settings' defaults (`model_picker::is_hidden_option`), on the user's word:
