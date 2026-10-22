@@ -19,6 +19,7 @@ mod machine_icon_picker;
 mod machine_modal;
 mod machines;
 mod mention_menu;
+mod model_picker;
 mod new_space_picker;
 mod new_thread_modal;
 mod open_in_editor;
@@ -171,6 +172,7 @@ fn init_for_test(cx: &mut App) {
     terminal_thread_view::init(cx);
     new_space_picker::init(cx);
     branch_picker::init(cx);
+    model_picker::init(cx);
     spaces_view::init(cx);
     bind_keys(cx);
 }
@@ -276,6 +278,7 @@ fn main() {
             new_thread_modal::init(cx);
             new_space_picker::init(cx);
             branch_picker::init(cx);
+            model_picker::init(cx);
             spaces_view::init(cx);
             add_project_modal::init(cx);
             worktree_modal::init(cx);

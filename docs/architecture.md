@@ -853,8 +853,25 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   context ring opens a menu with its numbers and Compact Context, which sends `/compact`; the
   ring otherwise only has its tooltip. `agentz_thread_read` reports compactions with the
   activity.
-- **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`):
-  Zed's message editor. One line, growing with the text to eight, then scrolling. Shift-Enter
+- **Composer** (`agent_view.rs`, `text_input`'s several-line mode; picked in `design/composer/`
+  and `design/composer-2/`): Zed's message editor, in a card (rounded, outlined, with a
+  shadow) in a sent thread as on the new thread screen, 16 px in from the thread's sides
+  (`render_thread_composer`, composer-2 topic 1 B, from t3code's context strip). The card holds
+  what's sent: the text, + and, at the right, the agent's settings and Send. Under it the
+  strip (`render_composer_strip`) says who answers at the left (the agent picker, the account
+  picker, the usage gauge) and where at the right (on the new thread screen the checkout and
+  machine pickers; in a sent thread the machine as a label, since a thread can't move), then
+  the branch and the context ring. A sent thread's strip menus open upward. The branch is in
+  the strip, so the header shows it only where there's no composer (an archived thread, a
+  subthread, a machine offline). The activity bar sits on the card's top edge as a tab. Send is
+  t3code's round button (topic 3 A): gray with nothing to send, filled with the accent color
+  once there is; Stop is red with a white square, and Queue keeps the round shape with the list
+  icon. The model and effort are one chip, "Opus 5.5 · High ⌄" (`model_picker.rs`, topic 2 A,
+  from Codex's /model, with the user's search): its menu searches the models (fuzzy, under
+  their groups' headers; Up, Down and Enter pick), and the effort's levels are a row of
+  segments under them, which set it and leave the menu open. An agent without effort keeps the
+  model alone, one without a model its effort's own menu, and the mode stays its own menu.
+  The text is one line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
   `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
   line breaks, and Up/Down move between rows, unless a menu is open for the composer
@@ -1175,24 +1192,31 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   second frame; `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
   `design/thread-narrow/`, 2 C and 3 B, from t3code's compact controls): a thread can be as
   narrow as 320 px (a small window, or the Changes panel beside it). In the header the
-  branch gives way first, as it shrinks faster than the rest (to 72 px, and under 560 px
-  only its icon, its name and folder in the tooltip); then the title truncates, keeping at
-  least 120 px, and the project's name shrinks only after it. At 360 px and under the
-  project shows only its icon. Under 480 px the branch, the artifacts pill, the changes and
-  Terminal leave the header for "⋯", which they head: the branch as a line, Toggle
-  Terminal, Show or Hide Changes with the counts, Open in Editor, then the artifacts, then the
-  agent's options; Terminal's running dot moves onto "⋯". Under 560 px the composer's agent picker
-  shows only its icon and a sent thread's account picker only its avatar, their names in
-  the tooltips, and when its controls wrap, they keep to the right, so Send stays in the
-  corner.
+  title truncates, keeping at least 120 px, and the project's name shrinks only after it. At
+  360 px and under the project shows only its icon. Under 480 px the artifacts pill, the
+  changes and Terminal leave the header for "⋯", which they head: Toggle Terminal, Show or
+  Hide Changes with the counts, Open in Editor, then the artifacts, then the agent's options;
+  Terminal's running dot moves onto "⋯". Where the header has the branch (no composer, see
+  Composer), it gives way first, as it shrinks faster than the rest (to 72 px, and under
+  560 px only its icon, its name and folder in the tooltip), and under 480 px heads "⋯" as a
+  line. Under 560 px the strip's agent picker shows only its icon and a sent thread's account
+  picker only its avatar, their names in the tooltips, and when the card's controls wrap,
+  they keep to the right, so Send stays in the corner.
 - **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
   `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
   `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
   `render_account_picker` and `render_switch_divider`; t3code's in-thread provider switch and
-  context handoff, design round `design/agent-switching/`): a sent thread's composer has the
-  agent picker, and beside it the account picker while the agent has more than one account
-  (the current one under "This thread", the others under "Switch to"; `design/thread-narrow/`,
-  1 D). They work between turns. Picking another agent
+  context handoff, design round `design/agent-switching/`): a sent thread's strip under the
+  composer has the agent picker, and beside it the account picker while the agent has more
+  than one account (the current one under "This thread", the others under "Switch to";
+  `design/thread-narrow/`, 1 D). They work between turns. Both pickers, here and on the new
+  thread screen, mark what's working (`design/composer-2/`, topic 9 A; `working_threads`): the
+  sidebar's working dot after the name of an agent or account with a thread on the machine
+  working right now, the row's tooltip saying "Working in 2 threads". The agent picker ends
+  each agent's row with what's left of the account a switch would use (topic 10 A,
+  `usage_left_label`): this thread's for its own agent, the agent's account for new threads
+  (`AgentAccounts::new_thread_account`) for another, in the account picker's words, yellow at
+  15% or less and red once used up, and nothing while it isn't read or is logged out. Picking another agent
   or account stops the thread's agent, keeping the conversation in its transcript, and starts
   the new one in the same thread and folder: in the session it had in the thread, if it was
   there before (`Thread::other_sessions`, each with how many entries it saw), or in a new one.
@@ -1224,9 +1248,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`design/forked-thread/`, 1 C), not the copied conversation: the carried conversation is a
   chip in the composer card like a merge's, "<source title> · 6 messages", which previews
   exactly what goes to the agent, and × sends the first message without it (the thread's
-  entries keep the copied messages, and its header pill still names the source). The card's
-  agent picker changes the agent of a thread that exists, and the strip under it shows only the
-  branch: its checkout and machine are its source's. Once it has a message of its own the
+  entries keep the copied messages, and its header pill still names the source). Its strip is
+  a sent thread's: the agent picker changes the agent of a thread that exists, and the machine
+  is only a label beside the branch, as its checkout and machine are its source's. Once it has a message of its own the
   copied conversation shows in full, as in any thread.
   t3code's pill dividers link the two where they part: Forked from conversation in the fork,
   Conversation fork in the source (one for each fork from there), each opening the other.
@@ -1289,7 +1313,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in
-  a started thread's composer, what's left of one of its account's windows ("62%", leaving out
+  a started thread's strip under the composer, what's left of one of its account's windows ("62%", leaving out
   windows past their reset) on a borderless button like the pickers' beside it, yellow at 15%
   or less and red when used up, with the window's name in its tooltip ("Weekly: 3% left").
   Which window is Settings › General › Threads › Usage shown in the composer
@@ -1315,11 +1339,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   storefront?" (`AgentView::render_new_thread_headline`, chats round topic 5), whose project
   opens a menu of Chat, the projects shown and Add Project… that makes the draft again there,
   keeping what's typed, with "or start a chat" under it; a Workspaces draft's is "What should
-  we work on?" and a continuation's "Continue “title”". The composer has the agent
-  picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
-  Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
-  existing one), the machine picker (each copy of a combined project, see Project copies in
-  sync), the account picker and the branch, which reads "From main"
+  we work on?" and a continuation's "Continue “title”". The strip under the composer has the
+  agent picker (installed agents, then Terminal, which replaces the draft with a shell, and
+  Manage Agents…) and the account picker at the left, and at the right the checkout picker
+  (Local, a new worktree or pasture, or an existing one), the machine picker (each copy of a
+  combined project, see Project copies in sync) and the branch, which reads "From main"
   for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
   only the draft's plan until its first message (`Request::PlanWorkspace`). In a small pane
   (under 480 px wide or 420 px high: `AgentView::is_new_thread_compact`) the screen is

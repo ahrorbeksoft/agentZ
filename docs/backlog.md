@@ -77,16 +77,6 @@ Needs a check of drawing and terminal speed on a Mac before it ships.
 
 Image annotation when an image is opened from the input composer.
 
-### Redesign the thread composer
-
-Redesign the composer in threads.
-
-### Show whether an agent or account is in use, and every agent's usage
-
-When picking agents or accounts, show an indicator of whether each is being used (whether
-it's working). Also show usage for agents with a single account: the usage percentage is
-shown only for accounts, not for agents.
-
 ### Use ACP v2 with agents that support it
 
 Requested October 22, 2026: use ACP v2 with the agents that support it rather than wait for

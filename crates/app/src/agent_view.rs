@@ -81,10 +81,11 @@ use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
+use crate::model_picker::{ModelPicker, current_choice_name, model_and_effort, select_choices};
 use crate::open_in_editor::{self, Choices, OpenWith};
 use crate::project_copies::{CopyRow, render_copy_aside, render_copy_row};
 use crate::project_info::{render_project_icon, workspace_icon};
-use crate::project_store::ProjectStore;
+use crate::project_store::{ProjectStore, ThreadStatus};
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient};
@@ -4436,10 +4437,17 @@ impl AgentView {
             is_drawer_full_screen,
             shows_new_thread_screen,
         } = layout;
+        // The branch is in the strip under the composer, and in the header only while
+        // there's none.
+        let shows_composer_strip = !is_drawer_full_screen
+            && (shows_new_thread_screen
+                || (!is_subthread && !self.is_archived && self.client.read(cx).is_online()));
         v_flex()
             .size_full()
             .relative()
-            .when(!self.is_in_pane, |this| this.child(self.render_toolbar(cx)))
+            .when(!self.is_in_pane, |this| {
+                this.child(self.render_toolbar(!shows_composer_strip, cx))
+            })
             .when(is_subthread, |this| {
                 this.child(self.render_subthread_title_bar(parent, cx))
             })
@@ -4555,7 +4563,7 @@ impl AgentView {
                         } else if !self.client.read(cx).is_online() {
                             this.child(self.render_offline_notice(cx))
                         } else {
-                            this.child(self.render_message_editor(ComposerStyle::Bar, window, cx))
+                            this.child(self.render_thread_composer(window, cx))
                         }
                     })
             })
@@ -4973,8 +4981,9 @@ impl AgentView {
     /// t3code's breadcrumb: the project, where a click starts a new thread, then the title,
     /// which opens the thread's menu (a double-click renames it in place). The branch and the
     /// thread's buttons follow.
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, has_branch: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let is_chat = self.is_chat(cx);
+        let has_branch = has_branch && !is_chat;
         let store = self.store.read(cx);
         let project = store
             .thread(self.thread_id)
@@ -5015,9 +5024,11 @@ impl AgentView {
             .when(!is_compact, |toolbar| {
                 toolbar
                     .children(self.render_artifacts_pill(cx))
-                    .when(!is_chat, |toolbar| toolbar.children(self.render_branch(cx)))
+                    .when(has_branch, |toolbar| {
+                        toolbar.children(self.render_branch(cx))
+                    })
             })
-            .child(self.render_toolbar_buttons(is_chat, is_compact, cx))
+            .child(self.render_toolbar_buttons(is_chat, has_branch, is_compact, cx))
     }
 
     /// Chat where a thread's project is; a click starts another chat, as the project starts
@@ -5947,11 +5958,12 @@ impl AgentView {
     fn render_toolbar_buttons(
         &self,
         is_chat: bool,
+        has_branch: bool,
         is_compact: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if is_compact {
-            let items = self.compact_header_items(is_chat, cx);
+            let items = self.compact_header_items(is_chat, has_branch, cx);
             return h_flex()
                 .flex_none()
                 .child(self.render_options_menu(Some(items), cx));
@@ -6000,7 +6012,12 @@ impl AgentView {
     }
 
     /// What a narrow header moves into its ⋯ menu.
-    fn compact_header_items(&self, is_chat: bool, cx: &App) -> CompactHeaderItems {
+    fn compact_header_items(
+        &self,
+        is_chat: bool,
+        has_branch: bool,
+        cx: &App,
+    ) -> CompactHeaderItems {
         let machine = self.store.read(cx).machine();
         let machines = Machines::global(cx).read(cx);
         let artifacts = self
@@ -6012,7 +6029,7 @@ impl AgentView {
             })
             .collect();
         CompactHeaderItems {
-            branch: (!is_chat)
+            branch: has_branch
                 .then(|| self.thread_branch(cx))
                 .flatten()
                 .map(|(branch, icon, _)| (branch, icon)),
@@ -11821,15 +11838,17 @@ impl AgentView {
                 children.push(ui::Divider::horizontal().into_any_element());
             }
         }
+        // A tab on the composer card's top edge, inset from its sides.
         Some(
             h_flex()
                 .w_full()
-                .px_2()
+                .px_4()
                 .justify_center()
                 .child(
                     v_flex()
                         .w_full()
-                        .max_w(MAX_CONTENT_WIDTH)
+                        .mx_3()
+                        .max_w(MAX_CONTENT_WIDTH - px(24.))
                         .bg(Self::activity_bar_bg(cx))
                         .border_1()
                         .border_b_0()
@@ -11850,7 +11869,17 @@ impl AgentView {
     fn render_session_settings(&self, cx: &App) -> Vec<AnyElement> {
         let thread = self.thread.read(cx);
         let mut controls = Vec::new();
+        let (model_option, effort_option) = model_and_effort(thread.config_options());
         for option in thread.config_options() {
+            if model_option.is_some_and(|model| model.id == option.id) {
+                controls.push(self.render_model_chip(option, effort_option));
+                continue;
+            }
+            // The model's chip has the effort.
+            if model_option.is_some() && effort_option.is_some_and(|effort| effort.id == option.id)
+            {
+                continue;
+            }
             let config_id = option.id.clone();
             let element_id = SharedString::from(format!("config-option-{}", option.id.0));
             let tooltip_title: SharedString = option.name.clone().into();
@@ -12038,6 +12067,50 @@ impl AgentView {
             );
         }
         controls
+    }
+
+    /// The model and its effort as one chip, "Opus 5.5 · High" (`design/composer-2`, topic
+    /// 2 A), opening a search over the models with the effort's levels under them.
+    fn render_model_chip(
+        &self,
+        model: &acp::SessionConfigOption,
+        effort: Option<&acp::SessionConfigOption>,
+    ) -> AnyElement {
+        let model_name = current_choice_name(model).unwrap_or_default();
+        let (label, tooltip_title): (SharedString, SharedString) =
+            match effort.and_then(|effort| Some((effort, current_choice_name(effort)?))) {
+                Some((effort, effort_name)) => (
+                    format!("{model_name} · {effort_name}").into(),
+                    format!("{} and {}", model.name, effort.name).into(),
+                ),
+                None => (model_name, model.name.clone().into()),
+            };
+        let tooltip_description = model.description.clone().map(SharedString::from);
+        let thread = self.thread.clone();
+        let model_option = model.id.clone();
+        div()
+            .debug_selector(|| "session-model".into())
+            .child(
+                PopoverMenu::new("session-model")
+                    .menu(move |window, cx| {
+                        let thread = thread.clone();
+                        let model_option = model_option.clone();
+                        Some(cx.new(|cx| ModelPicker::new(thread, model_option, window, cx)))
+                    })
+                    .trigger_with_tooltip(
+                        Button::new("session-model-trigger", label)
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .end_icon(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        setting_tooltip(tooltip_title, tooltip_description),
+                    )
+                    .anchor(gpui::Anchor::BottomRight),
+            )
+            .into_any_element()
     }
 
     /// Zed's context ring: how full the agent's context window is, with details on hover.
@@ -12730,18 +12803,9 @@ impl AgentView {
             .into_any_element()
     }
 
-    fn render_message_editor(
-        &self,
-        style: ComposerStyle,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_message_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
         let thread = self.thread.read(cx);
-        let agent_name = self.agent_name(cx);
-        // A draft's card picks the agent it starts with. A fresh fork's card, like the bar,
-        // changes the agent of a thread that exists.
-        let is_sent_thread = style == ComposerStyle::Bar || self.is_fresh_fork(cx);
         let is_generating = thread.is_working();
         let is_editor_empty = self.composer.read(cx).text().trim().is_empty();
         let has_failed = matches!(thread.status(), ConnectionStatus::Failed(_));
@@ -12766,40 +12830,54 @@ impl AgentView {
         });
 
         let send_button = if is_generating && is_editor_empty {
-            IconButton::new("stop-generation", IconName::Stop)
-                .icon_color(Color::Error)
-                .style(ButtonStyle::Tinted(ui::TintColor::Error))
-                .tooltip(Tooltip::text("Stop Generation"))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Cancel), cx))
-                .into_any_element()
-        } else {
-            IconButton::new(
-                "send-message",
-                if is_generating {
-                    IconName::QueueMessage
-                } else {
-                    IconName::Send
-                },
+            round_button(
+                "stop-generation",
+                IconName::Stop,
+                cx.theme().status().error,
+                gpui::white(),
             )
-            .style(ButtonStyle::Filled)
-            .map(|this| {
-                if is_editor_empty || has_failed || needs_login {
-                    this.disabled(true).icon_color(Color::Muted)
-                } else {
-                    this.icon_color(Color::Accent)
-                }
-            })
-            .tooltip(Tooltip::text(if needs_login {
-                "Log In to Send"
-            } else if is_editor_empty {
-                "Type to Send"
-            } else if is_generating {
-                "Queue and Send"
-            } else {
-                "Send Message"
-            }))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Confirm), cx))
+            .cursor_pointer()
+            .hover(|style| style.opacity(0.85))
+            .tooltip(Tooltip::text("Stop Generation"))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Cancel), cx))
             .into_any_element()
+        } else {
+            let icon = if is_generating {
+                IconName::QueueMessage
+            } else {
+                IconName::ArrowUp
+            };
+            let can_send = !(is_editor_empty || has_failed || needs_login);
+            // Gray until there's something to send, then filled with the accent color.
+            let button = if can_send {
+                round_button(
+                    "send-message",
+                    icon,
+                    colors.text_accent,
+                    colors.editor_background,
+                )
+                .cursor_pointer()
+                .hover(|style| style.opacity(0.85))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(menu::Confirm), cx))
+            } else {
+                round_button(
+                    "send-message",
+                    icon,
+                    colors.element_selected,
+                    colors.text_placeholder,
+                )
+            };
+            button
+                .tooltip(Tooltip::text(if needs_login {
+                    "Log In to Send"
+                } else if is_editor_empty {
+                    "Type to Send"
+                } else if is_generating {
+                    "Queue and Send"
+                } else {
+                    "Send Message"
+                }))
+                .into_any_element()
         };
 
         h_flex()
@@ -12822,30 +12900,20 @@ impl AgentView {
             .on_action(cx.listener(Self::select_previous_command))
             .on_action(cx.listener(|this, _: &IncreaseEffort, _, cx| this.step_effort(true, cx)))
             .on_action(cx.listener(|this, _: &DecreaseEffort, _, cx| this.step_effort(false, cx)))
+            .w_full()
             .justify_center()
-            .map(|this| match style {
-                ComposerStyle::Bar => this
-                    .py_2()
-                    .bg(colors.editor_background)
-                    .border_t_1()
-                    .border_color(colors.border),
-                ComposerStyle::Card => this.w_full(),
-            })
             .child(
                 v_flex()
                     .w_full()
                     .max_w(MAX_CONTENT_WIDTH)
                     .min_w_0()
-                    .px_2()
+                    .p_2()
                     .gap_2()
-                    .when(style == ComposerStyle::Card, |this| {
-                        this.p_2()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .shadow_md()
-                    })
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.editor_background)
+                    .shadow_md()
                     // A draft can still be typed, but the composer reads as waiting on the login.
                     .when(needs_login, |this| this.opacity(0.55))
                     .children(self.render_handoff_chips(window, cx))
@@ -12856,7 +12924,7 @@ impl AgentView {
                             .pt_1()
                             .pr_2p5()
                             .text_ui(cx)
-                            .when(style == ComposerStyle::Card, |this| this.min_h(px(44.)))
+                            .min_h(px(44.))
                             .debug_selector(|| "composer".into())
                             .child(self.composer.clone())
                             .children(self.render_command_menu(cx))
@@ -12879,51 +12947,7 @@ impl AgentView {
                             .flex_none()
                             .flex_wrap()
                             .justify_between()
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .gap_0p5()
-                                    .child(self.render_add_context_button(cx))
-                                    .child(match (is_sent_thread, self.agent_switch(cx)) {
-                                        (true, Some(can_switch)) => h_flex()
-                                            .min_w_0()
-                                            .gap_0p5()
-                                            .child(self.render_agent_picker(
-                                                PickerFor::SentThread { can_switch },
-                                                cx,
-                                            ))
-                                            .children(self.render_account_picker(
-                                                PickerFor::SentThread { can_switch },
-                                                cx,
-                                            ))
-                                            .children(self.render_usage_gauge(cx))
-                                            .into_any_element(),
-                                        (true, None) => h_flex()
-                                            .id("thread-agent-name")
-                                            .gap_1()
-                                            .px_1()
-                                            .child(
-                                                self.thread_agent_icon(cx).size(IconSize::XSmall),
-                                            )
-                                            .map(|agent| {
-                                                if self.is_composer_compact() {
-                                                    agent.tooltip(Tooltip::text(agent_name))
-                                                } else {
-                                                    agent.child(
-                                                        Label::new(agent_name)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted),
-                                                    )
-                                                }
-                                            })
-                                            .children(self.render_usage_gauge(cx))
-                                            .into_any_element(),
-                                        (false, _) => {
-                                            self.render_agent_picker(PickerFor::NewThread, cx)
-                                        }
-                                    }),
-                            )
+                            .child(self.render_add_context_button(cx))
                             .child(
                                 h_flex()
                                     .debug_selector(|| "composer-controls".into())
@@ -12934,12 +12958,167 @@ impl AgentView {
                                     .flex_wrap()
                                     .justify_end()
                                     .gap_1()
-                                    .children(self.render_context_usage(cx))
                                     .children(settings_loading)
                                     .children(self.render_session_settings(cx))
                                     .child(send_button),
                             ),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// The composer at the end of a sent thread: the card, 16 px in from the thread's sides,
+    /// and the strip under it.
+    fn render_thread_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .px_4()
+            .pb_3()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(MAX_CONTENT_WIDTH)
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(self.render_message_editor(window, cx))
+                    .child(self.render_composer_strip(ComposerStyle::Thread, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Under the composer's card (`design/composer-2`, topic 1 B, with the user's machine
+    /// and branch): who answers at the left (the agent, its account and the account's usage)
+    /// and where at the right (a draft's checkout, the machine and the branch), then the
+    /// context ring.
+    fn render_composer_strip(&self, style: ComposerStyle, cx: &mut Context<Self>) -> AnyElement {
+        let is_sent_thread = style == ComposerStyle::Thread || self.is_fresh_fork(cx);
+        let is_chat = self.is_chat(cx);
+        let mut who = Vec::new();
+        let mut place = Vec::new();
+        if is_sent_thread {
+            match self.agent_switch(cx) {
+                Some(can_switch) => {
+                    let picker = PickerFor::SentThread { can_switch };
+                    who.push(self.render_agent_picker(picker, cx));
+                    who.extend(self.render_account_picker(picker, cx));
+                }
+                None => who.push(self.render_thread_agent_name(cx)),
+            }
+            who.extend(self.render_usage_gauge(cx));
+            place.push(self.render_machine_label("thread-machine", cx));
+            if !is_chat {
+                place.extend(self.render_strip_branch("thread-branch", cx));
+            }
+        } else {
+            who.push(self.render_agent_picker(PickerFor::NewThread, cx));
+            match &self.replacing {
+                Some(status) => place.push(
+                    h_flex()
+                        .h(px(22.))
+                        .px_1p5()
+                        .child(
+                            Label::new(status.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .with_animation(
+                                    "new-thread-replacing",
+                                    Animation::new(Duration::from_secs(2))
+                                        .repeat()
+                                        .with_max_fps(LOOPING_ANIMATION_FPS)
+                                        .with_easing(pulsating_between(0.4, 0.8)),
+                                    |label, delta| label.alpha(delta),
+                                ),
+                        )
+                        .into_any_element(),
+                ),
+                None => {
+                    who.extend(self.render_account_picker(PickerFor::NewThread, cx));
+                    if self.in_workspaces(cx) {
+                        place.push(self.render_folder_picker(cx));
+                        place.push(self.render_machine_label("new-thread-machine", cx));
+                    } else if is_chat {
+                        place.push(self.render_chat_machine_picker(cx).unwrap_or_else(|| {
+                            self.render_machine_label("new-thread-machine", cx)
+                        }));
+                    } else {
+                        place.push(self.render_checkout_picker(cx));
+                        place.push(self.render_machine_picker(cx).unwrap_or_else(|| {
+                            self.render_machine_label("new-thread-machine", cx)
+                        }));
+                    }
+                }
+            }
+            if !is_chat {
+                match self.planned_workspace(cx) {
+                    Some(plan) if self.replacing.is_none() => {
+                        place.push(self.render_base_picker(plan, cx))
+                    }
+                    _ => place.extend(self.render_strip_branch("new-thread-branch", cx)),
+                }
+            }
+        }
+        h_flex()
+            .debug_selector(|| "composer-strip".into())
+            // Its menus' keys (Escape, Enter, the arrows) are bound in the composer's context.
+            .key_context(KEY_CONTEXT)
+            .w_full()
+            .min_w_0()
+            .flex_wrap()
+            .justify_between()
+            .gap_x_2()
+            .gap_y_1()
+            .child(h_flex().min_w_0().flex_wrap().gap_0p5().children(who))
+            .child(
+                h_flex()
+                    // Fills what its line leaves, so it keeps to the right there.
+                    .flex_grow_1()
+                    .min_w_0()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_1()
+                    .children(place)
+                    .children(self.render_context_usage(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// A sent thread's agent when it can't change: a task's, or a terminal's.
+    fn render_thread_agent_name(&self, cx: &mut Context<Self>) -> AnyElement {
+        let agent_name = self.agent_name(cx);
+        h_flex()
+            .id("thread-agent-name")
+            .gap_1()
+            .px_1()
+            .child(self.thread_agent_icon(cx).size(IconSize::XSmall))
+            .map(|agent| {
+                if self.is_composer_compact() {
+                    agent.tooltip(Tooltip::text(agent_name))
+                } else {
+                    agent.child(
+                        Label::new(agent_name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                }
+            })
+            .into_any_element()
+    }
+
+    /// The machine the thread is on, where there's nothing to pick: a sent thread stays on
+    /// its machine.
+    fn render_machine_label(&self, id: &'static str, cx: &App) -> AnyElement {
+        let machines = Machines::global(cx).read(cx);
+        let machine = self.store.read(cx).machine();
+        div()
+            .debug_selector(move || id.into())
+            .child(
+                static_chip(
+                    id,
+                    Icon::new(machines.machine_icon(machine, cx)),
+                    machines.label(machine, cx),
+                )
+                .tooltip(Tooltip::text("Machine")),
             )
             .into_any_element()
     }
@@ -12977,12 +13156,8 @@ impl AgentView {
                     .child(
                         v_flex()
                             .gap_2()
-                            .child(self.render_message_editor(ComposerStyle::Card, window, cx))
-                            .child(if self.is_fresh_fork(cx) {
-                                self.render_fork_strip(cx)
-                            } else {
-                                self.render_new_thread_strip(cx)
-                            })
+                            .child(self.render_message_editor(window, cx))
+                            .child(self.render_composer_strip(ComposerStyle::NewThread, cx))
                             .children(self.render_errors(cx)),
                     ),
             );
@@ -13224,6 +13399,13 @@ impl AgentView {
         } else {
             "Change Agent".into()
         };
+        let store = self.store.clone();
+        let client = self.client.clone();
+        let thread_account = self
+            .store
+            .read(cx)
+            .thread(self.thread_id)
+            .and_then(|thread| thread.account);
         let menu = PopoverMenu::new(id)
             .menu(move |window, cx| {
                 let agents: Vec<(AgentId, SharedString)> = {
@@ -13241,19 +13423,46 @@ impl AgentView {
                         .map(|agent| (agent.id().clone(), agent.name().clone()))
                         .collect()
                 };
+                // What's left of the account each would answer on: this thread's for its own
+                // agent, the agent's default for another (`design/composer-2`, topic 10 A).
+                let which = crate::app_settings::AppSettingsStore::global(cx)
+                    .read(cx)
+                    .settings()
+                    .usage_window;
+                let now = SystemTime::now();
+                let agents: Vec<(AgentId, SharedString, usize, Option<LimitWindow>)> = agents
+                    .into_iter()
+                    .map(|(agent_id, name)| {
+                        let accounts = client.read(cx).accounts(&agent_id);
+                        let account = if current_agent.as_ref() == Some(&agent_id) {
+                            thread_account
+                        } else {
+                            accounts.new_thread_account()
+                        };
+                        let entry = account_entry(&accounts, account);
+                        let window = (!entry.is_logged_out)
+                            .then(|| shown_window(&entry.windows, which, now).cloned())
+                            .flatten();
+                        let working = working_threads(store.read(cx), &agent_id, None);
+                        (agent_id, name, working, window)
+                    })
+                    .collect();
                 let view = view.clone();
                 let current_agent = current_agent.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for (agent_id, name) in &agents {
+                    for (agent_id, name, working, limit_window) in &agents {
                         let view = view.clone();
                         let render_id = agent_id.clone();
                         let agent_id = agent_id.clone();
                         let name = name.clone();
+                        let working = *working;
+                        let limit_window = limit_window.clone();
                         let is_current = current_agent.as_ref() == Some(&agent_id);
                         menu = menu.custom_entry(
                             move |_, cx| {
                                 let selector = format!("{id}-{}", render_id.0);
                                 h_flex()
+                                    .id(SharedString::from(format!("{id}-row-{}", render_id.0)))
                                     .debug_selector(move || selector)
                                     .w_full()
                                     .gap_1p5()
@@ -13264,13 +13473,38 @@ impl AgentView {
                                             .size(IconSize::Small)
                                             .color(Color::Muted),
                                     )
-                                    .child(div().flex_1().child(Label::new(name.clone())))
-                                    .when(is_current, |row| {
-                                        row.child(
-                                            Icon::new(IconName::Check)
-                                                .size(IconSize::Small)
-                                                .color(Color::Accent),
-                                        )
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1p5()
+                                            .child(Label::new(name.clone()).truncate())
+                                            .when(working > 0, |name| {
+                                                name.child(render_working_dot(
+                                                    format!("{id}-working-{}", render_id.0),
+                                                    cx,
+                                                ))
+                                            }),
+                                    )
+                                    .children(limit_window.as_ref().map(|window| {
+                                        let selector = format!("{id}-left-{}", render_id.0);
+                                        div()
+                                            .debug_selector(move || selector)
+                                            .pl_3()
+                                            .child(usage_left_label(window, now))
+                                    }))
+                                    .child(div().w(IconSize::Small.rems()).when(
+                                        is_current,
+                                        |row| {
+                                            row.child(
+                                                Icon::new(IconName::Check)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Accent),
+                                            )
+                                        },
+                                    ))
+                                    .when(working > 0, |row| {
+                                        row.tooltip(Tooltip::text(working_tooltip(working)))
                                     })
                                     .into_any_element()
                             },
@@ -13325,103 +13559,34 @@ impl AgentView {
                 .disabled(disabled),
                 Tooltip::text(tooltip),
             )
-            .anchor(gpui::Anchor::TopLeft)
-            .offset(gpui::point(px(0.), px(4.)));
+            .anchor(picker.menu_anchor())
+            .offset(picker.menu_offset());
         div()
             .debug_selector(move || id.into())
             .child(menu)
             .into_any_element()
     }
 
-    /// Under the new thread's composer: its checkout, machine and account, and its branch.
-    fn render_new_thread_strip(&self, cx: &mut Context<Self>) -> AnyElement {
-        let left = match &self.replacing {
-            Some(status) => h_flex()
-                .h(px(22.))
-                .px_1p5()
-                .child(
-                    Label::new(status.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .with_animation(
-                            "new-thread-replacing",
-                            Animation::new(Duration::from_secs(2))
-                                .repeat()
-                                .with_max_fps(LOOPING_ANIMATION_FPS)
-                                .with_easing(pulsating_between(0.4, 0.8)),
-                            |label, delta| label.alpha(delta),
-                        ),
-                )
-                .into_any_element(),
-            None if self.in_workspaces(cx) => h_flex()
-                .min_w_0()
-                .flex_wrap()
-                .gap_1()
-                .child(self.render_folder_picker(cx))
-                .children(self.render_account_picker(PickerFor::NewThread, cx))
-                .into_any_element(),
-            None if self.is_chat(cx) => h_flex()
-                .min_w_0()
-                .flex_wrap()
-                .gap_1()
-                .children(self.render_chat_machine_picker(cx))
-                .children(self.render_account_picker(PickerFor::NewThread, cx))
-                .into_any_element(),
-            None => h_flex()
-                .min_w_0()
-                .flex_wrap()
-                .gap_1()
-                .child(self.render_checkout_picker(cx))
-                .children(self.render_machine_picker(cx))
-                .children(self.render_account_picker(PickerFor::NewThread, cx))
-                .into_any_element(),
-        };
-        let branch = match self.planned_workspace(cx) {
-            _ if self.is_chat(cx) => None,
-            Some(plan) if self.replacing.is_none() => Some(self.render_base_picker(plan, cx)),
-            _ => self.render_new_thread_branch(cx),
-        };
-        h_flex()
-            .w_full()
-            .flex_wrap()
-            .justify_between()
-            .gap_x_2()
-            .gap_y_1()
-            .child(left)
-            .children(branch)
-            .into_any_element()
-    }
-
-    /// Under a fresh fork's composer: only the branch, for it works where its source did and
-    /// can't move its checkout or machine.
-    fn render_fork_strip(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
-            .w_full()
-            .justify_end()
-            .children(self.render_new_thread_branch(cx))
-            .into_any_element()
-    }
-
-    /// The branch the draft's folder has checked out.
-    fn render_new_thread_branch(&self, cx: &App) -> Option<AnyElement> {
-        self.thread_branch(cx).map(|(branch, _, folder)| {
+    /// The branch the thread's folder has checked out, marked as a worktree's or pasture's,
+    /// with its folder in the tooltip.
+    fn render_strip_branch(&self, id: &'static str, cx: &App) -> Option<AnyElement> {
+        self.thread_branch(cx).map(|(branch, icon, folder)| {
             h_flex()
-                .id("new-thread-branch")
-                .debug_selector(|| "new-thread-branch".into())
+                .id(id)
+                .debug_selector(move || id.into())
                 .min_w_0()
+                .max_w(px(240.))
                 .h(px(22.))
                 .px_1p5()
                 .gap_1()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
                 .child(
-                    Icon::new(IconName::GitBranch)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new(branch)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .truncate(),
+                    div().min_w_0().child(
+                        Label::new(branch)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
                 )
                 .tooltip(Tooltip::text(folder.display().to_string()))
                 .into_any_element()
@@ -13984,6 +14149,7 @@ impl AgentView {
             "Account".into()
         };
         let view = cx.weak_entity();
+        let store = self.store.clone();
         let now = SystemTime::now();
         let menu = PopoverMenu::new(id)
             .menu(move |window, cx| {
@@ -13991,14 +14157,26 @@ impl AgentView {
                 let entries = entries.clone();
                 let shown = shown.clone();
                 let agent_id = agent_id.clone();
+                let working: Vec<(Option<AccountId>, usize)> = entries
+                    .iter()
+                    .map(|entry| {
+                        let working =
+                            working_threads(store.read(cx), &agent_id, Some(entry.account));
+                        (entry.account, working)
+                    })
+                    .collect();
                 Some(ContextMenu::build(window, cx, move |menu, _, _| {
                     let add_row = |menu: ContextMenu, entry: &AccountEntry| {
                         let account = entry.account;
                         let entry = entry.clone();
                         let view = view.clone();
                         let agent_id = agent_id.clone();
+                        let working = working
+                            .iter()
+                            .find(|(account, _)| *account == entry.account)
+                            .map_or(0, |(_, working)| *working);
                         menu.custom_entry(
-                            move |_, cx| render_account_row(selector, &entry, now, cx),
+                            move |_, cx| render_account_row(selector, &entry, working, now, cx),
                             move |_, cx| {
                                 if account == current {
                                     return;
@@ -14045,8 +14223,8 @@ impl AgentView {
                 }))
             })
             .trigger_with_tooltip(chip, Tooltip::text(tooltip))
-            .anchor(gpui::Anchor::TopLeft)
-            .offset(gpui::point(px(0.), px(4.)));
+            .anchor(picker.menu_anchor())
+            .offset(picker.menu_offset());
         Some(
             div()
                 .debug_selector(move || selector.into())
@@ -14519,12 +14697,12 @@ fn unsent_prompt(text: &str, mentions: &[UnsentMention]) -> Vec<PromptPart> {
     prompt
 }
 
-/// How the composer is drawn: along the bottom of a conversation, or as a card in the middle
-/// of the new thread screen.
+/// Where the composer is: at the end of a sent thread's conversation, or in the middle of the
+/// new thread screen. Both are the same card; the strip under it differs.
 #[derive(Clone, Copy, PartialEq)]
 enum ComposerStyle {
-    Bar,
-    Card,
+    Thread,
+    NewThread,
 }
 
 /// The new thread screen's column, narrower than a conversation, as in t3code.
@@ -14567,22 +14745,80 @@ fn render_folder_crumb(folder: PathBuf) -> AnyElement {
 }
 
 /// An account in a thread's account picker: its avatar, its name over its plan and the window
-/// closest to running out.
+/// closest to running out, and while it's working in threads, a dot that says how many.
 fn render_account_row(
     picker: &'static str,
     entry: &AccountEntry,
+    working: usize,
     now: SystemTime,
     cx: &App,
 ) -> AnyElement {
     let selector = account_selector(entry.account);
-    account_row(entry, false, now, cx)
+    let working_selector = format!("{picker}-working-{selector}");
+    let row_id = SharedString::from(format!("{picker}-row-{selector}"));
+    let working_dot = (working > 0).then(|| render_working_dot(working_selector, cx));
+    account_row(entry, false, working_dot, now, cx)
         .debug_selector(move || format!("{picker}-{selector}"))
+        .id(row_id)
+        .when(working > 0, |row| {
+            row.tooltip(Tooltip::text(working_tooltip(working)))
+        })
         .into_any_element()
 }
 
-/// An account as the menus that pick one show it: its avatar, its name over its plan, and the
-/// window the usage setting picks. Greyed, it can't be picked.
-fn account_row(entry: &AccountEntry, is_greyed: bool, now: SystemTime, cx: &App) -> Div {
+/// How many threads are working with the agent right now, on the account when one is given
+/// (`Some(None)` being the External one).
+fn working_threads(
+    store: &ProjectStore,
+    agent_id: &AgentId,
+    account: Option<Option<AccountId>>,
+) -> usize {
+    store
+        .threads()
+        .iter()
+        .filter(|thread| thread.agent_id.as_deref() == Some(agent_id.0.as_str()))
+        .filter(|thread| account.is_none_or(|account| thread.account == account))
+        .filter(|thread| store.is_thread_working(thread.id))
+        .count()
+}
+
+/// The sidebar's working dot, after the name of an agent or account working in a thread.
+fn render_working_dot(selector: String, cx: &App) -> Div {
+    div()
+        .debug_selector(move || selector)
+        .flex_none()
+        .child(crate::sidebar::render_status_dot(ThreadStatus::Working, cx))
+}
+
+fn working_tooltip(threads: usize) -> String {
+    if threads == 1 {
+        "Working in 1 thread".to_string()
+    } else {
+        format!("Working in {threads} threads")
+    }
+}
+
+/// What's left of an agent's account at the end of its row in the agent picker, in the account
+/// picker's words: yellow once it's low, red once it's used up.
+fn usage_left_label(window: &LimitWindow, now: SystemTime) -> Label {
+    let left = window.left_percent();
+    let label = left_label(window, now).size(LabelSize::XSmall);
+    if left > 0 && left <= LOW_PERCENT {
+        label.color(Color::Warning)
+    } else {
+        label
+    }
+}
+
+/// An account as the menus that pick one show it: its avatar, its name (and the working dot)
+/// over its plan, and the window the usage setting picks. Greyed, it can't be picked.
+fn account_row(
+    entry: &AccountEntry,
+    is_greyed: bool,
+    working_dot: Option<Div>,
+    now: SystemTime,
+    cx: &App,
+) -> Div {
     let which = crate::app_settings::AppSettingsStore::global(cx)
         .read(cx)
         .settings()
@@ -14617,7 +14853,8 @@ fn account_row(entry: &AccountEntry, is_greyed: bool, now: SystemTime, cx: &App)
                                     .size(LabelSize::XSmall)
                                     .color(Color::Placeholder),
                             )
-                        }),
+                        })
+                        .children(working_dot.map(|dot| dot.ml_0p5())),
                 )
                 .children(
                     note.map(|note| Label::new(note).size(LabelSize::XSmall).color(note_color)),
@@ -14724,6 +14961,24 @@ enum PickerFor {
     SentThread { can_switch: bool },
 }
 
+impl PickerFor {
+    /// A sent thread's strip is at the bottom of the thread, so its menus open upward; the
+    /// new thread screen's is in its middle, with room below.
+    fn menu_anchor(self) -> Anchor {
+        match self {
+            PickerFor::NewThread => Anchor::TopLeft,
+            PickerFor::SentThread { .. } => Anchor::BottomLeft,
+        }
+    }
+
+    fn menu_offset(self) -> Point<Pixels> {
+        match self {
+            PickerFor::NewThread => point(px(0.), px(4.)),
+            PickerFor::SentThread { .. } => point(px(0.), px(-4.)),
+        }
+    }
+}
+
 /// Whether a draft can move to `client`'s machine and, when that machine lacks `agent_id`, the
 /// agent it takes there, by its id and name: the one that machine's new threads start with.
 fn agent_on_machine(
@@ -14752,6 +15007,32 @@ fn agent_on_machine(
         }
         None => (Some("No agents installed".into()), None),
     }
+}
+
+/// The composer's Send, Queue and Stop (`design/composer-2`, topic 3 A, from t3code's
+/// `ComposerPrimaryActions`): a round button filled with `background`. One without a click
+/// handler does nothing, as a disabled one.
+fn round_button(
+    id: &'static str,
+    icon: IconName,
+    background: Hsla,
+    icon_color: Hsla,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .flex_none()
+        .size(px(24.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(background)
+        .child(
+            Icon::new(icon)
+                .size(IconSize::Small)
+                .color(Color::Custom(icon_color)),
+        )
 }
 
 /// A borderless button that opens one of the new thread's pickers.
@@ -16384,36 +16665,6 @@ fn work_row_color(cx: &App) -> Hsla {
 fn user_message_background(cx: &App) -> Hsla {
     let colors = cx.theme().colors();
     colors.panel_background.blend(colors.text.opacity(0.1))
-}
-
-/// A select setting's choices as its menu lists them: each with the group it's in, if any.
-fn select_choices(
-    options: &acp::SessionConfigSelectOptions,
-) -> Vec<(
-    Option<SharedString>,
-    acp::SessionConfigValueId,
-    SharedString,
-)> {
-    match options {
-        acp::SessionConfigSelectOptions::Ungrouped(options) => options
-            .iter()
-            .map(|choice| (None, choice.value.clone(), choice.name.clone().into()))
-            .collect(),
-        acp::SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|group| {
-                let group_name: SharedString = group.name.clone().into();
-                group.options.iter().map(move |choice| {
-                    (
-                        Some(group_name.clone()),
-                        choice.value.clone(),
-                        choice.name.clone().into(),
-                    )
-                })
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// The name of the choice with the value, found without listing them all.
@@ -18386,8 +18637,8 @@ mod tests {
         };
         click("thread-account", cx);
         assert!(top("thread-account-external", cx) < top("thread-account-1", cx));
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
+        dismiss_menu(cx);
+        assert!(cx.debug_bounds("thread-account-external").is_none());
         let store = view.read_with(cx, |view, _| view.store.clone());
         let mut on_work = snapshot(Some("Fix the login"));
         on_work.threads[1].account = Some(work);
@@ -18395,8 +18646,7 @@ mod tests {
         cx.run_until_parked();
         click("thread-account", cx);
         assert!(top("thread-account-1", cx) < top("thread-account-external", cx));
-        cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
+        dismiss_menu(cx);
 
         // Not while the agent works.
         thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
@@ -18406,9 +18656,10 @@ mod tests {
     }
 
     /// As the thread narrows, its header gives way in order (`design/thread-narrow`, topic
-    /// 2C): under 560 px the branch shows only its icon; under 480 the branch, the changes and
-    /// Terminal move into ⋯, the branch as a line at its top, and ⋯ takes Terminal's running
+    /// 2C): under 480 the changes and Terminal move into ⋯, and ⋯ takes Terminal's running
     /// dot; at 360 and under the project shows only its icon. The title keeps at least 120 px.
+    /// The branch isn't in the header: it's in the strip under the composer
+    /// (`design/composer-2`, topic 1 B).
     #[gpui::test]
     fn a_narrow_header_gives_way_in_order(cx: &mut TestAppContext) {
         let mut snapshot = snapshot(Some("Fix the login"));
@@ -18430,6 +18681,10 @@ mod tests {
             };
             cx.notify();
         });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+        });
         let resize = |width: f32, cx: &mut VisualTestContext| {
             cx.simulate_resize(gpui::size(px(width), px(700.)));
             cx.run_until_parked();
@@ -18448,36 +18703,29 @@ mod tests {
         // Wide enough for Open in Editor's button too.
         resize(800., cx);
         let project_name = width_of("thread-header-project-name", cx).expect("the name is shown");
-        assert!(width_of("thread-header-branch", cx).is_some_and(|width| width > px(100.)));
+        assert!(cx.debug_bounds("thread-header-branch").is_none());
+        let strip = cx
+            .debug_bounds("composer-strip")
+            .expect("the strip is shown");
+        let branch = cx
+            .debug_bounds("thread-branch")
+            .expect("the strip has the branch");
+        assert!(strip.contains(&branch.center()));
         assert!(cx.debug_bounds("thread-header-changes").is_some());
         assert!(cx.debug_bounds("thread-header-terminal").is_some());
         assert!(cx.debug_bounds("thread-options-running").is_none());
-
-        // The branch gives way before the title does.
-        resize(600., cx);
-        let branch = width_of("thread-header-branch", cx).expect("the branch is shown");
-        assert!(
-            branch >= MIN_BRANCH_WIDTH && branch < px(100.),
-            "{branch:?}"
-        );
-        assert_eq!(
-            width_of("thread-header-project-name", cx),
-            Some(project_name)
-        );
 
         resize(520., cx);
         assert_eq!(
             width_of("thread-header-project-name", cx),
             Some(project_name)
         );
-        assert!(width_of("thread-header-branch", cx).is_some_and(|width| width < px(40.)));
         assert!(
             width_of("thread-header-title-slot", cx)
                 .is_some_and(|width| width >= MIN_HEADER_TITLE_WIDTH)
         );
 
         resize(440., cx);
-        assert!(cx.debug_bounds("thread-header-branch").is_none());
         assert!(cx.debug_bounds("thread-header-changes").is_none());
         assert!(cx.debug_bounds("thread-header-terminal").is_none());
         assert_eq!(
@@ -18486,20 +18734,17 @@ mod tests {
         );
         assert!(cx.debug_bounds("thread-options-running").is_some());
         click("thread-options", cx);
-        let branch = cx
-            .debug_bounds("thread-options-branch")
-            .expect("⋯ has the branch");
+        assert!(cx.debug_bounds("thread-options-branch").is_none());
         let terminal = cx
             .debug_bounds("MENU_ITEM-Toggle Terminal")
             .expect("⋯ has Terminal");
         let changes = cx
             .debug_bounds("thread-options-changes")
             .expect("⋯ has the changes");
-        assert!(branch.top() < terminal.top() && terminal.top() < changes.top());
+        assert!(terminal.top() < changes.top());
         click("MENU_ITEM-Toggle Terminal", cx);
         assert!(view.read_with(cx, |view, _| view.is_drawer_open));
         assert!(cx.debug_bounds("thread-options-running").is_none());
-
         for width in [400., 360., 320.] {
             resize(width, cx);
             let project = cx
@@ -18514,6 +18759,25 @@ mod tests {
             assert!(project.right() < title.left());
             assert!(title.size.width >= MIN_HEADER_TITLE_WIDTH);
         }
+    }
+
+    /// Without a composer (an archived thread), there's no strip, and the branch stays in the
+    /// header.
+    #[gpui::test]
+    fn an_archived_thread_keeps_its_branch_in_the_header(cx: &mut TestAppContext) {
+        let mut snapshot = snapshot(Some("Fix the login"));
+        snapshot.git_heads = vec![(
+            "/tmp/demo".into(),
+            projects::GitHead {
+                branch: "agentz/fix-login-redirect".into(),
+                worktree: None,
+            },
+        )];
+        let (_, cx) = open_in(snapshot, 2, true, cx);
+        cx.simulate_resize(gpui::size(px(800.), px(700.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("composer-strip").is_none());
+        assert!(cx.debug_bounds("thread-header-branch").is_some());
     }
 
     const SHOW_FOLDER: &str = if cfg!(target_os = "macos") {
@@ -18729,9 +18993,9 @@ mod tests {
         assert_eq!(note(cx), None);
     }
 
-    /// Under 560 px, the composer's agent and account show only their icon and avatar
-    /// (`design/thread-narrow`, topic 3B), and when its controls wrap, they keep to the
-    /// right, so Send stays in the corner.
+    /// Under 560 px, the strip's agent and account show only their icon and avatar
+    /// (`design/thread-narrow`, topic 3B), and when the composer's controls wrap, they keep
+    /// to the right, so Send stays in the corner.
     #[gpui::test]
     fn a_narrow_composer_shows_icons_then_wraps_to_the_right(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -18749,8 +19013,21 @@ mod tests {
             client.set_accounts_for_test([(AgentId::new("mock"), accounts)].into(), cx)
         });
         let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
+             "currentValue": "default",
+             "options": [{"value": "default", "name": "Default"}, {"value": "plan", "name": "Plan"}]},
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet 4.6"}, {"value": "opus", "name": "Opus 5.5"}]},
+            {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
+             "currentValue": "medium",
+             "options": [{"value": "low", "name": "Low"}, {"value": "medium", "name": "Medium"}]},
+        ]))
+        .expect("options");
         thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx);
+            thread.update_state_for_test(|state| state.config_options = options, cx);
         });
         let resize = |width: f32, cx: &mut VisualTestContext| {
             cx.simulate_resize(gpui::size(px(width), px(700.)));
@@ -18760,6 +19037,10 @@ mod tests {
             cx.debug_bounds(selector)
                 .unwrap_or_else(|| panic!("{selector} is shown"))
         };
+        // The agent and account are in the strip, not the card.
+        let strip = bounds_of("composer-strip", cx);
+        assert!(strip.contains(&bounds_of("thread-agent", cx).center()));
+        assert!(strip.top() > bounds_of("composer-footer", cx).bottom());
 
         let at_the_right = |cx: &mut VisualTestContext| {
             let footer = bounds_of("composer-footer", cx);
@@ -18782,7 +19063,7 @@ mod tests {
         assert!(!at_the_right(cx));
 
         // Too narrow for one line, the controls wrap to a line of their own.
-        resize(120., cx);
+        resize(240., cx);
         assert!(at_the_right(cx));
     }
 
@@ -21020,6 +21301,170 @@ mod tests {
         assert_eq!(last_set(cx).as_deref(), Some("high"));
     }
 
+    /// The model and its effort are one chip, "Sonnet 4.6 · Medium" (`design/composer-2`,
+    /// topic 2 A), and the effort has no menu of its own. The chip's menu searches the models:
+    /// picking one sets it and closes; the effort's levels under them set it and stay open.
+    #[gpui::test]
+    fn the_model_chip_searches_models_and_sets_effort(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": "sonnet",
+             "options": [{"value": "opus", "name": "Opus 5.5"},
+                         {"value": "sonnet", "name": "Sonnet 4.6"},
+                         {"value": "haiku", "name": "Haiku 4.5"}]},
+            {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
+             "currentValue": "medium",
+             "options": [{"value": "low", "name": "Low"},
+                         {"value": "medium", "name": "Medium"},
+                         {"value": "high", "name": "High"}]},
+        ]))
+        .expect("options");
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into())], cx);
+            thread.update_state_for_test(|state| state.config_options = options, cx);
+        });
+        cx.run_until_parked();
+        let last_set = |option: &'static str, cx: &mut VisualTestContext| {
+            sent(&client, cx)
+                .into_iter()
+                .rev()
+                .find_map(|request| match request {
+                    Request::SetConfigOption {
+                        config_id, value, ..
+                    } if &*config_id.0 == option => {
+                        value.as_value_id().map(|value| value.0.to_string())
+                    }
+                    _ => None,
+                })
+        };
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.render_session_settings(cx).len()),
+            1
+        );
+
+        click_on("session-model", cx);
+        assert!(cx.debug_bounds("model-picker").is_some());
+        assert!(cx.debug_bounds("model-opus").is_some());
+        assert!(cx.debug_bounds("model-haiku").is_some());
+        click_on("effort-high", cx);
+        assert_eq!(last_set("effort", cx).as_deref(), Some("high"));
+        assert!(cx.debug_bounds("model-picker").is_some());
+
+        cx.simulate_input("opu");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-opus").is_some());
+        assert!(cx.debug_bounds("model-sonnet").is_none());
+        assert!(cx.debug_bounds("model-haiku").is_none());
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(last_set("model", cx).as_deref(), Some("opus"));
+        assert!(cx.debug_bounds("model-picker").is_none());
+    }
+
+    /// The agent picker marks the agents working in a thread right now with the sidebar's
+    /// dot, and ends each with what's left of the account a switch would use: this thread's
+    /// for its own agent, the default for another (`design/composer-2`, topics 9 A and 10 A).
+    /// The account picker marks the accounts working.
+    #[gpui::test]
+    fn the_pickers_say_what_is_working_and_whats_left(cx: &mut TestAppContext) {
+        use agentz_protocol::accounts::{AccountStatus, StatusRead};
+
+        let now = SystemTime::now();
+        let read = |used_percent| StatusRead {
+            status: AccountStatus {
+                windows: vec![LimitWindow {
+                    label: "5-hour".into(),
+                    used_percent,
+                    resets_at: Some(now + Duration::from_secs(60 * 60)),
+                    length: None,
+                }],
+                ..AccountStatus::default()
+            },
+            read_at: now,
+        };
+        let mut mock_accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(read(31.)),
+            ..AgentAccounts::default()
+        };
+        let work = mock_accounts.add();
+        if let Some(account) = mock_accounts.account_mut(work) {
+            account.choices.label = Some("Work".into());
+            account.logged_in = Some(true);
+        }
+        let codex_accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            external_status: Some(read(90.)),
+            ..AgentAccounts::default()
+        };
+
+        let mut snapshot = snapshot(Some("Fix the login"));
+        let mut on_work = thread(5, Some("session-5"));
+        on_work.account = Some(work);
+        let mut codex = thread(6, Some("session-6"));
+        codex.agent_id = Some("codex".into());
+        snapshot.threads.extend([on_work, codex]);
+        snapshot.working_threads = vec![ThreadId(5), ThreadId(6)];
+        let (view, cx) = open_in(snapshot, 2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        cx.update(|_, cx| {
+            install_agents(
+                &client,
+                &[("mock", "Mock"), ("codex", "Codex"), ("pi", "Pi")],
+                cx,
+            )
+        });
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test(
+                [
+                    (AgentId::new("mock"), mock_accounts),
+                    (AgentId::new("codex"), codex_accounts),
+                ]
+                .into(),
+                cx,
+            )
+        });
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Fix the login".into())], cx)
+        });
+        cx.run_until_parked();
+
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.read_with(cx, |store, _| {
+            let mock = AgentId::new("mock");
+            assert_eq!(working_threads(store, &mock, None), 1);
+            assert_eq!(working_threads(store, &mock, Some(None)), 0);
+            assert_eq!(working_threads(store, &mock, Some(Some(work))), 1);
+        });
+        assert_eq!(working_tooltip(1), "Working in 1 thread");
+        assert_eq!(working_tooltip(2), "Working in 2 threads");
+
+        click_on("thread-agent", cx);
+        assert!(cx.debug_bounds("thread-agent-working-mock").is_some());
+        assert!(cx.debug_bounds("thread-agent-working-codex").is_some());
+        assert!(cx.debug_bounds("thread-agent-working-pi").is_none());
+        assert!(cx.debug_bounds("thread-agent-left-mock").is_some());
+        assert!(cx.debug_bounds("thread-agent-left-codex").is_some());
+        // Its usage isn't read.
+        assert!(cx.debug_bounds("thread-agent-left-pi").is_none());
+        let mock_row = cx.debug_bounds("thread-agent-mock").expect("Mock's row");
+        let dot = cx
+            .debug_bounds("thread-agent-working-mock")
+            .expect("Mock's dot");
+        let left = cx
+            .debug_bounds("thread-agent-left-mock")
+            .expect("Mock's usage");
+        assert!(dot.right() < left.left() && mock_row.contains(&left.center()));
+        dismiss_menu(cx);
+
+        click_on("thread-account", cx);
+        assert!(cx.debug_bounds("thread-account-working-1").is_some());
+        assert!(cx.debug_bounds("thread-account-working-external").is_none());
+    }
     /// What the agent left running shows above the composer, each with Stop, which asks the
     /// server to stop it.
     #[gpui::test]
