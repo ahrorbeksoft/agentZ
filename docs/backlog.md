@@ -224,6 +224,10 @@ The machine selector under a new thread's composer needs improving: it looks ugl
 
 ![The new thread's machine selector open, listing This Mac and agents-1](backlog/machine-selector.png)
 
+Also, another machine can't be chosen when the selected agent isn't installed there (above,
+"Google Antigravity isn't installed" on agents-1). But what if the user uses two different
+agents on two machines? How would they do that then?
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
