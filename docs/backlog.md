@@ -207,6 +207,17 @@ When picking agents or accounts, show an indicator of whether each is being used
 it's working). Also show usage for agents with a single account: the usage percentage is
 shown only for accounts, not for agents.
 
+### Redesign subthreads
+
+Redesign subthreads. This time they should look something like worktrees in Workspaces.
+
+- Give agents more control over them, but also good defaults, so they can split work up
+  easily.
+- Agents should be able to stop while waiting for a subthread's results.
+- Improve the messages the user sees from agents: for example, hide the default instructions,
+  maybe make them collapsible.
+- Improve the results side too: maybe make it look like a tool call. To be figured out.
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
