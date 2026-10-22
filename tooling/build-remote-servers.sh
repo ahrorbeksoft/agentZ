@@ -1,12 +1,14 @@
 #!/bin/sh
 # Builds agentz-server for the machines the app reaches over SSH, and copies each binary to
-# target/remote-servers/agentz-server-<target>, where development builds of the app look.
+# target/remote-servers/agentz-server-<target>, where development builds of the app look and
+# the bundle scripts take the app's own server from.
 #
 #   tooling/build-remote-servers.sh [rust target...]
 #
 # The default is x86_64-unknown-linux-musl. Linux servers are static musl builds made with
-# `cargo zigbuild` (brew install zig cargo-zigbuild; rustup target add <target>), stripped,
-# since the release profile's debug info makes them about 48 MB instead of 14.
+# `cargo zigbuild` (brew install zig cargo-zigbuild; rustup target add <target>). All of them
+# use the release-server profile: stripped, with fat LTO and optimized for size, since a
+# published app downloads the servers for other machines.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -15,19 +17,24 @@ mkdir -p target/remote-servers
 for target in $targets; do
     case "$target" in
         *-linux-musl)
-            CARGO_PROFILE_RELEASE_STRIP=symbols \
-                RUSTFLAGS="-C target-feature=+crt-static" \
-                cargo zigbuild --release -p agentz_server --bin agentz-server --target "$target"
+            RUSTFLAGS="-C target-feature=+crt-static" \
+                cargo zigbuild --profile release-server -p agentz_server --bin agentz-server \
+                --target "$target"
             ;;
         *-apple-darwin)
-            CARGO_PROFILE_RELEASE_STRIP=symbols \
-                cargo build --release -p agentz_server --bin agentz-server --target "$target"
+            cargo build --profile release-server -p agentz_server --bin agentz-server \
+                --target "$target"
             ;;
         *)
             echo "unsupported target: $target" >&2
             exit 1
             ;;
     esac
-    cp "target/$target/release/agentz-server" "target/remote-servers/agentz-server-$target"
-    echo "target/remote-servers/agentz-server-$target"
+    server="target/remote-servers/agentz-server-$target"
+    cp "target/$target/release-server/agentz-server" "$server"
+    case "$target" in
+        # Apple silicon runs only signed code: an ad-hoc signature, as the app has.
+        *-apple-darwin) codesign --force --sign - "$server" ;;
+    esac
+    echo "$server"
 done

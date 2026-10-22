@@ -48,13 +48,37 @@ verify() {
     [ "$(sha256 "$1")" = "$expected" ] || fail "$2 arrived damaged (its checksum doesn't match)"
 }
 
+# Whether the release has the asset.
+has_asset() {
+    awk -v name="$1" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
+        "$temporary/SHA256SUMS"
+}
+
 install_mac() {
     need ditto
-    asset=agentZ-macos.zip
+    asset="agentZ-macos-$arch.dmg"
+    if ! has_asset "$asset"; then
+        # Releases up to 0.3.0 had one universal zip.
+        asset=agentZ-macos.zip
+        has_asset "$asset" || fail "agentZ $version has no app for $arch Macs"
+    fi
     say "Downloading agentZ $version for macOS..."
     download "$base/$asset" "$temporary/$asset"
     verify "$temporary/$asset" "$asset"
-    ditto -x -k "$temporary/$asset" "$temporary/unpacked"
+    mkdir -p "$temporary/unpacked"
+    case "$asset" in
+        *.dmg)
+            need hdiutil
+            hdiutil attach -quiet -nobrowse -noautoopen -readonly \
+                -mountpoint "$temporary/mount" "$temporary/$asset" || fail "couldn't open $asset"
+            mounted="$temporary/mount"
+            ditto "$mounted/agentZ.app" "$temporary/unpacked/agentZ.app" ||
+                fail "$asset has no agentZ.app in it"
+            hdiutil detach -quiet "$mounted" || true
+            mounted=
+            ;;
+        *) ditto -x -k "$temporary/$asset" "$temporary/unpacked" ;;
+    esac
     [ -d "$temporary/unpacked/agentZ.app" ] || fail "$asset has no agentZ.app in it"
     # curl doesn't quarantine what it downloads, but a zip carried over from a browser would be.
     xattr -dr com.apple.quarantine "$temporary/unpacked/agentZ.app" 2> /dev/null || true
@@ -87,16 +111,20 @@ install_mac() {
 # The app, as Zed's install.sh puts Zed in ~/.local: agentz.app there, agentz in ~/.local/bin,
 # and its desktop entry pointing at both.
 install_linux_app() {
-    asset="agentZ-linux-$arch.tar.gz"
-    if ! awk -v name="$asset" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
-        "$temporary/SHA256SUMS"; then
-        fail "agentZ $version has no app for $arch Linux"
+    asset="agentZ-linux-$arch.tar.xz"
+    if ! has_asset "$asset"; then
+        # Releases up to 0.3.0 were gzipped.
+        asset="agentZ-linux-$arch.tar.gz"
+        has_asset "$asset" || fail "agentZ $version has no app for $arch Linux"
     fi
+    case "$asset" in
+        *.xz) need xz ;;
+    esac
     say "Downloading agentZ $version for Linux..."
     download "$base/$asset" "$temporary/$asset"
     verify "$temporary/$asset" "$asset"
     mkdir -p "$temporary/unpacked"
-    tar -xzf "$temporary/$asset" -C "$temporary/unpacked"
+    tar -xf "$temporary/$asset" -C "$temporary/unpacked"
     [ -x "$temporary/unpacked/agentz.app/bin/agentz" ] || fail "$asset has no agentz.app in it"
 
     mkdir -p "$HOME/.local"
@@ -162,7 +190,9 @@ esac
 base="$releases/download/v$version"
 
 temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT
+mounted=
+# A DMG still attached when this fails is detached first, or its folder couldn't be removed.
+trap 'if [ -n "$mounted" ]; then hdiutil detach -quiet -force "$mounted" || true; fi; rm -rf "$temporary"' EXIT
 trap 'exit 1' INT TERM
 download "$base/SHA256SUMS" "$temporary/SHA256SUMS"
 

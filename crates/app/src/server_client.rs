@@ -4,7 +4,8 @@
 //! reconnects when the connection drops. While it's down, the copies stay as they were.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
@@ -30,8 +31,10 @@ use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::channel::{mpsc, oneshot};
 use futures::future::{BoxFuture, Fuse, LocalBoxFuture};
-use futures::{FutureExt as _, StreamExt as _};
+use futures::{AsyncReadExt as _, FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
+use http_client::github::AssetKind;
+use http_client::{AsyncBody, HttpClient};
 use projects::ThreadId;
 use ui::SharedString;
 use util::ResultExt as _;
@@ -66,6 +69,11 @@ const SERVER_BINARY_ENV_VAR: &str = "AGENTZ_SERVER_BIN";
 /// A directory of `agentz-server-<rust target>` binaries for other machines.
 const REMOTE_SERVERS_ENV_VAR: &str = "AGENTZ_REMOTE_SERVERS";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The release this app was published as (`v0.4.0`), set by `.github/workflows/release.yml`.
+/// Other machines' servers are downloaded from it. A development build has none, and carries
+/// the servers it was built with instead.
+const RELEASE_TAG: Option<&str> = option_env!("AGENTZ_RELEASE_TAG");
+const RELEASES_URL: &str = "https://github.com/ahrorbeksoft/agentZ/releases/download";
 
 /// How the server is reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1257,6 +1265,7 @@ async fn maintain_connection(
     cx: &mut AsyncApp,
 ) {
     let runtime = reqwest_client::runtime().handle().clone();
+    let http_client = cx.update(|cx| cx.http_client());
     let (min_delay, max_delay) = match transport {
         Transport::Local => (MIN_RETRY_DELAY, MAX_RETRY_DELAY),
         Transport::Ssh(_) | Transport::Cloud { .. } => {
@@ -1291,7 +1300,7 @@ async fn maintain_connection(
                 if shown.is_err() {
                     return;
                 }
-                connect(&runtime, ssh, upload_progress)
+                connect(&runtime, ssh, http_client.clone(), upload_progress)
                     .await
                     .map_err(|error| {
                         if error.needs_attention {
@@ -1523,6 +1532,7 @@ async fn cloud_ssh(
 async fn connect(
     runtime: &tokio::runtime::Handle,
     ssh: Option<Ssh>,
+    http_client: Arc<dyn HttpClient>,
     upload_progress: mpsc::UnboundedSender<UploadProgress>,
 ) -> Result<(Connection, agentz_client::Events, bool), SshError> {
     match ssh {
@@ -1542,7 +1552,7 @@ async fn connect(
                 agentz_client::ssh::connect(
                     &ssh,
                     VERSION,
-                    remote_server_binary,
+                    move |platform| remote_server_binary(http_client, platform),
                     ClientKind::App,
                     move |update| {
                         upload_progress.unbounded_send(update).ok();
@@ -1617,10 +1627,15 @@ fn executable_directory() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// The server to install on a machine of this platform: this Mac's own when it matches, or
-/// `agentz-server-<rust target>` from `AGENTZ_REMOTE_SERVERS`, next to the app, in the bundle's
-/// resources, or where `tooling/build-remote-servers.sh` puts it.
-fn remote_server_binary(platform: RemotePlatform) -> Result<PathBuf> {
+/// The server to install on a machine of this platform: this computer's own when it matches,
+/// or `agentz-server-<rust target>` from `AGENTZ_REMOTE_SERVERS`, next to the app, in the
+/// bundle's resources, or where `tooling/build-remote-servers.sh` puts it. A published app
+/// carries only its own and downloads the others from its release, as Zed downloads its remote
+/// server.
+async fn remote_server_binary(
+    http_client: Arc<dyn HttpClient>,
+    platform: RemotePlatform,
+) -> Result<PathBuf> {
     if Some(platform) == RemotePlatform::current() {
         return server_binary();
     }
@@ -1632,17 +1647,111 @@ fn remote_server_binary(platform: RemotePlatform) -> Result<PathBuf> {
     directories.push(executable_directory.clone());
     directories.push(executable_directory.join("../Resources"));
     directories.push(executable_directory.join("../remote-servers"));
-    directories
+    if let Some(path) = directories
         .iter()
         .map(|directory| agentz_client::ssh::bundled_server_binary(directory, platform))
         .find(|path| path.is_file())
-        .ok_or_else(|| {
-            anyhow!(
-                "no agentz-server for {platform} was built with this app; build it with \
-                 `tooling/build-remote-servers.sh {}`",
-                platform.rust_target()
+    {
+        return Ok(path);
+    }
+    match RELEASE_TAG {
+        Some(tag) => {
+            download_remote_server(
+                http_client.as_ref(),
+                &paths::remote_servers_dir(),
+                RELEASES_URL,
+                tag,
+                platform,
             )
-        })
+            .await
+        }
+        None => Err(anyhow!(
+            "no agentz-server for {platform} was built with this app; build it with \
+             `tooling/build-remote-servers.sh {}`",
+            platform.rust_target()
+        )),
+    }
+}
+
+/// `agentz-server-<rust target>.gz` from the release, checked against its `SHA256SUMS` and
+/// kept in `<tag>/` in `directory`. Older releases' servers are removed once it's there.
+async fn download_remote_server(
+    http_client: &dyn HttpClient,
+    directory: &Path,
+    releases_url: &str,
+    tag: &str,
+    platform: RemotePlatform,
+) -> Result<PathBuf> {
+    let name = format!("agentz-server-{}", platform.rust_target());
+    let release_directory = directory.join(tag);
+    let path = release_directory.join(&name);
+    if path.is_file() {
+        return Ok(path);
+    }
+    let release = format!("{releases_url}/{tag}");
+    let checksums = download_text(http_client, &format!("{release}/SHA256SUMS")).await?;
+    let asset = format!("{name}.gz");
+    let digest = release_checksum(&checksums, &asset)
+        .with_context(|| format!("agentZ {tag} has no agentz-server for {platform}"))?;
+    smol::fs::create_dir_all(&release_directory)
+        .await
+        .with_context(|| format!("creating {}", release_directory.display()))?;
+    log::info!("downloading agentz-server for {platform} from agentZ {tag}");
+    http_client::github_download::download_server_binary(
+        http_client,
+        &format!("{release}/{asset}"),
+        Some(digest),
+        &path,
+        AssetKind::Gz,
+    )
+    .await
+    .with_context(|| format!("downloading agentz-server for {platform}"))?;
+    remove_other_releases(directory, tag).await.log_err();
+    Ok(path)
+}
+
+async fn download_text(http_client: &dyn HttpClient, url: &str) -> Result<String> {
+    let mut response = http_client
+        .get(url, AsyncBody::empty(), true)
+        .await
+        .with_context(|| format!("downloading {url}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "downloading {url}: {}",
+        response.status()
+    );
+    let mut text = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut text)
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    Ok(text)
+}
+
+/// The asset's SHA-256 in a `sha256sum` listing.
+fn release_checksum<'a>(checksums: &'a str, asset: &str) -> Option<&'a str> {
+    checksums.lines().find_map(|line| {
+        let (digest, name) = line.split_once(char::is_whitespace)?;
+        let name = name.trim_start();
+        (name.strip_prefix('*').unwrap_or(name) == asset).then_some(digest)
+    })
+}
+
+async fn remove_other_releases(directory: &Path, tag: &str) -> Result<()> {
+    let mut entries = smol::fs::read_dir(directory)
+        .await
+        .with_context(|| format!("reading {}", directory.display()))?;
+    while let Some(entry) = entries.next().await {
+        let entry = entry?;
+        if entry.file_name() != tag {
+            let path = entry.path();
+            smol::fs::remove_dir_all(&path)
+                .await
+                .with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn agent_settings_changes(
@@ -1747,6 +1856,90 @@ mod tests {
         }
     }
 
+    /// A published app downloads another machine's server from its release once, checked
+    /// against the release's checksums, and drops older releases' servers.
+    #[test]
+    fn downloads_other_machines_servers_from_the_release() {
+        use async_compression::futures::bufread::GzipEncoder;
+        use sha2::Digest as _;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let server = b"#!/bin/sh\necho agentz-server\n".to_vec();
+        let mut compressed = Vec::new();
+        smol::block_on(GzipEncoder::new(&server[..]).read_to_end(&mut compressed))
+            .expect("compresses");
+        let digest: String = sha2::Sha256::digest(&compressed)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let damaged = "0".repeat(64);
+        let checksums = format!(
+            "{digest}  agentz-server-aarch64-unknown-linux-musl.gz\n\
+             {damaged} *agentz-server-x86_64-unknown-linux-musl.gz\n\
+             {digest}  agentZ-linux-x86_64.tar.xz\n"
+        );
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let http_client = {
+            let downloads = downloads.clone();
+            http_client::FakeHttpClient::create(move |request| {
+                let body = match request.uri().path() {
+                    "/download/v9.9.9/SHA256SUMS" => Some(checksums.clone().into_bytes()),
+                    "/download/v9.9.9/agentz-server-aarch64-unknown-linux-musl.gz"
+                    | "/download/v9.9.9/agentz-server-x86_64-unknown-linux-musl.gz" => {
+                        downloads.fetch_add(1, SeqCst);
+                        Some(compressed.clone())
+                    }
+                    _ => None,
+                };
+                async move {
+                    Ok(match body {
+                        Some(body) => http_client::Response::builder()
+                            .status(200)
+                            .body(AsyncBody::from(body))?,
+                        None => http_client::Response::builder()
+                            .status(404)
+                            .body(AsyncBody::empty())?,
+                    })
+                }
+            })
+        };
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir(directory.path().join("v9.9.8")).expect("an older release");
+        let download = |os, arch| {
+            let platform = RemotePlatform::from_uname(os, arch).expect("parses");
+            smol::block_on(download_remote_server(
+                http_client.as_ref(),
+                directory.path(),
+                "https://example.com/download",
+                "v9.9.9",
+                platform,
+            ))
+        };
+
+        for _ in 0..2 {
+            let path = download("Linux", "aarch64").expect("downloads");
+            assert_eq!(std::fs::read(&path).expect("reads it"), server);
+        }
+        assert_eq!(downloads.load(SeqCst), 1);
+        assert!(!directory.path().join("v9.9.8").exists());
+
+        let error = download("Linux", "x86_64").expect_err("is damaged");
+        assert!(
+            format!("{error:#}").contains("SHA-256 mismatch"),
+            "{error:#}"
+        );
+        assert!(
+            !directory
+                .path()
+                .join("v9.9.9/agentz-server-x86_64-unknown-linux-musl")
+                .exists()
+        );
+        let error = download("Darwin", "arm64").expect_err("isn't in the release");
+        assert_eq!(
+            format!("{error:#}"),
+            "agentZ v9.9.9 has no agentz-server for macOS aarch64"
+        );
+    }
     /// herdr's wake recovery: a machine over SSH that waits to reconnect is tried now, keeping
     /// its backoff, and a connected one is asked to answer. This Mac's own socket is left alone.
     #[gpui::test]

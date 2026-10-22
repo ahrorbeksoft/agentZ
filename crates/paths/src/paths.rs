@@ -49,6 +49,12 @@ pub fn server_socket() -> PathBuf {
     data_dir().join("server.sock")
 }
 
+/// Servers for other machines that a published app downloaded from its release, in a folder
+/// per release.
+pub fn remote_servers_dir() -> PathBuf {
+    data_dir().join("remote-servers")
+}
+
 /// The running server's process id.
 pub fn server_pid_file() -> PathBuf {
     data_dir().join("server.pid")

@@ -35,7 +35,8 @@ futures.workspace = true
 gpui = { workspace = true, features = ["profiler"] }
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 hdrhistogram.workspace = true
-http_client.workspace = true
+# github-download: the servers a published app downloads for other machines.
+http_client = { workspace = true, features = ["github-download"] }
 idna.workspace = true
 image.workspace = true
 log.workspace = true
@@ -70,5 +71,8 @@ objc2-app-kit = { workspace = true, features = ["NSSound"] }
 objc2-foundation.workspace = true
 
 [dev-dependencies]
+async-compression.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["github-download", "test-support"] }
+sha2.workspace = true
 tempfile.workspace = true

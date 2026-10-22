@@ -669,6 +669,15 @@ codegen-units = 1
 
 [profile.release.package]
 
+# The published agentz-server (tooling/build-remote-servers.sh), which apps download for other
+# machines: smaller matters more there than speed. Not `panic = "abort"`, which would let a
+# panic in any task end the server and every turn running on it.
+[profile.release-server]
+inherits = "release"
+lto = "fat"
+opt-level = "s"
+strip = "symbols"
+
 [profile.release-fast]
 inherits = "release"
 debug = "full"

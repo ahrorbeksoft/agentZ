@@ -53,18 +53,18 @@ struct Session {
     uploaded: bool,
 }
 
-async fn connect(
+async fn connect<ServerBinary: Future<Output = anyhow::Result<PathBuf>>>(
     ssh: &Ssh,
-    server_binary: impl FnOnce(RemotePlatform) -> anyhow::Result<PathBuf>,
+    server_binary: impl FnOnce(RemotePlatform) -> ServerBinary,
 ) -> Session {
     connect_as(ssh, VERSION, server_binary).await
 }
 
 /// Connects as an app of `version` does.
-async fn connect_as(
+async fn connect_as<ServerBinary: Future<Output = anyhow::Result<PathBuf>>>(
     ssh: &Ssh,
     version: &str,
-    server_binary: impl FnOnce(RemotePlatform) -> anyhow::Result<PathBuf>,
+    server_binary: impl FnOnce(RemotePlatform) -> ServerBinary,
 ) -> Session {
     let progress = std::sync::Mutex::new(Vec::new());
     let Connected {
@@ -111,7 +111,7 @@ async fn shut_down(session: Session) {
         .expect("drains the events");
 }
 
-fn server_binary(platform: RemotePlatform) -> anyhow::Result<PathBuf> {
+async fn server_binary(platform: RemotePlatform) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
         Some(platform) == RemotePlatform::current(),
         "no agentz-server for {platform}"
@@ -226,7 +226,7 @@ async fn connects_installs_and_reconnects_over_ssh() {
 
     // A newer binary is installed, but the running server stays until it's stopped.
     let newer = newer_server(scratch.path());
-    let newer_binary = |_: RemotePlatform| Ok(newer.clone());
+    let newer_binary = |_: RemotePlatform| std::future::ready(Ok(newer.clone()));
     let connected = connect(&ssh, newer_binary).await;
     assert!(connected.is_outdated);
     assert_eq!(connected.connection.welcome().pid, server_pid);
@@ -279,7 +279,7 @@ async fn hands_off_to_a_newer_version() {
     drop(connected.connection);
 
     let newer = newer_server(scratch.path());
-    let newer_binary = |_: RemotePlatform| Ok(newer.clone());
+    let newer_binary = |_: RemotePlatform| std::future::ready(Ok(newer.clone()));
     let connected = connect_as(&ssh, "0.2.0", newer_binary).await;
     assert!(connected.is_outdated);
     assert_eq!(connected.connection.welcome().pid, old_pid);
@@ -329,7 +329,7 @@ async fn connects_to_a_real_machine() {
             agentz_client::ssh::connect(
                 &ssh,
                 env!("CARGO_PKG_VERSION"),
-                |platform| {
+                async |platform| {
                     let path = agentz_client::ssh::bundled_server_binary(&servers, platform);
                     anyhow::ensure!(path.is_file(), "no {}", path.display());
                     Ok(path)

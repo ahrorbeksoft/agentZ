@@ -1,8 +1,7 @@
 #!/bin/sh
-# Builds target/bundle/agentZ-linux-<arch>.tar.gz, Zed's Linux bundle: agentz.app with the app in
-# bin and agentz-server beside it, the servers for other Linux machines from
-# tooling/build-remote-servers.sh in remote-servers, a desktop entry and the icon. site/install.sh
-# puts it in ~/.local.
+# Builds target/bundle/agentZ-linux-<arch>.tar.xz, Zed's Linux bundle: agentz.app with the app in
+# bin and agentz-server beside it, a desktop entry and the icon. site/install.sh puts it in
+# ~/.local. The published app downloads other machines' servers from its release.
 #
 #   tooling/bundle-linux.sh
 #
@@ -28,18 +27,11 @@ fi
 bundle=target/bundle/linux
 app="$bundle/agentz.app"
 rm -rf "$bundle"
-mkdir -p "$app/bin" "$app/remote-servers" "$app/share/applications" \
-    "$app/share/icons/hicolor/1024x1024/apps"
+mkdir -p "$app/bin" "$app/share/applications" "$app/share/icons/hicolor/1024x1024/apps"
 cp target/release/agentz "$app/bin/agentz"
 cp "target/remote-servers/agentz-server-$server_target" "$app/bin/agentz-server"
-for server in target/remote-servers/agentz-server-*; do
-    case "$server" in
-        *"-$server_target") ;;
-        *) cp "$server" "$app/remote-servers/" ;;
-    esac
-done
 # Artifacts lose their modes on the way between CI jobs.
-chmod 755 "$app/bin/agentz" "$app/bin/agentz-server" "$app"/remote-servers/* 2> /dev/null || true
+chmod 755 "$app/bin/agentz" "$app/bin/agentz-server"
 cp crates/app/resources/app-icon.png "$app/share/icons/hicolor/1024x1024/apps/$app_id.png"
 
 # Exec and Icon are names here; install.sh points them at where it puts the app.
@@ -58,7 +50,8 @@ StartupWMClass=$app_id
 Categories=Development;
 EOF
 
-archive="target/bundle/agentZ-linux-$arch.tar.gz"
+# xz rather than Zed's gzip: about a third smaller.
+archive="target/bundle/agentZ-linux-$arch.tar.xz"
 rm -f "$archive"
-tar -czf "$archive" -C "$bundle" agentz.app
+XZ_OPT="-9 -T0" tar -cJf "$archive" -C "$bundle" agentz.app
 echo "$archive"

@@ -928,14 +928,17 @@ impl UploadProgress {
 
 /// Connects to the server on the machine: checks its platform, uploads `server_binary`'s
 /// choice when the installed server differs (reporting its progress), and starts the proxy.
-/// Call it on the runtime.
-pub async fn connect(
+/// `server_binary` may download the server first. Call it on the runtime.
+pub async fn connect<ServerBinary>(
     ssh: &Ssh,
     version: &str,
-    server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
+    server_binary: impl FnOnce(RemotePlatform) -> ServerBinary,
     client_kind: ClientKind,
     on_upload_progress: impl Fn(UploadProgress) + Send + Sync,
-) -> Result<Connected, SshError> {
+) -> Result<Connected, SshError>
+where
+    ServerBinary: Future<Output = Result<PathBuf>>,
+{
     connect_inner(
         ssh,
         version,
@@ -947,17 +950,20 @@ pub async fn connect(
     .map_err(|error| SshError::classify(ssh.terminal_command(), &error))
 }
 
-async fn connect_inner(
+async fn connect_inner<ServerBinary>(
     ssh: &Ssh,
     version: &str,
-    server_binary: impl FnOnce(RemotePlatform) -> Result<PathBuf>,
+    server_binary: impl FnOnce(RemotePlatform) -> ServerBinary,
     client_kind: ClientKind,
     on_upload_progress: &(dyn Fn(UploadProgress) + Send + Sync),
-) -> Result<Connected> {
+) -> Result<Connected>
+where
+    ServerBinary: Future<Output = Result<PathBuf>>,
+{
     // A master left from before the Mac slept would hold every command until it timed out.
     ssh.prepare_shared_connection().await?;
     let (platform, installed) = ssh.probe().await?;
-    let path = server_binary(platform)?;
+    let path = server_binary(platform).await?;
     let binary = tokio::fs::read(&path)
         .await
         .with_context(|| format!("reading {}", path.display()))?;

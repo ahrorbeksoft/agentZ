@@ -139,8 +139,10 @@ A machine you reach from the app over SSH needs nothing installed: add it under 
 Machines › Add Machine, and the app installs its server there when it connects.
 
 You can also download a build from the [releases page](https://github.com/ahrorbeksoft/agentZ/releases/latest)
-and check it against `SHA256SUMS`. The app is signed ad hoc, not notarized by Apple, so a zip
-downloaded with a browser is quarantined and macOS refuses to open it. Clear that once:
+and check it against `SHA256SUMS`: the DMG for your Mac's chip (`aarch64` for Apple silicon,
+`x86_64` for Intel), or the `.tar.xz` for Linux. The app is signed ad hoc, not notarized by
+Apple, so a DMG downloaded with a browser is quarantined and macOS refuses to open the app.
+Clear that once:
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/agentZ.app
@@ -177,8 +179,8 @@ libzstd-dev`.
 ```sh
 cargo build                       # the app (target/debug/agentz) and agentz-server
 tooling/bundle-mac.sh             # target/bundle/agentZ.app, a release build
-tooling/bundle-linux.sh           # target/bundle/agentZ-linux-<arch>.tar.gz, on Linux
-tooling/build-remote-servers.sh   # Linux servers for SSH machines (needs zig and cargo-zigbuild)
+tooling/bundle-linux.sh           # target/bundle/agentZ-linux-<arch>.tar.xz, on Linux
+tooling/build-remote-servers.sh   # servers for SSH machines (Linux ones need zig and cargo-zigbuild)
 ```
 
 [`docs/architecture.md`](docs/architecture.md) maps the code: the architecture, the crates, the
@@ -195,9 +197,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` builds the Linux servers (static musl, x86_64 and arm64), the
-universal macOS app and the x86_64 Linux app with those servers inside them, and publishes the
-apps with `SHA256SUMS` as a GitHub release. The website in `site/` deploys to GitHub Pages from
+`.github/workflows/release.yml` builds the servers (static musl for Linux, x86_64 and arm64,
+and both kinds of Mac), a DMG per kind of Mac and the x86_64 Linux app, each with only its
+own server, and publishes them with the servers and `SHA256SUMS` as a GitHub release. The
+app downloads the server for a machine of another kind from its release. The website in `site/` deploys to GitHub Pages from
 `.github/workflows/pages.yml` whenever it changes on `main`. `install.sh` always fetches from
 the latest release, so there's no update server.
 

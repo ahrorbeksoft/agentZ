@@ -148,23 +148,29 @@ runs in `agentz-server`, not the app.
 
 `tooling/bundle-mac.sh` makes `target/bundle/agentZ.app` with the icon
 (`crates/app/resources/app-icon.svg`, rendered to `app-icon.png`, which the script turns into
-`AppIcon.icns`); `--universal` is the published build, Apple silicon and Intel joined with lipo.
-`tooling/build-remote-servers.sh` cross-builds the Linux servers.
+`AppIcon.icns`); `--dmg <rust target>` is the published build for one kind of Mac, in a DMG.
+`tooling/build-remote-servers.sh` builds the servers (the Linux ones cross-built) with the
+`release-server` profile.
 
 ### Releases and installing
 
 - **Releases** (`.github/workflows/release.yml`): a `v<version>` tag matching the workspace's
   version in `Cargo.toml` (one for the app and `agentz-server`, which the Machines settings
-  show side by side) builds the Linux servers, then the universal app with them in its
-  resources and the x86_64 Linux app (`tooling/bundle-linux.sh`, on Ubuntu 22.04 for an older
-  glibc), and publishes a GitHub release with `agentZ-macos.zip`, `agentZ-linux-x86_64.tar.gz`
-  and `SHA256SUMS`. There's no update server: the apps carry every machine's server, so remote
-  ones install and update over SSH (Machines over SSH below).
+  show side by side) builds every platform's server, an app per platform with only its own
+  server (`agentZ-macos-aarch64.dmg` and `agentZ-macos-x86_64.dmg`, LZMA-compressed, and
+  `agentZ-linux-x86_64.tar.xz` from `tooling/bundle-linux.sh`, on Ubuntu 22.04 for an older
+  glibc), and publishes a GitHub release with them, each server as
+  `agentz-server-<rust target>.gz`, and `SHA256SUMS`. There's no update server: remote
+  machines install and update over SSH (Machines over SSH below). Servers are built with the
+  `release-server` profile: fat LTO and `opt-level = "s"`, stripped, since their size counts
+  more than their speed; not `panic = "abort"`, which would let one task's panic end every
+  turn. The apps keep the release profile (thin LTO, stripped by the bundle scripts).
 - **Installing** (`site/install.sh`, served at `https://ahrorbeksoft.github.io/agentZ/install.sh`):
   takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. It installs
-  only the app: a machine reached over SSH gets its server from the app. On a Mac it puts
-  `agentZ.app` in `/Applications` (curl doesn't quarantine it, so the ad-hoc signature is
-  enough). On Linux, in a desktop session (or with `AGENTZ_APP=1`), it puts the app in
+  only the app: a machine reached over SSH gets its server from the app. On a Mac it copies
+  `agentZ.app` out of the DMG for its chip into `/Applications` (curl doesn't quarantine it,
+  so the ad-hoc signature is enough). Releases up to 0.3.0 had a universal zip and a
+  `.tar.gz`, which it still installs. On Linux, in a desktop session (or with `AGENTZ_APP=1`), it puts the app in
   `~/.local/agentz.app` as Zed's script puts Zed: `agentz` linked from `~/.local/bin`, and its
   desktop entry in `~/.local/share/applications` pointing there.
 - **Website** (`site/`, `.github/workflows/pages.yml`): the landing page on GitHub Pages,
@@ -212,6 +218,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
 | `logs/input-latency.txt`, `logs/hangs.jsonl` | app | The last input-latency report, and the hangs the hang monitor saw (Developer diagnostics) |
+| `remote-servers/<tag>/agentz-server-<rust target>` | app | Servers for other kinds of machine that a published app downloaded from its release |
 
 Both sides replace a file as herdr saves its state (`projects::write_durably`): written beside
 it, synced to disk, renamed into place, then the folder synced, so a crash or power loss leaves
@@ -252,9 +259,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Data** is in `~/.agentz`, as for a server there.
 - **Bundle** (`tooling/bundle-linux.sh`, Zed's `bundle-linux`): `agentz.app` with `bin/agentz`,
   the static musl `agentz-server` beside it (so it can install itself on a machine like this),
-  other machines' servers in `remote-servers/`, a desktop entry and the icon. It carries no
+  a desktop entry and the icon, as `.tar.xz`. It carries no
   libraries: the app links only libc, xkbcommon and xcb. The published builds (this and
-  `bundle-mac.sh --universal`) strip every symbol (`CARGO_PROFILE_RELEASE_STRIP=symbols`), as
+  `bundle-mac.sh --dmg`) strip every symbol (`CARGO_PROFILE_RELEASE_STRIP=symbols`), as
   the remote servers already were. That's what Zed's smaller binaries (~30%) mostly are:
   stripping local symbols from its bundles took about 100 MB off. Its other size changes are
   in crates agentZ lacks (editor, rpc, settings), and the gpui and ui ones (#64261, #64262)
@@ -2260,6 +2267,14 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   over SSH waiting to reconnect is tried at once and for 30 seconds every 2 seconds at most,
   and a connected one must answer a `Request::Ping` within 10 seconds or is reconnected.
 - **Linux servers**: static musl from `cargo zigbuild`, stripped (about 7 MB; 48 MB unstripped).
+- **Other machines' servers** (`server_client::remote_server_binary`): a machine of this
+  computer's kind gets the app's own server. For others, the app looks in
+  `AGENTZ_REMOTE_SERVERS`, beside itself, in the bundle's `Resources` and in
+  `target/remote-servers` (development builds); a published app (built with
+  `AGENTZ_RELEASE_TAG`) carries none of them and downloads
+  `agentz-server-<rust target>.gz` from its own release instead, as Zed downloads its remote
+  server, checked against the release's `SHA256SUMS` and kept unpacked in
+  `remote-servers/<tag>/` in the data directory, older releases' removed.
 - **Updates**: an older server keeps running beside the new binary (over SSH told by the
   installed SHA-256, on this Mac by the binary's modification time); the title bar shows it and
   Settings › Machines offers Update Server (Restart Server… for servers without the

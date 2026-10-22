@@ -1,39 +1,47 @@
 #!/bin/sh
-# Builds target/bundle/agentZ.app: the app and agentz-server in Contents/MacOS, the Linux
-# servers from tooling/build-remote-servers.sh (if built) in Contents/Resources, the icon, and an
+# Builds target/bundle/agentZ.app: the app and agentz-server in Contents/MacOS, the servers
+# from tooling/build-remote-servers.sh (if built) in Contents/Resources, the icon, and an
 # ad-hoc signature. Run from a bundle, macOS shows agentZ's notifications, and `open -g` starts
 # it without taking focus.
 #
-#   tooling/bundle-mac.sh [--debug | --universal]
+#   tooling/bundle-mac.sh [--debug | --dmg <rust target>]
 #
-# --debug bundles the debug builds instead of making release ones. --universal makes the release
-# that's published: release builds for Apple silicon and Intel joined with lipo, and each one's
-# server in Contents/Resources too, for a remote Mac of the other kind.
+# --debug bundles the debug builds instead of making release ones. --dmg makes the release
+# that's published for one kind of Mac (aarch64-apple-darwin or x86_64-apple-darwin),
+# target/bundle/agentZ-macos-<arch>.dmg: that Mac's app and server only, since the published
+# app downloads other machines' servers from its release.
 set -eu
+
+usage() {
+    echo "usage: $0 [--debug | --dmg aarch64-apple-darwin | --dmg x86_64-apple-darwin]" >&2
+    exit 1
+}
 
 cd "$(dirname "$0")/.."
 profile=release
-universal=false
+target=
 case "${1:-}" in
     --debug) profile=debug ;;
-    --universal) universal=true ;;
-    "") ;;
-    *)
-        echo "usage: $0 [--debug | --universal]" >&2
-        exit 1
+    --dmg)
+        target=${2:-}
+        case "$target" in
+            aarch64-apple-darwin | x86_64-apple-darwin) ;;
+            *) usage ;;
+        esac
         ;;
+    "") ;;
+    *) usage ;;
 esac
 
-mac_targets="aarch64-apple-darwin x86_64-apple-darwin"
-if [ "$universal" = true ]; then
-    for target in $mac_targets; do
-        # The release profile's debug info would more than double the download, and the symbol
-        # table is a large part of the rest (Zed strips local symbols from its bundles for the
-        # same reason); a panic's backtrace then has addresses only.
-        CARGO_PROFILE_RELEASE_STRIP=symbols \
-            cargo build --release -p app -p agentz_server --bin agentz --bin agentz-server \
-            --target "$target"
-    done
+if [ -n "$target" ]; then
+    # The release profile's debug info would more than double the download, and the symbol
+    # table is a large part of the rest (Zed strips local symbols from its bundles for the
+    # same reason); a panic's backtrace then has addresses only.
+    CARGO_PROFILE_RELEASE_STRIP=symbols \
+        cargo build --release -p app --bin agentz --target "$target"
+    if [ ! -f "target/remote-servers/agentz-server-$target" ]; then
+        tooling/build-remote-servers.sh "$target"
+    fi
 elif [ "$profile" = release ]; then
     cargo build --release -p app -p agentz_server --bin agentz --bin agentz-server
 else
@@ -44,25 +52,18 @@ version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Ca
 app=target/bundle/agentZ.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-if [ "$universal" = true ]; then
-    for binary in agentz agentz-server; do
-        lipo -create -output "$app/Contents/MacOS/$binary" \
-            "target/aarch64-apple-darwin/release/$binary" \
-            "target/x86_64-apple-darwin/release/$binary"
-    done
-    for target in $mac_targets; do
-        cp "target/$target/release/agentz-server" \
-            "$app/Contents/Resources/agentz-server-$target"
-    done
+if [ -n "$target" ]; then
+    cp "target/$target/release/agentz" "$app/Contents/MacOS/agentz"
+    cp "target/remote-servers/agentz-server-$target" "$app/Contents/MacOS/agentz-server"
 else
     # Clones on APFS, so the copies take no space until they change.
     cp -c "target/$profile/agentz" "target/$profile/agentz-server" "$app/Contents/MacOS/"
+    for server in target/remote-servers/agentz-server-*; do
+        if [ -f "$server" ]; then
+            cp -c "$server" "$app/Contents/Resources/"
+        fi
+    done
 fi
-for server in target/remote-servers/agentz-server-*; do
-    if [ -f "$server" ]; then
-        cp -c "$server" "$app/Contents/Resources/"
-    fi
-done
 
 iconset=target/bundle/AppIcon.iconset
 rm -rf "$iconset"
@@ -123,4 +124,20 @@ for server in "$app"/Contents/Resources/agentz-server-*-apple-darwin; do
 done
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
-echo "$app"
+
+if [ -z "$target" ]; then
+    echo "$app"
+    exit
+fi
+dmg="target/bundle/agentZ-macos-${target%%-*}.dmg"
+contents=target/bundle/dmg
+rm -rf "$contents" "$dmg"
+mkdir -p "$contents"
+ditto "$app" "$contents/agentZ.app"
+# To drag the app to, as in Zed's DMG.
+ln -s /Applications "$contents/Applications"
+# LZMA (ULMO, macOS 10.15 and later) rather than the zlib of Zed's DMG (UDZO): about a third
+# smaller, as xz is than gzip.
+hdiutil create -volname agentZ -srcfolder "$contents" -ov -format ULMO "$dmg"
+rm -rf "$contents"
+echo "$dmg"
