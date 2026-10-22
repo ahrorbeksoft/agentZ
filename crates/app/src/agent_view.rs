@@ -80,6 +80,10 @@ use crate::cloud_machines::state_label;
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
+use crate::image_markup::{
+    Mark, MarkedImage, MarkupEvent, draw_marks, marked_image, notes, notes_text,
+    remember_marked_image,
+};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::model_picker::{ModelPicker, current_choice_name, model_and_effort, select_choices};
 use crate::open_in_editor::{self, Choices, OpenWith};
@@ -504,6 +508,14 @@ struct HoveredImage {
     position: Point<Pixels>,
 }
 
+/// An image in the composer the viewer opened on, which it can mark up: its chip, the image as
+/// it was pasted, and the marks a copy of it has drawn in.
+struct ComposerImage {
+    chip: ChipId,
+    original: AttachmentId,
+    marks: Vec<Mark>,
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -606,13 +618,16 @@ pub struct AgentView {
     uploads: HashMap<ChipId, Task<()>>,
     /// The message was sent while files were still on their way, so it goes once they're there.
     send_after_uploads: bool,
+    /// The composer's images marked up, by their chips. The marks are drawn into a copy of
+    /// each only as the message is sent, so they stay editable until then.
+    marked_chips: HashMap<ChipId, MarkedImage>,
     /// Why a pasted or dropped file couldn't be attached.
     attachment_error: Option<SharedString>,
     hovered_image: Option<HoveredImage>,
-    /// The images to show in the viewer and which of them first, which opens at the next
-    /// render, where the window is.
-    pending_image_viewer: Option<(Vec<ViewedImage>, usize)>,
-    image_viewer: Option<(Entity<ImageViewer>, Subscription)>,
+    /// The images to show in the viewer and which of them first, and the composer's image to
+    /// mark up, which opens at the next render, where the window is.
+    pending_image_viewer: Option<(Vec<ViewedImage>, usize, Option<ComposerImage>)>,
+    image_viewer: Option<(Entity<ImageViewer>, Vec<Subscription>)>,
     /// The `@query` the composer's cursor is at, while its menu is open.
     mention_query: Option<MentionQuery>,
     mention_kind: MentionKind,
@@ -798,9 +813,8 @@ impl AgentView {
                     cx.notify();
                 }
                 TextInputEvent::ChipClicked(chip) => {
-                    if let Some(Mention::Image(id)) = this.mentions.get(chip) {
-                        let images = this.viewed_images(std::slice::from_ref(id), None, cx);
-                        this.view_images(images, 0, cx);
+                    if let Some(Mention::Image(id)) = this.mentions.get(chip).cloned() {
+                        this.view_composer_image(*chip, id, cx);
                     }
                 }
             },
@@ -871,6 +885,7 @@ impl AgentView {
             mentions: HashMap::default(),
             uploads: HashMap::default(),
             send_after_uploads: false,
+            marked_chips: HashMap::default(),
             attachment_error: None,
             hovered_image: None,
             pending_image_viewer: None,
@@ -2921,6 +2936,16 @@ impl AgentView {
                 return;
             }
         }
+        if !self.marked_chips.is_empty() {
+            self.forget_removed_mentions(cx);
+            for (chip, marked) in std::mem::take(&mut self.marked_chips) {
+                self.draw_marked_image(chip, marked, cx);
+            }
+            if !self.uploads.is_empty() {
+                self.send_after_uploads = true;
+                return;
+            }
+        }
         let prompt = self.composer_prompt(cx);
         self.composer
             .update(cx, |composer, cx| composer.set_text("", cx));
@@ -3361,6 +3386,7 @@ impl AgentView {
             .collect();
         self.mentions.retain(|chip, _| chips.contains(chip));
         self.uploads.retain(|chip, _| chips.contains(chip));
+        self.marked_chips.retain(|chip, _| chips.contains(chip));
     }
 
     /// The composer's message: its text, and what its chips mention, in order.
@@ -3382,7 +3408,31 @@ impl AgentView {
         if index < text.len() {
             prompt.push(PromptPart::Text(text[index..].to_string()));
         }
+        // A message put back in the composer brings its notes already.
+        if let Some(notes) = self.image_notes(&prompt, cx)
+            && !matches!(prompt.last(), Some(PromptPart::Text(text)) if text.trim_end().ends_with(notes.trim()))
+        {
+            prompt.push(PromptPart::Text(notes));
+        }
         prompt
+    }
+
+    /// The notes of the message's marked-up images, which their pins on the picture only
+    /// number.
+    fn image_notes(&self, prompt: &[PromptPart], cx: &App) -> Option<String> {
+        let images: Vec<Vec<String>> = prompt
+            .iter()
+            .filter_map(|part| match part {
+                PromptPart::Image(id) => Some(id),
+                _ => None,
+            })
+            .map(|id| {
+                marked_image(&self.attachment_image(id.clone(), cx), cx)
+                    .map(|marked| notes(&marked.marks))
+                    .unwrap_or_default()
+            })
+            .collect();
+        notes_text(&images)
     }
 
     /// Follows the `@query` at the composer's cursor, finding what it mentions.
@@ -11460,6 +11510,7 @@ impl AgentView {
             .update(cx, |composer, cx| composer.set_text("", cx));
         self.mentions.clear();
         self.uploads.clear();
+        self.marked_chips.clear();
         let mut after_chip = false;
         for part in prompt {
             if let PromptPart::Text(text) = part {
@@ -11514,9 +11565,14 @@ impl AgentView {
             }
             PromptPart::Image(id) => {
                 let image = self.attachment_image(id.clone(), cx);
+                let icon = if marked_image(&image, cx).is_some() {
+                    IconName::Pencil
+                } else {
+                    IconName::Image
+                };
                 (
                     "Image".to_string(),
-                    IconName::Image,
+                    icon,
                     ChipPreview::Image(image.thumbnail()),
                     Mention::Image(id.clone()),
                 )
@@ -11631,7 +11687,33 @@ impl AgentView {
     /// focus it in.
     fn view_images(&mut self, images: Vec<ViewedImage>, index: usize, cx: &mut Context<Self>) {
         self.hovered_image = None;
-        self.pending_image_viewer = Some((images, index));
+        self.pending_image_viewer = Some((images, index, None));
+        cx.notify();
+    }
+
+    /// Opens a composer chip's image in the viewer, which can mark it up. A marked-up image
+    /// opens as its original under the marks, to change or revert.
+    fn view_composer_image(&mut self, chip: ChipId, id: AttachmentId, cx: &mut Context<Self>) {
+        let marked = self
+            .marked_chips
+            .get(&chip)
+            .cloned()
+            .or_else(|| marked_image(&self.attachment_image(id.clone(), cx), cx));
+        let (original, marks) = match marked {
+            Some(marked) => (marked.original, marked.marks),
+            None => (id, Vec::new()),
+        };
+        let images = self.viewed_images(std::slice::from_ref(&original), None, cx);
+        self.hovered_image = None;
+        self.pending_image_viewer = Some((
+            images,
+            0,
+            Some(ComposerImage {
+                chip,
+                original,
+                marks,
+            }),
+        ));
         cx.notify();
     }
 
@@ -11639,17 +11721,168 @@ impl AgentView {
         &mut self,
         images: Vec<ViewedImage>,
         index: usize,
+        composer_image: Option<ComposerImage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let viewer = cx.new(|cx| ImageViewer::new(images, index, window, cx));
-        let subscription =
-            cx.subscribe_in(&viewer, window, |this, _, _: &DismissEvent, window, cx| {
-                this.image_viewer = None;
-                window.focus(&this.focus_handle(cx), cx);
-                cx.notify();
-            });
-        self.image_viewer = Some((viewer, subscription));
+        let marks = composer_image.as_ref().map(|image| image.marks.clone());
+        let first = images.first().cloned();
+        let viewer = cx.new(|cx| match (marks, first) {
+            (Some(marks), Some(image)) => ImageViewer::new_for_markup(image, marks, window, cx),
+            _ => ImageViewer::new(images, index, window, cx),
+        });
+        let mut subscriptions =
+            vec![
+                cx.subscribe_in(&viewer, window, |this, _, _: &DismissEvent, window, cx| {
+                    this.image_viewer = None;
+                    window.focus(&this.focus_handle(cx), cx);
+                    cx.notify();
+                }),
+            ];
+        if let Some(ComposerImage { chip, original, .. }) = composer_image {
+            subscriptions.push(
+                cx.subscribe(
+                    &viewer,
+                    move |this, _, event: &MarkupEvent, cx| match event {
+                        MarkupEvent::Done(marks) => {
+                            this.apply_marks(chip, original.clone(), marks.clone(), cx)
+                        }
+                        MarkupEvent::Revert => this.revert_marks(chip, original.clone(), cx),
+                    },
+                ),
+            );
+        }
+        self.image_viewer = Some((viewer, subscriptions));
+    }
+
+    /// Done on a composer's image: its chip shows a pencil, and keeps the marks to draw in as
+    /// the message is sent.
+    fn apply_marks(
+        &mut self,
+        chip: ChipId,
+        original: AttachmentId,
+        marks: Vec<Mark>,
+        cx: &mut Context<Self>,
+    ) {
+        if marks.is_empty() {
+            self.revert_marks(chip, original, cx);
+            return;
+        }
+        self.set_chip_image(chip, original.clone(), IconName::Pencil, cx);
+        self.marked_chips
+            .insert(chip, MarkedImage { original, marks });
+        cx.notify();
+    }
+
+    /// Revert to Original: the chip sends the image as it was pasted again.
+    fn revert_marks(&mut self, chip: ChipId, original: AttachmentId, cx: &mut Context<Self>) {
+        self.marked_chips.remove(&chip);
+        self.set_chip_image(chip, original, IconName::Image, cx);
+        cx.notify();
+    }
+
+    fn set_chip_image(
+        &mut self,
+        chip: ChipId,
+        id: AttachmentId,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) {
+        let preview = ChipPreview::Image(self.attachment_image(id.clone(), cx).thumbnail());
+        self.composer.update(cx, |composer, cx| {
+            composer.set_chip_look(chip, icon.path().into(), preview, cx)
+        });
+        self.set_mention(chip, Mention::Image(id), cx);
+        self.save_unsent_text(cx);
+    }
+
+    /// Draws a chip's marks into a copy of its image, which the thread's server keeps, and
+    /// which the chip then sends. The copy remembers its original and marks, so a message put
+    /// back in the composer can still be marked up again or reverted.
+    fn draw_marked_image(&mut self, chip: ChipId, marked: MarkedImage, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let thread_id = self.thread_id;
+        let svg_renderer = cx.svg_renderer();
+        let original = marked.original.clone();
+        let marks = marked.marks.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = async {
+                let response = client
+                    .read_with(cx, |client, _| {
+                        client.request(Request::Attachment {
+                            thread_id,
+                            id: original,
+                            thumbnail: false,
+                        })
+                    })
+                    .await?;
+                let Response::AttachmentData(data) = response else {
+                    anyhow::bail!("unexpected response: {response:?}");
+                };
+                let data = cx
+                    .background_spawn(async move {
+                        use base64::Engine as _;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(data.data)
+                            .context("decoding the image")?;
+                        let png = draw_marks(&bytes, &marks, &svg_renderer)?;
+                        anyhow::ensure!(
+                            png.len() <= MAX_ATTACHMENT_SIZE,
+                            "it's larger than {} MB",
+                            MAX_ATTACHMENT_SIZE >> 20
+                        );
+                        Ok(encode_base64(&png))
+                    })
+                    .await?;
+                // Not `send`, which would write the whole request into its log line.
+                let response = client
+                    .read_with(cx, |client, _| {
+                        client.request(Request::AddAttachment {
+                            thread_id,
+                            mime_type: "image/png".to_string(),
+                            data,
+                        })
+                    })
+                    .await?;
+                match response {
+                    Response::Attachment(id) => Ok(id),
+                    response => Err(anyhow::anyhow!("unexpected response: {response:?}")),
+                }
+            }
+            .await;
+            this.update(cx, |this, cx| this.marks_drawn(chip, marked, result, cx))
+                .log_err();
+        });
+        self.uploads.insert(chip, task);
+    }
+
+    fn marks_drawn(
+        &mut self,
+        chip: ChipId,
+        marked: MarkedImage,
+        result: anyhow::Result<AttachmentId>,
+        cx: &mut Context<Self>,
+    ) {
+        // Its chip was deleted meanwhile.
+        if self.uploads.remove(&chip).is_none() {
+            return;
+        }
+        match result {
+            Ok(id) => {
+                remember_marked_image(self.attachment_image(id.clone(), cx), marked, cx);
+                self.set_mention(chip, Mention::Image(id), cx);
+                if self.send_after_uploads && self.uploads.is_empty() {
+                    self.send_after_uploads = false;
+                    self.send_message(cx);
+                }
+            }
+            Err(error) => {
+                self.send_after_uploads = false;
+                self.marked_chips.insert(chip, marked);
+                self.attachment_failed(format!("Couldn't mark up the image: {error:#}"), cx);
+            }
+        }
+        cx.notify();
     }
 
     fn render_image_viewer(&self) -> Option<AnyElement> {
@@ -15280,8 +15513,8 @@ impl Render for AgentView {
         if let Some(position) = self.pending_composer_menu.take() {
             self.deploy_composer_menu(position, window, cx);
         }
-        if let Some((images, index)) = self.pending_image_viewer.take() {
-            self.open_image_viewer(images, index, window, cx);
+        if let Some((images, index, composer_image)) = self.pending_image_viewer.take() {
+            self.open_image_viewer(images, index, composer_image, window, cx);
         }
         self.remeasure_loaded_images(window, cx);
         self.sync_mention_query(cx);
@@ -22044,6 +22277,128 @@ mod tests {
         assert!(sent(&client, cx).iter().any(|request| matches!(request,
             Request::Prompt { prompt, .. }
                 if *prompt == [PromptPart::Image(image_id()), PromptPart::Text(" ".into())])));
+    }
+
+    /// A composer's image opens with Markup, as the conversation's don't. Done keeps the
+    /// marks and gives the chip a pencil; they're drawn into a copy of the image only as the
+    /// message is sent, which sends the copy and the notes. Put back in the composer, it opens
+    /// as the original under its marks, and Revert to Original sends the original again.
+    #[gpui::test]
+    fn a_composer_image_is_marked_up_and_sent_with_its_notes(cx: &mut TestAppContext) {
+        use crate::image_markup::{MarkupColor, Shape};
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        accept_images(&view, cx);
+        let copy = AttachmentId::parse(&format!("{}.png", "ef".repeat(32))).expect("an id");
+        let added = std::rc::Rc::new(std::cell::Cell::new(0));
+        client.update(cx, |client, _| {
+            let added = added.clone();
+            let copy = copy.clone();
+            client.answer_for_test(move |request| match request {
+                Request::Attachment { .. } => Some(Response::AttachmentData(
+                    agentz_protocol::attachments::AttachmentData {
+                        mime_type: "image/png".into(),
+                        data: TINY_PNG.into(),
+                    },
+                )),
+                Request::AddAttachment { .. } => {
+                    added.set(added.get() + 1);
+                    Some(Response::Attachment(if added.get() == 1 {
+                        image_id()
+                    } else {
+                        copy.clone()
+                    }))
+                }
+                _ => None,
+            })
+        });
+        let png = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(TINY_PNG)
+                .expect("a PNG")
+        };
+        view.update(cx, |view, cx| {
+            view.insert_image(gpui::ImageFormat::Png, png, cx)
+        });
+        cx.run_until_parked();
+        let chip = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.composer.read(cx).chips()[0].clone())
+        };
+        let open_chip = |cx: &mut VisualTestContext| {
+            let chip = chip(cx);
+            let Some(Mention::Image(id)) =
+                view.read_with(cx, |view, _| view.mentions.get(&chip.id).cloned())
+            else {
+                panic!("an image chip");
+            };
+            view.update(cx, |view, cx| view.view_composer_image(chip.id, id, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                view.image_viewer.as_ref().map(|(viewer, _)| viewer.clone())
+            })
+            .expect("the viewer")
+        };
+        let marks = |viewer: &Entity<ImageViewer>, cx: &mut VisualTestContext| {
+            viewer.read_with(cx, |viewer, _| viewer.marks().map(<[Mark]>::to_vec))
+        };
+
+        let viewer = open_chip(cx);
+        assert_eq!(marks(&viewer, cx), Some(Vec::new()));
+        let note = Mark::new(
+            Shape::Note {
+                at: gpui::point(0.5, 0.5),
+                text: "Make this full width".into(),
+            },
+            MarkupColor::Red,
+            1.,
+        );
+        viewer.update(cx, |_, cx| cx.emit(MarkupEvent::Done(vec![note.clone()])));
+        viewer.update(cx, |_, cx| cx.emit(DismissEvent));
+        cx.run_until_parked();
+        assert_eq!(chip(cx).icon.as_ref(), IconName::Pencil.path().as_ref());
+        assert_eq!(added.get(), 1, "nothing is drawn before it's sent");
+        let viewer = open_chip(cx);
+        assert_eq!(marks(&viewer, cx), Some(vec![note.clone()]));
+        viewer.update(cx, |_, cx| cx.emit(DismissEvent));
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| view.send_message(cx));
+        cx.run_until_parked();
+        assert_eq!(added.get(), 2);
+        let notes = PromptPart::Text("\n\n1: Make this full width".into());
+        let sent_prompt = sent(&client, cx)
+            .into_iter()
+            .find_map(|request| match request {
+                Request::Prompt { prompt, .. } => Some(prompt),
+                _ => None,
+            })
+            .expect("the message");
+        assert_eq!(
+            sent_prompt,
+            [
+                PromptPart::Image(copy.clone()),
+                PromptPart::Text(" ".into()),
+                notes.clone()
+            ]
+        );
+
+        view.update(cx, |view, cx| view.restore_prompt(&sent_prompt, cx));
+        let prompt =
+            |cx: &mut VisualTestContext| view.read_with(cx, |view, cx| view.composer_prompt(cx));
+        let restored = prompt(cx);
+        assert_eq!(restored.first(), Some(&PromptPart::Image(copy)));
+        assert!(
+            !matches!(restored.last(), Some(part) if *part == notes),
+            "the notes once: {restored:?}"
+        );
+        assert_eq!(chip(cx).icon.as_ref(), IconName::Pencil.path().as_ref());
+        let viewer = open_chip(cx);
+        assert_eq!(marks(&viewer, cx), Some(vec![note]));
+        viewer.update(cx, |_, cx| cx.emit(MarkupEvent::Revert));
+        cx.run_until_parked();
+        assert_eq!(chip(cx).icon.as_ref(), IconName::Image.path().as_ref());
+        assert_eq!(prompt(cx).first(), Some(&PromptPart::Image(image_id())));
     }
 
     /// A read starts closed and opens to the lines it got, numbered in a gutter.

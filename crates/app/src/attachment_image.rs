@@ -12,17 +12,23 @@ use anyhow::{Context as _, anyhow};
 use base64::Engine as _;
 use gpui::{
     App, Asset, Bounds, CursorStyle, DismissEvent, EventEmitter, FocusHandle, Focusable,
-    ImageCacheError, ImageFormat, ImageSource, ImgResourceLoader, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Point, RenderImage, Resource,
-    ScrollWheelEvent, SharedUri, Size, Stateful, Window, img, point, size,
+    ImageCacheError, ImageFormat, ImageSource, ImgResourceLoader, KeyBinding, KeyContext,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Point, RenderImage,
+    Resource, ScrollWheelEvent, SharedUri, Size, Stateful, Window, img, point, size,
 };
 use projects::ThreadId;
 use text_input::{CHIP_IMAGE_PREVIEW_SIZE, FittedImage, image_size};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 
+use crate::image_markup::{
+    MARKUP_TEXT_KEY_CONTEXT, Mark, Markup, MarkupColor, MarkupEvent, MarkupTool,
+};
 use crate::machines::{MachineId, Machines};
 
 const VIEWER_KEY_CONTEXT: &str = "ImageViewer";
+/// In the viewer's key context while a label or note is typed on the image, whose field takes
+/// the keys the viewer otherwise has.
+const TYPING_KEY_CONTEXT: &str = "typing";
 
 gpui::actions!(
     image_viewer,
@@ -43,23 +49,31 @@ gpui::actions!(
         ZoomOut,
         /// Shows the whole image again.
         ZoomToFit,
+        /// Undoes the last change to the image's marks.
+        UndoMark,
+        /// Does again the change to the marks last undone.
+        RedoMark,
     ]
 );
 
 pub fn init(cx: &mut App) {
     let context = Some(VIEWER_KEY_CONTEXT);
+    let not_typing = Some("ImageViewer && !typing");
     cx.bind_keys([
         KeyBinding::new("escape", menu::Cancel, context),
         KeyBinding::new("left", PreviousImage, context),
         KeyBinding::new("right", NextImage, context),
-        KeyBinding::new("up", PanUp, context),
-        KeyBinding::new("down", PanDown, context),
-        KeyBinding::new("enter", ToggleZoom, context),
-        KeyBinding::new("space", ToggleZoom, context),
-        KeyBinding::new("=", ZoomIn, context),
-        KeyBinding::new("+", ZoomIn, context),
-        KeyBinding::new("-", ZoomOut, context),
-        KeyBinding::new("0", ZoomToFit, context),
+        KeyBinding::new("up", PanUp, not_typing),
+        KeyBinding::new("down", PanDown, not_typing),
+        KeyBinding::new("enter", ToggleZoom, not_typing),
+        KeyBinding::new("space", ToggleZoom, not_typing),
+        KeyBinding::new("=", ZoomIn, not_typing),
+        KeyBinding::new("+", ZoomIn, not_typing),
+        KeyBinding::new("-", ZoomOut, not_typing),
+        KeyBinding::new("0", ZoomToFit, not_typing),
+        KeyBinding::new("secondary-z", UndoMark, not_typing),
+        KeyBinding::new("secondary-shift-z", RedoMark, not_typing),
+        KeyBinding::new("enter", menu::Confirm, Some(MARKUP_TEXT_KEY_CONTEXT)),
     ]);
 }
 
@@ -468,6 +482,8 @@ const KEY_ZOOM_STEP: f32 = 1.5;
 const DRAG_DISTANCE: f32 = 4.;
 const PAN_STEP: Pixels = px(40.);
 const ARROW_SIZE: Pixels = px(32.);
+/// Room above the close button for the markup toolbar, in a viewer that can mark up.
+const TOOLBAR_ROOM: Pixels = px(44.);
 
 /// t3code's expanded image preview: the image as large as the window allows, over a dark
 /// backdrop, with arrows to the other images it was opened with. A click zooms to 200% where
@@ -485,6 +501,8 @@ pub(crate) struct ImageViewer {
     /// The window's size the image was last fitted to.
     viewport: Size<Pixels>,
     press: Option<Press>,
+    /// The marks of an image opened from the composer, which can mark it up.
+    markup: Option<Markup>,
 }
 
 /// A press on the image: a click zooms, and a drag moves a zoomed image.
@@ -503,16 +521,17 @@ struct ViewerLayout {
 }
 
 impl ViewerLayout {
-    fn new(viewport: Size<Pixels>, image: Size<Pixels>, zoom: f32) -> Self {
-        let room = viewer_room(viewport);
+    fn new(viewport: Size<Pixels>, image: Size<Pixels>, zoom: f32, toolbar: bool) -> Self {
+        let room = viewer_room(viewport, toolbar);
         let fit = (room.width / image.width)
             .min(room.height / image.height)
             .min(1.);
         let image = size(image.width * (fit * zoom), image.height * (fit * zoom));
         let frame = size(image.width.min(room.width), image.height.min(room.height));
+        let toolbar_room = if toolbar { TOOLBAR_ROOM } else { px(0.) };
         let origin = point(
             (viewport.width - frame.width) * 0.5,
-            (viewport.height - frame.height) * 0.5,
+            (viewport.height - frame.height + toolbar_room) * 0.5,
         );
         Self {
             image,
@@ -530,8 +549,9 @@ impl ViewerLayout {
 }
 
 /// t3code's room for an image: most of the window, less room for the arrows beside it, and
-/// for the close button and name above and below it.
-fn viewer_room(viewport: Size<Pixels>) -> Size<Pixels> {
+/// for the close button and name above and below it, and the markup toolbar.
+fn viewer_room(viewport: Size<Pixels>, toolbar: bool) -> Size<Pixels> {
+    let toolbar_room = if toolbar { TOOLBAR_ROOM } else { px(0.) };
     let arrows = if viewport.width >= px(640.) {
         px(96.)
     } else {
@@ -539,13 +559,13 @@ fn viewer_room(viewport: Size<Pixels>) -> Size<Pixels> {
     };
     size(
         (viewport.width * 0.92 - arrows).max(px(1.)),
-        (viewport.height * 0.86)
-            .min(viewport.height - px(160.))
-            .max(px(1.)),
+        ((viewport.height * 0.86).min(viewport.height - px(160.)) - toolbar_room).max(px(1.)),
     )
 }
 
 impl EventEmitter<DismissEvent> for ImageViewer {}
+
+impl EventEmitter<MarkupEvent> for ImageViewer {}
 
 impl Focusable for ImageViewer {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -572,11 +592,137 @@ impl ImageViewer {
             image_size: None,
             viewport: window.viewport_size(),
             press: None,
+            markup: None,
         }
     }
 
-    fn close(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    /// Shows an image of the composer's under the marks it has, with Markup to change them.
+    pub fn new_for_markup(
+        image: ViewedImage,
+        marks: Vec<Mark>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut viewer = Self::new(vec![image], 0, window, cx);
+        viewer.markup = Some(Markup::new(marks));
+        viewer
+    }
+
+    /// The marks, if it was opened from the composer, with Markup.
+    #[cfg(test)]
+    pub(crate) fn marks(&self) -> Option<&[Mark]> {
+        self.markup.as_ref().map(Markup::marks)
+    }
+
+    fn is_marking_up(&self) -> bool {
+        self.markup.as_ref().is_some_and(Markup::is_editing)
+    }
+
+    /// Escape: while marking up, drops the marks made since Markup, else closes the viewer.
+    fn close(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_marking_up() {
+            self.cancel_markup(window, cx);
+            return;
+        }
         cx.emit(DismissEvent);
+    }
+
+    pub(crate) fn start_markup(&mut self, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut() {
+            markup.start();
+            cx.notify();
+        }
+    }
+
+    /// Done: keeps the marks, which the composer sends drawn into the image.
+    pub(crate) fn finish_markup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(markup) = self.markup.as_mut() else {
+            return;
+        };
+        let kept = markup.finish(cx);
+        window.focus(&self.focus_handle, cx);
+        if let Some(marks) = kept {
+            cx.emit(MarkupEvent::Done(marks));
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_markup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut() {
+            markup.cancel();
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    fn revert_markup(&mut self, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut() {
+            markup.revert();
+            cx.emit(MarkupEvent::Revert);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_markup_tool(
+        &mut self,
+        tool: MarkupTool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(markup) = self.markup.as_mut() {
+            markup.set_tool(tool, cx);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_markup_color(&mut self, color: MarkupColor, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut() {
+            markup.set_color(color);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn undo_mark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut().filter(|markup| markup.is_editing()) {
+            markup.undo(cx);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn redo_mark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut().filter(|markup| markup.is_editing()) {
+            markup.redo(cx);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Ends typing a label or note: Enter keeps it, Escape drops it.
+    pub(crate) fn end_typing(&mut self, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut() {
+            if keep {
+                markup.finish_typing(cx);
+            } else {
+                markup.cancel_typing();
+            }
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        }
+    }
+
+    /// Where `position` in the window is on the shown image, in its pixels, and how many of
+    /// them a point of the screen is.
+    fn image_point(&self, position: Point<Pixels>, window: &Window) -> Option<(Point<f32>, f32)> {
+        let image_size = self.image_size?;
+        let layout = self.layout(window.viewport_size())?;
+        let scale = layout.image.width / image_size.width;
+        let on_image = position - layout.frame.origin + self.scroll;
+        Some((
+            point(f32::from(on_image.x) / scale, f32::from(on_image.y) / scale),
+            1. / scale,
+        ))
     }
 
     /// Shows the next or previous image, wrapping around as t3code's does, whole.
@@ -598,7 +744,12 @@ impl ImageViewer {
     }
 
     fn layout(&self, viewport: Size<Pixels>) -> Option<ViewerLayout> {
-        Some(ViewerLayout::new(viewport, self.image_size?, self.zoom))
+        Some(ViewerLayout::new(
+            viewport,
+            self.image_size?,
+            self.zoom,
+            self.markup.is_some(),
+        ))
     }
 
     /// Moves a zoomed image. Sideways, an image no wider than its frame doesn't move, so the
@@ -684,15 +835,31 @@ impl ImageViewer {
         let at = at.unwrap_or_else(|| before.frame.center());
         // Where `at` is on the image, at its fitted size.
         let anchor = (self.scroll + (at - before.frame.origin)) * (1. / self.zoom);
-        let after = ViewerLayout::new(viewport, image_size, zoom);
+        let after = ViewerLayout::new(viewport, image_size, zoom, self.markup.is_some());
         self.zoom = zoom;
         self.scroll = after.clamp_scroll(anchor * zoom - (at - after.frame.origin));
         cx.notify();
     }
 
-    fn press(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn press(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A press on the image isn't one beside it, which closes the viewer.
         cx.stop_propagation();
+        if self.is_marking_up() {
+            let Some((at, unit)) = self.image_point(event.position, window) else {
+                return;
+            };
+            let Some(markup) = self.markup.as_mut() else {
+                return;
+            };
+            let was_typing = markup.is_typing();
+            if let Some((index, before)) = markup.press(at, unit, cx) {
+                markup.start_typing(index, before, window, cx);
+            } else if was_typing {
+                window.focus(&self.focus_handle, cx);
+            }
+            cx.notify();
+            return;
+        }
         self.press = Some(Press {
             position: event.position,
             scroll: self.scroll,
@@ -702,6 +869,20 @@ impl ImageViewer {
     }
 
     fn drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.markup.as_ref().is_some_and(Markup::has_gesture) {
+            let point = self.image_point(event.position, window);
+            let Some(markup) = self.markup.as_mut() else {
+                return;
+            };
+            if event.pressed_button != Some(MouseButton::Left) {
+                // Released outside the window.
+                markup.release();
+            } else if let Some((at, unit)) = point {
+                markup.drag(at, unit);
+            }
+            cx.notify();
+            return;
+        }
         if self.press.is_none() {
             return;
         }
@@ -727,6 +908,15 @@ impl ImageViewer {
     }
 
     fn release(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(markup) = self.markup.as_mut()
+            && markup.has_gesture()
+        {
+            if let Some((index, before)) = markup.release() {
+                markup.start_typing(index, before, window, cx);
+            }
+            cx.notify();
+            return;
+        }
         let Some(press) = self.press.take() else {
             return;
         };
@@ -785,8 +975,41 @@ impl ImageViewer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let frame = layout.frame;
-        let room = viewer_room(self.viewport);
-        let cursor = if self.zoom <= 1. {
+        let room = viewer_room(self.viewport, self.markup.is_some());
+        let scale = self
+            .image_size
+            .map_or(1., |image_size| layout.image.width / image_size.width);
+        let image_origin = point(-self.scroll.x, -self.scroll.y);
+        let marks = self.markup.as_ref().map(|markup| {
+            markup
+                .render_marks(scale)
+                .absolute()
+                .left(image_origin.x)
+                .top(image_origin.y)
+                .w(layout.image.width)
+                .h(layout.image.height)
+        });
+        let typing = self
+            .markup
+            .as_ref()
+            .and_then(|markup| markup.render_typing(image_origin, scale, cx));
+        let toolbar = self
+            .markup
+            .as_ref()
+            .filter(|markup| markup.is_editing())
+            .map(|markup| {
+                div()
+                    .absolute()
+                    .top(px(-30.) - px(40.))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(markup.render_toolbar(cx))
+            });
+        let cursor = if self.is_marking_up() {
+            CursorStyle::Crosshair
+        } else if self.zoom <= 1. {
             CursorStyle::ZoomIn
         } else if self.press.is_some() {
             CursorStyle::ClosedHand
@@ -820,15 +1043,20 @@ impl ImageViewer {
                             .w(layout.image.width)
                             .h(layout.image.height)
                             .rounded_lg(),
-                    ),
+                    )
+                    .children(marks),
             )
             .child(
-                div()
+                h_flex()
                     .absolute()
                     .top(px(-30.))
                     .right_0()
+                    .gap_1()
+                    .children(self.render_markup_buttons(cx))
                     .child(self.render_close_button(cx)),
             )
+            .children(toolbar)
+            .children(typing)
             .child(
                 self.render_caption()
                     .absolute()
@@ -846,31 +1074,71 @@ impl ImageViewer {
             .gap_2()
             .child(self.render_close_button(cx))
             .child(
-                FittedImage::new(source, viewer_room(self.viewport)).map_image(|image| {
-                    image
-                        .debug_selector(|| "image-viewer-image".into())
-                        .rounded_lg()
-                        .with_loading(|| {
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::Medium)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2)
-                                .into_any_element()
-                        })
-                        .with_fallback(|| {
-                            div()
-                                .p_6()
-                                .rounded_lg()
-                                .bg(gpui::black())
-                                .text_sm()
-                                .text_color(gpui::white())
-                                .child("Image unavailable. It may have been deleted.")
-                                .into_any_element()
-                        })
-                }),
+                FittedImage::new(source, viewer_room(self.viewport, self.markup.is_some()))
+                    .map_image(|image| {
+                        image
+                            .debug_selector(|| "image-viewer-image".into())
+                            .rounded_lg()
+                            .with_loading(|| {
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Medium)
+                                    .color(Color::Muted)
+                                    .with_rotate_animation(2)
+                                    .into_any_element()
+                            })
+                            .with_fallback(|| {
+                                div()
+                                    .p_6()
+                                    .rounded_lg()
+                                    .bg(gpui::black())
+                                    .text_sm()
+                                    .text_color(gpui::white())
+                                    .child("Image unavailable. It may have been deleted.")
+                                    .into_any_element()
+                            })
+                    }),
             )
             .child(self.render_caption().w_full())
             .into_any_element()
+    }
+
+    /// Markup, and Revert to Original for an image whose marks Done kept, beside Close.
+    fn render_markup_buttons(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let markup = self.markup.as_ref()?;
+        let is_editing = markup.is_editing();
+        // The backdrop is dark in every theme.
+        let label_color = Color::Custom(gpui::white().opacity(0.9));
+        let revert = (!is_editing && markup.has_kept_marks()).then(|| {
+            Button::new("image-markup-revert", "Revert to Original")
+                .label_size(LabelSize::Small)
+                .color(label_color)
+                .on_click(cx.listener(|viewer, _, _, cx| viewer.revert_markup(cx)))
+        });
+        Some(
+            h_flex()
+                .gap_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(revert)
+                .child(
+                    Button::new("image-markup", "Markup")
+                        .start_icon(
+                            Icon::new(IconName::Pencil)
+                                .size(IconSize::Small)
+                                .color(label_color),
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(label_color)
+                        .style(ButtonStyle::OutlinedCustom(gpui::white().opacity(0.35)))
+                        .toggle_state(is_editing)
+                        .on_click(cx.listener(move |viewer, _, window, cx| {
+                            if is_editing {
+                                viewer.finish_markup(window, cx);
+                            } else {
+                                viewer.start_markup(cx);
+                            }
+                        })),
+                ),
+        )
     }
 
     fn render_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -981,7 +1249,20 @@ impl Render for ImageViewer {
         div()
             .id("image-viewer")
             .debug_selector(|| "image-viewer".into())
-            .key_context(VIEWER_KEY_CONTEXT)
+            .key_context({
+                let mut context = KeyContext::new_with_defaults();
+                context.add(VIEWER_KEY_CONTEXT);
+                if self.markup.as_ref().is_some_and(Markup::is_typing) {
+                    context.add(TYPING_KEY_CONTEXT);
+                }
+                context
+            })
+            .on_action(cx.listener(|viewer, _: &UndoMark, window, cx| {
+                viewer.undo_mark(window, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &RedoMark, window, cx| {
+                viewer.redo_mark(window, cx);
+            }))
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close))
             .on_action(cx.listener(Self::previous))
@@ -1003,7 +1284,14 @@ impl Render for ImageViewer {
             .occlude()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.emit(DismissEvent)),
+                cx.listener(|viewer, _, window, cx| {
+                    // A stray click beside the image doesn't lose the marks being made.
+                    if viewer.is_marking_up() {
+                        viewer.end_typing(true, window, cx);
+                        return;
+                    }
+                    cx.emit(DismissEvent)
+                }),
             )
             .on_mouse_move(cx.listener(Self::drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::release))

@@ -40,6 +40,8 @@ http_client = { workspace = true, features = ["github-download"] }
 idna.workspace = true
 image.workspace = true
 log.workspace = true
+# The line caps and joins of the marks drawn on an image (image_markup.rs), as GPUI's paths take.
+lyon = "1.0"
 markdown.workspace = true
 menu.workspace = true
 paths.workspace = true

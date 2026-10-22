@@ -594,6 +594,21 @@ impl TextInput {
         }
     }
 
+    /// Gives a chip another icon and preview, as when what it mentions changes.
+    pub fn set_chip_look(
+        &mut self,
+        id: ChipId,
+        icon: SharedString,
+        preview: ChipPreview,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chip) = self.chips.iter_mut().find(|chip| chip.id == id) {
+            chip.icon = icon;
+            chip.preview = preview;
+            cx.notify();
+        }
+    }
+
     /// Takes a chip out of the text, with the space after it.
     pub fn remove_chip(&mut self, id: ChipId, cx: &mut Context<Self>) {
         let Some(mut range) = self

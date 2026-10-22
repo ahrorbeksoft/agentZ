@@ -73,10 +73,6 @@ Findings (October 19, 2026), Apple silicon, xz, app + server + icon: fat LTO 19.
 drawing and terminals. In the app, Mermaid rendering (`merman`) is about 8 MB of its 42.6 MB.
 Needs a check of drawing and terminal speed on a Mac before it ships.
 
-### Annotate an image opened from the composer
-
-Image annotation when an image is opened from the input composer.
-
 ### Use ACP v2 with agents that support it
 
 Requested October 22, 2026: use ACP v2 with the agents that support it rather than wait for

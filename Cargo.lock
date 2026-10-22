@@ -431,6 +431,7 @@ dependencies = [
  "idna",
  "image",
  "log",
+ "lyon",
  "markdown",
  "menu",
  "objc2 0.6.3",

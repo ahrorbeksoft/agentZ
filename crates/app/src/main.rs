@@ -14,6 +14,7 @@ mod diagnostics;
 mod diff_panel;
 mod elicitation_card;
 mod go_to_picker;
+mod image_markup;
 mod login_item;
 mod machine_icon_picker;
 mod machine_modal;

@@ -235,6 +235,7 @@ pub enum IconName {
     QueueMessage,
     Quote,
     Reader,
+    Redo,
     RefreshTitle,
     Regex,
     ReplNeutral,

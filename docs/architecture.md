@@ -1148,6 +1148,28 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   it. Every image is sized from its own size to fit its box whole (`text_input::FittedImage`):
   GPUI's `max_w` and `max_h` clamp each side alone, which stretched a tall image's preview and
   cut off its bottom in the viewer.
+- **Image markup** (`image_markup.rs`, `attachment_image.rs`, `agent_view.rs`; macOS Quick
+  Look's Markup, picked in `design/composer-2/`, topics 4–6): the viewer opened from a
+  composer's Image chip (`ImageViewer::new_for_markup`; never a sent image) has Markup beside
+  ×. It brings up a toolbar above the image: Pen (3 px, freehand), Rectangle, Arrow, Text (a
+  label typed where it's clicked) and Numbered Note (a numbered pin, its note typed in a card
+  beside it), five colors (red, the default, yellow, blue, green, white), Undo and Redo
+  (secondary-z, secondary-shift-z), an eraser that takes the mark clicked, then Cancel and
+  Done. Marks are kept in
+  the image's own pixels (`Mark`), sized at the zoom they were made at, and drawn over it
+  with GPUI paths (the pen's and arrow's ends rounded with lyon's options); with a drawing tool,
+  pressing on a mark moves it. Done keeps them (`MarkupEvent::Done`), Cancel or Esc drops what
+  changed since Markup, and a click beside the image doesn't close the viewer meanwhile. The
+  chip then shows a pencil and keeps its image's marks (`AgentView::marked_chips`); opening
+  it again shows them, still editable, with Revert to Original. They're drawn into the
+  picture only as the message is sent: `draw_marks` renders them as an SVG with GPUI's
+  `SvgRenderer` and lays that over the original's pixels, and the copy is kept by the
+  server as a pasted image is (the message waits for it, as for an upload). The message sends
+  the copy and, after its text, the notes ("1: Make this full width", under "Image 2:" when
+  several images have notes, `notes_text`), as t3code sends an annotation's comment with its
+  screenshot. The copy is remembered as marked-up (`MarkedImages`, while the app runs), so a
+  message put back in the composer opens as its original under the marks, and doesn't send its
+  notes twice.
 - **Thread header** (`agent_view.rs`, t3code's `ChatHeader`; the user chose its breadcrumb from
   four designs): "project / title ⌄". The project opens New Thread in it. The title opens the
   thread's menu (Pin or Unpin where it can be pinned, Rename, Regenerate Title where
