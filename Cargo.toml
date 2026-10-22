@@ -669,13 +669,13 @@ codegen-units = 1
 
 [profile.release.package]
 
-# The published agentz-server (tooling/build-remote-servers.sh), which apps download for other
-# machines: smaller matters more there than speed. Not `panic = "abort"`, which would let a
-# panic in any task end the server and every turn running on it.
+# The published agentz-server (tooling/build-remote-servers.sh), the app's own and the one apps
+# download for other machines: fat LTO and stripped, which make it smaller without slowing it.
+# Not `opt-level = "s"`, which makes slower code: speed comes before size. Not
+# `panic = "abort"`, which would let a panic in any task end the server and every turn on it.
 [profile.release-server]
 inherits = "release"
 lto = "fat"
-opt-level = "s"
 strip = "symbols"
 
 [profile.release-fast]

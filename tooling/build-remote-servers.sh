@@ -7,8 +7,8 @@
 #
 # The default is x86_64-unknown-linux-musl. Linux servers are static musl builds made with
 # `cargo zigbuild` (brew install zig cargo-zigbuild; rustup target add <target>). All of them
-# use the release-server profile: stripped, with fat LTO and optimized for size, since a
-# published app downloads the servers for other machines.
+# use the release-server profile: stripped and with fat LTO, which make them smaller without
+# slowing them, since a published app downloads the servers for other machines.
 set -eu
 
 cd "$(dirname "$0")/.."

@@ -102,6 +102,9 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   or sending `initialize` is fine. Logging the user out of a real agent is not.
 - **Never steal focus or the mouse.** Don't bring windows to the front while the user is working.
   See Testing for how to take screenshots.
+- **Speed before size.** Never make the app or its server slower to make a download smaller
+  (the user's word of October 22, 2026): no `opt-level = "s"` or `"z"`, nor anything else
+  that trades speed for bytes. Stripping symbols and LTO are fine.
 - **No backwards compatibility.** The user updates the app and every machine's server together.
   Change the protocol, requests, state files and settings freely: no fallbacks for older servers
   or apps, no old fields kept, no migrations. Only keep the user's data loading: a new field in a

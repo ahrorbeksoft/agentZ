@@ -162,12 +162,12 @@ runs in `agentz-server`, not the app.
   glibc), and publishes a GitHub release with them, each server as
   `agentz-server-<rust target>.gz`, and `SHA256SUMS`. There's no update server: remote
   machines install and update over SSH (Machines over SSH below). Servers are built with the
-  `release-server` profile: fat LTO and `opt-level = "s"`, stripped, since their size counts
-  more than their speed; not `panic = "abort"`, which would let one task's panic end every
-  turn. The apps keep the release profile (thin LTO, stripped by the bundle scripts): fat LTO
-  took only 4% (0.8 MB) off the Mac download, not worth slower release builds that may run
-  out of memory on GitHub's Mac runners, and `opt-level = "s"` makes slower code (the
-  user's decision of October 22, 2026).
+  `release-server` profile: fat LTO and stripped, which make them smaller without slowing
+  them; not `opt-level = "s"`, which makes slower code, since speed comes before size (the
+  user's word of October 22, 2026); and not `panic = "abort"`, which would let one task's
+  panic end every turn. The apps keep the release profile (thin LTO, stripped by the bundle
+  scripts): fat LTO took only 4% (0.8 MB) off the Mac download, not worth slower release
+  builds that may run out of memory on GitHub's Mac runners.
 - **Installing** (`site/install.sh`, served at `https://ahrorbeksoft.github.io/agentZ/install.sh`):
   takes the latest release (or `AGENTZ_VERSION`) and checks it against `SHA256SUMS`. It installs
   only the app: a machine reached over SSH gets its server from the app. On a Mac it copies
