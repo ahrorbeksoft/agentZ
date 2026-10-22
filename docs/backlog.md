@@ -147,6 +147,14 @@ loses a turn as Droid does.
 Auto title generation is not working on Droid, but Regenerate Title renames the thread
 correctly. Maybe enable it for every agent when it's enabled in the settings.
 
+### An agent misses the middle of an artifact it read
+
+Given as a screenshot only: after an `agentz_artifact_read` call (shown as "agentz: Agentz
+artifact read"), the agent thought "I'm missing the middle section covering comments on topics
+11 and 12, so I need to go back and check the log for that part."
+
+![An agentz_artifact_read call, then the agent's thought that it's missing the middle section](backlog/artifact-read-missing-middle.png)
+
 
 ## Features
 
