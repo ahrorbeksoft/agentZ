@@ -520,6 +520,12 @@ impl Server {
                     .copied()
                     .filter(|index| *index < end)
                     .collect(),
+                announced_tasks: state
+                    .announced_tasks
+                    .iter()
+                    .filter(|(index, _)| *index < end)
+                    .cloned()
+                    .collect(),
                 sent_times: state
                     .sent_times
                     .iter()
@@ -572,6 +578,7 @@ impl Server {
             finished_turns: &fork_view.state.finished_turns,
             prompts_from_agents: &fork_view.state.prompts_from_agents,
             task_notices: &fork_view.state.task_notices,
+            announced_tasks: &fork_view.state.announced_tasks,
             sent_times: &fork_view.state.sent_times,
             handoffs: &fork_view.state.handoffs,
         };
@@ -585,6 +592,7 @@ impl Server {
                 finished_turns: state.finished_turns,
                 prompts_from_agents: state.prompts_from_agents,
                 task_notices: state.task_notices,
+                announced_tasks: state.announced_tasks,
                 sent_times: state.sent_times,
                 handoffs: state.handoffs,
             });

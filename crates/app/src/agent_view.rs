@@ -387,13 +387,19 @@ enum ImagePlace {
 }
 /// The [`MarkdownKey`] part holding a tool call's raw input.
 const RAW_INPUT_PART: usize = usize::MAX;
-/// The [`MarkdownKey`] part holding the summary of the subthread a `delegate_task` call
-/// started.
+/// The [`MarkdownKey`] part holding the summary of the first subthread a `delegate_task` or
+/// `delegate_tasks` call started, or a task notice announced ([`summary_part`]).
 const SUMMARY_PART: usize = usize::MAX - 1;
+
+/// The [`MarkdownKey`] part holding the summary of a call's or a notice's subthread, by its
+/// place among them.
+fn summary_part(position: usize) -> usize {
+    SUMMARY_PART - position
+}
 
 pub enum AgentViewEvent {
     Unarchive,
-    /// Show another thread: a subthread from the Agents control, or a subthread's parent.
+    /// Show another thread: a subthread from its card, or a subthread's parent.
     OpenThread(ThreadId),
     /// Show a thread on another machine: the parent of a task delegated from there.
     OpenThreadOn(ThreadKey),
@@ -481,8 +487,13 @@ const COMPOSER_MAX_LINES: usize = 8;
 /// How long typing pauses before what's typed is kept on the server.
 const UNSENT_TEXT_SAVE_DELAY: Duration = Duration::from_millis(500);
 
-/// The most subthreads the Agents control lists before it scrolls.
-const MAX_AGENT_ROWS_SHOWN: usize = 6;
+/// The most rows a section of the bar above the composer lists before it scrolls.
+const MAX_SECTION_ROWS_SHOWN: usize = 6;
+
+/// The lines a subthread's task, and each later message from its parent, folds to
+/// (`design/subthreads-machines/decisions.md`, topic 6): agents fill them with the same rules
+/// every time, which buried the task itself.
+const FOLDED_MESSAGE_LINES: usize = 4;
 
 /// An image link in a message under the mouse, whose thumbnail shows above it.
 struct HoveredImage {
@@ -579,6 +590,11 @@ pub struct AgentView {
     toggled_thoughts: HashSet<usize>,
     /// The compactions whose summary is open.
     expanded_compactions: HashSet<usize>,
+    /// The messages that fold ([`Self::render_folded_message`]) and were last drawn taller
+    /// than they fold to.
+    tall_messages: HashSet<usize>,
+    /// The folded messages opened with Show more.
+    expanded_messages: HashSet<usize>,
     plan_expanded: bool,
     /// The find bar, while it's open.
     find: Option<ThreadFind>,
@@ -613,10 +629,6 @@ pub struct AgentView {
     command_menu_index: usize,
     /// The composer text for which the user dismissed the slash-command menu.
     command_menu_dismissed_for: Option<SharedString>,
-    agents_expanded: bool,
-    /// Whether a subthread ran when the Agents list last opened or folded on its own: it's
-    /// open while one runs and folds once the last one ends, until a click says otherwise.
-    agents_running: Option<bool>,
     /// What each subthread changed, for its row.
     subthread_changes: HashMap<ThreadId, ChangeStat>,
     /// The turn completion each subthread's changes were last asked for at.
@@ -628,8 +640,14 @@ pub struct AgentView {
     /// The subthreads whose cards show their steps, the agent's own subagents' and those
     /// `delegate_task` started: those still running, and those opened.
     subagent_threads: HashMap<ThreadId, (Entity<AgentThread>, Subscription)>,
-    /// The subthreads `delegate_task` calls started, by the call's entry.
-    delegated_subthreads: BTreeMap<usize, ThreadId>,
+    /// The subthreads each `delegate_task` or `delegate_tasks` call started, by the call's
+    /// entry, in order.
+    delegated_subthreads: BTreeMap<usize, Vec<ThreadId>>,
+    /// The rows of the cards of started subthreads that are open to their preview.
+    opened_subthread_previews: HashSet<ThreadId>,
+    /// The rows of subthreads' results that are open: a row of several results by its notice's
+    /// entry, and a result's own row, to its summary, by that entry and its subthread.
+    opened_results: HashSet<(usize, Option<ThreadId>)>,
     /// The thread's terminals (t3code's drawer). Kept while hidden, so its layout stays.
     drawer: Option<(Entity<TerminalDrawer>, Subscription)>,
     is_drawer_open: bool,
@@ -747,7 +765,7 @@ impl AgentView {
                 this.sync_agent(cx);
                 this.sync_fork_dividers(cx);
                 this.sync_blocked_subthreads(cx);
-                this.sync_agents_section(cx);
+                this.load_subthread_changes(cx);
                 this.sync_delegated_cards(cx);
                 this.load_changed_files(false, cx);
                 this.follow_discarded_unsent_text(cx);
@@ -755,7 +773,7 @@ impl AgentView {
             }),
             // Whether messages can be sent follows the machine's connection.
             cx.observe(&client, |this, _, cx| {
-                this.sync_agents_section(cx);
+                this.load_subthread_changes(cx);
                 this.load_changed_files(false, cx);
                 cx.notify();
             }),
@@ -845,6 +863,8 @@ impl AgentView {
                 .show_thinking,
             toggled_thoughts: HashSet::default(),
             expanded_compactions: HashSet::default(),
+            tall_messages: HashSet::default(),
+            expanded_messages: HashSet::default(),
             plan_expanded: false,
             find: None,
             mentions: HashMap::default(),
@@ -866,8 +886,6 @@ impl AgentView {
             queue_expanded: true,
             command_menu_index: 0,
             command_menu_dismissed_for: None,
-            agents_expanded: true,
-            agents_running: None,
             subthread_changes: HashMap::default(),
             subthread_changes_asked_for: HashMap::default(),
             _subthread_change_loads: HashMap::default(),
@@ -875,6 +893,8 @@ impl AgentView {
             blocked_subthreads: HashMap::default(),
             subagent_threads: HashMap::default(),
             delegated_subthreads: BTreeMap::new(),
+            opened_subthread_previews: HashSet::default(),
+            opened_results: HashSet::default(),
             drawer: None,
             is_drawer_open: false,
             drawer_height: DRAWER_HEIGHT,
@@ -928,7 +948,7 @@ impl AgentView {
         sync_elicitation_cards(&mut this.elicitation_cards, &thread, cx);
         this.sync_composer_placeholder(cx);
         this.sync_blocked_subthreads(cx);
-        this.sync_agents_section(cx);
+        this.load_subthread_changes(cx);
         this.load_changed_files(false, cx);
         this
     }
@@ -983,10 +1003,10 @@ impl AgentView {
     }
 
     /// Follows the subthreads whose subagents' cards show their steps, as Zed's subagent cards
-    /// follow their threads: while one runs, and while its card is open.
+    /// follow their threads: while one runs, and while its card, or its row in the card of
+    /// those started together, is open.
     fn sync_subagent_threads(&mut self, cx: &mut Context<Self>) {
         let entries = self.thread.read(cx).entries();
-        let store = self.store.read(cx);
         let mut shown: Vec<(usize, ThreadId)> = entries
             .iter()
             .enumerate()
@@ -1000,20 +1020,20 @@ impl AgentView {
                 _ => None,
             })
             .collect();
-        // A subthread `delegate_task` started runs on after the call has ended.
+        // A started subthread's row opened to its preview, in the card at its batch's first
+        // call.
         shown.extend(
             self.delegated_subthreads
                 .iter()
-                .filter(|(index, thread_id)| {
-                    let is_running = store
-                        .thread(**thread_id)
-                        .and_then(|thread| thread.task.as_ref())
-                        .is_some_and(|task| task.outcome.is_none());
-                    let is_open = matches!(entries.get(**index), Some(Entry::ToolCall(tool_call))
-                        if self.toggled_tool_calls.contains(&tool_call.id));
-                    is_running || is_open
-                })
-                .map(|(index, thread_id)| (*index, *thread_id)),
+                .flat_map(|(index, subthreads)| {
+                    let start = self
+                        .delegation_batch(*index)
+                        .map_or(*index, |batch| batch.start);
+                    subthreads
+                        .iter()
+                        .filter(|thread_id| self.opened_subthread_previews.contains(thread_id))
+                        .map(move |thread_id| (start, *thread_id))
+                }),
         );
         self.subagent_threads
             .retain(|thread_id, _| shown.iter().any(|(_, shown)| shown == thread_id));
@@ -1038,40 +1058,86 @@ impl AgentView {
         }
     }
 
-    /// Follows the subthreads `delegate_task` started as they run and end: their cards show
-    /// the step each is on, and its summary once it's done.
+    /// Follows the subthreads this thread started as they run and end: their cards and result
+    /// rows show their state, and their summary once they're done, and the end of the
+    /// conversation how many it waits for.
     fn sync_delegated_cards(&mut self, cx: &mut Context<Self>) {
-        if self.delegated_subthreads.is_empty() {
-            return;
-        }
         self.sync_delegated_summaries(cx);
-        for index in self.delegated_subthreads.keys() {
+        let thread = self.thread.read(cx);
+        let rows: Vec<usize> = self
+            .delegated_subthreads
+            .keys()
+            .copied()
+            .chain(
+                thread
+                    .state
+                    .announced_tasks
+                    .iter()
+                    .map(|(notice, _)| *notice),
+            )
+            .collect();
+        let entry_count = thread.entries().len();
+        for index in rows {
             self.list_state.remeasure_items(index + 1..index + 2);
         }
+        self.list_state
+            .remeasure_items(entry_count + 1..entry_count + 2);
         self.sync_subagent_threads(cx);
     }
 
-    /// The summary of each subthread `delegate_task` started, as markdown, once it has ended.
+    /// The summary of each subthread this thread started, as markdown, once it has ended: for
+    /// its card, by the call's entry, and for its result, by the notice's.
     fn sync_delegated_summaries(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
-        let summaries: Vec<(usize, String)> = self
+        let thread = self.thread.read(cx);
+        let summaries: Vec<(MarkdownKey, String)> = self
             .delegated_subthreads
             .iter()
-            .filter_map(|(index, thread_id)| {
-                let summary = store
-                    .thread(*thread_id)?
-                    .task
-                    .as_ref()?
-                    .outcome
-                    .as_ref()?
-                    .summary
-                    .clone()?;
-                Some((*index, summary))
+            .map(|(index, subthreads)| (*index, subthreads.as_slice()))
+            .chain(
+                thread
+                    .state
+                    .announced_tasks
+                    .iter()
+                    .map(|(notice, tasks)| (*notice, tasks.as_slice())),
+            )
+            .flat_map(|(index, subthreads)| {
+                subthreads
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(position, thread_id)| {
+                        let summary = store
+                            .thread(*thread_id)?
+                            .task
+                            .as_ref()?
+                            .outcome
+                            .as_ref()?
+                            .summary
+                            .clone()?;
+                        Some(((index, summary_part(position)), summary))
+                    })
             })
             .collect();
-        for (index, summary) in summaries {
-            self.sync_markdown((index, SUMMARY_PART), &summary, cx);
+        for (key, summary) in summaries {
+            self.sync_markdown(key, &summary, cx);
         }
+    }
+
+    /// The calls starting subthreads made one after another, whose subthreads share a card,
+    /// drawn at the first: those around the call at `index`.
+    fn delegation_batch(&self, index: usize) -> Option<Range<usize>> {
+        if !self.delegated_subthreads.contains_key(&index) {
+            return None;
+        }
+        let mut start = index;
+        while start > 0 && self.delegated_subthreads.contains_key(&(start - 1)) {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while self.delegated_subthreads.contains_key(&end) {
+            end += 1;
+        }
+        Some(start..end)
     }
 
     /// Whether this thread works on a task, delegated by a thread here or on another machine.
@@ -1122,38 +1188,23 @@ impl AgentView {
             .unwrap_or_else(|| (self.client.clone(), subthread.id))
     }
 
-    /// Opens the Agents list while a subthread runs and folds it once the last one ends, and
-    /// asks what each subthread changed after each of its turns.
-    fn sync_agents_section(&mut self, cx: &mut Context<Self>) {
+    /// Asks what each subthread changed after each of its turns, for its card.
+    fn load_subthread_changes(&mut self, cx: &mut Context<Self>) {
         let store = self.store.clone();
         let store = store.read(cx);
-        let subthreads: Vec<(ThreadId, Option<SystemTime>, bool, bool)> = store
+        // The agent's own subagents change files in its thread, which counts them.
+        let subthreads: Vec<(ThreadId, Option<SystemTime>)> = store
             .subthreads(self.thread_id)
             .into_iter()
-            .filter_map(|thread| {
-                let task = thread.task.as_ref().filter(|task| task.is_listed())?;
-                Some((
-                    thread.id,
-                    thread.completed_at,
-                    task.outcome.is_none(),
-                    task.is_agents_own(),
-                ))
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.is_listed() && !task.is_agents_own())
             })
+            .map(|thread| (thread.id, thread.completed_at))
             .collect();
-        let is_running = (!subthreads.is_empty())
-            .then(|| subthreads.iter().any(|(_, _, is_running, _)| *is_running));
-        if is_running != self.agents_running {
-            self.agents_running = is_running;
-            if let Some(is_running) = is_running {
-                self.agents_expanded = is_running;
-            }
-        }
-
-        // The agent's own subagents change files in its thread, which counts them.
-        for (thread_id, completed_at, _, _) in subthreads
-            .into_iter()
-            .filter(|(_, _, _, is_agents_own)| !is_agents_own)
-        {
+        for (thread_id, completed_at) in subthreads {
             if self.subthread_changes_asked_for.get(&thread_id) == Some(&completed_at) {
                 continue;
             }
@@ -1203,278 +1254,8 @@ impl AgentView {
         .detach();
     }
 
-    /// t3code's Agents control with Zed's subagent headers as its rows: each subthread's state,
-    /// title and model, and what it changed. The agent's own subagents show only while they
-    /// run, with the agent's name: it runs them, so they have no model of their own, and Stop
-    /// only when it lets agentZ stop them.
-    fn render_agents_section(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let store = self.store.clone();
-        let store = store.read(cx);
-        let subthreads: Vec<projects::Thread> = store
-            .subthreads(self.thread_id)
-            .into_iter()
-            .filter(|thread| thread.task.as_ref().is_some_and(projects::Task::is_listed))
-            .cloned()
-            .collect();
-        let agent_name = self.agent_name(cx);
-        if subthreads.is_empty() {
-            return None;
-        }
-        let colors = cx.theme().colors();
-        let count = subthreads.len();
-        let running = subthreads
-            .iter()
-            .filter(|thread| {
-                thread
-                    .task
-                    .as_ref()
-                    .is_some_and(|task| task.outcome.is_none())
-            })
-            .count();
-        let expanded = self.agents_expanded;
-        let title = if count == 1 {
-            "1 Agent".to_string()
-        } else {
-            format!("{count} Agents")
-        };
-        let progress = if running > 0 {
-            format!("· {running} running")
-        } else {
-            "· all done".to_string()
-        };
-        let summary = h_flex()
-            .id("agents-summary")
-            .debug_selector(|| "agents-summary".into())
-            .p_1()
-            .w_full()
-            .gap_1()
-            .cursor_pointer()
-            .when(expanded, |this| {
-                this.border_b_1().border_color(colors.border)
-            })
-            .child(Disclosure::new("agents-disclosure", expanded))
-            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
-            .child(
-                Label::new(progress)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.agents_expanded = !this.agents_expanded;
-                cx.notify();
-            }));
-
-        let rows: Vec<AnyElement> = subthreads
-            .iter()
-            .enumerate()
-            .map(|(index, thread)| {
-                let thread_id = thread.id;
-                let end = thread
-                    .task
-                    .as_ref()
-                    .and_then(|task| task.outcome.as_ref())
-                    .map(|outcome| outcome.end);
-                let is_agents_own = thread
-                    .task
-                    .as_ref()
-                    .is_some_and(projects::Task::is_agents_own);
-                let can_stop = thread.task.as_ref().is_some_and(projects::Task::can_stop);
-                // Zed's subagent card: a spinner while it runs, then a check, a cross, or a
-                // faint circle once stopped.
-                let status = match end {
-                    None => SpinnerLabel::new()
-                        .size(LabelSize::Small)
-                        .into_any_element(),
-                    Some(TaskEnd::Completed) => Icon::new(IconName::Check)
-                        .size(IconSize::Small)
-                        .color(Color::Success)
-                        .into_any_element(),
-                    Some(TaskEnd::Failed) => div()
-                        .id(("agent-row-status", thread_id.0))
-                        .child(
-                            Icon::new(IconName::Close)
-                                .size(IconSize::Small)
-                                .color(Color::Error),
-                        )
-                        .tooltip(Tooltip::text("Subthread Failed"))
-                        .into_any_element(),
-                    Some(TaskEnd::Cancelled | TaskEnd::Interrupted) => div()
-                        .id(("agent-row-status", thread_id.0))
-                        .child(
-                            Icon::new(IconName::Circle)
-                                .size(IconSize::Small)
-                                .color(Color::Custom(colors.icon_disabled.opacity(0.5))),
-                        )
-                        .tooltip(Tooltip::text("Subthread Stopped"))
-                        .into_any_element(),
-                };
-                let changes = self
-                    .subthread_changes
-                    .get(&thread_id)
-                    .copied()
-                    .filter(|changes| changes.files > 0);
-                // A task delegated to another machine says which.
-                let machine = thread.runs_on().map(|runs_on| {
-                    let machines = Machines::global(cx).read(cx);
-                    let icon = machines
-                        .machine_named(&runs_on.machine, cx)
-                        .map_or(IconName::Server, |machine| {
-                            machines.machine_icon(machine, cx)
-                        });
-                    (icon, runs_on.machine.clone())
-                });
-                h_flex()
-                    .id(("agent-row", thread_id.0))
-                    .debug_selector(move || format!("subthread-row-{}", thread_id.0))
-                    .w_full()
-                    .h_8()
-                    .px_2()
-                    .gap_1p5()
-                    .bg(colors.editor_background)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(colors.element_hover))
-                    .when(index + 1 < count, |this| {
-                        this.border_b_1().border_color(colors.border_variant)
-                    })
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1p5()
-                            .child(h_flex().w_4().flex_none().justify_center().child(status))
-                            .child(
-                                div().min_w_0().child(
-                                    Label::new(thread.title.clone())
-                                        .size(LabelSize::Small)
-                                        .truncate(),
-                                ),
-                            )
-                            .when_some(
-                                thread.model.clone().filter(|_| !is_agents_own),
-                                |this, model| {
-                                    this.child(
-                                        div().flex_none().child(
-                                            Label::new(format!("· {model}"))
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                    )
-                                },
-                            )
-                            .when_some(machine, |this, (icon, machine)| {
-                                this.child(
-                                    h_flex()
-                                        .debug_selector(move || {
-                                            format!("subthread-row-machine-{}", thread_id.0)
-                                        })
-                                        .flex_none()
-                                        .gap_1()
-                                        .child(
-                                            Label::new("·")
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Icon::new(icon)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Label::new(machine)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted),
-                                        ),
-                                )
-                            }),
-                    )
-                    .when(is_agents_own, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .debug_selector(move || {
-                                    format!("subthread-row-agent-{}", thread_id.0)
-                                })
-                                .child(
-                                    Label::new(format!("{agent_name}’s"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Placeholder),
-                                ),
-                        )
-                    })
-                    .when_some(changes, |this, changes| {
-                        let files = if changes.files == 1 {
-                            "— 1 file changed".to_string()
-                        } else {
-                            format!("— {} files changed", changes.files)
-                        };
-                        this.child(
-                            h_flex()
-                                .debug_selector(move || {
-                                    format!("subthread-row-changes-{}", thread_id.0)
-                                })
-                                .flex_none()
-                                .gap_1p5()
-                                .child(Label::new(files).size(LabelSize::Small).color(Color::Muted))
-                                .child(diff_stat(changes.additions, changes.deletions)),
-                        )
-                    })
-                    .when(can_stop, |this| {
-                        this.child(
-                            div()
-                                .debug_selector(move || {
-                                    format!("stop-subthread-row-{}", thread_id.0)
-                                })
-                                .child(
-                                    IconButton::new(
-                                        ("stop-agent-row", thread_id.0),
-                                        IconName::Stop,
-                                    )
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(Tooltip::text("Stop Subthread"))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.stop_subthread(thread_id, cx);
-                                        },
-                                    )),
-                                ),
-                        )
-                    })
-                    .tooltip(Tooltip::text("Open this agent's thread"))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(AgentViewEvent::OpenThread(thread_id))
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-        Some(
-            v_flex()
-                .child(summary)
-                .when(expanded, |this| {
-                    this.child(with_scrollbar(
-                        v_flex()
-                            .id("agent-rows")
-                            .max_h(rems_from_px(33. * MAX_AGENT_ROWS_SHOWN as f32))
-                            .overflow_y_scroll()
-                            .children(rows),
-                        div(),
-                        "agent-rows".into(),
-                        ScrollAxes::Vertical,
-                        window,
-                        cx,
-                    ))
-                })
-                .into_any_element(),
-        )
-    }
-
-    /// What the agent left running after its turn, such as commands it sent to the background,
-    /// in the Agents section's style: each with how long it has run, and Stop.
+    /// What the agent left running after its turn, such as commands it sent to the background:
+    /// each with how long it has run, and Stop.
     fn render_background_tasks_section(
         &self,
         window: &mut Window,
@@ -1608,7 +1389,7 @@ impl AgentView {
                     this.child(with_scrollbar(
                         v_flex()
                             .id("background-task-rows")
-                            .max_h(rems_from_px(31. * MAX_AGENT_ROWS_SHOWN as f32))
+                            .max_h(rems_from_px(31. * MAX_SECTION_ROWS_SHOWN as f32))
                             .overflow_y_scroll()
                             .children(rows),
                         div(),
@@ -2288,8 +2069,14 @@ impl AgentView {
                     // A subagent's text is its report, a plan to approve is the plan, and a
                     // fetch's and findings' are notes, all written in markdown.
                     let kind = ToolCallKind::of(tool_call);
-                    if let Some(subthread) = kind.delegated_subthread() {
-                        self.delegated_subthreads.insert(index, subthread);
+                    let subthreads = kind.delegated_subthreads();
+                    if !subthreads.is_empty() {
+                        self.delegated_subthreads.insert(index, subthreads);
+                        // A call right after another's joins its card, drawn at the first.
+                        if let Some(batch) = self.delegation_batch(index) {
+                            self.list_state
+                                .remeasure_items(batch.start + 1..batch.end + 1);
+                        }
                     }
                     let is_markdown = is_plan(tool_call)
                         || matches!(kind, ToolCallKind::Subagent(_))
@@ -4247,6 +4034,7 @@ impl AgentView {
                 .filter(|card| !card.read(cx).is_for_request())
                 .map(|card| div().px_5().py_1p5().child(card.clone()).into_any_element()),
         );
+        rows.extend(self.render_waiting_for_subthreads(cx));
         if let Some(generating) = self.render_generating(cx) {
             rows.push(generating);
         }
@@ -6356,6 +6144,7 @@ impl AgentView {
         &self,
         index: usize,
         style: MarkdownStyle,
+        line_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let task = self
@@ -6420,11 +6209,17 @@ impl AgentView {
                                     .child(Chip::new(role))
                             })),
                     )
-                    .child(div().px_3().py_2().text_ui(cx).children(self.markdown(
-                        (index, 0),
-                        style,
-                        cx,
-                    ))),
+                    .child(div().px_3().py_2().text_ui(cx).child({
+                        let task = div().children(self.markdown((index, 0), style, cx));
+                        let background = cx.theme().colors().editor_background;
+                        self.render_folded_message(
+                            index,
+                            task.into_any_element(),
+                            line_height,
+                            background,
+                            cx,
+                        )
+                    })),
             )
             .into_any_element()
     }
@@ -6439,12 +6234,15 @@ impl AgentView {
     ) -> AnyElement {
         match entry {
             Entry::UserMessage(_) if self.thread.read(cx).is_task_notice(index) => {
-                div().into_any_element()
+                self.render_task_results(index, window, cx)
             }
             Entry::UserMessage(_) => {
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                let line_height = style
+                    .base_text_style
+                    .line_height_in_pixels(window.rem_size());
                 if self.is_task_message(index, cx) {
-                    return self.render_task_card(index, style, cx);
+                    return self.render_task_card(index, style, line_height, cx);
                 }
                 // Messages from other threads' agents are marked, as t3code marks
                 // `createdBy: agent`.
@@ -6460,6 +6258,20 @@ impl AgentView {
                     .sent_time(index)
                     .map(|time| day_aware_time(time, SystemTime::now()));
                 let group = SharedString::from(format!("user-message-{index}"));
+                let is_from_parent = sent_by.is_some() && self.is_subthread(cx);
+                let text = div().children(self.markdown((index, 0), style, cx));
+                let text = if is_from_parent {
+                    let background = user_message_background(cx);
+                    self.render_folded_message(
+                        index,
+                        text.into_any_element(),
+                        line_height,
+                        background,
+                        cx,
+                    )
+                } else {
+                    text.into_any_element()
+                };
                 // t3code's bubble: on the right, soft, at most four fifths wide; its time and
                 // Copy under it on hover.
                 let message = v_flex()
@@ -6496,7 +6308,7 @@ impl AgentView {
                             .rounded_xl()
                             .bg(user_message_background(cx))
                             .text_ui(cx)
-                            .children(self.markdown((index, 0), style, cx)),
+                            .child(text),
                     )
                     .child(
                         h_flex()
@@ -6728,6 +6540,94 @@ impl AgentView {
                     }),
             )
             .into_any_element()
+    }
+
+    /// A subthread's task, or a later message from its parent, folded to its first
+    /// [`FOLDED_MESSAGE_LINES`] lines, fading out, with Show more for the rest. Whether it's
+    /// taller than that is measured as it's drawn.
+    fn render_folded_message(
+        &self,
+        index: usize,
+        content: AnyElement,
+        line_height: Pixels,
+        background: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let folded_height = line_height * FOLDED_MESSAGE_LINES as f32;
+        let is_tall = self.tall_messages.contains(&index);
+        let is_folded = !self.expanded_messages.contains(&index);
+        let view = cx.weak_entity();
+        v_flex()
+            .child(
+                div()
+                    .debug_selector(move || format!("folded-message-{index}"))
+                    .relative()
+                    .when(is_folded, |this| {
+                        this.max_h(folded_height).overflow_hidden()
+                    })
+                    .child(div().flex_none().child(content))
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        let Some(content) = bounds.first() else {
+                            return;
+                        };
+                        // Rounding can leave a hair over the folded height.
+                        let is_tall = content.size.height > folded_height + px(1.);
+                        let view = view.clone();
+                        // The list is being laid out, so it's measured again once it's done.
+                        cx.defer(move |cx| {
+                            view.update(cx, |view, cx| view.set_message_tall(index, is_tall, cx))
+                                .log_err();
+                        });
+                    })
+                    .when(is_folded && is_tall, |this| {
+                        this.child(div().absolute().inset_0().size_full().bg(
+                            gpui::linear_gradient(
+                                180.,
+                                gpui::linear_color_stop(background.opacity(0.), 0.5),
+                                gpui::linear_color_stop(background, 1.),
+                            ),
+                        ))
+                    }),
+            )
+            .when(is_folded && is_tall, |this| {
+                this.child(
+                    h_flex().child(
+                        div()
+                            .debug_selector(move || format!("show-more-message-{index}"))
+                            .child(
+                                Button::new(("show-more-message", index), "Show more")
+                                    .label_size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.expand_message(index, cx)
+                                    })),
+                            ),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn set_message_tall(&mut self, index: usize, is_tall: bool, cx: &mut Context<Self>) {
+        let changed = if is_tall {
+            self.tall_messages.insert(index)
+        } else {
+            self.tall_messages.remove(&index)
+        };
+        if changed {
+            self.list_state.remeasure_items(index + 1..index + 2);
+            cx.notify();
+        }
+    }
+
+    fn expand_message(&mut self, index: usize, cx: &mut Context<Self>) {
+        // Following the end would scroll to the message's foot, and it's read from the top.
+        if self.list_state.is_following_tail() {
+            self.list_state.pause_following_tail();
+        }
+        self.expanded_messages.insert(index);
+        self.list_state.remeasure_items(index + 1..index + 2);
+        cx.notify();
     }
 
     fn toggle_compaction(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -7343,10 +7243,13 @@ impl AgentView {
             .is_some();
         if live_run.is_none()
             && !needs_confirmation
-            && let Some(subthread) = self.delegated_subthreads.get(&index).copied()
-            && let Some(card) = self.render_delegated_card(index, tool_call, subthread, window, cx)
+            && let Some(batch) = self.delegation_batch(index)
+            && self.knows_a_subthread(batch.clone(), cx)
         {
-            return card;
+            if batch.start != index {
+                return div().into_any_element();
+            }
+            return self.render_delegation_batch(batch, window, cx);
         }
         // A publish's row is the artifact's card, or for a page it later republished a line
         // (design/artifacts, topics 1 and 2).
@@ -8365,8 +8268,6 @@ impl AgentView {
                 subthread,
                 title: one_line(&subagent.description),
                 meta: subagent.kind.clone(),
-                state: CardState::Running,
-                changes: None,
                 can_stop: self
                     .store
                     .read(cx)
@@ -8695,59 +8596,640 @@ impl AgentView {
             .unwrap_or_default()
     }
 
-    /// A subthread a `delegate_task` call started, as Zed's subagent card
-    /// (`design/agentz-tools`, topics 7 and 8): its state, title, model and the files it
-    /// changed, with Stop while it runs.
-    fn render_delegated_card(
+    /// Whether this machine knows any of the subthreads the calls in `batch` started: one it
+    /// doesn't has no card, so its call shows as its row.
+    fn knows_a_subthread(&self, batch: Range<usize>, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        batch
+            .filter_map(|index| self.delegated_subthreads.get(&index))
+            .flatten()
+            .any(|thread_id| store.thread(*thread_id).is_some())
+    }
+
+    /// The subthreads started together, in one card (`design/subthreads-machines/decisions.md`,
+    /// topic 4): "Started 4 subthreads · 2 running", then a row each. They're those of the
+    /// calls in `batch`, one `delegate_tasks` or several `delegate_task` one after another.
+    fn render_delegation_batch(
         &self,
-        index: usize,
-        tool_call: &ToolCall,
-        subthread: ThreadId,
+        batch: Range<usize>,
         window: &Window,
         cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let start = batch.start;
+        let subthreads: Vec<(usize, usize, ThreadId)> = batch
+            .flat_map(|index| {
+                self.delegated_subthreads
+                    .get(&index)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(move |(position, thread_id)| (index, position, *thread_id))
+            })
+            .collect();
+        let running = {
+            let store = self.store.read(cx);
+            subthreads
+                .iter()
+                .filter(|(_, _, thread_id)| {
+                    store
+                        .thread(*thread_id)
+                        .and_then(|thread| thread.task.as_ref())
+                        .is_some_and(|task| task.outcome.is_none() && !task.is_queued())
+                })
+                .count()
+        };
+        let title_size = LabelSize::Custom(rems_from_px(13_f32));
+        let title = match subthreads.len() {
+            1 => "Started a subthread".to_string(),
+            count => format!("Started {count} subthreads"),
+        };
+        let header = h_flex()
+            .h_8()
+            .px_2()
+            .gap_1p5()
+            .bg(Self::tool_card_header_bg(cx))
+            .child(Label::new(title).size(title_size))
+            .when(running > 0, |this| {
+                this.child(
+                    Label::new(format!("· {running} running"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            });
+        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let rows: Vec<AnyElement> = subthreads
+            .into_iter()
+            .filter_map(|(index, position, thread_id)| {
+                self.render_started_subthread(start, (index, position), thread_id, &style, cx)
+            })
+            .collect();
+        let border = Self::tool_card_border_color(cx);
+        v_flex()
+            .mx_5()
+            .child(
+                v_flex()
+                    .debug_selector(move || format!("subthread-batch-{start}"))
+                    .my_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(cx.theme().colors().editor_background)
+                    .overflow_hidden()
+                    .child(header)
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// A subthread's row in the card of those started together: its state, the agent's icon,
+    /// the title, "· model", the worktree or pasture it works in, the lines it changed, and
+    /// Stop while it runs or else how long it ran, and Open. A click opens its preview under
+    /// it, Zed's subagent card's: its last steps and, once it ended, its summary. `call` is the
+    /// call's entry and the subthread's place among those it started, where its summary is.
+    fn render_started_subthread(
+        &self,
+        batch_start: usize,
+        call: (usize, usize),
+        thread_id: ThreadId,
+        style: &MarkdownStyle,
+        cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let thread = self.store.read(cx).thread(subthread)?;
-        let end = thread
-            .task
-            .as_ref()?
+        let store = self.store.read(cx);
+        let thread = store.thread(thread_id)?;
+        let task = thread.task.as_ref()?;
+        let end = task.outcome.as_ref().map(|outcome| outcome.end);
+        let is_queued = task.is_queued();
+        let can_stop = task.can_stop();
+        let is_waiting = self.blocked_subthreads.contains_key(&thread_id);
+        let title = thread.title.clone();
+        let model = thread.model.clone();
+        let icon = thread
+            .agent_id
+            .as_ref()
+            .and_then(|agent_id| agent_icon(&AgentId::new(agent_id.clone()), cx));
+        let workspace = store
+            .thread_workspace(thread_id)
+            .map(|workspace| (workspace.kind, workspace.branch.clone()));
+        let changes = self
+            .subthread_changes
+            .get(&thread_id)
+            .copied()
+            .or_else(|| task.changes.map(ChangeStat::of_task))
+            .filter(|changes| changes.files > 0);
+        let ran = task
             .outcome
             .as_ref()
-            .map(|outcome| outcome.end);
-        let (title, model) = (thread.title.clone(), thread.model.clone());
-        let state = match end {
-            None => CardState::Running,
-            Some(TaskEnd::Completed) => CardState::Done,
-            Some(TaskEnd::Failed) => CardState::Failed,
-            Some(TaskEnd::Cancelled | TaskEnd::Interrupted) => CardState::Stopped,
+            .and_then(|outcome| outcome.ended_at.duration_since(thread.created_at?).ok());
+        let id = thread_id.0 as usize;
+        let is_open = self.opened_subthread_previews.contains(&thread_id);
+        let colors = cx.theme().colors();
+        let (element_hover, icon_disabled, text_placeholder) = (
+            colors.element_hover,
+            colors.icon_disabled,
+            colors.text_placeholder,
+        );
+        let border = Self::tool_card_border_color(cx);
+        let title_size = LabelSize::Custom(rems_from_px(13_f32));
+        let status = if is_queued {
+            Icon::new(IconName::Clock)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else if is_waiting && end.is_none() {
+            div()
+                .id(("subthread-batch-status", id))
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+                .tooltip(Tooltip::text("Waiting for You"))
+                .into_any_element()
+        } else {
+            match end {
+                None => SpinnerLabel::new()
+                    .size(LabelSize::Small)
+                    .into_any_element(),
+                Some(TaskEnd::Completed) => Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success)
+                    .into_any_element(),
+                Some(TaskEnd::Failed) => div()
+                    .id(("subthread-batch-status", id))
+                    .child(
+                        Icon::new(IconName::Close)
+                            .size(IconSize::Small)
+                            .color(Color::Error),
+                    )
+                    .tooltip(Tooltip::text("Subthread Failed"))
+                    .into_any_element(),
+                Some(TaskEnd::Cancelled | TaskEnd::Interrupted) => div()
+                    .id(("subthread-batch-status", id))
+                    .child(
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(icon_disabled.opacity(0.5))),
+                    )
+                    .tooltip(Tooltip::text("Subthread Stopped"))
+                    .into_any_element(),
+            }
         };
-        let card = SubthreadCard {
-            subthread,
-            title,
-            meta: model,
-            state,
-            changes: self
-                .subthread_changes
-                .get(&subthread)
-                .copied()
-                .filter(|changes| changes.files > 0),
-            can_stop: true,
-            is_waiting: self.blocked_subthreads.contains_key(&subthread),
-            question: None,
+        let trailing = if is_queued {
+            Label::new("Queued")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else if can_stop {
+            div()
+                .debug_selector(move || format!("subthread-batch-stop-{id}"))
+                .child(
+                    IconButton::new(("subthread-batch-stop", id), IconName::Stop)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Error)
+                        .tooltip(Tooltip::text("Stop Subthread"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // The row behind it opens and closes on a click.
+                            cx.stop_propagation();
+                            this.stop_subthread(thread_id, cx);
+                        })),
+                )
+                .into_any_element()
+        } else {
+            Label::new(ran.map(format_duration).unwrap_or_default())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
         };
-        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let row = h_flex()
+            .id(("subthread-batch-row", id))
+            .debug_selector(move || format!("subthread-batch-row-{id}"))
+            .h(px(30.))
+            .pl_3()
+            .pr_1()
+            .gap_1p5()
+            .border_t_1()
+            .border_color(border)
+            .cursor_pointer()
+            .hover(|style| style.bg(element_hover))
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                this.toggle_subthread_preview(batch_start, thread_id, cx);
+            }))
+            .child(h_flex().w_4().flex_none().justify_center().child(status))
+            .children(icon.map(|icon| {
+                Icon::from_svg_markup(icon)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+            }))
+            .child(
+                div()
+                    .min_w_0()
+                    .child(Label::new(title).size(title_size).truncate()),
+            )
+            .children(model.map(|model| {
+                div().flex_none().child(
+                    Label::new(format!("· {model}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            }))
+            .children(workspace.map(|(kind, branch)| {
+                h_flex()
+                    .min_w_0()
+                    .max_w(px(160.))
+                    .gap_0p5()
+                    .child(
+                        Icon::new(workspace_icon(kind))
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(text_placeholder)),
+                    )
+                    .children(branch.map(|branch| {
+                        Label::new(branch)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder)
+                            .truncate()
+                    }))
+            }))
+            .child(div().flex_1())
+            .children(changes.map(|changes| {
+                let files = if changes.files == 1 {
+                    "1 file".to_string()
+                } else {
+                    format!("{} files", changes.files)
+                };
+                h_flex()
+                    .debug_selector(move || format!("subthread-batch-changes-{id}"))
+                    .flex_none()
+                    .gap_1p5()
+                    .child(Label::new(files).size(LabelSize::Small).color(Color::Muted))
+                    .child(diff_stat(changes.additions, changes.deletions))
+            }))
+            .child(div().flex_none().child(trailing))
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || format!("subthread-batch-open-{id}"))
+                    .child(
+                        Button::new(("subthread-batch-open", id), "Open")
+                            .label_size(LabelSize::Small)
+                            .color(Color::Accent)
+                            .end_icon(
+                                Icon::new(IconName::ArrowUpRight)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(AgentViewEvent::OpenThread(thread_id));
+                            })),
+                    ),
+            );
+        if !is_open {
+            return Some(row.into_any_element());
+        }
+        let steps = self.subagent_steps(thread_id, cx);
         let report: Vec<AnyElement> = self
-            .markdown((index, SUMMARY_PART), style, cx)
+            .markdown((call.0, summary_part(call.1)), style.clone(), cx)
             .filter(|_| end.is_some())
             .map(IntoElement::into_any_element)
             .into_iter()
             .collect();
-        Some(self.render_subthread_card(index, tool_call, card, report, cx))
+        Some(
+            v_flex()
+                .child(row)
+                .children(self.render_subagent_work(id, thread_id, &steps, report, true, cx))
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_subthread_preview(
+        &mut self,
+        batch_start: usize,
+        thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.opened_subthread_previews.remove(&thread_id) {
+            self.opened_subthread_previews.insert(thread_id);
+        }
+        self.sync_subagent_threads(cx);
+        self.list_state
+            .remeasure_items(batch_start + 1..batch_start + 2);
+        cx.notify();
+    }
+
+    /// Where this thread heard its subthreads ended (`design/subthreads-machines/decisions.md`,
+    /// topic 5), in place of the notice its agent got: a row for one result, and for several
+    /// that came together one row, "4 subthreads finished", which opens to theirs. A notice
+    /// that names none shows nothing, as before.
+    fn render_task_results(
+        &self,
+        notice: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tasks = self.thread.read(cx).announced_tasks(notice).to_vec();
+        let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let rows: Vec<AnyElement> = match tasks.as_slice() {
+            [] => Vec::new(),
+            [task] => self
+                .render_task_result(notice, 0, *task, &style, cx)
+                .into_iter()
+                .collect(),
+            tasks => {
+                let is_open = self.opened_results.contains(&(notice, None));
+                let mut rows = vec![self.render_task_results_row(notice, tasks, is_open, cx)];
+                if is_open {
+                    rows.extend(tasks.iter().enumerate().filter_map(|(position, task)| {
+                        self.render_task_result(notice, position, *task, &style, cx)
+                    }));
+                }
+                rows
+            }
+        };
+        v_flex().mx_5().children(rows).into_any_element()
+    }
+
+    /// The row of several results that came together: "4 subthreads finished", and how many
+    /// failed, in red.
+    fn render_task_results_row(
+        &self,
+        notice: usize,
+        tasks: &[ThreadId],
+        is_open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let store = self.store.read(cx);
+        let failed = tasks
+            .iter()
+            .filter(|task| {
+                store
+                    .thread(**task)
+                    .and_then(|thread| thread.task.as_ref()?.outcome.as_ref())
+                    .is_some_and(|outcome| outcome.end == TaskEnd::Failed)
+            })
+            .count();
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .id(("task-results", notice))
+            .debug_selector(move || format!("task-results-{notice}"))
+            .min_h(px(24.))
+            .gap_1p5()
+            .px_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(hover_background))
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                this.toggle_result(notice, None, cx);
+            }))
+            .child(
+                h_flex().w(px(24.)).flex_none().justify_center().child(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Success),
+                ),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .text_size(rems_from_px(13_f32))
+                    .text_color(work_row_color(cx))
+                    .child(format!("{} subthreads finished", tasks.len()))
+                    .when(failed > 0, |this| {
+                        this.child(
+                            div()
+                                .text_color(cx.theme().status().error)
+                                .child(format!("· {failed} failed")),
+                        )
+                    }),
+            )
+            .child(
+                div().flex_none().child(
+                    Icon::new(if is_open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// A result's row, as a tool call's: "Subthread finished: <title>" (or failed, or
+    /// stopped), the lines it changed, how long it ran, and Open. A click opens it to the
+    /// subthread's summary.
+    fn render_task_result(
+        &self,
+        notice: usize,
+        position: usize,
+        thread_id: ThreadId,
+        style: &MarkdownStyle,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let thread = store.thread(thread_id)?;
+        let task = thread.task.as_ref()?;
+        let end = task.outcome.as_ref().map(|outcome| outcome.end);
+        let title = thread.title.clone();
+        let changes = self
+            .subthread_changes
+            .get(&thread_id)
+            .copied()
+            .or_else(|| task.changes.map(ChangeStat::of_task))
+            .filter(|changes| changes.files > 0);
+        let ran = task
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.ended_at.duration_since(thread.created_at?).ok());
+        // One sent more work since runs again, and its row says how it ended then.
+        let (icon, verb) = match end {
+            Some(TaskEnd::Failed) => (
+                Icon::new(IconName::XCircle).color(Color::Error),
+                "Subthread failed:",
+            ),
+            Some(TaskEnd::Cancelled | TaskEnd::Interrupted) => (
+                Icon::new(IconName::Circle).color(Color::Muted),
+                "Subthread stopped:",
+            ),
+            Some(TaskEnd::Completed) | None => (
+                Icon::new(IconName::Check).color(Color::Success),
+                "Subthread finished:",
+            ),
+        };
+        let is_open = self.opened_results.contains(&(notice, Some(thread_id)));
+        let colors = cx.theme().colors();
+        let (hover_background, text, text_placeholder, border_variant) = (
+            colors.ghost_element_hover,
+            colors.text,
+            colors.text_placeholder,
+            colors.border_variant,
+        );
+        let selector = format!("task-result-{notice}-{}", thread_id.0);
+        let group = SharedString::from(selector.clone());
+        let row = h_flex()
+            .id(gpui::ElementId::Name(selector.clone().into()))
+            .debug_selector({
+                let selector = selector.clone();
+                move || selector
+            })
+            .group(group.clone())
+            .min_h(px(24.))
+            .gap_1p5()
+            .px_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(hover_background))
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                this.toggle_result(notice, Some(thread_id), cx);
+            }))
+            .child(
+                h_flex()
+                    .w(px(24.))
+                    .flex_none()
+                    .justify_center()
+                    .child(icon.size(IconSize::Small)),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .text_size(rems_from_px(13_f32))
+                    .text_color(work_row_color(cx))
+                    .child(div().flex_none().child(verb))
+                    .child(div().min_w_0().truncate().text_color(text).child(title)),
+            )
+            .children(changes.map(|changes| {
+                div()
+                    .flex_none()
+                    .child(diff_stat(changes.additions, changes.deletions))
+            }))
+            .children(ran.map(|ran| {
+                div()
+                    .flex_none()
+                    .text_size(rems_from_px(12_f32))
+                    .text_color(text_placeholder)
+                    .child(format_duration(ran))
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || format!("{selector}-open")
+                    })
+                    .child(
+                        Button::new(
+                            gpui::ElementId::Name(format!("{selector}-open").into()),
+                            "Open",
+                        )
+                        .label_size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .end_icon(
+                            Icon::new(IconName::ArrowUpRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            // The row behind it opens and closes on a click.
+                            cx.stop_propagation();
+                            cx.emit(AgentViewEvent::OpenThread(thread_id));
+                        })),
+                    ),
+            )
+            .child(
+                div().flex_none().visible_on_hover(group).child(
+                    Icon::new(if is_open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                ),
+            );
+        if !is_open {
+            return Some(row.into_any_element());
+        }
+        let summary = self.markdown((notice, summary_part(position)), style.clone(), cx);
+        Some(
+            v_flex()
+                .child(row)
+                .children(summary.map(|summary| {
+                    div().ml(px(30.)).pt_1().pb_2().child(
+                        div()
+                            .debug_selector(move || format!("{selector}-summary"))
+                            .border_l_2()
+                            .border_color(border_variant)
+                            .pl_2p5()
+                            .text_ui(cx)
+                            .child(summary),
+                    )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_result(&mut self, notice: usize, task: Option<ThreadId>, cx: &mut Context<Self>) {
+        if !self.opened_results.remove(&(notice, task)) {
+            self.opened_results.insert((notice, task));
+        }
+        self.list_state.remeasure_items(notice + 1..notice + 2);
+        cx.notify();
+    }
+
+    /// "Waiting for 3 subthreads" at the end of a thread whose turn ended while subthreads it
+    /// started still work (`design/subthreads-machines/decisions.md`, topic 8): its agent goes
+    /// on when they end, in a turn their results start.
+    fn render_waiting_for_subthreads(&self, cx: &App) -> Option<AnyElement> {
+        if self.thread.read(cx).is_working() {
+            return None;
+        }
+        let waiting = self
+            .store
+            .read(cx)
+            .subthreads(self.thread_id)
+            .into_iter()
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
+            })
+            .count();
+        let (label, ends) = match waiting {
+            0 => return None,
+            1 => ("Waiting for a subthread".to_string(), "when it ends"),
+            count => (format!("Waiting for {count} subthreads"), "when they end"),
+        };
+        Some(
+            h_flex()
+                .debug_selector(|| "waiting-for-subthreads".into())
+                .py_2()
+                .px(rems_from_px(22_f32))
+                .gap_2()
+                .child(
+                    h_flex().w_2().justify_center().child(
+                        SpinnerLabel::new()
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(format!("· the agent continues {ends}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Zed's subagent card for a subthread at work: a bordered card whose header has a
-    /// spinner, a check, a cross or a faint circle, the title, "· model", the files it
-    /// changed, and Stop while it runs. While it runs, the step it's on shows inside, and a
-    /// strip at the bottom opens it full screen; opened, it shows Zed's preview of its work.
+    /// spinner, the title, "· model", and Stop. The step it's on shows inside, and a strip at
+    /// the bottom opens it full screen; opened, it shows Zed's preview of its work.
     fn render_subthread_card(
         &self,
         index: usize,
@@ -8757,54 +9239,20 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let (editor_background, element_hover, icon_disabled) = (
-            colors.editor_background,
-            colors.element_hover,
-            colors.icon_disabled,
-        );
+        let (editor_background, element_hover) = (colors.editor_background, colors.element_hover);
         let border = Self::tool_card_border_color(cx);
         let SubthreadCard {
             subthread,
             title,
             meta,
-            state,
-            changes,
             can_stop,
             is_waiting,
             question,
         } = card;
-        let is_running = state == CardState::Running;
         let is_open = self.toggled_tool_calls.contains(&tool_call.id);
         let steps = self.subagent_steps(subthread, cx);
         let header_group = SharedString::from(format!("subthread-card-header-{index}"));
         let title_size = LabelSize::Custom(rems_from_px(13_f32));
-        let status = match state {
-            CardState::Running => SpinnerLabel::new()
-                .size(LabelSize::Small)
-                .into_any_element(),
-            CardState::Done => Icon::new(IconName::Check)
-                .size(IconSize::Small)
-                .color(Color::Success)
-                .into_any_element(),
-            CardState::Failed => div()
-                .id(("subthread-card-status", index))
-                .child(
-                    Icon::new(IconName::Close)
-                        .size(IconSize::Small)
-                        .color(Color::Error),
-                )
-                .tooltip(Tooltip::text("Subthread Failed"))
-                .into_any_element(),
-            CardState::Stopped => div()
-                .id(("subthread-card-status", index))
-                .child(
-                    Icon::new(IconName::Circle)
-                        .size(IconSize::Small)
-                        .color(Color::Custom(icon_disabled.opacity(0.5))),
-                )
-                .tooltip(Tooltip::text("Subthread Stopped"))
-                .into_any_element(),
-        };
         let toggle = {
             let tool_call_id = tool_call.id.clone();
             cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
@@ -8836,7 +9284,13 @@ impl AgentView {
                     .cursor_pointer()
                     .hover(|style| style.bg(element_hover))
                     .on_click(toggle)
-                    .child(h_flex().w_4().flex_none().justify_center().child(status))
+                    .child(
+                        h_flex()
+                            .w_4()
+                            .flex_none()
+                            .justify_center()
+                            .child(SpinnerLabel::new().size(LabelSize::Small)),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -8848,19 +9302,6 @@ impl AgentView {
                                 .size(title_size)
                                 .color(Color::Muted),
                         )
-                    }))
-                    .children(changes.map(|changes| {
-                        let files = if changes.files == 1 {
-                            "— 1 file changed".to_string()
-                        } else {
-                            format!("— {} files changed", changes.files)
-                        };
-                        h_flex()
-                            .debug_selector(move || format!("subthread-card-changes-{index}"))
-                            .flex_none()
-                            .gap_1p5()
-                            .child(Label::new(files).size(title_size).color(Color::Muted))
-                            .child(diff_stat(changes.additions, changes.deletions))
                     }))
                     .when(is_waiting, |this| {
                         let warning = cx.theme().status().warning;
@@ -8889,7 +9330,7 @@ impl AgentView {
                         ),
                     ),
             )
-            .when(is_running && can_stop, |this| {
+            .when(can_stop, |this| {
                 this.child(
                     div()
                         .debug_selector(move || format!("subthread-card-stop-{index}"))
@@ -8917,8 +9358,8 @@ impl AgentView {
                 .into_iter()
                 .chain(self.render_subagent_work(index, subthread, &steps, report, true, cx))
                 .collect()
-        } else if is_running {
-            // While it runs, the step it's on; "Waiting for you" stands in for it.
+        } else {
+            // The step it's on; "Waiting for you" stands in for it.
             let step = steps
                 .iter()
                 .rev()
@@ -8938,10 +9379,7 @@ impl AgentView {
                 .chain(question)
                 .chain([self.render_full_screen_strip(index, subthread, true, cx)])
                 .collect()
-        } else {
-            question.into_iter().collect()
         };
-        let has_ended_badly = matches!(state, CardState::Failed | CardState::Stopped);
         v_flex()
             .mx_5()
             .child(
@@ -8950,7 +9388,6 @@ impl AgentView {
                     .my_1()
                     .rounded_md()
                     .border_1()
-                    .when(has_ended_badly, |this| this.border_dashed())
                     .border_color(border)
                     .bg(editor_background)
                     .overflow_hidden()
@@ -11356,14 +11793,15 @@ impl AgentView {
         }
     }
 
-    /// The bar above the message editor: agents, plan, edited files and queued messages.
+    /// The bar above the message editor: background tasks, plan, edited files and queued
+    /// messages. Subthreads aren't listed there: they're rows under the parent in the sidebar
+    /// and cards in the conversation (`design/subthreads-machines/decisions.md`, topic 3).
     fn render_activity_bar(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let sections: Vec<AnyElement> = [
-            self.render_agents_section(window, cx),
             self.render_background_tasks_section(window, cx),
             self.render_plan_section(window, cx),
             self.render_queue_section(window, cx),
@@ -14872,6 +15310,17 @@ pub(crate) struct ChangeStat {
     deletions: usize,
 }
 
+impl ChangeStat {
+    /// What a task's thread changed, as its server kept it when it ended.
+    fn of_task(changes: projects::TaskChanges) -> Self {
+        Self {
+            files: changes.files as usize,
+            additions: changes.additions as usize,
+            deletions: changes.deletions as usize,
+        }
+    }
+}
+
 /// Asks the thread's server what the thread changed, for its header's button. `None` when it
 /// couldn't say.
 pub(crate) fn load_change_stat(
@@ -16091,6 +16540,7 @@ fn is_work(entry: &Entry) -> bool {
             !tool_calls::is_subagent(tool_call)
                 && tool_call.mode_switch.is_none()
                 && tool_calls::published_artifact(tool_call).is_none()
+                && !tool_calls::is_delegation(tool_call)
         }
         Entry::AgentThought(_) | Entry::Plan => true,
         Entry::UserMessage(_) | Entry::AgentMessage(_) | Entry::Compaction(_) => false,
@@ -16128,23 +16578,12 @@ fn draws_row(entry: &Entry) -> bool {
     }
 }
 
-/// A subthread's state, as Zed's subagent card shows it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CardState {
-    Running,
-    Done,
-    Failed,
-    Stopped,
-}
-
 /// What a subthread's card shows in its header, and a question its call asks.
 struct SubthreadCard {
     subthread: ThreadId,
     title: String,
-    /// The model it runs on, or the type of the agent's own subagent.
+    /// The type of the agent's own subagent.
     meta: Option<String>,
-    state: CardState,
-    changes: Option<ChangeStat>,
     /// The agent runs its own subagents, so only the subthreads agentZ runs have Stop.
     can_stop: bool,
     is_waiting: bool,
@@ -19405,9 +19844,7 @@ mod tests {
             )
         });
         cx.run_until_parked();
-        let run = cx.debug_bounds("work-run-1").expect("the folded run");
-        cx.simulate_click(run.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        // This machine doesn't know the subthread, so its call has no card.
         assert!(cx.debug_bounds("tool-call-open-1").is_some());
         assert!(cx.debug_bounds("tool-call-open-2").is_none());
         let search = cx
@@ -19458,14 +19895,25 @@ mod tests {
         assert!(cx.debug_bounds("tool-call-input-json-1").is_none());
     }
 
-    /// A subthread `delegate_task` started is Zed's subagent card where it started
-    /// (`design/agentz-tools`, topics 7 and 8): with Stop and the step it's on while it runs,
-    /// and the files it changed once it's done, opening to its summary.
+    /// The subthreads a thread started together share a card where it started them
+    /// (`design/subthreads-machines/decisions.md`, topic 4): "Started 2 subthreads · 1
+    /// running", then a row each with Stop while it runs, or else how long it ran, and Open. A
+    /// row opens to its preview, with its summary once it ended.
     #[gpui::test]
-    fn a_delegated_subthread_is_zeds_card_where_it_started(cx: &mut TestAppContext) {
+    fn subthreads_started_together_share_a_card(cx: &mut TestAppContext) {
         use std::cell::RefCell;
 
-        let (view, cx) = open_in(subthreads_snapshot(&[10]), 2, false, cx);
+        let mut snapshot = subthreads_snapshot(&[10]);
+        if let Some(outcome) = snapshot
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == ThreadId(11))
+            .and_then(|thread| thread.task.as_mut())
+            .and_then(|task| task.outcome.as_mut())
+        {
+            outcome.summary = Some("The **delegation tests** pass.".into());
+        }
+        let (view, cx) = open_in(snapshot, 2, false, cx);
         let opened = opened_threads(&view, cx);
         let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
         let client = view.read_with(cx, |view, _| view.client.clone());
@@ -19482,45 +19930,38 @@ mod tests {
                 vec![
                     Entry::UserMessage("Delegate it".into()),
                     mcp_call(
-                        "agentz___delegate_task",
-                        r#"{"task": "Look into it", "title": "Research"}"#,
-                        r#"{"taskId": 10, "childThreadId": 10}"#,
+                        "agentz___delegate_tasks",
+                        r#"{"tasks": [{"task": "Look into it"}, {"task": "Test it"}]}"#,
+                        r#"{"tasks": [{"taskId": 10, "childThreadId": 10},
+                            {"taskId": 11, "childThreadId": 11}]}"#,
                     ),
-                    Entry::AgentMessage("It's on it.".into()),
+                    Entry::AgentMessage("They're on it.".into()),
                 ],
                 cx,
             )
         });
         cx.run_until_parked();
-        for selector in [
-            "subthread-card-1",
-            "subthread-card-stop-1",
-            "subagent-full-screen-1",
-        ] {
-            assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
-        }
+        assert!(cx.debug_bounds("subthread-batch-1").is_some());
         assert!(cx.debug_bounds("tool-call-row-1").is_none());
-        click("subthread-card-stop-1", cx);
+        let first = cx
+            .debug_bounds("subthread-batch-row-10")
+            .expect("the first row");
+        let second = cx
+            .debug_bounds("subthread-batch-row-11")
+            .expect("the second row");
+        assert!(first.top() < second.top());
+        // The one still at work has Stop; the one that ended doesn't.
+        assert!(cx.debug_bounds("subthread-batch-stop-11").is_none());
+        click("subthread-batch-stop-10", cx);
         assert!(requests.borrow().contains(&Request::Cancel(
             agentz_protocol::ConnectionId::Thread(ThreadId(10))
         )));
         assert!(opened.borrow().is_empty());
+        assert!(cx.debug_bounds("subagent-report-11").is_none());
 
-        let mut ended = subthreads_snapshot(&[]);
-        if let Some(outcome) = ended
-            .threads
-            .iter_mut()
-            .find(|thread| thread.id == ThreadId(10))
-            .and_then(|thread| thread.task.as_mut())
-            .and_then(|task| task.outcome.as_mut())
-        {
-            outcome.summary = Some("The **child tasks** need a card.".into());
-        }
-        let store = view.read_with(cx, |view, _| view.store.clone());
-        store.update(cx, |store, cx| store.set_snapshot(ended, cx));
         view.update(cx, |view, cx| {
             view.subthread_changes.insert(
-                ThreadId(10),
+                ThreadId(11),
                 ChangeStat {
                     files: 2,
                     additions: 12,
@@ -19530,14 +19971,123 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("subthread-card-changes-1").is_some());
-        for selector in ["subthread-card-stop-1", "subagent-full-screen-1"] {
-            assert!(cx.debug_bounds(selector).is_none(), "{selector} is hidden");
+        assert!(cx.debug_bounds("subthread-batch-changes-11").is_some());
+        click("subthread-batch-row-11", cx);
+        assert!(cx.debug_bounds("subagent-report-11").is_some());
+        click("subthread-batch-open-11", cx);
+        assert_eq!(*opened.borrow(), vec![ThreadId(11)]);
+    }
+
+    /// Subthreads started by calls one after another share the first one's card.
+    #[gpui::test]
+    fn calls_one_after_another_share_a_card(cx: &mut TestAppContext) {
+        let (view, cx) = open_in(subthreads_snapshot(&[10, 11]), 2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let delegate = |id: u64| {
+            let mut entry = mcp_call(
+                "agentz___delegate_task",
+                r#"{"task": "Look into it"}"#,
+                &format!(r#"{{"taskId": {id}, "childThreadId": {id}}}"#),
+            );
+            if let Entry::ToolCall(tool_call) = &mut entry {
+                tool_call.id = acp::ToolCallId::new(format!("delegate-{id}"));
+            }
+            entry
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Delegate it".into()),
+                    delegate(10),
+                    delegate(11),
+                    Entry::AgentMessage("They're on it.".into()),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("subthread-batch-1").expect("the card");
+        assert!(cx.debug_bounds("subthread-batch-2").is_none());
+        for selector in ["subthread-batch-row-10", "subthread-batch-row-11"] {
+            let row = cx.debug_bounds(selector).expect("a row");
+            assert!(card.contains(&row.center()), "{selector} is in the card");
         }
-        click("subthread-card-title-1", cx);
-        assert!(cx.debug_bounds("subagent-report-1").is_some());
-        click("subagent-full-screen-1", cx);
-        assert_eq!(*opened.borrow(), vec![ThreadId(10)]);
+    }
+
+    /// Where a thread heard its subthreads ended, their results show
+    /// (`design/subthreads-machines/decisions.md`, topic 5): one result as its own row,
+    /// opening to its summary, and several that came together as one row opening to theirs.
+    #[gpui::test]
+    fn subthreads_results_show_where_they_came_back(cx: &mut TestAppContext) {
+        let mut snapshot = subthreads_snapshot(&[]);
+        for thread in &mut snapshot.threads {
+            let Some(outcome) = thread.task.as_mut().and_then(|task| task.outcome.as_mut()) else {
+                continue;
+            };
+            match thread.id {
+                ThreadId(10) => outcome.end = TaskEnd::Failed,
+                _ => outcome.summary = Some("All **green**.".into()),
+            }
+        }
+        let (view, cx) = open_in(snapshot, 2, false, cx);
+        let opened = opened_threads(&view, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.task_notices = vec![1, 3];
+                    state.announced_tasks = vec![
+                        (1, vec![ThreadId(11)]),
+                        (3, vec![ThreadId(10), ThreadId(11)]),
+                    ];
+                },
+                cx,
+            );
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Spawn some".into()),
+                    Entry::UserMessage("Subthreads ended: 11.".into()),
+                    Entry::AgentMessage("The tests pass.".into()),
+                    Entry::UserMessage("Subthreads ended: 10, 11.".into()),
+                    Entry::AgentMessage("One failed.".into()),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("task-result-1-11-summary").is_none());
+        click("task-result-1-11", cx);
+        assert!(cx.debug_bounds("task-result-1-11-summary").is_some());
+        click("task-result-1-11-open", cx);
+        assert_eq!(*opened.borrow(), vec![ThreadId(11)]);
+
+        assert!(cx.debug_bounds("task-result-3-10").is_none());
+        click("task-results-3", cx);
+        let failed = cx.debug_bounds("task-result-3-10").expect("the failed one");
+        let done = cx.debug_bounds("task-result-3-11").expect("the done one");
+        assert!(failed.top() < done.top());
+    }
+
+    /// A thread whose turn ended while its subthreads work says it waits for them
+    /// (`design/subthreads-machines/decisions.md`, topic 8), until they end.
+    #[gpui::test]
+    fn a_parent_says_it_waits_for_its_subthreads(cx: &mut TestAppContext) {
+        let (view, cx) = open_parent(subthreads_snapshot(&[10, 11]), cx);
+        assert!(cx.debug_bounds("waiting-for-subthreads").is_some());
+
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waiting-for-subthreads").is_none());
+
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| {
+            store.set_snapshot(subthreads_snapshot(&[]), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("waiting-for-subthreads").is_none());
     }
 
     fn completed_call(
@@ -21625,13 +22175,16 @@ mod tests {
                 runs_on: None,
                 parent_machine: None,
                 stoppable: false,
+                queued: None,
+                can_delegate: false,
+                changes: None,
             });
             snapshot.threads.push(subthread);
         }
         snapshot
     }
 
-    /// Opens the parent, with a conversation for its Agents list to sit under.
+    /// Opens the parent, with a conversation.
     fn open_parent(
         snapshot: ProjectsSnapshot,
         cx: &mut TestAppContext,
@@ -21660,118 +22213,6 @@ mod tests {
             .detach();
         });
         opened
-    }
-
-    /// Zed's subagent headers as rows: a running one has Stop, which stops it without opening
-    /// it, and one that changed files says how much.
-    #[gpui::test]
-    fn subthread_rows_show_their_state_and_changes(cx: &mut TestAppContext) {
-        use std::cell::RefCell;
-
-        let (view, cx) = open_parent(subthreads_snapshot(&[11]), cx);
-        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
-        let client = view.read_with(cx, |view, _| view.client.clone());
-        client.update(cx, |client, _| {
-            let requests = requests.clone();
-            client.answer_for_test(move |request| {
-                requests.borrow_mut().push(request.clone());
-                Some(Response::Ok)
-            });
-        });
-        let opened = opened_threads(&view, cx);
-        assert!(cx.debug_bounds("subthread-row-10").is_some());
-        assert!(cx.debug_bounds("subthread-row-11").is_some());
-        // Newest first.
-        let newest = cx.debug_bounds("subthread-row-11").expect("a row");
-        let oldest = cx.debug_bounds("subthread-row-10").expect("a row");
-        assert!(newest.top() < oldest.top());
-        assert!(cx.debug_bounds("stop-subthread-row-11").is_some());
-        assert!(cx.debug_bounds("stop-subthread-row-10").is_none());
-        assert!(cx.debug_bounds("subthread-row-changes-10").is_none());
-
-        view.update(cx, |view, cx| {
-            view.subthread_changes.insert(
-                ThreadId(10),
-                ChangeStat {
-                    files: 1,
-                    additions: 12,
-                    deletions: 0,
-                },
-            );
-            cx.notify();
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("subthread-row-changes-10").is_some());
-        assert!(cx.debug_bounds("subthread-row-changes-11").is_none());
-
-        let stop = cx.debug_bounds("stop-subthread-row-11").expect("Stop");
-        cx.simulate_click(stop.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(requests.borrow().contains(&Request::Cancel(
-            agentz_protocol::ConnectionId::Thread(ThreadId(11))
-        )));
-        assert!(opened.borrow().is_empty());
-
-        let row = cx.debug_bounds("subthread-row-10").expect("a row");
-        cx.simulate_click(row.center(), gpui::Modifiers::none());
-        assert_eq!(*opened.borrow(), vec![ThreadId(10)]);
-    }
-
-    /// The list is open while a subthread runs, folds once the last one ends, and opens again
-    /// with a click or when another starts.
-    #[gpui::test]
-    fn the_agents_list_folds_once_all_are_done(cx: &mut TestAppContext) {
-        let (view, cx) = open_parent(subthreads_snapshot(&[10, 11]), cx);
-        let store = view.read_with(cx, |view, _| view.store.clone());
-        assert!(cx.debug_bounds("subthread-row-10").is_some());
-
-        store.update(cx, |store, cx| {
-            store.set_snapshot(subthreads_snapshot(&[11]), cx)
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("subthread-row-10").is_some(),
-            "one still runs"
-        );
-
-        store.update(cx, |store, cx| {
-            store.set_snapshot(subthreads_snapshot(&[]), cx)
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("agents-summary").is_some());
-        assert!(
-            cx.debug_bounds("subthread-row-10").is_none(),
-            "all are done"
-        );
-
-        let summary = cx.debug_bounds("agents-summary").expect("the summary");
-        cx.simulate_click(summary.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("subthread-row-10").is_some(),
-            "a click opens it"
-        );
-        // Open, the list pushes its summary up.
-        let summary = cx.debug_bounds("agents-summary").expect("the summary");
-        cx.simulate_click(summary.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("subthread-row-10").is_none());
-
-        store.update(cx, |store, cx| {
-            store.set_snapshot(subthreads_snapshot(&[11]), cx)
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("subthread-row-10").is_some(),
-            "another started"
-        );
-    }
-
-    #[gpui::test]
-    fn a_parent_whose_subthreads_are_done_opens_folded(cx: &mut TestAppContext) {
-        let (_, cx) = open_parent(subthreads_snapshot(&[]), cx);
-        assert!(cx.debug_bounds("agents-summary").is_some());
-        assert!(cx.debug_bounds("subthread-row-10").is_none());
     }
 
     /// An open subthread: the parent's header, Zed's subagent bar under it, its task as a card,
@@ -21823,6 +22264,39 @@ mod tests {
         assert!(cx.debug_bounds("subthread-title-bar-stop").is_none());
     }
 
+    /// A subthread's long task folds to its first four lines, and Show more opens the rest.
+    /// A short one shows whole.
+    #[gpui::test]
+    fn a_long_task_folds_to_four_lines(cx: &mut TestAppContext) {
+        let (view, cx) = open_in(subthreads_snapshot(&[10]), 10, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let rules: Vec<String> = (1..=12).map(|rule| format!("Rule {rule}.")).collect();
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage(rules.join("\n\n"))], cx)
+        });
+        cx.run_until_parked();
+        let folded = cx.debug_bounds("folded-message-0").expect("the task");
+        let show_more = cx
+            .debug_bounds("show-more-message-0")
+            .expect("Show more is offered");
+        cx.simulate_click(show_more.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let opened = cx.debug_bounds("folded-message-0").expect("the task");
+        assert!(
+            folded.size.height * 2. < opened.size.height,
+            "{folded:?} folds {opened:?}"
+        );
+        assert!(cx.debug_bounds("show-more-message-0").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Look into it".into())], cx)
+        });
+        view.update(cx, |view, _| view.expanded_messages.clear());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("folded-message-0").is_some());
+        assert!(cx.debug_bounds("show-more-message-0").is_none());
+    }
+
     /// This Mac's [`subthreads_snapshot`], whose 10 was delegated to Devbox 1, where its
     /// thread is 7, and Devbox 1's, with that thread.
     fn delegated_snapshots() -> (ProjectsSnapshot, ProjectsSnapshot) {
@@ -21853,6 +22327,9 @@ mod tests {
             runs_on: None,
             parent_machine: Some("This Mac".into()),
             stoppable: false,
+            queued: None,
+            can_delegate: false,
+            changes: None,
         });
         devbox.threads.push(working);
         (mac, devbox)
@@ -22046,17 +22523,27 @@ mod tests {
         assert_eq!(*created_with.borrow(), vec![AgentId::new("other")]);
     }
 
-    /// A task delegated to another machine is a row under its parent that names the machine.
-    /// Its Stop stops its thread there, and opening it opens that thread.
+    /// A task delegated to another machine is a card in its parent whose Stop stops its thread
+    /// there, and its permission requests are asked there.
     #[gpui::test]
-    fn a_task_on_another_machine_is_a_row_naming_it(cx: &mut TestAppContext) {
+    fn a_task_on_another_machine_is_stopped_there(cx: &mut TestAppContext) {
         use std::cell::RefCell;
 
         let (mac, devbox) = two_machines(cx);
         let (view, cx) = open_on(&mac, 2, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         thread.update(cx, |thread, cx| {
-            thread.set_entries_for_test(vec![Entry::UserMessage("Spawn some".into())], cx)
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Spawn some".into()),
+                    mcp_call(
+                        "agentz___delegate_task",
+                        r#"{"task": "Look into it", "title": "Research", "machine": "Devbox 1"}"#,
+                        r#"{"taskId": 10, "childThreadId": 10}"#,
+                    ),
+                ],
+                cx,
+            )
         });
         cx.run_until_parked();
         let requests: Rc<RefCell<Vec<(MachineId, Request)>>> = Rc::default();
@@ -22070,10 +22557,7 @@ mod tests {
                 });
             });
         }
-        assert!(cx.debug_bounds("subthread-row-machine-10").is_some());
-        assert!(cx.debug_bounds("subthread-row-machine-11").is_none());
-
-        let stop = cx.debug_bounds("stop-subthread-row-10").expect("Stop");
+        let stop = cx.debug_bounds("subthread-batch-stop-10").expect("Stop");
         cx.simulate_click(stop.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         let cancels: Vec<(MachineId, Request)> = requests
@@ -22193,6 +22677,9 @@ mod tests {
             runs_on: None,
             parent_machine: None,
             stoppable: false,
+            queued: None,
+            can_delegate: false,
+            changes: None,
         });
         snapshot.threads.push(subagent);
         snapshot
@@ -22402,28 +22889,6 @@ mod tests {
         assert!(cx.debug_bounds("subagent-report-2").is_some());
     }
 
-    /// The Agents list shows the agent's own subagent while it runs, by the agent's name and with
-    /// no Stop, and its subthread has no Stop either: the agent runs it.
-    #[gpui::test]
-    fn the_agents_own_subagents_are_listed_while_they_run(cx: &mut TestAppContext) {
-        let (view, cx) = open_parent(subagent_snapshot(true), cx);
-        assert!(cx.debug_bounds("subthread-row-12").is_some());
-        assert!(cx.debug_bounds("subthread-row-agent-12").is_some());
-        assert!(cx.debug_bounds("stop-subthread-row-12").is_none());
-        assert!(cx.debug_bounds("subthread-row-agent-10").is_none());
-
-        let store = view.read_with(cx, |view, _| view.store.clone());
-        store.update(cx, |store, cx| {
-            store.set_snapshot(subagent_snapshot(false), cx)
-        });
-        cx.run_until_parked();
-        let summary = cx.debug_bounds("agents-summary").expect("the summary");
-        cx.simulate_click(summary.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("subthread-row-10").is_some());
-        assert!(cx.debug_bounds("subthread-row-12").is_none());
-    }
-
     #[gpui::test]
     fn an_agents_own_subagent_has_no_stop(cx: &mut TestAppContext) {
         let (_, cx) = open_in(subagent_snapshot(true), 12, false, cx);
@@ -22445,9 +22910,17 @@ mod tests {
         snapshot
     }
 
-    /// One its agent lets agentZ stop has Stop in its row, which asks its server to stop it.
+    /// Its subthread has Stop too.
     #[gpui::test]
-    fn an_agents_own_subagent_its_agent_lets_stop_has_stop(cx: &mut TestAppContext) {
+    fn the_subthread_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
+        let (_, cx) = open_in(stoppable_subagent_snapshot(), 12, false, cx);
+        assert!(cx.debug_bounds("subthread-title-bar-stop").is_some());
+        assert!(cx.debug_bounds("subthread-bar-stop").is_some());
+    }
+
+    /// And its card in the parent has Stop while it runs, which asks its server to stop it.
+    #[gpui::test]
+    fn the_card_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
         use std::cell::RefCell;
 
         let (view, cx) = open_parent(stoppable_subagent_snapshot(), cx);
@@ -22460,26 +22933,6 @@ mod tests {
                 Some(Response::Ok)
             });
         });
-        let stop = cx.debug_bounds("stop-subthread-row-12").expect("Stop");
-        cx.simulate_click(stop.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(requests.borrow().contains(&Request::Cancel(
-            agentz_protocol::ConnectionId::Thread(ThreadId(12))
-        )));
-    }
-
-    /// Its subthread has Stop too.
-    #[gpui::test]
-    fn the_subthread_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
-        let (_, cx) = open_in(stoppable_subagent_snapshot(), 12, false, cx);
-        assert!(cx.debug_bounds("subthread-title-bar-stop").is_some());
-        assert!(cx.debug_bounds("subthread-bar-stop").is_some());
-    }
-
-    /// And its card in the parent has Stop while it runs.
-    #[gpui::test]
-    fn the_card_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
-        let (view, cx) = open_parent(stoppable_subagent_snapshot(), cx);
         let mut call = subagent_call(
             "subagent:subagent-session",
             "Find where the login view is drawn",
@@ -22495,7 +22948,12 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("subthread-card-1").is_some());
-        assert!(cx.debug_bounds("subthread-card-stop-1").is_some());
+        let stop = cx.debug_bounds("subthread-card-stop-1").expect("Stop");
+        cx.simulate_click(stop.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(requests.borrow().contains(&Request::Cancel(
+            agentz_protocol::ConnectionId::Thread(ThreadId(12))
+        )));
     }
 
     /// Ctrl-minus, Minimize and Open Parent all open the parent, and the command palette offers

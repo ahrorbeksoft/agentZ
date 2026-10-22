@@ -67,25 +67,56 @@ impl ToolCallKind {
         }
     }
 
-    /// The subthread a `delegate_task` call started, once it has. Another machine's thread ids
-    /// aren't this one's.
-    pub fn delegated_subthread(&self) -> Option<ThreadId> {
-        let Self::Own {
-            tool: OwnTool::DelegateTask,
-            arguments,
-            output: Some(output),
-        } = self
-        else {
-            return None;
+    /// The subthreads a `delegate_task` or `delegate_tasks` call started, in order, once it
+    /// has. A task on another machine has a thread here too, which its id is.
+    pub fn delegated_subthreads(&self) -> Vec<ThreadId> {
+        let started = |output: &Value| {
+            thread_id_in(output.get("childThreadId")).or_else(|| thread_id_in(output.get("taskId")))
         };
-        if arguments
-            .get("machine")
-            .is_some_and(|machine| !machine.is_null())
-        {
-            return None;
+        match self {
+            Self::Own {
+                tool: OwnTool::DelegateTask,
+                output: Some(output),
+                ..
+            } => started(output).into_iter().collect(),
+            Self::Own {
+                tool: OwnTool::DelegateTasks,
+                output: Some(output),
+                ..
+            } => output
+                .get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(started)
+                .collect(),
+            _ => Vec::new(),
         }
-        thread_id_in(output.get("childThreadId")).or_else(|| thread_id_in(output.get("taskId")))
     }
+}
+
+/// Whether the call is `delegate_task` or `delegate_tasks`, whose subthreads show in a card
+/// apart from the work around it, as a subagent's does.
+pub fn is_delegation(tool_call: &ToolCall) -> bool {
+    // Told apart by name before the input is parsed, as most calls aren't one.
+    let title = tool_call.title.as_str();
+    if ![
+        "delegate_task",
+        "Delegate a child task",
+        "Delegate child tasks",
+    ]
+    .iter()
+    .any(|name| title.contains(name))
+    {
+        return false;
+    }
+    matches!(
+        ToolCallKind::of(tool_call),
+        ToolCallKind::Own {
+            tool: OwnTool::DelegateTask | OwnTool::DelegateTasks,
+            ..
+        }
+    )
 }
 
 /// One of the agent's own subagents: Claude Agent's, which work in a subthread of their own and
@@ -281,6 +312,7 @@ pub enum OwnTool {
     ThreadOrganize,
     ThreadDiff,
     DelegateTask,
+    DelegateTasks,
     WorkspaceStatus,
     WorkspaceList,
     WorkspaceHandoff,
@@ -288,6 +320,7 @@ pub enum OwnTool {
     WorkspaceBringBack,
     TaskStatus,
     TaskCancel,
+    TaskSend,
     TerminalList,
     TerminalStart,
     TerminalSend,
@@ -315,6 +348,7 @@ impl OwnTool {
         Self::ThreadOrganize,
         Self::ThreadDiff,
         Self::DelegateTask,
+        Self::DelegateTasks,
         Self::WorkspaceStatus,
         Self::WorkspaceList,
         Self::WorkspaceHandoff,
@@ -322,6 +356,7 @@ impl OwnTool {
         Self::WorkspaceBringBack,
         Self::TaskStatus,
         Self::TaskCancel,
+        Self::TaskSend,
         Self::TerminalList,
         Self::TerminalStart,
         Self::TerminalSend,
@@ -356,10 +391,12 @@ impl OwnTool {
         state: CallState,
         title_of: &dyn Fn(ThreadId) -> Option<String>,
     ) -> Sentence {
-        // Thread ids are per machine, so another machine's aren't looked up here.
-        let is_remote = arguments
-            .get("machine")
-            .is_some_and(|machine| !machine.is_null());
+        // Thread ids are per machine, so another machine's aren't looked up here. A task
+        // delegated there has a thread here, whose id the call gives.
+        let is_remote = !matches!(self, Self::DelegateTask | Self::DelegateTasks)
+            && arguments
+                .get("machine")
+                .is_some_and(|machine| !machine.is_null());
         let title_of = |thread_id: Option<ThreadId>| {
             thread_id
                 .filter(|_| !is_remote)
@@ -531,6 +568,48 @@ impl OwnTool {
                     thread_id,
                 )
             }
+            Self::DelegateTasks => {
+                let specs = arguments
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                match specs.as_slice() {
+                    [spec] => {
+                        let started = output
+                            .and_then(|output| output.get("tasks"))
+                            .and_then(Value::as_array)
+                            .and_then(|tasks| tasks.first());
+                        let thread_id = started
+                            .and_then(|task| {
+                                thread_id_in(task.get("childThreadId"))
+                                    .or_else(|| thread_id_in(task.get("taskId")))
+                            })
+                            .filter(|_| !is_remote);
+                        (
+                            verbs(
+                                "Start a subthread:",
+                                "Starting a subthread:",
+                                "Started a subthread:",
+                            ),
+                            made(thread_id, spec, started, "task"),
+                            thread_id,
+                        )
+                    }
+                    specs => {
+                        let count = specs.len();
+                        (
+                            verbs(
+                                &format!("Start {count} subthreads"),
+                                &format!("Starting {count} subthreads"),
+                                &format!("Started {count} subthreads"),
+                            ),
+                            None,
+                            None,
+                        )
+                    }
+                }
+            }
             Self::WorkspaceStatus => (
                 verbs(
                     "Check this thread's workspace",
@@ -601,6 +680,15 @@ impl OwnTool {
             ),
             Self::TaskCancel => (
                 verbs("Cancel", "Cancelling", "Cancelled"),
+                thread("taskId", "a subthread", "a subthread"),
+                None,
+            ),
+            Self::TaskSend => (
+                verbs(
+                    "Send more work to",
+                    "Sending more work to",
+                    "Sent more work to",
+                ),
                 thread("taskId", "a subthread", "a subthread"),
                 None,
             ),
@@ -862,9 +950,11 @@ impl OwnTool {
             | Self::ThreadUpdate
             | Self::ThreadOrganize
             | Self::DelegateTask
+            | Self::DelegateTasks
             | Self::WorkspaceHandoff
             | Self::WorkspaceBringBack
             | Self::TaskCancel
+            | Self::TaskSend
             | Self::TerminalStart
             | Self::TerminalSend => None,
         }
@@ -1013,6 +1103,20 @@ impl OwnTool {
                 parts.extend(text_in(output.get("summary")).map(OwnPart::Prose));
                 parts
             }
+            Self::DelegateTasks => output
+                .get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|task| match text_in(task.pointer("/error/message")) {
+                    Some(error) => Some(OwnPart::Line(vec![Span::error(error)])),
+                    None => ThreadLine::of(task).map(OwnPart::Thread),
+                })
+                .collect(),
+            Self::TaskSend => text_in(arguments.get("message"))
+                .map(OwnPart::Prose)
+                .into_iter()
+                .collect(),
             Self::WorkspaceStatus => {
                 let Some(kind) = text_in(output.get("kind")) else {
                     return Vec::new();
@@ -1139,6 +1243,7 @@ impl OwnTool {
     pub fn fold_group(self) -> Self {
         match self {
             Self::CreateThreads => Self::ThreadLaunch,
+            Self::DelegateTasks => Self::DelegateTask,
             tool => tool,
         }
     }
@@ -1148,7 +1253,11 @@ impl OwnTool {
     pub fn leads_summary(self) -> bool {
         matches!(
             self,
-            Self::DelegateTask | Self::ThreadLaunch | Self::TerminalStart | Self::CommandRun
+            Self::DelegateTask
+                | Self::DelegateTasks
+                | Self::ThreadLaunch
+                | Self::TerminalStart
+                | Self::CommandRun
         )
     }
 
@@ -1175,7 +1284,9 @@ impl OwnTool {
             Self::ThreadUpdate => counted("Renamed a thread", "Renamed {} threads"),
             Self::ThreadOrganize => counted("Organized a thread", "Organized {} threads"),
             Self::ThreadDiff => counted("Read a thread's changes", "Read {} threads' changes"),
-            Self::DelegateTask => counted("Started a subthread", "Started {} subthreads"),
+            Self::DelegateTask | Self::DelegateTasks => {
+                counted("Started a subthread", "Started {} subthreads")
+            }
             Self::WorkspaceStatus => "Checked this thread's workspace".to_string(),
             Self::WorkspaceList => "Listed branches and workspaces".to_string(),
             Self::WorkspaceHandoff => "Handed off to a new workspace".to_string(),
@@ -1183,6 +1294,10 @@ impl OwnTool {
             Self::WorkspaceBringBack => "Brought this pasture's branch to the project".to_string(),
             Self::TaskStatus => counted("Checked on a subthread", "Checked on {} subthreads"),
             Self::TaskCancel => counted("Cancelled a subthread", "Cancelled {} subthreads"),
+            Self::TaskSend => counted(
+                "Sent more work to a subthread",
+                "Sent more work to {} subthreads",
+            ),
             Self::TerminalList => "Listed terminals".to_string(),
             Self::TerminalStart => counted("Started a terminal", "Started {} terminals"),
             Self::TerminalSend => counted("Typed into a terminal", "Typed into {} terminals"),
@@ -1204,6 +1319,10 @@ impl OwnTool {
                 .get("threads")
                 .and_then(Value::as_array)
                 .map_or(1, |threads| threads.len().max(1)),
+            Self::DelegateTasks => arguments
+                .get("tasks")
+                .and_then(Value::as_array)
+                .map_or(1, |tasks| tasks.len().max(1)),
             _ => 1,
         }
     }

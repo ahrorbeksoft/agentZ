@@ -986,6 +986,9 @@ mod tests {
                     runs_on: None,
                     parent_machine: None,
                     stoppable: false,
+                    queued: None,
+                    can_delegate: false,
+                    changes: None,
                 },
                 None,
             )

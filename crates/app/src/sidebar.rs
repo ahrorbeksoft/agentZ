@@ -44,6 +44,11 @@ use crate::{NewChat, NewThread, OpenSettings};
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const CARD_HEIGHT: Pixels = px(78.);
+/// How far a subthread's row sits in from its parent's card, as a worktree's does from its
+/// workspace in the Workspaces view.
+const SUBTHREAD_ROW_INDENT: Pixels = px(24.);
+/// Where the tree line from a parent's card to its subthreads runs: under the card's icon.
+const SUBTHREAD_CONNECTOR_LEFT: Pixels = px(18.);
 pub(crate) const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
@@ -356,7 +361,12 @@ impl ThreadDrag {
 /// in a collapsible shelf at the bottom (t3code's "Settled" shelf).
 pub struct Sidebar {
     machines: Entity<Machines>,
+    /// The open thread's card: its own, or for a subthread its top-level thread's.
     active_thread: Option<ThreadKey>,
+    /// The open subthread, whose row is marked in place of its parent's card while it's shown.
+    active_subthread: Option<ThreadKey>,
+    /// How the user left each parent's subthread rows, while it still applies.
+    subthread_folds: HashMap<ThreadKey, SubthreadFold>,
     /// The open draft's row as it was when the draft was opened. Like t3code, the row doesn't
     /// repaint while you type in it, and a draft never left has none.
     frozen_draft: Option<(ThreadKey, Thread)>,
@@ -429,6 +439,8 @@ impl Sidebar {
         Self {
             machines,
             active_thread: None,
+            active_subthread: None,
+            subthread_folds: HashMap::default(),
             frozen_draft: None,
             search,
             search_index: 0,
@@ -455,6 +467,9 @@ impl Sidebar {
     }
 
     pub fn set_active_thread(&mut self, thread: Option<ThreadKey>, cx: &mut Context<Self>) {
+        let root = thread.map(|key| self.machines.read(cx).root_thread(key, cx));
+        self.active_subthread = thread.filter(|key| Some(*key) != root);
+        let thread = root;
         if self.active_thread != thread {
             self.frozen_draft = thread.and_then(|key| {
                 let store = self.store(key.machine, cx)?;
@@ -1736,7 +1751,15 @@ impl Sidebar {
             machine,
             thread: thread.id,
         };
-        let is_active = self.active_thread == Some(thread_id);
+        let listed = listed_subthreads(store.read(cx), thread.id);
+        let shows_subthreads = !listed.is_empty() && self.shows_subthreads(thread_id, &listed);
+        // While the open subthread's row shows, it's marked in place of its parent's card.
+        let shows_active_subthread = shows_subthreads
+            && self.active_subthread.is_some_and(|open| {
+                open.machine == machine
+                    && listed.iter().any(|subthread| subthread.id == open.thread)
+            });
+        let is_active = self.active_thread == Some(thread_id) && !shows_active_subthread;
         let is_renaming = raised.is_none() && self.renaming_thread == Some(thread_id);
         // Cards pass under the pointer while one is dragged.
         let is_dragging = self.thread_drag.is_some();
@@ -2175,11 +2198,37 @@ impl Sidebar {
                         } else {
                             Color::Custom(faint_text)
                         };
-                        // The details popover says what the count is.
+                        // The count folds the subthreads' rows, and the details popover says
+                        // what it counts.
                         this.child(
                             h_flex()
+                                .id(thread_element_id("subthreads-toggle", thread_id))
+                                .debug_selector(|| {
+                                    format!("subthreads-toggle-{}", thread_id.thread.0)
+                                })
                                 .flex_none()
                                 .gap_0p5()
+                                .when(raised.is_none(), |this| {
+                                    this.cursor_pointer()
+                                        .tooltip(Tooltip::text(if shows_subthreads {
+                                            "Hide Subthreads"
+                                        } else {
+                                            "Show Subthreads"
+                                        }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_subthreads(thread_id, cx);
+                                        }))
+                                })
+                                .child(
+                                    Icon::new(if shows_subthreads {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(color),
+                                )
                                 .child(
                                     Icon::new(IconName::UserGroup)
                                         .size(IconSize::XSmall)
@@ -2213,15 +2262,33 @@ impl Sidebar {
                     )
                     .child(div().flex_none().child(icon.size(IconSize::Small))),
             );
+        let rows: Vec<AnyElement> = if shows_subthreads {
+            let last = listed.len().saturating_sub(1);
+            listed
+                .iter()
+                .enumerate()
+                .map(|(index, subthread)| {
+                    self.render_subthread_row(
+                        machine,
+                        subthread,
+                        index == last,
+                        raised.is_some(),
+                        cx,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if raised.is_some() {
-            return card.into_any_element();
+            return v_flex().child(card).children(rows).into_any_element();
         }
 
         // The details popover stays hidden while the thread's menu is open.
         let details_popover = (self.details_thread == Some(thread_id) && !is_dragging)
             .then(|| render_details_popover(details, cx));
         let menu = self.thread_menu(machine, &thread, false, thread.terminal.is_some(), cx);
-        right_click_menu(thread_element_id("thread-menu", thread_id))
+        let card = right_click_menu(thread_element_id("thread-menu", thread_id))
             .trigger(move |is_menu_open, _, _| {
                 div()
                     .relative()
@@ -2229,6 +2296,257 @@ impl Sidebar {
                     .when(!is_menu_open, |this| this.children(details_popover))
             })
             .menu(menu)
+            .into_any_element();
+        if rows.is_empty() {
+            card
+        } else {
+            v_flex().child(card).children(rows).into_any_element()
+        }
+    }
+
+    /// Whether a parent's subthread rows show: while any of them runs, unless the user folded
+    /// them, and once all are done only if the user opened them again. One starting, or the
+    /// last one ending, drops what the user chose.
+    fn shows_subthreads(&self, parent: ThreadKey, subthreads: &[Thread]) -> bool {
+        let fold = SubthreadFold::of(subthreads);
+        match self.subthread_folds.get(&parent) {
+            Some(left) if left.is_running == fold.is_running && left.newest == fold.newest => {
+                left.is_open
+            }
+            _ => fold.is_open,
+        }
+    }
+
+    fn toggle_subthreads(&mut self, parent: ThreadKey, cx: &mut Context<Self>) {
+        let Some(store) = self.store(parent.machine, cx) else {
+            return;
+        };
+        let subthreads = listed_subthreads(store.read(cx), parent.thread);
+        let is_open = self.shows_subthreads(parent, &subthreads);
+        self.subthread_folds.insert(
+            parent,
+            SubthreadFold {
+                is_open: !is_open,
+                ..SubthreadFold::of(&subthreads)
+            },
+        );
+        cx.notify();
+    }
+
+    /// A subthread's row under its parent's card, as a worktree's sits under its workspace in
+    /// the Workspaces view (`design/subthreads-machines/decisions.md`, topic 1): the agent's
+    /// icon, the title and its state, then the agent and model, the worktree it works in and
+    /// the lines it changed. A click opens it.
+    fn render_subthread_row(
+        &self,
+        machine: MachineId,
+        thread: &Thread,
+        is_last: bool,
+        is_raised: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let border = colors.border;
+        let selected_background = colors.ghost_element_selected;
+        let hover_background = colors.ghost_element_hover;
+        let faint_icon = Color::Custom(colors.text_muted.opacity(0.6));
+        let faint_text = colors.text_muted.opacity(0.4);
+        let key = ThreadKey {
+            machine,
+            thread: thread.id,
+        };
+        let is_active = self.active_subthread == Some(key);
+        let task = thread.task.as_ref();
+        let is_running = task.is_some_and(|task| task.outcome.is_none());
+        let machines = self.machines.read(cx);
+        let status = machines
+            .projects(machine, cx)
+            .and_then(|store| store.read(cx).thread_status(thread.id))
+            // A task delegated to another machine works there.
+            .or(is_running.then_some(ThreadStatus::Working));
+        let state = if task.is_some_and(projects::Task::is_queued) {
+            Label::new("Queued")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            match status {
+                Some(ThreadStatus::Working) => h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Accent)
+                            .with_rotate_animation(2),
+                    )
+                    .child(
+                        Label::new("Working")
+                            .size(LabelSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .into_any_element(),
+                Some(status) => render_status_pill(status, cx).into_any_element(),
+                None => {
+                    let ended = task
+                        .and_then(|task| task.outcome.as_ref())
+                        .map(|outcome| outcome.ended_at)
+                        .or(thread.last_activity_at);
+                    Label::new(
+                        ended
+                            .map(|time| format_relative_time(time, SystemTime::now()))
+                            .unwrap_or_default(),
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+                }
+            }
+        };
+        let agent_name = thread.agent_id.as_ref().map(|agent_id| {
+            let agent_id = AgentId::new(agent_id.clone());
+            machines
+                .client(machine, cx)
+                .and_then(|client| {
+                    let registry = client.read(cx).registry().read(cx);
+                    registry.agent(&agent_id).map(|agent| agent.name().clone())
+                })
+                .unwrap_or(agent_id.0)
+        });
+        // The agent runs its own subagents, so they have no model of their own.
+        let is_agents_own = task.is_some_and(projects::Task::is_agents_own);
+        let about: Vec<String> = agent_name
+            .map(|name| name.to_string())
+            .into_iter()
+            .chain(thread.model.clone().filter(|_| !is_agents_own))
+            .chain(thread.runs_on().map(|runs_on| runs_on.machine.clone()))
+            .collect();
+        let checkout = self.thread_checkout(machine, thread, cx);
+        let marker = checkout
+            .as_ref()
+            .and_then(|checkout| render_checkout_marker(key, checkout, faint_text));
+        let branch = marker
+            .is_some()
+            .then(|| checkout.as_ref().and_then(ThreadCheckout::branch))
+            .flatten();
+        let changes = task
+            .and_then(|task| task.changes)
+            .filter(|changes| changes.files > 0);
+
+        let first_line =
+            h_flex()
+                .h_5()
+                .gap_2()
+                .child(div().flex_none().child(
+                    thread_agent_icon(machine, thread, faint_icon, cx).size(IconSize::Small),
+                ))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(thread.title.clone())
+                            .color(if is_active {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
+                            .truncate(),
+                    ),
+                )
+                .child(div().flex_none().child(state));
+        let second_line = h_flex()
+            .pl_6()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(about.join(" · "))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Custom(faint_text))
+                        .truncate(),
+                ),
+            )
+            .when_some(marker, |this, marker| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .max_w(px(110.))
+                        .gap_0p5()
+                        .child(marker)
+                        .children(branch.map(|branch| {
+                            Label::new(branch)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Custom(faint_text))
+                                .truncate()
+                        })),
+                )
+            })
+            .when_some(changes, |this, changes| {
+                this.child(
+                    h_flex()
+                        .debug_selector(move || format!("subthread-row-changes-{}", key.thread.0))
+                        .flex_none()
+                        .gap_1()
+                        .child(
+                            Label::new(format!("+{}", changes.additions))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Created),
+                        )
+                        .child(
+                            Label::new(format!("−{}", changes.deletions))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Deleted),
+                        ),
+                )
+            });
+        // herdr's tree lines, as the Workspaces view draws them to a workspace's worktrees: ├
+        // for a row with more below, └ for the last, meeting the row at its first line.
+        let elbow = px(14.);
+        let connector = div()
+            .absolute()
+            .top_0()
+            .left(SUBTHREAD_CONNECTOR_LEFT)
+            .w(px(8.))
+            .map(|this| {
+                if is_last {
+                    this.h(elbow)
+                } else {
+                    this.h_full()
+                }
+            })
+            .border_l_1()
+            .border_color(border)
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(elbow)
+                    .w_full()
+                    .border_t_1()
+                    .border_color(border),
+            );
+        let is_dragging = self.thread_drag.is_some();
+        div()
+            .relative()
+            .pl(SUBTHREAD_ROW_INDENT)
+            .child(connector)
+            .child(
+                v_flex()
+                    .id(thread_element_id("subthread-row", key))
+                    .debug_selector(move || format!("subthread-row-{}", key.thread.0))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .when(is_active, |row| row.bg(selected_background))
+                    .when(!is_raised, |row| {
+                        row.cursor_pointer()
+                            .when(!is_dragging, |row| {
+                                row.hover(|row| row.bg(hover_background))
+                            })
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(SidebarEvent::OpenThread(key))
+                            }))
+                    })
+                    .child(first_line)
+                    .child(second_line),
+            )
             .into_any_element()
     }
 
@@ -5023,6 +5341,111 @@ mod view_tests {
         assert!(cx.debug_bounds("woke-mark-1").is_none());
         assert!(cx.debug_bounds("woke-mark-2").is_some());
     }
+
+    /// A subthread of thread 1, running until it's given an end.
+    fn subthread(id: u64, end: Option<projects::TaskEnd>) -> Thread {
+        let mut thread = thread(id, false, None);
+        let mut task: projects::Task =
+            serde_json::from_value(json!({"parent": 1, "prompt": "Look around"})).expect("a task");
+        task.outcome = end.map(|end| projects::TaskOutcome {
+            end,
+            summary: None,
+            ended_at: SystemTime::now(),
+        });
+        thread.task = Some(task);
+        thread
+    }
+
+    /// A parent's subthreads are rows under its card, newest first, not cards of their own,
+    /// and a row opens its subthread. A queued one says so.
+    #[gpui::test]
+    fn subthreads_are_rows_under_their_parent(cx: &mut TestAppContext) {
+        let (sidebar, store, cx) = new_sidebar(cx);
+        let mut queued = subthread(3, None);
+        if let Some(task) = queued.task.as_mut() {
+            task.queued = Some(projects::QueuedStart::default());
+        }
+        show(
+            &store,
+            vec![thread(1, false, None), subthread(2, None), queued],
+            cx,
+        );
+        assert!(cx.debug_bounds("thread-card-2").is_none());
+        assert!(cx.debug_bounds("thread-card-3").is_none());
+        let card = bounds(cx, "thread-card-1");
+        let newest = bounds(cx, "subthread-row-3");
+        let older = bounds(cx, "subthread-row-2");
+        assert!(card.bottom() <= newest.top());
+        assert!(newest.bottom() <= older.top());
+
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&sidebar, move |_, event: &super::SidebarEvent, _| {
+                if let super::SidebarEvent::OpenThread(key) = event {
+                    opened.borrow_mut().push(key.thread);
+                }
+            })
+            .detach();
+        });
+        click_on("subthread-row-2", cx);
+        assert_eq!(*opened.borrow(), [ThreadId(2)]);
+    }
+
+    /// The count on a parent's card folds its subthread rows and opens them again. They fold
+    /// on their own once the last one ends, and open again when another starts.
+    #[gpui::test]
+    fn subthread_rows_fold_once_all_are_done(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        show(&store, vec![thread(1, false, None), subthread(2, None)], cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_some());
+        click_on("subthreads-toggle-1", cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_none());
+        click_on("subthreads-toggle-1", cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_some());
+
+        let done = vec![
+            thread(1, false, None),
+            subthread(2, Some(projects::TaskEnd::Completed)),
+        ];
+        show(&store, done.clone(), cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_none());
+        click_on("subthreads-toggle-1", cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_some());
+        click_on("subthreads-toggle-1", cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_none());
+
+        let mut again = done;
+        again.push(subthread(3, None));
+        show(&store, again, cx);
+        assert!(cx.debug_bounds("subthread-row-3").is_some());
+        assert!(cx.debug_bounds("subthread-row-2").is_some());
+    }
+
+    /// The agent's own subagents list only while they run.
+    #[gpui::test]
+    fn an_agents_own_subagent_leaves_once_it_ends(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        let own = |end| {
+            let mut thread = subthread(2, end);
+            if let Some(task) = thread.task.as_mut() {
+                task.agent_session = Some("subagent-session".into());
+            }
+            thread
+        };
+        show(&store, vec![thread(1, false, None), own(None)], cx);
+        assert!(cx.debug_bounds("subthread-row-2").is_some());
+        show(
+            &store,
+            vec![
+                thread(1, false, None),
+                own(Some(projects::TaskEnd::Completed)),
+            ],
+            cx,
+        );
+        assert!(cx.debug_bounds("subthread-row-2").is_none());
+        assert!(cx.debug_bounds("subthreads-toggle-1").is_none());
+    }
 }
 
 /// t3code's Regenerate title, after Rename in a thread's menus, while the thread's machine
@@ -5085,8 +5508,47 @@ pub(crate) fn thread_account_color(machine: MachineId, thread: &Thread, cx: &App
 /// one, and `Color::Player` skips the first (the local user's).
 pub(crate) const AWAITING_INPUT_COLOR: Color = Color::Player(2);
 
+/// A parent's subthreads as rows under its card, newest first: the agent's own subagents only
+/// while they run.
+fn listed_subthreads(store: &projects::ProjectStore, thread: projects::ThreadId) -> Vec<Thread> {
+    let mut subthreads: Vec<Thread> = store
+        .subthreads(thread)
+        .into_iter()
+        .filter(|thread| thread.task.as_ref().is_some_and(projects::Task::is_listed))
+        .cloned()
+        .collect();
+    subthreads.sort_by_key(|thread| std::cmp::Reverse((thread.created_at, thread.id)));
+    subthreads
+}
+
+/// How the user left a parent's subthread rows, which holds until another subthread starts or
+/// the last one ends (`design/subthreads-machines/decisions.md`, topic 2).
+#[derive(Clone, Copy, PartialEq)]
+struct SubthreadFold {
+    is_running: bool,
+    newest: Option<ThreadId>,
+    is_open: bool,
+}
+
+impl SubthreadFold {
+    /// The rows show while a subthread runs, and fold once the last one ends.
+    fn of(subthreads: &[Thread]) -> Self {
+        let is_running = subthreads.iter().any(|thread| {
+            thread
+                .task
+                .as_ref()
+                .is_some_and(|task| task.outcome.is_none())
+        });
+        Self {
+            is_running,
+            newest: subthreads.iter().map(|thread| thread.id).max(),
+            is_open: is_running,
+        }
+    }
+}
+
 /// The thread's subthreads, and how many of them still run their task. The agent's own
-/// subagents count only while they run, as the Agents list shows them.
+/// subagents count only while they run, as their rows show them.
 fn subthread_counts(store: &projects::ProjectStore, thread: projects::ThreadId) -> (usize, usize) {
     let subthreads: Vec<&projects::Thread> = store
         .subthreads(thread)

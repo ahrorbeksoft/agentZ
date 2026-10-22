@@ -109,6 +109,9 @@ pub(crate) const ADD_ACCOUNT_DIALOG_WIDTH: Pixels = px(480.);
 /// a time, as the sidebar shows archived threads.
 const SESSIONS_INITIAL_COUNT: usize = 10;
 const SESSIONS_PAGE_COUNT: usize = 25;
+/// The range of General's Subthreads at once.
+const MIN_SUBTHREAD_LIMIT: u32 = 1;
+const MAX_SUBTHREAD_LIMIT: u32 = 16;
 
 actions!(
     settings,
@@ -1105,6 +1108,7 @@ impl SettingsPage {
                     self.render_show_thinking_row(cx),
                     self.render_working_group_row(cx),
                     self.render_auto_archive_row(window, cx),
+                    self.render_subthread_limit_row(cx),
                     self.render_usage_window_row(window, cx),
                 ],
                 cx,
@@ -1238,6 +1242,69 @@ impl SettingsPage {
                 .debug_selector(|| "auto-archive".to_string())
                 .child(DropdownMenu::new("auto-archive", current.label(), menu))
                 .into_any_element(),
+            cx,
+        )
+    }
+
+    /// How many subthreads a thread runs at once, which every machine's server is given: a
+    /// stepper, as the design defaults' variants.
+    fn render_subthread_limit_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.app_settings.read(cx).settings().subthread_limit;
+        let change = |step: fn(u32) -> u32| {
+            let app_settings = self.app_settings.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                app_settings.update(cx, |store, cx| {
+                    store.update(
+                        |settings| {
+                            settings.subthread_limit = step(settings.subthread_limit)
+                                .clamp(MIN_SUBTHREAD_LIMIT, MAX_SUBTHREAD_LIMIT)
+                        },
+                        cx,
+                    )
+                })
+            }
+        };
+        let colors = cx.theme().colors().clone();
+        let stepper = h_flex()
+            .debug_selector(|| "subthread-limit".to_string())
+            .h(px(28.))
+            .px_0p5()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .debug_selector(|| "fewer-subthreads".to_string())
+                    .child(
+                        IconButton::new("fewer-subthreads", IconName::Dash)
+                            .icon_size(IconSize::Small)
+                            .disabled(current <= MIN_SUBTHREAD_LIMIT)
+                            .on_click(change(|limit| limit.saturating_sub(1))),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex()
+                    .justify_center()
+                    .child(Label::new(current.to_string())),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "more-subthreads".to_string())
+                    .child(
+                        IconButton::new("more-subthreads", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .disabled(current >= MAX_SUBTHREAD_LIMIT)
+                            .on_click(change(|limit| limit + 1)),
+                    ),
+            );
+        render_row(
+            "Subthreads at once",
+            "How many subthreads a thread runs at once; more wait their turn.",
+            stepper.into_any_element(),
             cx,
         )
     }
@@ -12135,6 +12202,53 @@ mod tests {
         cx.run_until_parked();
         for client in [&local, &devbox] {
             assert_eq!(last_sent(client, cx), Some(Some(3)));
+        }
+    }
+
+    /// The number of subthreads a thread runs at once goes to every machine's server as it's
+    /// stepped, and again after a reconnect: the server keeps it for tasks delegated while the
+    /// app is closed.
+    #[gpui::test]
+    fn the_subthread_limit_goes_to_every_machine(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        cx.update(|cx| {
+            for client in [&local, &devbox] {
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx)
+        });
+        cx.run_until_parked();
+        let last_sent = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .rev()
+                    .find_map(|request| match request {
+                        Request::SetSubthreadLimit(limit) => Some(limit),
+                        _ => None,
+                    })
+            })
+        };
+        assert_eq!(
+            last_sent(&local, cx),
+            Some(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT)
+        );
+
+        let bounds = cx
+            .debug_bounds("more-subthreads")
+            .expect("the stepper is shown");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        for client in [&local, &devbox] {
+            assert_eq!(
+                last_sent(client, cx),
+                Some(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT + 1)
+            );
         }
     }
 

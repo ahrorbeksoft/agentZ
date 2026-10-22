@@ -200,6 +200,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `cloud.json` | server | The cloud providers found, their machines and usage as last listed, each machine's Stop when idle, and the notices not yet shown |
 | `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
+| `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › General › Threads › Subthreads at once), a number |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
@@ -332,7 +333,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 - **Thread cards** (`sidebar.rs`, t3code): title, agent and machine icons (the machine's only
   mark on a card, Disconnected while it's offline; draft rows name it), the thread's own
   branch with a worktree or pasture marker, its subthreads' count by a people icon (accent
-  while one runs; the details say "3 subthreads, 1 running"), attention state, details popover
+  while one runs; the details say "3 subthreads, 1 running") that folds their rows (see
+  Subthreads), attention state, details popover
   (a custom anchored element, since GPUI tooltips follow the cursor), rename, delete, archive
   with an Archived shelf, title search, context menu. Automatic titles (the first prompt, the
   agent, a shell's folder, a terminal's agent CLI) keep updating under the user's own
@@ -402,6 +404,12 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   whose last activity (or creation) is older than that, unless pinned, working, blocked,
   awaiting input or waiting, open in some client, or with something for their agent to do.
   Chats, Workspaces threads, drafts, subthreads and terminal threads are never archived.
+- **Subthreads at once** (`AppSettings::subthread_limit`, Settings › General › Threads, a
+  stepper from 1 to 16, 4 by default, `DEFAULT_SUBTHREAD_LIMIT`;
+  `agentz_server::server::subthread_limit`): sent to every server as auto-archive's days are
+  (`Request::SetSubthreadLimit`, `Machines::sync_subthread_limit`) and kept in
+  `subthread-limit.json`, so tasks delegated while the app is closed keep to it. See
+  Subthreads for what it limits.
 - **Snooze** (`snooze.rs`, `sidebar.rs`, `projects::ProjectStore::{snooze_thread,
   wake_thread, is_thread_snoozed, has_thread_woken}`; t3code's snooze, the user's picks in
   `design/snooze/`): a card's clock ("Snooze Thread", before Archive), Snooze ▸ after Archive
@@ -1902,7 +1910,7 @@ for `t3_`.
   `acp-mcp-call`).
 - **Tools** (`server/tools.rs`): `orchestrator_capabilities`, `agentz_thread_list`/`_read`/
   `_launch`/`_send`/`_wait`/`_interrupt`/`_update`/`_organize`/`_diff`, `create_threads`,
-  `delegate_task`, `task_status`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal
+  `delegate_task`, `delegate_tasks`, `task_status`, `task_send`, `task_cancel`; workspace tools (`tools/workspaces.rs`); terminal
   tools after herdr's `pane` commands (`tools/terminals.rs`), which also reach the Workspaces
   view's panes (`paneId`; `agentz_terminal_start` with `folder`, `workspaceId` or `paneId` opens
   a workspace, a tab or a split); `agentz_command_run` (`tools/commands.rs`), a one-off command
@@ -1916,9 +1924,10 @@ for `t3_`.
 - **Policy**: the caller's project only; no broader permissions than the caller; agents can't
   delete threads or answer permissions; `clientRequestId` idempotency; agent-created threads and
   messages are marked `createdBy: agent` and shown as such. The message that tells an agent its
-  delegated tasks ended (`send_follow_ups`, t3code's wording) is the exception: it goes in the
+  delegated tasks ended (`send_follow_ups`, `task_notice`) is the exception: it goes in the
   user's place, as nothing else starts a turn while an agent is idle, but it's marked
-  (`ThreadState::task_notices`) and not shown, so the agent's next turn just follows. The
+  (`ThreadState::task_notices`, with the tasks it announced in
+  `ThreadState::announced_tasks`) and not shown, so the agent's next turn just follows. The
   Workspaces view's panes belong to no project, so any thread may list, open and type into
   them, as the user can, run commands, which can do no more than typing into a pane, and add a
   project, which runs nothing; removing projects and closing panes stay with the user. A chat
@@ -1937,7 +1946,7 @@ for `t3_`.
   So an agent can open a terminal there, clone the repository
   and add it; when that's the caller's repository, the answer waits up to 10 seconds for the app
   to combine them and says whether it did (`combinedWithThisProject`).
-- **Tasks on another machine** (`delegate_elsewhere`, `delegate_from_elsewhere`):
+- **Tasks on another machine** (`prepare_elsewhere`, `start_elsewhere`, `delegate_from_elsewhere`):
   `delegate_task` with `machine` starts the task's thread in that machine's checkout, with the
   caller's agent and mode (`parentMode`, `parentModeOption`: never broader than the caller's)
   and the caller as its parent there (`Task::parent_machine`). That thread is no subthread of
@@ -1948,7 +1957,9 @@ for `t3_`.
   its title, model and state (working, waiting for approval or input) to the stand-in. Once
   the task is over there, its outcome ends the stand-in, which the parent then hears of as of
   any task; a task whose thread there was deleted ends as Failed. `task_cancel` cancels it
-  there. Any thread may delegate there as it may here. It works only while the app is open:
+  there, and `task_send` sends it more work there (`task_send_elsewhere`), which reopens the
+  stand-in until the task ends again. A stand-in counts toward its parent's subthread limit
+  but is never queued: its machine started it already. Any thread may delegate there as it may here. It works only while the app is open:
   without the app, the stand-in waits until the app relays again.
 
 ### Subthreads
@@ -1956,47 +1967,84 @@ for `t3_`.
 t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSubagentBar.tsx`).
 
 - A subthread is a thread with a `task` (`projects::Task`): parent, prompt, role, outcome. It
-  gets the task prompt only, and the parent's mode, never broader.
-- Finalization runs after every batch: a task ends when its child is idle with nothing queued.
-  The parent hears with t3code's message; tasks unfinished at shutdown end as Interrupted.
-- In the app: the parent's Agents control lists them; a subthread opens read-only; its
-  permission requests show on the parent, which becomes blocked, without a sound. The parent
-  waits for its subthreads and completes once, after the last one's end reaches it.
-- **Agents control** (`agent_view::render_agents_section`, `design/subthreads/`): t3code's
-  list above the parent's composer, newest first, with Zed's subagent card headers as rows
-  (`thread_view::render_subagent_card`): a spinner, check, cross or faint circle, the title,
-  "· model" (`Thread::model`), "— 1 file changed +12 −0" (the subthread's own checkpoints,
-  `Request::ThreadDiff` with `DiffScope::All`, asked again after each of its turns), and Stop
-  while it runs (`Request::Cancel`). Its "4 Agents · 1 running" line folds it; it's open while
-  a subthread runs and folds to "· all done" once the last one ends (`sync_agents_section`),
-  until a click or a new subthread opens it again.
+  gets the task prompt only, and the parent's mode, never broader. `delegate_tasks` starts
+  several at once (each `task` with the shared `instructions` after it, its results in order,
+  a `clientRequestId` that's each one's with `#1`, `#2`, … after it). A subthread may
+  delegate tasks of its own only with `canDelegate` (`Task::can_delegate`, false by default;
+  `capability_denied` otherwise).
+- **Ending the turn**: `delegate_task` and `delegate_tasks` return at once, with a `note`
+  telling the agent to end its turn: the end of each task reaches it as a message. There's no
+  blocking wait; `agentz_thread_wait` on one's own task answers at once with its status and
+  that note, and `task_status` reads it mid-turn.
+- **The subthread limit** (`start_task_here`, `start_queued_tasks`, `running_tasks`): a
+  parent runs as many tasks at once as the setting allows (Subthreads at once, 4 by default);
+  more wait their turn (`Task::queued`, with the model and mode to start with:
+  `QueuedStart`), with status `queued` and work state `waiting_to_start`, and start oldest
+  first after every batch as others end or the limit rises. Queued tasks stay queued across a
+  restart; one cancelled never starts, and those of a parent that ended are cancelled with it.
+- **More work** (`task_send`, picked in `design/subthreads-machines/`): the parent sends a
+  task more work as a message from it, queued behind a running turn (or, for a queued task,
+  behind its prompt), or starting one. An ended task runs again (`reopen_task`): its outcome
+  and changes are cleared, and its parent is told again once it ends. `agentz_thread_send`
+  refuses subthreads and points to `task_send`.
+- Finalization runs after every batch: a task ends when its child is idle with nothing queued
+  and no `task_send` work left, after which its changes are read from its checkpoints
+  (`read_task_changes`, `Task::changes`) before its parent is told. The parent hears, in one
+  message for every task that ended meanwhile (`task_notice`, after t3code's), each task's
+  id, title, end, how long it took, the files it changed and its own branch, with its result
+  while they fit in 16,000 bytes; the rest point to `task_status`, which also returns
+  `canDelegate` and `changes`. Tasks unfinished at shutdown end as Interrupted.
+- In the app: a subthread opens read-only; its permission requests show on the parent,
+  which becomes blocked, without a sound. The parent waits for its subthreads and completes
+  once, after the last one's end reaches it.
+- **In the sidebar** (`sidebar::render_subthread_row`, picked in
+  `design/subthreads-machines/`): each subthread is a row under its parent's card, newest
+  first, with herdr's tree lines as the Workspaces view draws worktrees: the agent's icon, the
+  title and its state (Working, Queued, a status pill, or how long ago it ended), then the
+  agent, the model, the machine it runs on, its worktree or pasture and the lines it changed
+  (`Task::changes`). A click opens it, and while it's open its row is marked in place of the
+  parent's card. The count on the card folds the rows ("Hide Subthreads"): they show while
+  one runs and fold once the last one ends, and what the user chose holds until another
+  starts or the last one ends (`SubthreadFold`).
 - **An open subthread**: the header is its parent's (`header_thread`: the title and its
   menu act on the parent), with Zed's subagent title bar under it
   (`render_subthread_title_bar`: its title, a check or cross once it ended, Stop, and
   Minimize to the parent). Its first message, the task, is a card ("Task from “…”" and the
-  role) instead of a bubble (`render_task_card`). t3code's `ProviderSubagentBar` takes the
+  role) instead of a bubble (`render_task_card`). The task and the parent's later messages
+  show their first four lines, fading out, with Show more for the rest
+  (`render_folded_message`, `FOLDED_MESSAGE_LINES`). t3code's `ProviderSubagentBar` takes the
   composer's place (`render_subthread_bar`): the agent's icon, model and effort, "Working
   1m 20s" or "Done in 2m 14s" (from the subthread's `created_at`, when it was delegated, to
   now or its task's `ended_at`), "Runs on its own", Stop, and Open Parent. Ctrl-− (Zed's Go
   Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread, which the
   command palette lists there, and both ways back show it in their tooltips.
 - **On another machine** (`Machines::working_thread`, `Machines::root_thread`): a task
-  delegated to another machine is a row in its parent's Agents list like any other, with
-  "· <machine icon> Devbox 1" after its model. Opening it opens its thread on that machine,
-  with the sidebar marking the parent. Its Stop, its changes and its permission requests go to
-  that thread there (`AgentView::working_thread`). That thread opens under its parent's header
-  from the other machine (`header_parent`), and its bar reads "Runs on its own on Devbox 1".
-  Open Parent and Minimize go back to the parent there (`AgentViewEvent::OpenThreadOn`).
-- **Where it started** (`render_delegated_card`, `render_subthread_card`; picked in
-  `design/agentz-tools/`): a `delegate_task` call that started a subthread on this machine
-  (`ToolCallKind::delegated_subthread`, kept by entry in `delegated_subthreads`) is Zed's
-  subagent card in place of its row: a spinner, check, cross or faint circle (dashed once it
-  failed or stopped), the title, "· model", the files it changed and Stop while it runs. A
-  running one shows the step it's on inside and the strip that opens it full screen
-  (`sync_subagent_threads` follows it while it runs and while it's open). Opened, it shows
-  Zed's preview of its work (`render_subagent_work`): its last 8 steps, its summary once it
-  ended (`TaskOutcome::summary` as markdown, `SUMMARY_PART`) and the strip. Each call is its
-  own card, and a finished run folds them as it folds every row.
+  delegated to another machine is a row like any other, with the machine after its model.
+  Opening it opens its thread on that machine, with the sidebar marking the parent. Its Stop,
+  its changes and its permission requests go to that thread there
+  (`AgentView::working_thread`). That thread opens under its parent's header from the other
+  machine (`header_parent`), and its bar reads "Runs on its own on Devbox 1". Open Parent
+  and Minimize go back to the parent there (`AgentViewEvent::OpenThreadOn`).
+- **Where it started** (`render_delegation_batch`, picked in `design/subthreads-machines/`):
+  the subthreads a `delegate_tasks` call started, or `delegate_task` calls one after
+  another (`delegation_batch`), share one card in place of the calls' rows
+  (`ToolCallKind::delegated_subthreads`, kept by entry in `delegated_subthreads`):
+  "Started 4 subthreads · 2 running", then a row each (`render_started_subthread`): its
+  state (a spinner, Queued, a check, a cross or a faint circle), the agent's icon, the title,
+  the model, its worktree or pasture, the lines it changed, Stop while it runs
+  (`Request::Cancel`) or how long it ran, and Open. A click on a row opens Zed's preview of
+  its work under it (`render_subagent_work`, with `sync_subagent_threads` following it):
+  its last 8 steps, its summary once it ended (`TaskOutcome::summary` as markdown,
+  `SUMMARY_PART`) and the strip that opens it full screen. Delegations aren't work, so a
+  finished run doesn't fold them.
+- **The results** (`render_task_results`): the notice that tells the parent its subthreads
+  ended shows in its place as their rows (`ThreadView::announced_tasks`): one row for one
+  result, and for several "4 subthreads finished · 1 failed" (the failures in red), which
+  opens to a row each. A row has the task's end ("Subthread finished: <title>"), the lines
+  it changed, how long it ran and Open, and opens to its summary.
+- **Waiting** (`render_waiting_for_subthreads`): once the parent's turn ends while
+  subthreads it started still work, "Waiting for 3 subthreads" with a spinner ends its
+  conversation, until their results start its next turn.
 
 ### Agents' own subagents
 
@@ -2027,8 +2075,8 @@ Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`
   be, its card naming the subagent ("<description> · Edit .env")
   (`PermissionRequest::subagent_card`), while its tool call goes to the subthread.
 - **Stop** (`Task::stoppable`, `Task::can_stop`): the agent runs its subagents, so agentZ can
-  stop one only when its `subagent_update` says it may (`capabilities.cancel`). Then its card,
-  its row in the Agents list and its subthread have Stop, which cancels its session
+  stop one only when its `subagent_update` says it may (`capabilities.cancel`). Then its card
+  and its subthread have Stop, which cancels its session
   (`session/cancel` with the subagent's session, `AgentThread::stop_subagent`, sent by the
   server's `Request::Cancel` for the subthread). It ends as its agent says, Stopped once idle
   as cancelled.
@@ -2051,9 +2099,8 @@ Picked in `design/agent-subagents/`; Zed's subagent card (`render_subagent_card`
   tags and its prompt, as Input opens JSON (`render_subagent_task`). A background one, whose
   report is only the launch notice, and one still running open to their task.
 - **Its subthread** opens as agentZ's own do, with no Stop in its title bar or bar unless its
-  agent lets agentZ stop it. The Agents list and the sidebar's count show it only while it
-  runs (`Task::is_listed`), with "Claude Agent’s" in place of the model, and Stop only when it
-  can be stopped.
+  agent lets agentZ stop it. The sidebar's rows and count show it only while it runs
+  (`Task::is_listed`), with no model of its own.
 
 ### Diffs
 

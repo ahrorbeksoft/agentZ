@@ -29,7 +29,7 @@ use projects::{ProjectId, RemoteThread, Task, TaskEnd, TaskOutcome, ThreadId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    Arguments, Caller, Continuation, Delegation, Failure, MAX_PROMPT_CHARS, Outcome, Server, Step,
+    Arguments, Caller, Continuation, Delegated, Delegation, Failure, Outcome, Server, Step,
     failure, invalid,
 };
 use crate::server::ClientId;
@@ -277,6 +277,20 @@ impl Relays {
     }
 }
 
+/// A task checked to start on another machine ([`Server::prepare_elsewhere`]).
+pub(super) struct RemoteDelegation {
+    target: Target,
+    arguments: Map<String, Value>,
+    prompt: String,
+    agent_id: Option<String>,
+    delegation: Delegation,
+}
+
+/// What a task started on another machine does here once that machine answers: add the
+/// subthread that stands for it under the parent, or fail.
+pub(super) type StartedElsewhere =
+    Box<dyn FnOnce(&mut Server, ThreadId) -> Result<ThreadId, Failure> + Send>;
+
 /// Where a relayed call runs.
 pub(super) struct Target {
     client: ClientId,
@@ -300,13 +314,17 @@ impl Server {
             Ok(None) => return None,
             Err(failure) => return Some(Err(failure)),
         };
-        if self.relays.is_this_machine(machine) || machine.eq_ignore_ascii_case("this machine") {
+        if !self.is_other_machine(machine) {
             return None;
         }
         if !RELAYED_TOOLS.contains(&name)
             || (caller.is_chat() && !super::CHAT_RELAYED_TOOLS.contains(&name))
         {
             return Some(Err(invalid(format!("{name} only works on this machine."))));
+        }
+        // Delegating keeps a subthread here for the task, so it takes machine itself.
+        if name == "delegate_task" {
+            return None;
         }
         let needs_project = !MACHINE_TOOLS.contains(&name) && !caller.is_chat();
         let target = match self.relay_target(caller, machine, needs_project) {
@@ -316,7 +334,7 @@ impl Server {
         let mut arguments = arguments.0.clone();
         arguments.remove("machine");
         // The other machine has no calling thread to take the agent from.
-        if matches!(name, "agentz_thread_launch" | "delegate_task")
+        if name == "agentz_thread_launch"
             && !arguments.contains_key("agentId")
             && let Some(agent_id) = caller
                 .thread_id
@@ -332,9 +350,7 @@ impl Server {
         {
             arguments.insert("folder".into(), json!(path));
         }
-        Some(if name == "delegate_task" {
-            self.delegate_elsewhere(caller, target, arguments)
-        } else if name == "agentz_project_add" {
+        Some(if name == "agentz_project_add" {
             Ok(self.add_project_elsewhere(caller, target, arguments))
         } else if name == "agentz_artifact_read" {
             let folder = self.data_dir.join("artifacts").join("fetched");
@@ -457,40 +473,54 @@ impl Server {
         .boxed()
     }
 
-    /// A task for another machine: its server starts the task's thread with this thread as its
-    /// parent and this thread's mode, and a subthread here stands for it, followed as any
-    /// task is.
-    fn delegate_elsewhere(
-        &mut self,
+    /// Whether the call's `machine` names another machine than this one.
+    pub(super) fn is_other_machine(&self, machine: &str) -> bool {
+        !self.relays.is_this_machine(machine) && !machine.eq_ignore_ascii_case("this machine")
+    }
+
+    /// A task for another machine, checked: its server starts the task's thread with this
+    /// thread as its parent and this thread's mode, and a subthread here stands for it,
+    /// followed as any task is.
+    pub(super) fn prepare_elsewhere(
+        &self,
         caller: Caller,
-        target: Target,
-        mut arguments: Map<String, Value>,
-    ) -> Outcome {
-        let parent = self.delegating_parent(caller)?;
-        let delegation = Delegation::new(&Arguments(&arguments))?;
-        if let Some(task) = self.delegated_task(parent, delegation.client_request_id.as_deref()) {
-            return delegation.answer(self, caller, task);
+        parent: ThreadId,
+        machine: &str,
+        arguments: &Arguments,
+        prompt: String,
+        delegation: Delegation,
+    ) -> Result<Delegated, Failure> {
+        let target = self.relay_target(caller, machine, true)?;
+        let mut arguments = arguments.0.clone();
+        arguments.remove("machine");
+        // The other machine has no calling thread to take the agent from.
+        let agent_id = arguments
+            .get("agentId")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| {
+                caller
+                    .thread_id
+                    .and_then(|thread_id| self.projects.thread(thread_id))
+                    .and_then(|thread| thread.agent_id.clone())
+            });
+        if let Some(agent_id) = &agent_id {
+            arguments.insert("agentId".into(), json!(agent_id));
         }
-        let prompt = Arguments(&arguments)
-            .string("task", MAX_PROMPT_CHARS)?
-            .ok_or_else(|| invalid("task is required."))?
-            .to_string();
+        arguments.insert("task".into(), json!(prompt));
+        match &delegation.client_request_id {
+            Some(request_id) => arguments.insert("clientRequestId".into(), json!(request_id)),
+            None => arguments.remove("clientRequestId"),
+        };
         let this_machine = self
             .relays
             .latest()
             .map(|(_, peers)| peers.this_machine.clone())
             .unwrap_or_default();
-        let agent_id = arguments
-            .get("agentId")
-            .and_then(Value::as_str)
-            .map(String::from);
         let (mode, mode_option) = match &agent_id {
             Some(agent_id) => self.caller_mode(caller, &AgentId::new(agent_id.clone())),
             None => (None, None),
         };
-        // It answers at once; this server does the waiting.
-        arguments.remove("mode");
-        arguments.remove("timeoutMs");
         arguments.insert("parentThreadId".into(), json!(parent.0));
         arguments.insert("parentMachine".into(), json!(this_machine));
         if let Some(mode) = mode {
@@ -502,29 +532,77 @@ impl Server {
                 json!({"configId": config_id.0.to_string(), "value": value}),
             );
         }
+        Ok(Delegated::Elsewhere(RemoteDelegation {
+            target,
+            arguments,
+            prompt,
+            agent_id,
+            delegation,
+        }))
+    }
+
+    /// Asks the other machine to start the task; once it answers, the subthread that stands
+    /// for it is added under the parent.
+    pub(super) fn start_elsewhere(
+        &mut self,
+        remote: RemoteDelegation,
+    ) -> BoxFuture<'static, StartedElsewhere> {
+        let RemoteDelegation {
+            target,
+            arguments,
+            prompt,
+            agent_id,
+            delegation,
+        } = remote;
         let machine = target.machine.clone();
         let delegated = self.relay(target, "delegate_task", Value::Object(arguments));
+        async move {
+            let delegated = delegated.await;
+            Box::new(move |server: &mut Server, parent: ThreadId| {
+                let delegated = delegated?;
+                let thread = delegated["taskId"].as_u64().map(ThreadId).ok_or_else(|| {
+                    failure(
+                        "orchestration_error",
+                        format!("{machine} didn't say which task it started."),
+                    )
+                })?;
+                let task = Task {
+                    runs_on: Some(RemoteThread { machine, thread }),
+                    ..delegation.task(parent, prompt)
+                };
+                let task = server
+                    .projects
+                    .add_subthread(task, agent_id)
+                    .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
+                server.apply_remote_task(task, &delegated);
+                Ok(task)
+            }) as StartedElsewhere
+        }
+        .boxed()
+    }
+
+    /// Sends more work to a task on another machine, as `task_send` there: an ended one runs
+    /// again, so the subthread here is followed again until it ends once more.
+    pub(super) fn task_send_elsewhere(&mut self, task: ThreadId, arguments: &Arguments) -> Outcome {
+        let (target, thread) = self.remote_task_target(task).ok_or_else(|| {
+            failure(
+                "task_not_found",
+                format!("This thread has no task {}.", task.0),
+            )
+        })??;
+        let mut arguments = arguments.0.clone();
+        arguments.insert("taskId".into(), json!(thread.0));
+        let sent = self.relay(target, "task_send", Value::Object(arguments));
         Ok(Step::Then(
             async move {
-                let delegated = delegated.await;
+                let sent = sent.await;
                 Box::new(move |server: &mut Server| -> Outcome {
-                    let delegated = delegated?;
-                    let thread = delegated["taskId"].as_u64().map(ThreadId).ok_or_else(|| {
-                        failure(
-                            "orchestration_error",
-                            format!("{machine} didn't say which task it started."),
-                        )
-                    })?;
-                    let task = Task {
-                        runs_on: Some(RemoteThread { machine, thread }),
-                        ..delegation.task(parent, prompt)
-                    };
-                    let task = server
-                        .projects
-                        .add_subthread(task, agent_id)
-                        .ok_or_else(|| failure("thread_not_found", "This thread was deleted."))?;
-                    server.apply_remote_task(task, &delegated);
-                    delegation.answer(server, caller, task)
+                    let mut sent = sent?;
+                    server.reopen_task(task);
+                    server.projects.set_thread_working(task, true);
+                    // Its id there means nothing to the parent; this one is the task's.
+                    sent["taskId"] = json!(task.0);
+                    Ok(Step::Done(sent))
                 }) as Continuation
             }
             .boxed(),

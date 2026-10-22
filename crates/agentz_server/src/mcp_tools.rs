@@ -9,9 +9,11 @@ threads, start new ones, message, wait for, interrupt, rename and archive them, 
 each thread made (agentz_thread_diff), work in git worktrees and copy-on-write pastures \
 (agentz_workspace_*, and workspaceStrategy when launching or delegating), and delegate tasks to \
 child agents. A delegated task is \
-child work owned by this thread: use delegate_task (see orchestrator_capabilities for agents and \
-models), keep each taskId, and use task_status or task_cancel to manage it. An async task's end is \
-announced to this thread, so end the turn instead of polling. agentz_thread_launch and \
+child work owned by this thread: use delegate_task, or delegate_tasks for several at once (see \
+orchestrator_capabilities for agents and models), keep each taskId, and use task_send, task_status \
+or task_cancel to manage it. Delegating returns at once, and each task's end is announced to this \
+thread with its result, queued until this turn ends, so end the turn instead of polling, waiting \
+or spawning watchers; use task_status only when a result is needed mid-turn. agentz_thread_launch and \
 create_threads make ordinary top-level threads: use them only when the user asks for separate or \
 new threads, never merely because they said subagent. When this project is also on other machines (orchestrator_capabilities' otherMachines), the thread tools take machine to work there; thread ids are per machine. agentz_document_publish publishes a Markdown document for the user to read in their browser, and agentz_design_publish a design of variants to pick from, each with a version per publish; agentz_artifact_list and agentz_artifact_read find them again on any machine, a design with the user's picks and comments.";
 

@@ -1138,10 +1138,8 @@ impl Shell {
         self.active_thread = Some(thread_id);
         self.active_project = self.project_of(thread_id, cx);
         self.pending_draft = None;
-        // A subthread isn't in the sidebar, so its top-level thread is highlighted.
-        let sidebar_thread = self.machines.read(cx).root_thread(thread_id, cx);
         self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.set_active_thread(Some(sidebar_thread), cx)
+            sidebar.set_active_thread(Some(thread_id), cx)
         });
         if let Some(open_thread) = self.open_threads.get(&thread_id) {
             window.focus(&open_thread.view.focus_handle(cx), cx);

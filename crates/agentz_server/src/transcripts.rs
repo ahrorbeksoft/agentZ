@@ -102,6 +102,7 @@ mod tests {
             finished_turns: &transcript.finished_turns,
             prompts_from_agents: &transcript.prompts_from_agents,
             task_notices: &transcript.task_notices,
+            announced_tasks: &transcript.announced_tasks,
             sent_times: &transcript.sent_times,
             handoffs: &transcript.handoffs,
         };

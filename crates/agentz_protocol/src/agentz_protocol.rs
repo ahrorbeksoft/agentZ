@@ -102,6 +102,10 @@ pub const CAPABILITY_IMPORT_SESSIONS: &str = "import_sessions";
 /// Long threads with big tool outputs are the largest messages.
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+/// How many delegated tasks a thread runs at once until the user picks another number
+/// ([`Request::SetSubthreadLimit`]).
+pub const DEFAULT_SUBTHREAD_LIMIT: u32 = 4;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClientHello {
     pub protocol_version: u32,
@@ -876,6 +880,9 @@ pub enum Request {
     /// archives none. The app's setting, given to each server as it connects and as it
     /// changes. The server keeps it, so threads archive while the app is closed.
     SetAutoArchive(Option<u32>),
+    /// How many delegated tasks each thread runs at once; more wait their turn. The app's
+    /// setting, given to each server as it connects and as it changes.
+    SetSubthreadLimit(u32),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,

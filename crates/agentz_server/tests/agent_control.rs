@@ -188,11 +188,30 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
         &mut events,
         thread,
         &mut view,
-        r#"mcp delegate_task {"task": "delegated", "mode": "wait"}"#,
+        r#"mcp delegate_task {"task": "delegated"}"#,
     )
     .await;
-    assert_eq!(delegated["status"], json!("completed"));
-    assert_eq!(delegated["summary"], json!("Echo: delegated"));
+    let task = delegated["taskId"].as_u64().expect("a task id");
+    // It returns at once, and the CLI reads its result once it has ended.
+    let status = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let output = tokio::process::Command::new(BRIDGE)
+                .args(["call", "task_status", &json!({"taskId": task}).to_string()])
+                .env("AGENTZ_SOCKET", &socket)
+                .env("AGENTZ_THREAD_ID", thread_id.0.to_string())
+                .output()
+                .await
+                .expect("run the CLI");
+            let status: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            if status["status"] == json!("completed") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the task ends");
+    assert_eq!(status["summary"], json!("Echo: delegated"));
 
     // A thread's agent can run the CLI from its shell with the environment it was given.
     let output = tokio::process::Command::new(BRIDGE)

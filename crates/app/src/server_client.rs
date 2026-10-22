@@ -200,6 +200,8 @@ pub struct ServerClient {
     /// The days of inactivity the server was last told to archive threads after, this
     /// connection.
     auto_archive_sent: Option<Option<u32>>,
+    /// How many subthreads the server was last told a thread runs at once, this connection.
+    subthread_limit_sent: Option<u32>,
     /// What this Mac's server was last told of the provider machines' use, this connection.
     cloud_activity_sent: Option<Vec<CloudActivity>>,
     #[cfg(test)]
@@ -257,6 +259,7 @@ impl ServerClient {
                 peers_sent: None,
                 design_settings_sent: None,
                 auto_archive_sent: None,
+                subthread_limit_sent: None,
                 cloud_activity_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
@@ -556,6 +559,15 @@ impl ServerClient {
         }
         self.send(Request::SetAutoArchive(days), cx);
         self.auto_archive_sent = Some(days);
+    }
+
+    /// Tells the server how many subthreads a thread runs at once, when that's changed.
+    pub(crate) fn set_subthread_limit(&mut self, limit: u32, cx: &App) {
+        if !self.is_online() || self.subthread_limit_sent == Some(limit) {
+            return;
+        }
+        self.send(Request::SetSubthreadLimit(limit), cx);
+        self.subthread_limit_sent = Some(limit);
     }
 
     /// Tells this Mac's server what's working on each provider machine and whether anything of
@@ -1059,6 +1071,7 @@ impl ServerClient {
         self.peers_sent = None;
         self.design_settings_sent = None;
         self.auto_archive_sent = None;
+        self.subthread_limit_sent = None;
         self.cloud_activity_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;

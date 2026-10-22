@@ -582,6 +582,40 @@ pub struct Task {
     /// `cancel` capability).
     #[serde(default)]
     pub stoppable: bool,
+    /// Set while the task waits for its turn: its parent already runs as many subthreads as
+    /// the server's limit allows. It starts, in order, as others end.
+    #[serde(default)]
+    pub queued: Option<QueuedStart>,
+    /// The parent let it delegate tasks of its own (`canDelegate`).
+    #[serde(default)]
+    pub can_delegate: bool,
+    /// What its thread changed, from its checkpoints, as of its end. `None` while it runs,
+    /// and when it couldn't be read: outside git, or before this was kept.
+    #[serde(default)]
+    pub changes: Option<TaskChanges>,
+}
+
+/// How a queued task starts once its turn comes: the settings it was delegated with, which
+/// its agent only takes as it starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedStart {
+    /// The model's setting and value.
+    #[serde(default)]
+    pub model: Option<(String, String)>,
+    /// The parent's mode, which it may not go beyond.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// The parent's mode, for agents that keep it in a setting: the setting and value.
+    #[serde(default)]
+    pub mode_option: Option<(String, String)>,
+}
+
+/// The files a task's thread changed over its turns, as its changes panel counts them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskChanges {
+    pub files: u32,
+    pub additions: u32,
+    pub deletions: u32,
 }
 
 /// A thread on another machine, by the name the app gives that machine.
@@ -606,6 +640,11 @@ impl Task {
     /// agentZ stop it.
     pub fn can_stop(&self) -> bool {
         self.outcome.is_none() && (!self.is_agents_own() || self.stoppable)
+    }
+
+    /// Waiting for its turn to start ([`Task::queued`]).
+    pub fn is_queued(&self) -> bool {
+        self.outcome.is_none() && self.queued.is_some()
     }
 }
 
@@ -2804,6 +2843,9 @@ mod tests {
             runs_on: None,
             parent_machine: None,
             stoppable: false,
+            queued: None,
+            can_delegate: false,
+            changes: None,
         };
         let child = store.add_subthread(task(parent), None).expect("subthread");
         let grandchild = store.add_subthread(task(child), None).expect("subthread");
@@ -2956,6 +2998,9 @@ mod tests {
                     runs_on: None,
                     parent_machine: None,
                     stoppable: false,
+                    queued: None,
+                    can_delegate: false,
+                    changes: None,
                 },
                 None,
             )
@@ -3035,6 +3080,9 @@ mod tests {
                     runs_on: None,
                     parent_machine: None,
                     stoppable: false,
+                    queued: None,
+                    can_delegate: false,
+                    changes: None,
                 },
                 None,
             )

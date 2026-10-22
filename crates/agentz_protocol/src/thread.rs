@@ -799,6 +799,11 @@ pub struct ThreadState {
     /// they aren't the user's, so they aren't shown.
     #[serde(default)]
     pub task_notices: Vec<usize>,
+    /// The delegated tasks each task notice announces, by its entry index, in order, so the
+    /// app can show their results with it. A list for the same reason as
+    /// `prompts_from_agents`.
+    #[serde(default)]
+    pub announced_tasks: Vec<(usize, Vec<projects::ThreadId>)>,
     /// When each user message sent here went, by entry index, in order (t3code's time under
     /// the message). Messages replayed from history have none.
     #[serde(default)]
@@ -1015,6 +1020,15 @@ impl ThreadView {
     /// Whether the user message at `index` only tells the agent its delegated tasks ended.
     pub fn is_task_notice(&self, index: usize) -> bool {
         self.state.task_notices.contains(&index)
+    }
+
+    /// The delegated tasks the task notice at `index` announces, in the order it names them.
+    pub fn announced_tasks(&self, index: usize) -> &[projects::ThreadId] {
+        self.state
+            .announced_tasks
+            .iter()
+            .find(|(notice, _)| *notice == index)
+            .map_or(&[], |(_, tasks)| tasks.as_slice())
     }
 
     /// When the user message at `index` was sent, if it was sent here.

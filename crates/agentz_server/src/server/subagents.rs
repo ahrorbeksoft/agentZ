@@ -114,6 +114,9 @@ impl Server {
                 runs_on: None,
                 parent_machine: None,
                 stoppable: subagent.stoppable,
+                queued: None,
+                can_delegate: false,
+                changes: None,
             },
             agent_id,
         ) else {

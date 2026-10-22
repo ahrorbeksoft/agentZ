@@ -23,6 +23,7 @@ mod skill_requests;
 mod space_requests;
 mod storage_reads;
 mod subagents;
+mod subthread_limit;
 mod terminal_requests;
 mod title_requests;
 mod tools;
@@ -290,6 +291,10 @@ pub(crate) struct Server {
     generated_titles: HashSet<ThreadId>,
     /// Days of inactivity after which threads are archived ([`Self::archive_stale_threads`]).
     auto_archive_days: Option<u32>,
+    /// How many delegated tasks a thread runs at once ([`Self::start_queued_tasks`]).
+    subthread_limit: u32,
+    /// Ended tasks whose changes are being read, announced once they're known.
+    reading_task_changes: HashSet<ThreadId>,
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
@@ -386,6 +391,9 @@ impl Server {
             providers: Vec::new(),
         };
         let auto_archive_days = auto_archive::load(&data_dir).log_err().flatten();
+        let subthread_limit = subthread_limit::load(&data_dir)
+            .log_err()
+            .unwrap_or(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT);
         let cleanup_file = workspace_cleanup::load(&data_dir)
             .log_err()
             .unwrap_or_default();
@@ -486,6 +494,8 @@ impl Server {
             agent_titled_threads: HashSet::default(),
             generated_titles: HashSet::default(),
             auto_archive_days,
+            subthread_limit,
+            reading_task_changes: HashSet::default(),
             clients: HashMap::default(),
             registry_changed: false,
             changed_connections: HashSet::default(),
@@ -1536,6 +1546,10 @@ impl Server {
             }
             Request::SetAutoArchive(days) => {
                 self.set_auto_archive(days)?;
+                Ok(Response::Ok)
+            }
+            Request::SetSubthreadLimit(limit) => {
+                self.set_subthread_limit(limit)?;
                 Ok(Response::Ok)
             }
             Request::SetDesignDefaults(settings) => {
@@ -2637,6 +2651,7 @@ impl Server {
         self.move_threads();
         self.end_orphaned_subagents();
         self.finish_tasks();
+        self.start_queued_tasks();
         let answers = self.answer_waiting_tool_calls();
         self.send_waiting_prompts();
         self.announce_finished_tasks();

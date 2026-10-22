@@ -606,6 +606,7 @@ pub struct Transcript {
     pub finished_turns: Vec<TurnTime>,
     pub prompts_from_agents: Vec<(usize, projects::ThreadCreator)>,
     pub task_notices: Vec<usize>,
+    pub announced_tasks: Vec<(usize, Vec<projects::ThreadId>)>,
     pub sent_times: Vec<(usize, SystemTime)>,
     pub handoffs: Vec<HandoffMark>,
 }
@@ -620,6 +621,7 @@ pub struct TranscriptRef<'a> {
     pub finished_turns: &'a [TurnTime],
     pub prompts_from_agents: &'a [(usize, projects::ThreadCreator)],
     pub task_notices: &'a [usize],
+    pub announced_tasks: &'a [(usize, Vec<projects::ThreadId>)],
     pub sent_times: &'a [(usize, SystemTime)],
     pub handoffs: &'a [HandoffMark],
 }
@@ -632,6 +634,7 @@ impl From<TranscriptRef<'_>> for Transcript {
             finished_turns: transcript.finished_turns.to_vec(),
             prompts_from_agents: transcript.prompts_from_agents.to_vec(),
             task_notices: transcript.task_notices.to_vec(),
+            announced_tasks: transcript.announced_tasks.to_vec(),
             sent_times: transcript.sent_times.to_vec(),
             handoffs: transcript.handoffs.to_vec(),
         }
@@ -902,6 +905,7 @@ impl AgentThread {
         self.view.state.finished_turns = transcript.finished_turns;
         self.view.state.prompts_from_agents = transcript.prompts_from_agents;
         self.view.state.task_notices = transcript.task_notices;
+        self.view.state.announced_tasks = transcript.announced_tasks;
         self.view.state.sent_times = transcript.sent_times;
         self.view.state.handoffs = transcript.handoffs;
         self.entry_changed(0);
@@ -929,6 +933,7 @@ impl AgentThread {
             finished_turns: &self.view.state.finished_turns,
             prompts_from_agents: &self.view.state.prompts_from_agents,
             task_notices: &self.view.state.task_notices,
+            announced_tasks: &self.view.state.announced_tasks,
             sent_times: &self.view.state.sent_times,
             handoffs: &self.view.state.handoffs,
         })
@@ -1391,6 +1396,7 @@ impl AgentThread {
             self.entry_changed(0);
             self.view.state.prompts_from_agents.clear();
             self.view.state.task_notices.clear();
+            self.view.state.announced_tasks.clear();
             self.view.state.sent_times.clear();
             self.view.state.handoffs.clear();
             self.view.state.plan.clear();
@@ -1556,19 +1562,27 @@ impl AgentThread {
                 std::mem::take(&mut self.view.entries),
                 std::mem::take(&mut self.view.state.prompts_from_agents),
                 std::mem::take(&mut self.view.state.task_notices),
+                std::mem::take(&mut self.view.state.announced_tasks),
                 std::mem::take(&mut self.view.state.sent_times),
                 std::mem::take(&mut self.view.state.handoffs),
             )
         });
         self.reload();
         self.queued_prompts = queued_prompts;
-        if let Some((entries, prompts_from_agents, task_notices, sent_times, handoffs)) =
-            conversation
+        if let Some((
+            entries,
+            prompts_from_agents,
+            task_notices,
+            announced_tasks,
+            sent_times,
+            handoffs,
+        )) = conversation
         {
             self.view.entries = entries;
             self.entry_changed(0);
             self.view.state.prompts_from_agents = prompts_from_agents;
             self.view.state.task_notices = task_notices;
+            self.view.state.announced_tasks = announced_tasks;
             self.view.state.sent_times = sent_times;
             self.view.state.handoffs = handoffs;
         }
@@ -2534,11 +2548,17 @@ impl AgentThread {
     }
 
     /// Tells the agent its delegated tasks ended, in a message that isn't shown as the user's.
-    pub fn send_task_notice(&mut self, text: String, from: projects::ThreadCreator) {
+    pub fn send_task_notice(
+        &mut self,
+        text: String,
+        from: projects::ThreadCreator,
+        tasks: Vec<projects::ThreadId>,
+    ) {
         let index = self.view.entries.len();
         self.send_from(text, from);
         if self.view.entries.len() > index {
             self.view.state.task_notices.push(index);
+            self.view.state.announced_tasks.push((index, tasks));
         }
     }
 

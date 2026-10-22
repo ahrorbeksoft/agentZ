@@ -675,7 +675,19 @@ impl Machines {
         self.sync_peers(cx);
         self.sync_design_defaults(cx);
         self.sync_auto_archive(cx);
+        self.sync_subthread_limit(cx);
         self.sync_cloud_activity(cx);
+    }
+
+    /// Gives each server the number of subthreads a thread runs at once, which it keeps.
+    fn sync_subthread_limit(&mut self, cx: &mut Context<Self>) {
+        let limit = AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .subthread_limit;
+        for client in self.clients.clone() {
+            client.update(cx, |client, cx| client.set_subthread_limit(limit, cx));
+        }
     }
 
     /// Gives each server the setting for archiving threads left alone, which it keeps.

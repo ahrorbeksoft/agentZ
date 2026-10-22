@@ -278,6 +278,9 @@ pub struct AppSettings {
     pub working_group: bool,
     /// Threads left alone this long are archived, going by their last activity.
     pub auto_archive: AutoArchive,
+    /// How many subthreads a thread runs at once; more wait their turn. Given to every
+    /// machine's server.
+    pub subthread_limit: u32,
     /// When a published artifact's page opens in the browser.
     pub artifact_auto_open: ArtifactAutoOpen,
     /// Which of an account's windows the composer's usage gauge and its account picker show.
@@ -337,6 +340,7 @@ impl Default for AppSettings {
             chats: true,
             working_group: false,
             auto_archive: AutoArchive::default(),
+            subthread_limit: agentz_protocol::DEFAULT_SUBTHREAD_LIMIT,
             artifact_auto_open: ArtifactAutoOpen::default(),
             usage_window: UsageWindow::default(),
             design_defaults: DesignDefaults::default(),
