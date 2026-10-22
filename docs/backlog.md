@@ -228,6 +228,10 @@ Also, another machine can't be chosen when the selected agent isn't installed th
 "Google Antigravity isn't installed" on agents-1). But what if the user uses two different
 agents on two machines? How would they do that then?
 
+### A close button for terminals in the Agents tab
+
+Terminals in the Agents tab need a close button (not the terminals in threads).
+
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
