@@ -883,6 +883,10 @@ pub enum Request {
     /// How many delegated tasks each thread runs at once; more wait their turn. The app's
     /// setting, given to each server as it connects and as it changes.
     SetSubthreadLimit(u32),
+    /// Whether agents are asked for ACP v2 before v1 (Settings › General › Experimental). The
+    /// app's setting, given to each server as it connects and as it changes. Agents started
+    /// after it changes use it.
+    SetAcpV2(bool),
     /// The answer to an [`Event::RelayToolCall`].
     RelayToolResult {
         relay_id: u64,

@@ -78,6 +78,7 @@ pub(super) fn description() -> AgentDescription {
             "OVERRIDE_DROID_SESSION_TIMEOUT_MS".into(),
             SESSION_TIMEOUT_MS.into(),
         )]),
+        acp_v2_variables: BTreeMap::new(),
         // Both in the home it's given.
         skills_folders: vec![".factory/skills".into(), ".agents/skills".into()],
         outside_skills_folders: Vec::new(),

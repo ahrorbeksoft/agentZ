@@ -210,6 +210,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
 | `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › General › Threads › Subthreads at once), a number |
+| `acp-v2.json` | server | Whether agents are asked for ACP v2 (Settings › General › Experimental › ACP v2), true or false |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
 | `chats/<date>-<first words>-<id>/` | server | Each chat's folder, made with its first message and removed with the chat |
@@ -422,6 +423,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`Request::SetSubthreadLimit`, `Machines::sync_subthread_limit`) and kept in
   `subthread-limit.json`, so tasks delegated while the app is closed keep to it. See
   Subthreads for what it limits.
+- **ACP v2** (`AppSettings::acp_v2`, Settings › General › Experimental, a switch, off by
+  default; `agentz_server::server::acp_v2`): sent to every server as the subthread limit is
+  (`Request::SetAcpV2`, `Machines::sync_acp_v2`) and kept in `acp-v2.json`. Agents started
+  after it changes use it. See ACP v2 under Threads for what it does.
 - **Snooze** (`snooze.rs`, `sidebar.rs`, `projects::ProjectStore::{snooze_thread,
   wake_thread, is_thread_snoozed, has_thread_woken}`; t3code's snooze, the user's picks in
   `design/snooze/`): a card's clock ("Snooze Thread", before Archive), Snooze ▸ after Archive
@@ -1117,12 +1122,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   ends only after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`). On ACP v2 none of this is
   inferred: the agent's `state_update` says when its work starts and ends (see ACP v2).
 - **ACP v2** (`agent_thread/src/acp_v2.rs`, `wire.rs`; Zed's `agent_servers/src/acp/v2.rs`,
-  without its `acp-beta` flag): agentZ asks every agent for v2 in `initialize` and speaks v1
-  with the SDK, rewriting each message between the two as it passes the wire (`Translator`).
-  An agent that answers v1 goes on unchanged on the same connection; one that refuses v2 with
-  `-32022` (Zed's `v1_only_mismatch`) gets a new process spoken to in v1. Of the installed
-  agents only Claude Agent has a v2 surface (0.94.0, behind `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2`,
-  which its description sets). On v2 a load is `session/resume` with `replayFrom` (whole
+  behind its `acp-beta` flag): experimental, as most agents' v2 isn't stable yet (Claude
+  Agent's stops a turn with "does not translate async_task_spawned session updates yet").
+  With the ACP v2 switch on (Settings › General › Experimental), agentZ asks every agent for v2
+  in `initialize` (`AgentThread::start`'s `acp_v2`, and the server's agent info and session
+  listing) and speaks v1 with the SDK, rewriting each message between the two as it passes the
+  wire (`Translator`); off, it asks for v1 only (`Translator::v1`). An agent that answers v1
+  goes on unchanged on the same connection; one that refuses v2 with `-32022` (Zed's
+  `v1_only_mismatch`) gets a new process spoken to in v1. Of the installed agents only Claude
+  Agent has a v2 surface (0.94.0, behind `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2`, which its
+  description sets only while the switch is on: `AgentDescription::acp_v2_variables`). On v2 a load is `session/resume` with `replayFrom` (whole
   messages, replayed as v1's chunks), logins are `auth/login` and `auth/logout`, config options
   go by `configId`, tool calls come as patches (`tool_call_update`, content chunks, and the
   agent's own terminals, shown by their output), plans whole, and permission requests about a
@@ -1139,7 +1148,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   until then. Claude takes it in once the turn ends, and one cancelled before goes after the
   turn. Background tasks have no Stop there (Claude's v2 doesn't serve
   `_session/async_task/stop`). A handoff carries the translator's state with the wire.
-  `mock_agent.py` speaks v2 with `MOCK_ACP_V2`.- **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
+  `mock_agent.py` speaks v2 with `MOCK_ACP_V2`.
+- **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
   `cancel_inner` ends the turn at once): Stop sends `session/cancel` and the turn ends when the
   agent answers its prompt as cancelled. One that hasn't answered 5 seconds later
   (`STOP_TIMEOUT`) ends as stopped all the same, its running tool calls Stopped, and the agent

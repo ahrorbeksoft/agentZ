@@ -28,7 +28,8 @@ said: "t3-code implement their own thing we use acp, we gotta find acp way of do
 
 Fixed for agents on ACP v2 (October 22, 2026), the ACP way: the agent's `idle` `state_update`
 ends its turn while a background task runs, and its follow-up once the task ends shows as work
-of its own. Claude Agent 0.94.0 is on v2, with `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2` set.
+of its own. Claude Agent 0.94.0 is on v2 while the experimental ACP v2 switch is on, with
+`CLAUDE_AGENT_ACP_EXPERIMENTAL_V2` set.
 
 Still to decide: what agents on v1 do (a Claude Agent without its v2 surface). There a running
 background task still counts as reported work (`is_reported` in `AgentThread`'s
@@ -47,17 +48,6 @@ When the user changes the agent, any screenshots and mentions in the composer ar
 When a prompt is sent to Claude mid-turn and the user presses Steer, it doesn't show for a
 little while, then shows (it does work as steering). It seems to wait a little, maybe until
 the last turn finishes. Until it shows up, show it somewhere.
-
-### ACP v2 isn't stable for most agents: make it an experimental setting
-
-ACP v2 is not stable for most agents; make it an experimental, optional setting. In the
-screenshot, a Claude Agent thread stopped with "The ACP v2 surface does not translate
-async_task_spawned session updates yet", and the user's message "did u finish?" shows Not sent.
-
-![A Claude Agent thread stopped with the ACP v2 async_task_spawned error](backlog/acp-v2-async-task-error.png)
-
-This changes the "ACP v2 with agents that support it" rule in `AGENTS.md` (the user's decision
-of October 22, 2026), which should be updated with it.
 
 ## Features
 

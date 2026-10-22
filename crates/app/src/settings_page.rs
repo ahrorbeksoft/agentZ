@@ -1148,7 +1148,31 @@ impl SettingsPage {
                 )],
                 cx,
             ),
+            render_section("Experimental", vec![self.render_acp_v2_row(cx)], cx),
         ]
+    }
+
+    /// Asks agents for ACP v2 on every machine, which most agents don't speak reliably yet.
+    fn render_acp_v2_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = self.app_settings.read(cx).settings().acp_v2;
+        let app_settings = self.app_settings.clone();
+        render_row(
+            "ACP v2",
+            "Asks agents for the draft ACP v2 before v1, on every machine. Most agents' v2 \
+             isn't stable yet. Agents started after it changes use it.",
+            div()
+                .debug_selector(|| "acp-v2".to_string())
+                .child(
+                    Switch::new("acp-v2", enabled.into()).on_click(move |state, _, cx| {
+                        let enabled = *state == ToggleState::Selected;
+                        app_settings.update(cx, |store, cx| {
+                            store.update(|settings| settings.acp_v2 = enabled, cx)
+                        })
+                    }),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// Zed's "Use Modifier To Send", in its words.
@@ -12252,6 +12276,45 @@ mod tests {
                 last_sent(client, cx),
                 Some(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT + 1)
             );
+        }
+    }
+
+    /// ACP v2 is off until it's switched on in General's Experimental section, and goes to
+    /// every machine's server then, as the server keeps it for agents started while the app is
+    /// closed.
+    #[gpui::test]
+    fn the_acp_v2_switch_goes_to_every_machine(cx: &mut TestAppContext) {
+        let (local, devbox) = machines_with_copies(cx);
+        cx.update(|cx| {
+            for client in [&local, &devbox] {
+                client.update(cx, |client, cx| client.set_online_for_test(cx));
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1100.), px(3000.)));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::General, window, cx)
+        });
+        cx.run_until_parked();
+        let last_sent = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .rev()
+                    .find_map(|request| match request {
+                        Request::SetAcpV2(acp_v2) => Some(acp_v2),
+                        _ => None,
+                    })
+            })
+        };
+        assert_eq!(last_sent(&local, cx), Some(false));
+
+        let bounds = cx.debug_bounds("acp-v2").expect("the switch is shown");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        for client in [&local, &devbox] {
+            assert_eq!(last_sent(client, cx), Some(true));
         }
     }
 

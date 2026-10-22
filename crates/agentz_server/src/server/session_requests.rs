@@ -25,9 +25,10 @@ impl Server {
         account: Option<AccountId>,
     ) {
         let command = self.agent_command(&agent_id, account, true);
+        let acp_v2 = self.acp_v2;
         self.spawn_then(
             async move {
-                let listing = agent_thread::list_sessions(command).await?;
+                let listing = agent_thread::list_sessions(command, acp_v2).await?;
                 // Projects' folders are canonical, and agents may report `/tmp` for
                 // `/private/tmp`.
                 Ok(match listing {

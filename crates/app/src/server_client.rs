@@ -210,6 +210,8 @@ pub struct ServerClient {
     auto_archive_sent: Option<Option<u32>>,
     /// How many subthreads the server was last told a thread runs at once, this connection.
     subthread_limit_sent: Option<u32>,
+    /// Whether the server was last told to ask agents for ACP v2, this connection.
+    acp_v2_sent: Option<bool>,
     /// What this Mac's server was last told of the provider machines' use, this connection.
     cloud_activity_sent: Option<Vec<CloudActivity>>,
     #[cfg(test)]
@@ -268,6 +270,7 @@ impl ServerClient {
                 design_settings_sent: None,
                 auto_archive_sent: None,
                 subthread_limit_sent: None,
+                acp_v2_sent: None,
                 cloud_activity_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
@@ -576,6 +579,15 @@ impl ServerClient {
         }
         self.send(Request::SetSubthreadLimit(limit), cx);
         self.subthread_limit_sent = Some(limit);
+    }
+
+    /// Tells the server whether to ask agents for ACP v2, when that's changed.
+    pub(crate) fn set_acp_v2(&mut self, acp_v2: bool, cx: &App) {
+        if !self.is_online() || self.acp_v2_sent == Some(acp_v2) {
+            return;
+        }
+        self.send(Request::SetAcpV2(acp_v2), cx);
+        self.acp_v2_sent = Some(acp_v2);
     }
 
     /// Tells this Mac's server what's working on each provider machine and whether anything of
@@ -1080,6 +1092,7 @@ impl ServerClient {
         self.design_settings_sent = None;
         self.auto_archive_sent = None;
         self.subthread_limit_sent = None;
+        self.acp_v2_sent = None;
         self.cloud_activity_sent = None;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;

@@ -52,6 +52,7 @@ pub(super) fn description() -> AgentDescription {
         // The adapter's API Key login reads them.
         login_variables: vec!["CODEX_API_KEY".into(), "OPENAI_API_KEY".into()],
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into()],
         // The adapter asks Codex for the account before it opens a session.
@@ -894,7 +895,7 @@ with open("run.json", "w") as file:
             ..AgentCommand::default()
         };
         let home = Path::new("/data/accounts/codex-acp/2");
-        description().apply(&mut command, BTreeMap::new(), home, None);
+        description().apply(&mut command, BTreeMap::new(), home, None, false);
         assert_eq!(
             command.env.get("CODEX_HOME").map(String::as_str),
             Some("/data/accounts/codex-acp/2")

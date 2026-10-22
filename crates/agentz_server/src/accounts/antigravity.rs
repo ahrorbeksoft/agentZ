@@ -91,6 +91,7 @@ pub(super) fn description() -> AgentDescription {
         .map(String::from)
         .to_vec(),
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: vec!["config/skills".into(), "antigravity-cli/skills".into()],
         // It reads no skills outside its home but the project's.
         outside_skills_folders: Vec::new(),
@@ -1102,7 +1103,13 @@ fi
             ..AgentCommand::default()
         };
         let home = Path::new("/data/accounts/antigravity-acp/2");
-        description().apply(&mut command, BTreeMap::new(), home, Some("key".into()));
+        description().apply(
+            &mut command,
+            BTreeMap::new(),
+            home,
+            Some("key".into()),
+            false,
+        );
         assert_eq!(
             command.env.get("GEMINI_HOME").map(String::as_str),
             Some("/data/accounts/antigravity-acp/2")

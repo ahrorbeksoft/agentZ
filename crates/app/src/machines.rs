@@ -676,7 +676,16 @@ impl Machines {
         self.sync_design_defaults(cx);
         self.sync_auto_archive(cx);
         self.sync_subthread_limit(cx);
+        self.sync_acp_v2(cx);
         self.sync_cloud_activity(cx);
+    }
+
+    /// Gives each server the ACP v2 setting, which it keeps.
+    fn sync_acp_v2(&mut self, cx: &mut Context<Self>) {
+        let acp_v2 = AppSettingsStore::global(cx).read(cx).settings().acp_v2;
+        for client in self.clients.clone() {
+            client.update(cx, |client, cx| client.set_acp_v2(acp_v2, cx));
+        }
     }
 
     /// Gives each server the number of subthreads a thread runs at once, which it keeps.

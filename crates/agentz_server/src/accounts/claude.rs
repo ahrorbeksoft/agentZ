@@ -68,8 +68,9 @@ pub(super) fn description() -> AgentDescription {
             "ANTHROPIC_AUTH_TOKEN".into(),
             "CLAUDE_CODE_OAUTH_TOKEN".into(),
         ],
-        // Its ACP v2 surface, which agentZ asks for, is behind this until it's done.
-        variables: BTreeMap::from([("CLAUDE_AGENT_ACP_EXPERIMENTAL_V2".into(), "1".into())]),
+        variables: BTreeMap::new(),
+        // Its ACP v2 surface is behind this until it's done.
+        acp_v2_variables: BTreeMap::from([("CLAUDE_AGENT_ACP_EXPERIMENTAL_V2".into(), "1".into())]),
         skills_folders: vec!["skills".into()],
         outside_skills_folders: Vec::new(),
         // Its sessions open while it's logged out. `loggedIn` is also true on an API key or
@@ -608,7 +609,7 @@ with open(os.path.join(reads, "usage.jsonl")) as file:
             ..AgentCommand::default()
         };
         let home = Path::new("/data/accounts/claude-acp/2");
-        description().apply(&mut command, BTreeMap::new(), home, None);
+        description().apply(&mut command, BTreeMap::new(), home, None, false);
         assert_eq!(
             command.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
             Some("/data/accounts/claude-acp/2")

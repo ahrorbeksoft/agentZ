@@ -66,6 +66,7 @@ pub(super) fn description() -> AgentDescription {
         .map(String::from)
         .to_vec(),
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         // Whatever its home, as Devin reads Claude's.
         outside_skills_folders: vec![
@@ -612,7 +613,7 @@ with open("run.json", "w") as file:
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let home = dir.path().join("accounts/grok-build/2");
-        description().apply(&mut command, BTreeMap::new(), &home, None);
+        description().apply(&mut command, BTreeMap::new(), &home, None, false);
         assert_eq!(
             command.env.get("GROK_HOME").map(PathBuf::from),
             Some(home.clone())

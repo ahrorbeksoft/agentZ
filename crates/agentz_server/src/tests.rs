@@ -346,6 +346,7 @@ fn mock_accounts() -> crate::AgentDescription {
         login_variables: vec!["MOCK_API_KEY".into()],
         // Its External account's home is the user's: tests that link skills name their own.
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: Vec::new(),
         outside_skills_folders: Vec::new(),
         login_check: crate::LoginCheck::Session,
@@ -9792,6 +9793,47 @@ async fn steering_sends_a_queued_message_into_the_turn() {
                 && agent_text(client.thread(connection)).ends_with("(steered: also this)")
         })
         .await;
+}
+
+/// ACP v2 is experimental: agents are asked for it only once it's on, and the server keeps the
+/// setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_are_asked_for_acp_v2_only_once_it_is_on() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_ACP_V2".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    // The mock takes messages into its turn only on v2.
+    let on_v1 = client.create_thread_in(project_id).await;
+    client.wait_until_ready(on_v1).await;
+    assert!(
+        !client
+            .thread(ConnectionId::Thread(on_v1))
+            .state
+            .supports_steering
+    );
+
+    client.ok(Request::SetAcpV2(true)).await;
+    let on_v2 = client.create_thread_in(project_id).await;
+    client.wait_until_ready(on_v2).await;
+    assert!(
+        client
+            .thread(ConnectionId::Thread(on_v2))
+            .state
+            .supports_steering
+    );
+    let kept = std::fs::read_to_string(server.data_dir.path().join("acp-v2.json"))
+        .expect("the setting is kept");
+    assert_eq!(kept.trim(), "true");
 }
 
 /// Images are kept by the thread's server and named by their hash: the user's go to the agent

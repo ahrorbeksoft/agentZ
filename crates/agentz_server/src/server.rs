@@ -1,6 +1,7 @@
 //! The state the server owns, and how requests and background results change it.
 
 mod account_requests;
+mod acp_v2;
 mod artifact_requests;
 mod attachment_requests;
 mod auto_archive;
@@ -292,6 +293,8 @@ pub(crate) struct Server {
     auto_archive_days: Option<u32>,
     /// How many delegated tasks a thread runs at once ([`Self::start_queued_tasks`]).
     subthread_limit: u32,
+    /// Agents are asked for ACP v2 before v1.
+    acp_v2: bool,
     /// Ended tasks whose changes are being read, announced once they're known.
     reading_task_changes: HashSet<ThreadId>,
     clients: HashMap<ClientId, Client>,
@@ -393,6 +396,7 @@ impl Server {
         let subthread_limit = subthread_limit::load(&data_dir)
             .log_err()
             .unwrap_or(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT);
+        let acp_v2 = acp_v2::load(&data_dir).log_err().unwrap_or(false);
         let cleanup_file = workspace_cleanup::load(&data_dir)
             .log_err()
             .unwrap_or_default();
@@ -493,6 +497,7 @@ impl Server {
             generated_titles: HashSet::default(),
             auto_archive_days,
             subthread_limit,
+            acp_v2,
             reading_task_changes: HashSet::default(),
             clients: HashMap::default(),
             registry_changed: false,
@@ -1550,6 +1555,10 @@ impl Server {
                 self.set_subthread_limit(limit)?;
                 Ok(Response::Ok)
             }
+            Request::SetAcpV2(acp_v2) => {
+                self.set_acp_v2(acp_v2)?;
+                Ok(Response::Ok)
+            }
             Request::SetDesignDefaults(settings) => {
                 self.set_design_defaults(settings)?;
                 Ok(Response::Ok)
@@ -1903,6 +1912,7 @@ impl Server {
             previous_session,
             Some(self.agent_terminal_host(thread_id)),
             Some(self.agent_mcp_host()),
+            self.acp_v2,
         );
         agent_thread.set_session_login(session_login);
         agent_thread.set_agent(ThreadAgent {
@@ -2304,11 +2314,12 @@ impl Server {
             None => self.account_description(agent_id),
             Some(_) => None,
         };
+        let acp_v2 = self.acp_v2;
         async move {
             let mut command = command.await?;
             match home {
                 None => match external_description {
-                    Some(description) => description.apply_external(&mut command, env),
+                    Some(description) => description.apply_external(&mut command, env, acp_v2),
                     None => command.env.extend(env),
                 },
                 Some((description, home)) => {
@@ -2321,7 +2332,7 @@ impl Server {
                         .context("linking the user's folders into the account's home")
                         .log_err();
                     let key = accounts::stored_key(&home)?;
-                    description.apply(&mut command, env, &home, key);
+                    description.apply(&mut command, env, &home, key, acp_v2);
                 }
             }
             Ok(command)
@@ -2347,6 +2358,7 @@ impl Server {
             self.runtime.clone(),
             self.agent_name(&agent_id),
             command,
+            self.acp_v2,
         );
         if let Some(key_login) = self.key_login(&agent_id, account) {
             thread.set_key_method(acp::AuthMethodId::new(key_login.method));

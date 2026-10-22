@@ -62,6 +62,7 @@ pub(super) fn description() -> AgentDescription {
         normal_home: String::new(),
         login_variables: vec![KEY_VARIABLE.into()],
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: vec![".config/devin/skills".into()],
         outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into(), ".claude/skills".into()],
         // Its sessions open while it's logged out, with no models.

@@ -51,6 +51,9 @@ pub struct AgentDescription {
     /// Variables the agent runs with on every account, the External one included, unless the
     /// account's Environment sets them.
     pub variables: BTreeMap<String, String>,
+    /// Variables that turn on the agent's ACP v2, added to `variables` while agents are asked
+    /// for v2 (Settings › General › Experimental).
+    pub acp_v2_variables: BTreeMap<String, String>,
     /// The folders the agent loads skills from, by their path in a home. agentZ links its own
     /// skills into the first but the shared one ([`crate::skills`]).
     pub skills_folders: Vec<String>,
@@ -261,37 +264,43 @@ impl AgentDescription {
         Ok(())
     }
 
-    /// Makes `command` run on the External account: the description's `variables`, then the
-    /// account's Environment (`account_env`).
+    /// Makes `command` run on the External account: the description's `variables` (with its
+    /// `acp_v2_variables` when `acp_v2` is on), then the account's Environment
+    /// (`account_env`).
     pub fn apply_external(
         &self,
         command: &mut AgentCommand,
         account_env: BTreeMap<String, String>,
+        acp_v2: bool,
     ) {
+        let acp_v2_variables = self.acp_v2_variables.iter().filter(|_| acp_v2);
         command.env.extend(
             self.variables
                 .iter()
+                .chain(acp_v2_variables)
                 .map(|(variable, value)| (variable.clone(), value.clone())),
         );
         command.env.extend(account_env);
     }
 
     /// Makes `command` run on an agentZ account whose folder is `home`: the server's
-    /// environment without the agent's login variables, then the description's `variables`,
-    /// then the account's Environment (`account_env`), then the home variables and file storage
-    /// switches, then the key it logs in with, if any. A login variable set in the account's
-    /// Environment stays, since the user set it on purpose.
+    /// environment without the agent's login variables, then the description's `variables`
+    /// (with its `acp_v2_variables` when `acp_v2` is on), then the account's Environment
+    /// (`account_env`), then the home variables and file storage switches, then the key it logs
+    /// in with, if any. A login variable set in the account's Environment stays, since the user
+    /// set it on purpose.
     pub fn apply(
         &self,
         command: &mut AgentCommand,
         account_env: BTreeMap<String, String>,
         home: &Path,
         key: Option<String>,
+        acp_v2: bool,
     ) {
         for variable in &self.login_variables {
             command.env.remove(variable);
         }
-        self.apply_external(command, account_env);
+        self.apply_external(command, account_env, acp_v2);
         for (variable, folder) in &self.home_variables {
             let path = if folder.is_empty() {
                 home.to_path_buf()
@@ -464,6 +473,7 @@ mod tests {
                 ("AGENT_SESSION_TIMEOUT".into(), "forever".into()),
                 ("AGENT_LOG".into(), "quiet".into()),
             ]),
+            acp_v2_variables: BTreeMap::from([("AGENT_ACP_V2".into(), "1".into())]),
             skills_folders: Vec::new(),
             outside_skills_folders: Vec::new(),
             login_check: LoginCheck::Session,
@@ -496,6 +506,7 @@ mod tests {
             account_env.clone(),
             Path::new("/data/accounts/agent/1"),
             None,
+            false,
         );
 
         let env = |variable: &str| command.env.get(variable).map(String::as_str);
@@ -507,15 +518,18 @@ mod tests {
         assert_eq!(env("AGENT_KEYRING"), Some("file"));
         assert_eq!(env("AGENT_SESSION_TIMEOUT"), Some("forever"));
         assert_eq!(env("AGENT_LOG"), Some("debug"));
+        assert_eq!(env("AGENT_ACP_V2"), None);
         assert_eq!(command.env_remove, ["AGENT_API_KEY"]);
 
-        // The External account keeps the server's login and gets the variables too.
+        // The External account keeps the server's login and gets the variables too, and those
+        // of ACP v2 while it's on.
         let mut command = registry_command.clone();
-        description.apply_external(&mut command, account_env.clone());
+        description.apply_external(&mut command, account_env.clone(), true);
         let env = |variable: &str| command.env.get(variable).map(String::as_str);
         assert_eq!(env("AGENT_API_KEY"), Some("from-the-registry"));
         assert_eq!(env("AGENT_SESSION_TIMEOUT"), Some("forever"));
         assert_eq!(env("AGENT_LOG"), Some("debug"));
+        assert_eq!(env("AGENT_ACP_V2"), Some("1"));
         assert!(command.env_remove.is_empty());
 
         // An API-key account's own key goes in its place.
@@ -525,6 +539,7 @@ mod tests {
             account_env,
             Path::new("/data/accounts/agent/2"),
             Some("sk-account".into()),
+            false,
         );
         assert_eq!(
             command.env.get("AGENT_API_KEY").map(String::as_str),

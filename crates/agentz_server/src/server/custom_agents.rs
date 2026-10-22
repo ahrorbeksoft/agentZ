@@ -44,12 +44,15 @@ impl Server {
         let probe = command.clone();
         // The environment is the agent's settings', which its Environment tab edits too.
         let env: BTreeMap<String, String> = std::mem::take(&mut command.env).into_iter().collect();
-        self.spawn_then(agent_thread::agent_info(probe), move |server, info| {
-            let saved = info
-                .context("It didn't start")
-                .and_then(|info| server.keep_custom_agent(agent_id, &name, command, env, info));
-            server.respond(client, id, saved.map(Response::CustomAgentSaved));
-        });
+        self.spawn_then(
+            agent_thread::agent_info(probe, self.acp_v2),
+            move |server, info| {
+                let saved = info
+                    .context("It didn't start")
+                    .and_then(|info| server.keep_custom_agent(agent_id, &name, command, env, info));
+                server.respond(client, id, saved.map(Response::CustomAgentSaved));
+            },
+        );
     }
 
     fn keep_custom_agent(

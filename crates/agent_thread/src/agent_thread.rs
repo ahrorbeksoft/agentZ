@@ -488,6 +488,9 @@ pub struct AgentThread {
     /// False for a connection made only to log in or out (from settings), which never opens a
     /// session.
     opens_session: bool,
+    /// The agent is asked for ACP v2 before v1 (Settings › General › Experimental), for each
+    /// start of it.
+    acp_v2: bool,
     /// The login method that reads a key from the agent's environment, which clients are asked
     /// for ([`Self::set_key_method`]).
     key_method: Option<acp::AuthMethodId>,
@@ -776,10 +779,12 @@ impl Drop for AgentThread {
 impl AgentThread {
     /// Starts the agent and an ACP session in `cwd`. With `previous_session`, the earlier
     /// conversation is loaded (or at least resumed) when the agent supports it. Prompts sent
-    /// before the session is ready are queued.
+    /// before the session is ready are queued. With `acp_v2`, the agent is asked for ACP v2
+    /// first.
     ///
     /// Pass what arrives on the returned inbox to [`Self::handle`], and drain
     /// [`Self::take_events`] after each call.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         runtime: tokio::runtime::Handle,
         agent_name: SharedString,
@@ -788,12 +793,14 @@ impl AgentThread {
         previous_session: Option<acp::SessionId>,
         terminal_host: Option<TerminalHost>,
         mcp_host: Option<McpHost>,
+        acp_v2: bool,
     ) -> (Self, ThreadInbox) {
         let (mut this, inbox) =
             Self::new(Some(runtime), agent_name, ConnectionStatus::Connecting, cwd);
         this.previous_session = previous_session;
         this.terminal_host = terminal_host;
         this.mcp_host = mcp_host;
+        this.acp_v2 = acp_v2;
         this.connect_agent(command);
         (this, inbox)
     }
@@ -804,6 +811,7 @@ impl AgentThread {
         runtime: tokio::runtime::Handle,
         agent_name: SharedString,
         command: CommandFuture,
+        acp_v2: bool,
     ) -> (Self, ThreadInbox) {
         let (mut this, inbox) = Self::new(
             Some(runtime),
@@ -812,6 +820,7 @@ impl AgentThread {
             std::env::temp_dir(),
         );
         this.opens_session = false;
+        this.acp_v2 = acp_v2;
         this.connect_agent(command);
         (this, inbox)
     }
@@ -959,6 +968,7 @@ impl AgentThread {
             prompts_sent: 0,
             stderr_lines: VecDeque::new(),
             opens_session: true,
+            acp_v2: false,
             key_method: None,
             authenticate_once_connected: None,
             waits_for_login: false,
@@ -1152,6 +1162,7 @@ impl AgentThread {
         let sender = self.sender();
         let terminal_host = self.terminal_host.clone();
         let mcp_host = self.mcp_host.clone();
+        let acp_v2 = self.acp_v2;
         self.spawn_task(async move {
             // The agent's own tasks, which stop the agent when dropped.
             let mut agent_tasks = JoinSet::new();
@@ -1164,6 +1175,7 @@ impl AgentThread {
                     terminal_host,
                     mcp_host,
                     &mut agent_tasks,
+                    acp_v2,
                 )
                 .await?;
                 anyhow::Ok((command, connected))
@@ -4978,8 +4990,9 @@ fn login_links(line: &str) -> Vec<String> {
 }
 
 /// Spawns the agent and wires up and initializes the ACP connection. The agent's process and
-/// transport run in `agent_tasks`, and report through `sender`. The agent is asked for ACP v2,
-/// and one that refuses it is started again on v1, as Zed's `AcpConnection` does.
+/// transport run in `agent_tasks`, and report through `sender`. With `acp_v2`, the agent is
+/// asked for ACP v2, and one that refuses it is started again on v1, as Zed's `AcpConnection`
+/// does; otherwise it's asked for v1 only.
 async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
@@ -4987,7 +5000,22 @@ async fn connect(
     terminal_host: Option<TerminalHost>,
     mcp_host: Option<McpHost>,
     agent_tasks: &mut JoinSet<()>,
+    acp_v2: bool,
 ) -> Result<Connected> {
+    if !acp_v2 {
+        return connect_with(
+            &command,
+            &cwd,
+            &sender,
+            terminal_host,
+            mcp_host,
+            agent_tasks,
+            Translator::v1(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await?
+        .context("the agent refused ACP v1");
+    }
     let reports_exit = Arc::new(AtomicBool::new(true));
     let asked = connect_with(
         &command,
@@ -5771,7 +5799,10 @@ pub enum SessionListing {
 
 /// Starts the agent only to initialize it, for what it says it is (ACP's `agentInfo`), and
 /// stops it. An agent that doesn't start fails with the last lines it printed.
-pub async fn agent_info(command: AgentCommand) -> Result<Option<acp::Implementation>> {
+pub async fn agent_info(
+    command: AgentCommand,
+    acp_v2: bool,
+) -> Result<Option<acp::Implementation>> {
     let (messages, mut inbox) = mpsc::unbounded();
     let sender = MessageSender {
         sender: messages,
@@ -5786,6 +5817,7 @@ pub async fn agent_info(command: AgentCommand) -> Result<Option<acp::Implementat
         None,
         None,
         &mut agent_tasks,
+        acp_v2,
     );
     let deadline = tokio::time::sleep(AGENT_INFO_TIMEOUT);
     tokio::pin!(connecting, deadline);
@@ -5828,7 +5860,7 @@ pub async fn agent_info(command: AgentCommand) -> Result<Option<acp::Implementat
 
 /// The agent's sessions, every page of them, as Zed's thread import collects them. The agent
 /// starts only for this, in a scratch directory, and stops afterwards.
-pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
+pub async fn list_sessions(command: CommandFuture, acp_v2: bool) -> Result<SessionListing> {
     tokio::time::timeout(LIST_SESSIONS_TIMEOUT, async {
         let command = command.await?;
         // Nothing listens: the agent has no session to report on, and a request it sends is
@@ -5847,6 +5879,7 @@ pub async fn list_sessions(command: CommandFuture) -> Result<SessionListing> {
             None,
             None,
             &mut agent_tasks,
+            acp_v2,
         )
         .await?;
         if connected.capabilities.session_capabilities.list.is_none() {
@@ -6068,6 +6101,14 @@ mod tests {
     }
 
     fn start(command: AgentCommand, previous_session: Option<acp::SessionId>) -> TestThread {
+        start_asking(command, previous_session, true)
+    }
+
+    fn start_asking(
+        command: AgentCommand,
+        previous_session: Option<acp::SessionId>,
+        acp_v2: bool,
+    ) -> TestThread {
         TestThread::new(AgentThread::start(
             tokio::runtime::Handle::current(),
             "Mock".into(),
@@ -6076,6 +6117,7 @@ mod tests {
             previous_session,
             None,
             None,
+            acp_v2,
         ))
     }
 
@@ -6089,6 +6131,7 @@ mod tests {
             tokio::runtime::Handle::current(),
             "Mock".into(),
             ready(command),
+            true,
         ));
 
         login
@@ -6441,6 +6484,24 @@ mod tests {
             Some(&acp::StopReason::EndTurn)
         );
         assert_eq!(thread.thread.state.finished_turns.len(), 1);
+    }
+
+    /// With ACP v2 off, an agent that speaks v2 is asked for v1 only, and spoken to in it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn asks_for_v1_only_with_acp_v2_off() {
+        let Some(command) = v2_mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start_asking(command, None, false);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(!thread.thread.is_v2());
+        thread.update(|thread| thread.send("hello".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["hello"]);
     }
 
     /// An agent of v1 only refuses v2 (`-32022`), and a new process of it is spoken to in v1.
@@ -8324,7 +8385,7 @@ mod tests {
         let Some(mut command) = mock_agent(&[]) else {
             return;
         };
-        let unsupported = list_sessions(ready(command.clone()))
+        let unsupported = list_sessions(ready(command.clone()), true)
             .await
             .expect("listing");
         assert!(matches!(unsupported, SessionListing::Unsupported));
@@ -8348,7 +8409,7 @@ mod tests {
             "MOCK_SESSIONS_FILE".into(),
             sessions_file.to_string_lossy().into_owned(),
         );
-        let SessionListing::Listed(listed) = list_sessions(ready(command.clone()))
+        let SessionListing::Listed(listed) = list_sessions(ready(command.clone()), true)
             .await
             .expect("listing")
         else {
@@ -8382,7 +8443,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let logged_out = list_sessions(ready(command)).await.expect("listing");
+        let logged_out = list_sessions(ready(command), true).await.expect("listing");
         assert!(matches!(logged_out, SessionListing::LoggedOut));
     }
 

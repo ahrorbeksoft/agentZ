@@ -27,6 +27,7 @@ pub(super) fn description() -> AgentDescription {
         .map(String::from)
         .to_vec(),
         variables: BTreeMap::new(),
+        acp_v2_variables: BTreeMap::new(),
         skills_folders: vec!["skills".into()],
         // Whatever its home.
         outside_skills_folders: vec![SHARED_SKILLS_FOLDER.into()],
@@ -85,7 +86,13 @@ mod tests {
             ..AgentCommand::default()
         };
         let home = Path::new("/data/accounts/qoder/2");
-        description().apply(&mut command, BTreeMap::new(), home, Some("token".into()));
+        description().apply(
+            &mut command,
+            BTreeMap::new(),
+            home,
+            Some("token".into()),
+            false,
+        );
         assert_eq!(
             command.env.get("QODER_CONFIG_DIR").map(String::as_str),
             Some("/data/accounts/qoder/2")
