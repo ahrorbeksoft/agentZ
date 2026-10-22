@@ -23,8 +23,9 @@ use crate::artifacts::{Content, Publish, design_text};
 
 const MAX_PATH_CHARS: usize = 4_096;
 const MAX_FILES: usize = 20;
-/// The most of a document a read answers with.
-const MAX_READ_CHARS: usize = 50_000;
+/// The most of an artifact's text one read answers with, ending on a whole line. Agents' clients
+/// shorten a long tool result, some by dropping its middle, so a long text comes in pages.
+const MAX_READ_CHARS: usize = 16_000;
 const MAX_TOPICS: usize = 20;
 const MAX_VARIANTS: usize = 12;
 const MAX_TEXT_CHARS: usize = 4_000;
@@ -421,7 +422,16 @@ impl Server {
                 design_text(&artifact.title, version, &listing.place, &design, &picks)
             }
         };
-        let (text, truncated) = super::truncate(&text, MAX_READ_CHARS);
+        let offset = arguments.number("offset")?.unwrap_or(1).max(1) as usize;
+        let limit = arguments
+            .number("limit")?
+            .map(|limit| limit.max(1) as usize);
+        let page = read_page(&text, offset, limit, MAX_READ_CHARS).map_err(|total| {
+            invalid(format!(
+                "{} has {total} lines, so offset can be 1 to {total}.",
+                artifact.title
+            ))
+        })?;
         // A relayed read's paths would be on this machine, not the caller's.
         let folder = (!caller.relayed).then(|| self.artifacts.files_folder(&id, version));
         let files: Vec<Value> = published
@@ -442,11 +452,25 @@ impl Server {
             "version": version,
             "versions": artifact.latest(),
             "from": listing.place,
-            "text": text,
+            "text": page.text,
+            "fromLine": page.first,
+            "toLine": page.last,
+            "totalLines": page.total,
             "files": files,
         });
-        if truncated {
-            answer["truncated"] = json!(true);
+        if page.last < page.total {
+            answer["hasMore"] = json!(true);
+            answer["nextOffset"] = json!(page.last + 1);
+            answer["more"] = json!(format!(
+                "This is lines {} to {} of {}. Read on with offset {}.",
+                page.first,
+                page.last,
+                page.total,
+                page.last + 1
+            ));
+        }
+        if page.line_cut {
+            answer["lineTruncated"] = json!(true);
         }
         if artifact.kind == ArtifactKind::Design {
             answer["note"] = json!(if caller.relayed {
@@ -657,6 +681,61 @@ async fn read_file(path: &Path) -> Result<Vec<u8>, Failure> {
         .map_err(|error| unreadable(path, error))
 }
 
+/// One page of a read's text: whole lines from `first` to `last` (1-based) of `total`.
+#[derive(Debug, PartialEq)]
+struct ReadPage {
+    text: String,
+    first: usize,
+    last: usize,
+    total: usize,
+    /// The page's one line was longer than a page, so it ends partway through it.
+    line_cut: bool,
+}
+
+/// The lines from `offset`, at most `limit` of them and `max_chars` characters together, but
+/// always at least one; or, past the end, how many lines there are.
+fn read_page(
+    text: &str,
+    offset: usize,
+    limit: Option<usize>,
+    max_chars: usize,
+) -> Result<ReadPage, usize> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = lines.len();
+    if offset == 0 || offset > total.max(1) {
+        return Err(total);
+    }
+    let mut page = String::new();
+    let mut chars = 0;
+    let mut last = offset - 1;
+    let mut line_cut = false;
+    for line in lines
+        .iter()
+        .skip(offset - 1)
+        .take(limit.unwrap_or(usize::MAX))
+    {
+        let line_chars = line.chars().count();
+        if chars + line_chars > max_chars {
+            if last < offset {
+                page = super::truncate(line, max_chars).0;
+                last += 1;
+                line_cut = true;
+            }
+            break;
+        }
+        page.push_str(line);
+        chars += line_chars;
+        last += 1;
+    }
+    Ok(ReadPage {
+        text: page,
+        first: offset.min(total),
+        last,
+        total,
+        line_cut,
+    })
+}
+
 /// A design's pictures and pages by their paths, each named in the version by its topic and
 /// variant ("1-B.png", "1-today-phone.png").
 #[derive(Default)]
@@ -834,12 +913,14 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
         json!({
             "name": "agentz_artifact_read",
             "title": "Read an artifact",
-            "description": "Read an artifact, the latest version without version: a document's Markdown, or a whole design as text: its state and intro, then a heading per topic with the user's pick by letter and name, and every variant with its words, its files by name, and the user's comment. files lists the version's files with their paths, to look at a variant's picture or read its page. For an artifact on another machine, pass a file's name as file to copy it here and get its path.",
+            "description": "Read an artifact, the latest version without version: a document's Markdown, or a whole design as text: its state and intro, then a heading per topic with the user's pick by letter and name, and every variant with its words, its files by name, and the user's comment. A long text comes in pages of whole lines: while hasMore is true, read on with offset set to nextOffset until you've read to totalLines. files lists the version's files with their paths, to look at a variant's picture or read its page. For an artifact on another machine, pass a file's name as file to copy it here and get its path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "artifactId": {"type": "string", "maxLength": 64, "description": "From agentz_artifact_list, a publish's answer or a mention."},
                     "version": {"type": "integer", "minimum": 1, "description": "The version to read; the latest without one."},
+                    "offset": {"type": "integer", "minimum": 1, "description": "The line to start at, 1 (the default) for the first: nextOffset from the read before."},
+                    "limit": {"type": "integer", "minimum": 1, "description": "The most lines to read; a page also ends before 16,000 characters."},
                     "file": {"type": "string", "maxLength": 256, "description": "One of the version's files, by name, to get its path instead of the text; from another machine, it's copied here first."},
                     "machine": {"type": "string", "maxLength": 256, "description": "The machine it's on, as agentz_artifact_list or a mention names it. Omit for this machine."},
                 },
@@ -849,4 +930,40 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Vec<Value> {
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true},
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadPage, read_page};
+
+    #[test]
+    fn long_texts_are_read_in_pages_of_whole_lines() {
+        let text = "one\ntwo\nthree\nfour\n";
+        let page = |offset, limit, max_chars| read_page(text, offset, limit, max_chars);
+        assert_eq!(
+            page(1, None, 100),
+            Ok(ReadPage {
+                text: text.to_string(),
+                first: 1,
+                last: 4,
+                total: 4,
+                line_cut: false,
+            })
+        );
+        // A page ends before the line that would take it over, never in the middle.
+        let first = page(1, None, 9).expect("a page");
+        assert_eq!((first.text.as_str(), first.last), ("one\ntwo\n", 2));
+        let second = page(first.last + 1, None, 9).expect("a page");
+        assert_eq!(
+            (second.text.as_str(), second.first, second.last),
+            ("three\n", 3, 3)
+        );
+        assert_eq!(page(2, Some(2), 100).expect("a page").text, "two\nthree\n");
+        assert_eq!(page(5, None, 100), Err(4));
+        // A line longer than a page is cut, so a read always moves on.
+        let cut = page(3, None, 2).expect("a page");
+        assert_eq!((cut.text.as_str(), cut.last, cut.line_cut), ("th", 3, true));
+        let empty = read_page("", 1, None, 100).expect("a page");
+        assert_eq!((empty.text.as_str(), empty.total), ("", 0));
+    }
 }

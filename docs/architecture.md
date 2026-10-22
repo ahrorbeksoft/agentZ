@@ -1732,7 +1732,10 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   topic's description, and every variant, today's first, with its words, Good, Cost, its
   files by name, Picked, Also, Wanted or Recommended, and the user's comment (a pick-any
   topic's heading says "(pick any)", so a variant with no Wanted is one the user doesn't
-  want). `files` gives each of
+  want). A long text comes in pages of whole lines under 16,000 characters (`read_page`;
+  `offset` and `limit` in lines, `fromLine`, `toLine`, `totalLines`, and `hasMore` with
+  `nextOffset`), since agents' clients shorten a long tool result, some by dropping its middle;
+  a line longer than a page is cut (`lineTruncated`). `files` gives each of
   the version's files with its path, so the agent looks at a picture or reads a page with its
   own tools; another machine's have no paths, and `file` copies one over to this machine and
   gives its path (`keep_fetched_file`). `agentz_artifact_list` lists the thread's, the

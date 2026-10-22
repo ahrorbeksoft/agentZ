@@ -11283,6 +11283,17 @@ async fn artifacts_are_published_served_and_sent_back() {
         )
         .await;
     assert_eq!(read["text"], json!("# Benchmarks\n\nFaster."));
+    assert_eq!(read["totalLines"], json!(3));
+    assert_eq!(read["hasMore"], Value::Null);
+    let rest = client
+        .tool(
+            thread,
+            "agentz_artifact_read",
+            json!({"artifactId": id.0, "version": 1, "limit": 1}),
+        )
+        .await;
+    assert_eq!(rest["text"], json!("# Benchmarks\n"));
+    assert_eq!(rest["nextOffset"], json!(2));
     assert_eq!(read["files"][0]["name"], json!("runs.csv"));
     let path = read["files"][0]["path"].as_str().expect("the file's path");
     assert_eq!(
