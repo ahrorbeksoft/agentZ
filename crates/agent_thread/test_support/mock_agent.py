@@ -32,7 +32,11 @@ ACP's sessions with any client that takes them, as an agent that doesn't know AI
 a subagent as Factory Droid does: a "Task" tool call, with its type, description, complexity and
 prompt as input, that completes with the report after half a second (or the seconds given);
 "droid-task background" sends it to the background, so it ends at once with Droid's notice
-that it was launched. A prompt of "slow" streams
+that it was launched. "droid-tasks <n> <seconds>" sends n there and ends its turn, then wakes by
+itself once per report, the seconds apart, sending another off in its first wake, and ends
+with "All reports are in.". "droid-exec-bg <seconds>" leaves a command ("sleep") running as
+Droid's Execute with fireAndForget does, with its PID, ends its turn, and wakes a second after
+the command exits with "The command finished.". A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. To a client that takes ACP's notices, "notice" sends
 a warning and a notice of a severity of its own, then replies; to one that takes compaction
@@ -762,6 +766,66 @@ def run_droid_task(request_id, session_id, seconds, background=False):
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
+def launch_droid_task(session_id, call_id):
+    """A Task Factory Droid doesn't wait for: a call that ends at once with its launch notice."""
+    update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "Task",
+                        "kind": "other", "status": "in_progress",
+                        "rawInput": {"subagent_type": "worker", "description": call_id,
+                                     "await": False, "prompt": "Work on your own."}})
+    update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                        "status": "completed",
+                        "content": [{"type": "content", "content": {
+                            "type": "text",
+                            "text": f"Task launched in background.\ntask_id: {call_id}"}}]})
+
+
+def run_droid_tasks(request_id, session_id, count, seconds):
+    """As Factory Droid sends subagents off and wakes by itself with each one's report."""
+    for index in range(count):
+        launch_droid_task(session_id, f"task-{request_id}-{index}")
+    update(session_id, text_chunk("agent_message_chunk", "The workers run on their own."))
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+    def wake():
+        for report in range(count + 1):
+            time.sleep(seconds)
+            update(session_id, text_chunk("agent_message_chunk", f"Report {report + 1}."))
+            if report == 0:
+                launch_droid_task(session_id, f"task-{request_id}-more")
+        update(session_id, text_chunk("agent_message_chunk", "All reports are in."))
+
+    threading.Thread(target=wake, daemon=True).start()
+
+
+def run_droid_background_command(request_id, session_id, seconds):
+    """As Factory Droid's Execute with fireAndForget leaves a command running, and Droid wakes
+    once it exits."""
+    process = subprocess.Popen(["sleep", str(seconds)])
+    call_id = f"exec-{request_id}"
+    update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id,
+                        "title": f"sleep {seconds}", "kind": "execute", "status": "in_progress",
+                        "rawInput": {"command": f"sleep {seconds}", "fireAndForget": True}})
+    update(session_id, {"sessionUpdate": "tool_call_update", "toolCallId": call_id,
+                        "status": "completed",
+                        "content": [{"type": "content", "content": {
+                            "type": "text",
+                            "text": f"Background process started (PID: {process.pid})\n"
+                                    f"Command: sleep {seconds}\n"
+                                    "Output: /tmp/droid-bg.out\n"
+                                    "Status: Running in background"}}]})
+    update(session_id, text_chunk("agent_message_chunk", "The command runs in the background."))
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+    def wake():
+        process.wait()
+        time.sleep(1)
+        for word in ["The", " command", " finished."]:
+            update(session_id, text_chunk("agent_message_chunk", word))
+            time.sleep(0.2)
+
+    threading.Thread(target=wake, daemon=True).start()
+
+
 def logged_in():
     return not logged_out and stored_login()
 
@@ -1419,6 +1483,12 @@ for line in sys.stdin:
             start_stoppable_subagent(message["id"], params["sessionId"])
         elif prompt_text == "droid-task background":
             run_droid_task(message["id"], params["sessionId"], 0, background=True)
+        elif prompt_text.startswith("droid-tasks "):
+            count, seconds = prompt_text.split(" ")[1:3]
+            run_droid_tasks(message["id"], params["sessionId"], int(count), float(seconds))
+        elif prompt_text.startswith("droid-exec-bg "):
+            run_droid_background_command(message["id"], params["sessionId"],
+                                         float(prompt_text.split(" ")[1]))
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
             seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
             run_droid_task(message["id"], params["sessionId"], seconds)

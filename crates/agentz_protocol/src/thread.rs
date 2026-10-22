@@ -275,6 +275,15 @@ impl ToolCall {
                 .first()
                 .is_some_and(|text| text.trim_start().starts_with("Task launched in background"))
     }
+
+    /// The process of a command the call left running in the background, as Factory Droid's
+    /// Execute with `fireAndForget` answers: "Background process started (PID: 22997)". Droid
+    /// wakes by itself once it ends.
+    pub fn background_process_id(&self) -> Option<u32> {
+        let text = self.text.first()?.trim_start();
+        let rest = text.strip_prefix("Background process started (PID: ")?;
+        rest.split_once(')')?.0.trim().parse().ok()
+    }
 }
 
 /// A message waiting in a thread's queue for the agent to be free.

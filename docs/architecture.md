@@ -1060,6 +1060,21 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   minutes of 30-second checks (`OWN_WORK_QUIET_ROUNDS`) for work that only seems to run, such
   as a tool call never closed. The sidebar has no Waiting status for it: the thread shows
   Working until it's over, then Completed (`Server::is_waiting` holds that back).
+  Work of the agent's own that follows a completed turn with nothing between them joins that
+  turn (`reopen_last_turn`): a turn ends with the user's next message, not each time the
+  agent pauses.
+  Droid's background subagents are counted one by one, by their calls
+  (`AgentThread::detached_subagents`), including those sent off during a wake
+  (`count_background_work`), and each wake (the first update after a quiet check) uses up one
+  report. Commands it leaves running (an Execute with `fireAndForget`, answered "Background
+  process started (PID: …)", `ToolCall::background_process_id`) hold the turn they started
+  in while the PID lives, checked every 5 seconds (`check_background_processes`); once one
+  exits, the thread works again until Droid wakes with its end (up to 3 minutes,
+  `PROCESS_WAKE_QUIET_ROUNDS`), so a message sent meanwhile waits rather than reach Droid
+  mid-wake, where it folds it into its work and never answers the prompt. One left from an
+  earlier turn (a dev server) doesn't hold later turns. Once awake with what its background
+  work brought, Droid may pause for most of a minute as it writes its next call, so that work
+  ends only after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`).
 - **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
   `cancel_inner` ends the turn at once): Stop sends `session/cancel` and the turn ends when the
   agent answers its prompt as cancelled. One that hasn't answered 5 seconds later

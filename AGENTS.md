@@ -150,7 +150,10 @@ From Zed's guidelines, which this code follows:
   ask for permission; `subagents standard` runs them in ACP's subagent sessions, and
   `subagents standard resume` then sends the first more work; `subagent-stop` runs one there
   that searches until it's stopped), and `droid-task [seconds]` runs one as Factory Droid's Task call does
-  (`droid-task background` sends it to the background, as Droid's Task with `await: false`).
+  (`droid-task background` sends it to the background, as Droid's Task with `await: false`;
+  `droid-tasks <n> <seconds>` sends n there, wakes by itself once per report and sends one
+  more off in its first wake, and `droid-exec-bg <seconds>` leaves a command running as Droid's
+  Execute with `fireAndForget` does, then wakes once it exits).
   With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`

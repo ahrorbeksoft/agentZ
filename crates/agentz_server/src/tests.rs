@@ -7488,12 +7488,17 @@ async fn threads_work_in_worktrees_and_pastures() {
     );
 
     // The task's end is told to its parent in a turn of the parent's, in the worktree.
+    let notice = format!("Delegated task {} (", task.0);
     client
         .wait_until(|client| {
             client
-                .projects
-                .as_ref()
-                .is_some_and(|projects| projects.working_threads.is_empty())
+                .user_messages(thread)
+                .iter()
+                .any(|message| message.starts_with(&notice))
+                && client
+                    .projects
+                    .as_ref()
+                    .is_some_and(|projects| projects.working_threads.is_empty())
         })
         .await;
 
