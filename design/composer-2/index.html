@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Composer, Image Markup, Pictures and Pickers Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="composer-2" data-title="Composer, Image Markup, Pictures and Pickers">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Composer, Image Markup, Pictures and Pickers <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Four entries from the backlog, as you gave them. <b>The composer</b>: “Redesign the composer in threads.” <b>Image markup</b>: “Image annotation when an image is opened from the input composer.” <b>Pictures and live pages</b>: “Maybe warn agents when they give pictures instead of live pages. A setting, global or per project (the project’s setting overrides the global one), decides whether they’re warned that this is happening.” <b>The pickers</b>: “When picking agents or accounts, show an indicator of whether each is being used (whether it’s working). Also show usage for agents with a single account: the usage percentage is shown only for accounts, not for agents.”</p>
+<p>The mocks share one world: the thread <b>“Add usage indicators to the agent picker”</b> in agentZ, with Claude Agent on its Personal account (69% left this 5-hour window; Work has 88%, the External account ahror@example.com 46%). Claude Agent is working in two threads (this one and one on Work), Codex in one. Codex has 41% left, Factory Droid 12%, and Google Antigravity’s usage isn’t read. The pasted image is a screenshot of a checkout page.</p>
+<p>Words used: the <b>composer</b> is where you type to the agent; its <b>footer</b> is the row of controls under the text. The <b>image viewer</b> is what opens when you click an image. A <b>live page</b> is a design variant as a page you can click through; a <b>picture</b> is an image of it. The <b>design defaults</b> are Settings › General › Artifacts’ rows for designs, which a project can replace with its own. Where topics meet, the mocks use the recommended pick of the other topic, and each topic says which.</p>`;
+</script>
+<script src="mock-composer-2.js"></script>
+<script src="topics-composer.js"></script>
+<script src="topics-images.js"></script>
+<script src="topics-pictures.js"></script>
+<script src="topics-pickers.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
