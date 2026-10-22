@@ -48,18 +48,6 @@ thread to another machine yet (Continue with Another Agent, workspace handoff an
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
 
-### Try a size-optimized build of the app
-
-Left from "Smaller release downloads" (built October 22, 2026: one download per platform, a DMG
-per kind of Mac and `.tar.xz` on Linux, each with only its own server, the servers built with
-fat LTO and `opt-level = "s"`, and the app downloading other machines' servers from its
-release). The app still has the release profile (thin LTO).
-
-Findings (October 19, 2026), Apple silicon, xz, app + server + icon: fat LTO 19.2 MB against
-20.0 MB; fat LTO with `opt-level = "s"` 16.0 MB, but the code is slower, untried for the app's
-drawing and terminals. In the app, Mermaid rendering (`merman`) is about 8 MB of its 42.6 MB.
-Needs a check of drawing and terminal speed on a Mac before it ships.
-
 ## Zed upstream updates
 
 Requested October 18, 2026: add all five groups from the upstream review. The review compared
