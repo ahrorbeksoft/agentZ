@@ -1,11 +1,11 @@
 {
   "topics": {
     "shape": {
-      "pick": "A",
+      "pick": "B",
       "picks": [],
       "none": false,
       "comments": {
-        "B": ""
+        "B": "Put the machine and branch in the strip too. The branch moves there from the thread’s header (strip only). The machine always shows; in a sent thread it’s only a label (its icon and name), since a thread can’t move to another machine. The new thread screen gets the same strip: its agent picker moves out of the card into the strip, beside the account, the checkout, the machine and the branch."
       },
       "note": "",
       "also": []

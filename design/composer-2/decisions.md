@@ -2,13 +2,15 @@
 
 Picked on the design board (`design/composer-2/`, see `design/README.md`). Each section is the spec for that part: build the picked option as described, with the comments applied. Generated from `choices.json`; don't edit by hand.
 
-## 1. The composer’s shape in a thread: A. A card, as on the new thread
+## 1. The composer’s shape in a thread: B. A card, with a strip under it
 
 *Composer*
 
 **Today:** Once a thread has its first message, the composer is a bar across the bottom of the thread, as in Zed: a border along its top, the editor’s darker background, and its contents (up to 850 px wide) in the middle. The new thread screen has the same composer as a card: rounded, outlined, with a shadow. The activity bar (the plan’s current step, the Agents list) sits on the bar’s top edge. The footer is the next topic.
 
-**A. A card, as on the new thread** (from t3code ChatComposer, agentZ new thread): The thread keeps the new thread’s card: rounded, outlined and shadowed, 16 px in from the thread’s sides and above its bottom, on the thread’s background. Same contents and width (up to 850 px). Sending the first message no longer changes it.
+**B. A card, with a strip under it** (from t3code context strip, Codex): The card holds what you send: the text, + and Send, with the mode, model and effort. Who answers moves to a strip under the card, in small muted type: the agent, the account and its usage at the left, the context ring at the right, as the new thread’s strip shows the checkout and machine.
+
+**Comment on B:** Put the machine and branch in the strip too. The branch moves there from the thread’s header (strip only). The machine always shows; in a sent thread it’s only a label (its icon and name), since a thread can’t move to another machine. The new thread screen gets the same strip: its agent picker moves out of the card into the strip, beside the account, the checkout, the machine and the branch.
 
 ## 2. The footer’s controls: A. Model and effort in one menu
 
