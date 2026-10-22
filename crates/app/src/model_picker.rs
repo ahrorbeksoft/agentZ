@@ -1,14 +1,20 @@
 //! A thread's model and effort, as one menu (`design/composer-2`, topic 2 A, from Codex's
-//! /model): a search over the agent's models, then its effort's levels as a row of segments.
-//! The composer's "Opus 5.5 · High" chip opens it.
+//! /model): a search over the agent's models, then its effort's levels in a list under them,
+//! which the user asked for in place of a row of segments that cut their names short. The
+//! agent's other model settings (ACP's `model_config` category, such as Claude Agent's Fast
+//! mode) follow, as the user asked, rather than in the composer's footer. The composer's
+//! "Opus 5.5 · High" chip opens it.
 
 use agent_client_protocol::schema::v1 as acp;
+use agentz_protocol::agents::AgentId;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     KeyBinding, ScrollHandle, Subscription, Window,
 };
 use text_input::{TextInput, TextInputEvent};
-use ui::{HighlightedLabel, ListItem, ListItemSpacing, WithScrollbar as _, prelude::*};
+use ui::{
+    HighlightedLabel, ListItem, ListItemSpacing, Switch, Tooltip, WithScrollbar as _, prelude::*,
+};
 
 use crate::project_switcher::fuzzy_match;
 use crate::thread_entity::AgentThread;
@@ -41,6 +47,26 @@ pub(crate) fn model_and_effort(
         select(acp::SessionConfigOptionCategory::Model),
         select(acp::SessionConfigOptionCategory::ThoughtLevel),
     )
+}
+
+/// Whether a setting goes with the model, in its menu: ACP's `model_config` category.
+pub(crate) fn is_model_setting(option: &acp::SessionConfigOption) -> bool {
+    option.category == Some(acp::SessionConfigOptionCategory::ModelConfig)
+        && matches!(
+            option.kind,
+            acp::SessionConfigKind::Select(_) | acp::SessionConfigKind::Boolean(_)
+        )
+}
+
+/// Whether an agent's setting is left out of the composer and its defaults. Claude Agent's
+/// Agent setting picks a persona for the main thread, and its adapter offers Claude Code's
+/// own `web-fetch` agent there, which Claude Code then refuses ("Agent \"web-fetch\" not
+/// found"); the user asked for it to be hidden.
+pub(crate) fn is_hidden_option(
+    agent_id: Option<&AgentId>,
+    option: &acp::SessionConfigOption,
+) -> bool {
+    agent_id.is_some_and(|agent_id| agent_id.0 == "claude-acp") && &*option.id.0 == "agent"
 }
 
 /// A select setting's choices, each with the group it's in, if any.
@@ -97,12 +123,44 @@ struct ModelEntry {
     positions: Vec<usize>,
 }
 
-/// An effort setting's levels and the current one.
-struct Effort {
+/// A setting under the models: the effort, or another of the model's settings.
+struct Setting {
     id: acp::SessionConfigId,
     name: SharedString,
-    levels: Vec<(acp::SessionConfigValueId, SharedString)>,
-    current: acp::SessionConfigValueId,
+    description: Option<SharedString>,
+    kind: SettingKind,
+}
+
+enum SettingKind {
+    /// Its choices, in a list, and the current one.
+    Levels {
+        levels: Vec<(acp::SessionConfigValueId, SharedString)>,
+        current: acp::SessionConfigValueId,
+    },
+    /// On or off, with a switch.
+    Switch(bool),
+}
+
+impl Setting {
+    fn new(option: &acp::SessionConfigOption) -> Option<Self> {
+        let kind = match &option.kind {
+            acp::SessionConfigKind::Select(select) => SettingKind::Levels {
+                levels: select_choices(&select.options)
+                    .into_iter()
+                    .map(|(_, value, name)| (value, name))
+                    .collect(),
+                current: select.current_value.clone(),
+            },
+            acp::SessionConfigKind::Boolean(boolean) => SettingKind::Switch(boolean.current_value),
+            _ => return None,
+        };
+        Some(Self {
+            id: option.id.clone(),
+            name: option.name.clone().into(),
+            description: option.description.clone().map(SharedString::from),
+            kind,
+        })
+    }
 }
 
 pub struct ModelPicker {
@@ -193,22 +251,15 @@ impl ModelPicker {
             .collect()
     }
 
-    fn effort(&self, cx: &App) -> Option<Effort> {
-        let thread = self.thread.read(cx);
-        let (_, effort) = model_and_effort(thread.config_options());
-        let effort = effort?;
-        let acp::SessionConfigKind::Select(select) = &effort.kind else {
-            return None;
-        };
-        Some(Effort {
-            id: effort.id.clone(),
-            name: effort.name.clone().into(),
-            levels: select_choices(&select.options)
-                .into_iter()
-                .map(|(_, value, name)| (value, name))
-                .collect(),
-            current: select.current_value.clone(),
-        })
+    /// The effort, then the model's other settings, in the agent's order.
+    fn settings(&self, cx: &App) -> Vec<Setting> {
+        let options = self.thread.read(cx).config_options();
+        let (_, effort) = model_and_effort(options);
+        effort
+            .into_iter()
+            .chain(options.iter().filter(|option| is_model_setting(option)))
+            .filter_map(Setting::new)
+            .collect()
     }
 
     /// The selected model's row, after the headers of its group and those before it.
@@ -273,16 +324,15 @@ impl ModelPicker {
         cx.emit(DismissEvent);
     }
 
-    /// The menu stays open, so the level picked shows.
-    fn set_effort(
+    /// The menu stays open, so the value picked shows.
+    fn set_setting(
         &mut self,
         id: acp::SessionConfigId,
-        value: acp::SessionConfigValueId,
+        value: acp::SessionConfigOptionValue,
         cx: &mut Context<Self>,
     ) {
-        self.thread.update(cx, |thread, cx| {
-            thread.set_config_option(id, acp::SessionConfigOptionValue::value_id(value), cx)
-        });
+        self.thread
+            .update(cx, |thread, cx| thread.set_config_option(id, value, cx));
     }
 
     fn render_entry(
@@ -319,68 +369,97 @@ impl ModelPicker {
             .into_any_element()
     }
 
-    fn render_effort(&self, effort: Effort, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let border_variant = colors.border_variant;
-        let selected_background = colors.element_selected;
-        let hover_background = colors.element_hover;
-        let Effort {
+    fn render_setting(&self, setting: Setting, cx: &mut Context<Self>) -> AnyElement {
+        let Setting {
             id,
             name,
-            levels,
-            current,
-        } = effort;
-        v_flex()
-            .debug_selector(|| "model-picker-effort".into())
-            .px_2()
-            .py_1p5()
-            .gap_1()
+            description,
+            kind,
+        } = setting;
+        let section = v_flex()
+            .debug_selector({
+                let selector = format!("model-setting-{}", id.0);
+                move || selector
+            })
+            .p_1()
             .border_t_1()
-            .border_color(border_variant)
-            .child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
-            .child(
-                h_flex()
-                    .w_full()
-                    .p_0p5()
-                    .gap_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border_variant)
-                    .children(
-                        levels
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, (value, name))| {
-                                let is_current = value == current;
-                                let selector = format!("effort-{}", value.0);
-                                let id = id.clone();
-                                div()
-                                    .id(("effort-level", index))
-                                    .debug_selector(move || selector)
-                                    .flex_1()
-                                    .min_w_0()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .text_center()
-                                    .text_ui_sm(cx)
-                                    .map(|segment| {
-                                        if is_current {
-                                            segment.bg(selected_background).text_color(colors.text)
-                                        } else {
-                                            segment
-                                                .text_color(colors.text_muted)
-                                                .cursor_pointer()
-                                                .hover(move |style| style.bg(hover_background))
-                                        }
-                                    })
-                                    .child(div().truncate().child(name))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.set_effort(id.clone(), value.clone(), cx)
-                                    }))
-                            }),
-                    ),
-            )
-            .into_any_element()
+            .border_color(cx.theme().colors().border_variant);
+        match kind {
+            SettingKind::Levels { levels, current } => section
+                .child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .children(
+                    levels
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (value, name))| {
+                            let is_current = value == current;
+                            let selector = format!("{}-{}", id.0, value.0);
+                            let id = id.clone();
+                            let item = ListItem::new((
+                                SharedString::from(format!("model-setting-{}", id.0)),
+                                index,
+                            ))
+                            .inset(true)
+                            .spacing(ListItemSpacing::Sparse)
+                            .child(div().min_w_0().child(Label::new(name).truncate()))
+                            .end_slot(div().w(IconSize::Small.rems()).when(is_current, |this| {
+                                this.child(
+                                    Icon::new(IconName::Check)
+                                        .size(IconSize::Small)
+                                        .color(Color::Accent),
+                                )
+                            }))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.set_setting(
+                                        id.clone(),
+                                        acp::SessionConfigOptionValue::value_id(value.clone()),
+                                        cx,
+                                    )
+                                },
+                            ));
+                            div().debug_selector(move || selector).child(item)
+                        }),
+                )
+                .into_any_element(),
+            SettingKind::Switch(is_on) => {
+                let toggle = cx.listener({
+                    let id = id.clone();
+                    move |this, _, _, cx| {
+                        this.set_setting(
+                            id.clone(),
+                            acp::SessionConfigOptionValue::boolean(!is_on),
+                            cx,
+                        )
+                    }
+                });
+                section
+                    .child(
+                        ListItem::new(SharedString::from(format!("model-setting-{}", id.0)))
+                            .inset(true)
+                            .spacing(ListItemSpacing::Sparse)
+                            .child(div().min_w_0().child(Label::new(name).truncate()))
+                            .end_slot(Switch::new(
+                                SharedString::from(format!("model-setting-{}-switch", id.0)),
+                                if is_on {
+                                    ToggleState::Selected
+                                } else {
+                                    ToggleState::Unselected
+                                },
+                            ))
+                            .when_some(description, |item, description| {
+                                item.tooltip(Tooltip::text(description))
+                            })
+                            .on_click(toggle),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 }
 
@@ -408,7 +487,11 @@ impl Render for ModelPicker {
             }
             rows.push(self.render_entry(index, entry, current.as_ref(), cx));
         }
-        let effort = self.effort(cx).map(|effort| self.render_effort(effort, cx));
+        let settings: Vec<AnyElement> = self
+            .settings(cx)
+            .into_iter()
+            .map(|setting| self.render_setting(setting, cx))
+            .collect();
 
         v_flex()
             .key_context(KEY_CONTEXT)
@@ -458,6 +541,6 @@ impl Render for ModelPicker {
                     )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
-            .children(effort)
+            .children(settings)
     }
 }

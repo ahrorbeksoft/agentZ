@@ -2330,7 +2330,9 @@ fn render_waiting_badge(count: usize, status: ThreadStatus, cx: &App) -> Div {
                 .size(LabelSize::XSmall)
                 .line_height_style(LineHeightStyle::UiLabel)
                 .weight(gpui::FontWeight::BOLD)
-                .color(Color::Custom(cx.theme().colors().editor_background)),
+                .color(Color::Custom(window_background::solid_editor_background(
+                    cx,
+                ))),
         )
 }
 

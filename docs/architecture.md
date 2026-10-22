@@ -860,20 +860,31 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   and `design/composer-2/`): Zed's message editor, in a card (rounded, outlined, with a
   shadow) in a sent thread as on the new thread screen, 16 px in from the thread's sides
   (`render_thread_composer`, composer-2 topic 1 B, from t3code's context strip). The card holds
-  what's sent: the text, + and, at the right, the agent's settings and Send. Under it the
-  strip (`render_composer_strip`) says who answers at the left (the agent picker, the account
-  picker, the usage gauge) and where at the right (on the new thread screen the checkout and
-  machine pickers; in a sent thread the machine as a label, since a thread can't move), then
-  the branch and the context ring. A sent thread's strip menus open upward. The branch is in
-  the strip, so the header shows it only where there's no composer (an archived thread, a
-  subthread, a machine offline). The activity bar sits on the card's top edge as a tab. Send is
+  what's sent and who answers: the text, then + with the agent picker, the account picker and
+  a sent thread's usage gauge (`render_who_answers`; the user moved them back into the card
+  from the strip), and at the right the agent's settings and Send. Under it the strip
+  (`render_composer_strip`) says where the thread works: at the left the checkout and machine
+  pickers on the new thread screen, or in a sent thread the machine as a label, since a
+  thread can't move; at the right the branch and the context ring. A sent thread's picker
+  menus open upward. The branch is in the strip, so the header shows it only where there's no
+  composer (an archived thread, a subthread, a machine offline). The activity bar sits on the card's top edge as a tab. Send is
   t3code's round button (topic 3 A): gray with nothing to send, filled with the accent color
   once there is; Stop is red with a white square, and Queue keeps the round shape with the list
   icon. The model and effort are one chip, "Opus 5.5 · High ⌄" (`model_picker.rs`, topic 2 A,
   from Codex's /model, with the user's search): its menu searches the models (fuzzy, under
-  their groups' headers; Up, Down and Enter pick), and the effort's levels are a row of
-  segments under them, which set it and leave the menu open. An agent without effort keeps the
-  model alone, one without a model its effort's own menu, and the mode stays its own menu.
+  their groups' headers; Up, Down and Enter pick), and the effort's levels are a list under
+  them (the user's word, in place of a row of segments that cut names short), which set it
+  and leave the menu open. The model's other settings, ACP's `model_config` category (Claude
+  Agent's and Codex's Fast mode), follow in the menu rather than the footer: a switch row for
+  on/off, a list for choices (`model_picker::is_model_setting`); one that's on is named on the
+  chip ("Opus 5.5 · High · Fast mode"). An agent without effort keeps the model alone, one
+  without a model its effort's and model settings' own controls, and the mode stays its own
+  menu. Claude Agent's Agent setting (a persona for the main thread) is hidden, in the
+  composer and in Settings' defaults (`model_picker::is_hidden_option`), on the user's word:
+  its adapter offers Claude Code's own web-fetch agent there, which Claude Code refuses.
+  Send's arrow and the view switch's waiting count are drawn in the solid editor color
+  (`window_background::solid_editor_background`), as a background picture's see-through
+  theme makes it clear.
   The text is one line, growing with the text to eight, then scrolling. Shift-Enter
   makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
   `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
@@ -1249,15 +1260,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Terminal's running dot moves onto "⋯". Where the header has the branch (no composer, see
   Composer), it gives way first, as it shrinks faster than the rest (to 72 px, and under
   560 px only its icon, its name and folder in the tooltip), and under 480 px heads "⋯" as a
-  line. Under 560 px the strip's agent picker shows only its icon and a sent thread's account
+  line. Under 560 px the card's agent picker shows only its icon and a sent thread's account
   picker only its avatar, their names in the tooltips, and when the card's controls wrap,
   they keep to the right, so Send stays in the corner.
 - **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
   `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
   `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
   `render_account_picker` and `render_switch_divider`; t3code's in-thread provider switch and
-  context handoff, design round `design/agent-switching/`): a sent thread's strip under the
-  composer has the agent picker, and beside it the account picker while the agent has more
+  context handoff, design round `design/agent-switching/`): a sent thread's composer card has
+  the agent picker, and beside it the account picker while the agent has more
   than one account (the current one under "This thread", the others under "Switch to";
   `design/thread-narrow/`, 1 D). They work between turns. Both pickers, here and on the new
   thread screen, mark what's working (`design/composer-2/`, topic 9 A; `working_threads`): the
@@ -1363,7 +1374,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   never waits. On Droid this only happens when Droid itself stops at its limit.
 - **The usage gauge** (`AgentView::render_usage_gauge`, `usage_limits::UsagePopover`;
   t3code's `ComposerUsageLimits`, accounts topic 16, usage round topic 3): beside the agent in
-  a started thread's strip under the composer, what's left of one of its account's windows ("62%", leaving out
+  a started thread's composer card, what's left of one of its account's windows ("62%", leaving out
   windows past their reset) on a borderless button like the pickers' beside it, yellow at 15%
   or less and red when used up, with the window's name in its tooltip ("Weekly: 3% left").
   Which window is Settings › General › Threads › Usage shown in the composer
@@ -1389,11 +1400,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   storefront?" (`AgentView::render_new_thread_headline`, chats round topic 5), whose project
   opens a menu of Chat, the projects shown and Add Project… that makes the draft again there,
   keeping what's typed, with "or start a chat" under it; a Workspaces draft's is "What should
-  we work on?" and a continuation's "Continue “title”". The strip under the composer has the
-  agent picker (installed agents, then Terminal, which replaces the draft with a shell, and
-  Manage Agents…) and the account picker at the left, and at the right the checkout picker
-  (Local, a new worktree or pasture, or an existing one), the machine picker (each copy of a
-  combined project, see Project copies in sync) and the branch, which reads "From main"
+  we work on?" and a continuation's "Continue “title”". The composer's card has the agent
+  picker (installed agents, then Terminal, which replaces the draft with a shell, and Manage
+  Agents…) and the account picker beside +, and the strip under it the checkout picker (Local,
+  a new worktree or pasture, or an existing one) and the machine picker (each copy of a
+  combined project, see Project copies in sync) at the left, and at the right the branch, which reads "From main"
   for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
   only the draft's plan until its first message (`Request::PlanWorkspace`). In a small pane
   (under 480 px wide or 420 px high: `AgentView::is_new_thread_compact`) the screen is

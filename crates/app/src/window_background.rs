@@ -295,6 +295,15 @@ pub fn solid_theme(cx: &App) -> Option<Arc<Theme>> {
     Some(state.see_through.as_ref()?.source.clone())
 }
 
+/// The editor's color for a mark drawn in it on a filled shape (Send's arrow, a badge's count):
+/// solid while a picture shows, as the see-through theme's is clear and the mark would vanish.
+pub fn solid_editor_background(cx: &App) -> Hsla {
+    solid_theme(cx).map_or_else(
+        || cx.theme().colors().editor_background,
+        |theme| theme.colors().editor_background,
+    )
+}
+
 /// What to paint a surface's color over where it must hide what's under it, as a cover over the
 /// end of a long title does: while a picture shows, the editor's color, solid, which the
 /// surfaces' colors are drawn to show over; otherwise nothing, as they're solid themselves.

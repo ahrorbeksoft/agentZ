@@ -4041,6 +4041,9 @@ impl SettingsPage {
         let agent = client.read(cx).account_settings(&agent_id, account);
         let mut rows: Vec<AnyElement> = Vec::new();
         for option in &agent.known_config_options {
+            if crate::model_picker::is_hidden_option(Some(&agent_id), option) {
+                continue;
+            }
             let config_id = option.id.0.to_string();
             let current = agent.default_config_options.get(&config_id).cloned();
             let choices: Vec<(SharedString, acp::SessionConfigOptionValue)> = match &option.kind {
