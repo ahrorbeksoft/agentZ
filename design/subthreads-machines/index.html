@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subthreads, Machines and Shells Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="subthreads-machines" data-title="Subthreads, Machines and Shells">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Subthreads, Machines and Shells <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Three entries from the backlog. <b>Subthreads</b>: “Redesign subthreads. This time they should look something like worktrees in Workspaces. Give agents more control over them, but also good defaults, so they can split work up easily. Agents should be able to stop while waiting for a subthread’s results. Improve the messages the user sees from agents: for example, hide the default instructions, maybe make them collapsible. Improve the results side too: maybe make it look like a tool call.” <b>The machine picker</b> under a new thread’s composer “looks ugly”, and another machine can’t be chosen when the selected agent isn’t installed there: “what if the user uses two different agents on two machines?” And <b>terminals in the Agents view</b> need a close button (not the terminals in threads).</p>
+<p>The mocks share one world: the thread <b>“Add usage indicators to the agent picker”</b> in agentZ, whose Claude Agent split the work into four subthreads: Claude researches how Zed shows usage (done), Codex builds the indicator in a worktree (working), Factory Droid writes tests in another worktree (waiting for your approval), and Claude reviews the server side (working). For the machine picker: This Mac (Google Antigravity, Claude Agent, Codex), the cloud machine <b>agents-1</b> (Claude Agent, Codex, Factory Droid; 2 commits behind and 3 changed files), and Devbox 1, offline.</p>
+<p>Words used: a <b>subthread</b> is a thread another thread’s agent started with <code>delegate_task</code>; its <b>parent</b> is the thread that started it. The <b>Agents list</b> is the list above the parent’s composer. A <b>copy</b> is a project’s checkout on one machine. Where topics meet, the mocks use the recommended pick of the other topic, and each topic says which.</p>`;
+</script>
+<script src="mock-subthreads-machines.js"></script>
+<script src="topics-subthreads.js"></script>
+<script src="topics-machines.js"></script>
+<script src="topics-shells.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
