@@ -156,6 +156,16 @@ that can't load sessions do. With MOCK_RESUME=fail, resuming fails.
 With MOCK_SCRIPTS set to a JSON object of prompts and the prompts above they stand for, such
 as {"Add a checkout page": "demo"}, those prompts run their scripts, so a demo thread shows a
 real-looking prompt.
+
+With MOCK_ACP_V2 set, it speaks ACP v2 to a client that asks for it in `initialize`, as Claude
+Agent's v2 surface does (with CLAUDE_AGENT_ACP_EXPERIMENTAL_V2): `auth/login` and
+`auth/logout`, `session/resume` with `replayFrom` for a load (replaying whole user messages),
+config options by `configId`, a prompt answered with its message id as it's taken in (after its
+`user_message`, and followed by `running`) and its turn ended by an `idle` `state_update`,
+tool calls as `tool_call_update`s, plans as `plan_update`s and permission requests about their
+`subject`. A prompt sent while a turn runs waits for it to end, as Claude Agent queues one, and
+a cancel ends it with -32800. Its work once a background task ended is `running` until its
+`idle`. With MOCK_ACP_V2=reject, it refuses v2 with -32022, as an agent of v1 only does.
 """
 import json
 import os
@@ -435,19 +445,171 @@ def config_options():
 # Background work writes too.
 send_lock = threading.Lock()
 
+# ACP v2 (MOCK_ACP_V2), spoken once `initialize` asked for it.
+ACP_V2 = os.environ.get("MOCK_ACP_V2")
+v2 = False
+# The prompt whose turn runs on v2, as (request id, session id). Prompts sent meanwhile wait in
+# the queue, and the next is taken in once the turn ends (from `v2_ready`).
+v2_turn = None
+v2_queue = []
+v2_ready = []
+v2_replayed = 0
+
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+
 
 def send(message):
     with send_lock:
-        sys.stdout.write(json.dumps(message) + "\n")
+        for line in (to_v2(message) if v2 else [message]):
+            write(line)
         sys.stdout.flush()
 
 
+def send_state(session_id, state, **fields):
+    """v2's report of the agent's foreground work, as Claude Agent sends it around its own."""
+    if v2:
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": session_id,
+            "update": {"sessionUpdate": "state_update", "state": state, **fields}}})
+
+
+def v2_options(options):
+    return [{("configId" if key == "id" else key): value for key, value in option.items()}
+            for option in options]
+
+
+def v2_initialize(result):
+    """v2's answer to `initialize`, for the v1 one."""
+    capabilities = result["agentCapabilities"]
+    prompt = capabilities.get("promptCapabilities") or {}
+    mcp = capabilities.get("mcpCapabilities") or {}
+    session = {"prompt": {key: {} for key in ("image", "embeddedContext") if prompt.get(key)},
+               "mcp": {"stdio": {}, **{key: {} for key in ("http", "acp") if mcp.get(key)}}}
+    if "fork" in (capabilities.get("sessionCapabilities") or {}):
+        session["fork"] = {}
+    methods = [{"type": method.get("type", "agent"), "methodId": method["id"],
+                **{key: value for key, value in method.items() if key not in ("id", "type")}}
+               for method in result["authMethods"]]
+    return {"protocolVersion": 2, "info": result["agentInfo"],
+            "capabilities": {"session": session, "_meta": result.get("_meta") or {}},
+            "authMethods": methods}
+
+
+def to_v2(message):
+    """The v2 messages for a v1 one the mock sends."""
+    global v2_turn, v2_replayed
+    message = json.loads(json.dumps(message))
+    method = message.get("method")
+    if method is None:
+        if v2_turn is not None and message.get("id") == v2_turn[0]:
+            # The prompt was answered as it was taken in: its turn ends with `idle`.
+            session_id = v2_turn[1]
+            v2_turn = None
+            if "error" in message:
+                state = {"stopReason": "error", "error": message["error"]}
+            else:
+                state = message.get("result") or {}
+            if v2_queue:
+                v2_ready.append(v2_queue.pop(0))
+            return [{"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "state_update", "state": "idle", **state}}}]
+        result = message.get("result")
+        if isinstance(result, dict) and "agentCapabilities" in result:
+            message["result"] = v2_initialize(result)
+        elif isinstance(result, dict) and "configOptions" in result:
+            result["configOptions"] = v2_options(result["configOptions"])
+        return [message]
+    params = message.get("params") or {}
+    if method == "session/update":
+        update = params["update"]
+        kind = update.get("sessionUpdate")
+        if kind == "tool_call":
+            update["sessionUpdate"] = "tool_call_update"
+        elif kind == "plan":
+            params["update"] = {"sessionUpdate": "plan_update", "plan": {
+                "type": "items", "planId": "plan", "entries": update["entries"]}}
+        elif kind == "user_message_chunk":
+            # v2 replays whole messages.
+            v2_replayed += 1
+            params["update"] = {"sessionUpdate": "user_message",
+                                "messageId": f"replayed-{v2_replayed}",
+                                "content": [update["content"]]}
+        elif kind == "config_option_update":
+            update["configOptions"] = v2_options(update["configOptions"])
+    elif method == "session/request_permission":
+        tool_call = params.pop("toolCall")
+        params["title"] = tool_call.get("title") or "Allow this?"
+        params["subject"] = {"type": "tool_call", "toolCall": tool_call}
+    return [message]
+
+
+def from_v2(message):
+    """The v1 message the mock reads for one sent on v2, or None for a prompt that waits for the
+    turn before it."""
+    global v2_turn
+    method = message.get("method")
+    params = message.get("params") or {}
+    if method == "auth/login":
+        message["method"] = "authenticate"
+    elif method == "auth/logout":
+        message["method"] = "logout"
+    elif method == "session/resume" and "replayFrom" in params:
+        message["method"] = "session/load"
+    elif method == "session/cancel":
+        for waiting in [waiting for waiting in v2_queue
+                        if waiting["params"]["sessionId"] == params["sessionId"]]:
+            v2_queue.remove(waiting)
+            send({"jsonrpc": "2.0", "id": waiting["id"],
+                  "error": {"code": -32800, "message": "Request cancelled"}})
+    elif method == "session/prompt":
+        if v2_turn is not None:
+            v2_queue.append(message)
+            return None
+        v2_turn = (message["id"], params["sessionId"])
+        message_id = f"user-{message['id']}"
+        with send_lock:
+            write({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": params["sessionId"],
+                "update": {"sessionUpdate": "user_message", "messageId": message_id,
+                           "content": params["prompt"]}}})
+            write({"jsonrpc": "2.0", "id": message["id"], "result": {"messageId": message_id}})
+            write({"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": params["sessionId"],
+                "update": {"sessionUpdate": "state_update", "state": "running"}}})
+            sys.stdout.flush()
+    return message
+
+
+def incoming():
+    """What the client sends, as v1 messages."""
+    while True:
+        while v2_ready:
+            message = from_v2(v2_ready.pop(0))
+            if message is not None:
+                yield message
+        line = sys.stdin.readline()
+        if not line:
+            return
+        message = json.loads(line)
+        if v2:
+            message = from_v2(message)
+            if message is None:
+                continue
+        yield message
+
+
 def work_in_background(session_id):
+    time.sleep(0.5)
+    send_state(session_id, "running")
     for _ in range(12):
         time.sleep(0.5)
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": session_id, "update": text_chunk("agent_message_chunk", ".")}})
     send_result_cost(session_id)
+    send_state(session_id, "idle", stopReason="end_turn")
 
 
 def work_without_prompt(session_id):
@@ -493,10 +655,12 @@ def run_background_task(session_id, task_id, seconds, stop):
     if async_tasks:
         send_task_update(session_id, {"sessionUpdate": "async_task_state_update",
                                       "asyncTaskId": task_id, "state": "completed"})
+    send_state(session_id, "running")
     for word in ["The", " command", " finished."]:
         update(session_id, text_chunk("agent_message_chunk", word))
         time.sleep(0.2)
     send_result_cost(session_id)
+    send_state(session_id, "idle", stopReason="end_turn")
 
 
 def listed_sessions():
@@ -1094,8 +1258,7 @@ def call_mcp_tool(name=None, arguments=None, cancel=False):
         process.wait()
 
 
-for line in sys.stdin:
-    message = json.loads(line)
+for message in incoming():
     method = message.get("method")
     if (method == "session/new" and os.environ.get("MOCK_SESSION_LOGS_IN") and not logged_in()
             and browser_open_login() is None):
@@ -1104,7 +1267,13 @@ for line in sys.stdin:
         request_id, session_id, prompt_text = pending.pop(message["id"])
         outcome = message.get("result", {}).get("outcome", {})
         finish_prompt(request_id, session_id, prompt_text, outcome.get("optionId", "cancelled"))
+    elif (method == "initialize" and ACP_V2 == "reject"
+          and message["params"].get("protocolVersion") == 2):
+        send({"jsonrpc": "2.0", "id": message["id"],
+              "error": {"code": -32022, "message": "Unsupported protocol version",
+                        "data": {"requested": 2, "supported": [1]}}})
     elif method == "initialize":
+        v2 = bool(ACP_V2) and message["params"].get("protocolVersion") == 2
         auth_methods = [{"id": "mock-login", "name": "Log In",
                          "description": "Log in to the mock agent"}]
         capabilities = message["params"].get("clientCapabilities", {})

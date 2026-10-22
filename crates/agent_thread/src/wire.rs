@@ -2,7 +2,8 @@
 //! unanswered either way is noted, so the connection can be paused between messages and
 //! handed to another server in the middle of a turn: the requests the agent waits on are
 //! received again by the new connection, and the answer to the prompt in flight is taken out
-//! for the thread, since the new SDK connection never sent it.
+//! for the thread, since the new SDK connection never sent it. With an agent on ACP v2, the
+//! lines are translated to and from the SDK's v1 as they pass ([`Translator`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -16,6 +17,8 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::unix::pipe;
 use tokio::task::JoinHandle;
+
+use crate::acp_v2::Translator;
 
 /// The session of the message that marks where a pause took effect. No agent sends it; it
 /// goes through the SDK after every line the agent sent before the pause.
@@ -137,6 +140,7 @@ pub struct WireHandoff {
     pub prompt_id: Option<Value>,
     /// The requests the agent waits on an answer to, as they arrived.
     pub unanswered: Vec<String>,
+    pub translator: Translator,
 }
 
 struct Running {
@@ -151,6 +155,7 @@ struct Running {
 
 pub(crate) struct Wire {
     state: Arc<Mutex<WireState>>,
+    translator: Arc<Mutex<Translator>>,
     running: Option<Running>,
     parked: Option<Parked>,
 }
@@ -170,6 +175,7 @@ impl Wire {
         outgoing: OutgoingLines,
         on_stderr: Arc<dyn Fn(String) + Send + Sync>,
         on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
+        translator: Translator,
     ) -> Result<Self> {
         // Pipes are made in the runtime's context, which registers them with its reactor.
         let _guard = runtime.enter();
@@ -195,6 +201,7 @@ impl Wire {
         };
         Ok(Self {
             state: Arc::default(),
+            translator: Arc::new(Mutex::new(translator)),
             running: None,
             parked: Some(parked),
         })
@@ -231,6 +238,11 @@ impl Wire {
                 incoming.unbounded_send(Ok(line)).ok();
             }
         }
+    }
+
+    /// Whether the agent answered `initialize` with ACP v2.
+    pub(crate) fn is_v2(&self) -> bool {
+        lock(&self.translator).is_v2()
     }
 
     pub(crate) fn is_paused(&self) -> bool {
@@ -287,10 +299,17 @@ impl Wire {
         let (stop_stdin, stdin_stopped) = oneshot::channel();
         let (stop_stdout, stdout_stopped) = oneshot::channel();
         let (stop_stderr, stderr_stopped) = oneshot::channel();
-        let stdin = runtime.spawn(write_lines(parked.stdin, self.state.clone(), stdin_stopped));
+        let stdin = runtime.spawn(write_lines(
+            parked.stdin,
+            self.state.clone(),
+            self.translator.clone(),
+            parked.incoming.clone(),
+            stdin_stopped,
+        ));
         let stdout = runtime.spawn(read_agent_lines(
             parked.stdout,
             self.state.clone(),
+            self.translator.clone(),
             parked.incoming.clone(),
             parked.on_exit.clone(),
             stdout_stopped,
@@ -346,6 +365,7 @@ impl Wire {
             stderr_rest: parked.stderr.rest.clone(),
             prompt_id,
             unanswered,
+            translator: lock(&self.translator).clone(),
         })
     }
 }
@@ -360,17 +380,30 @@ impl Drop for Wire {
     }
 }
 
-fn lock(state: &Mutex<WireState>) -> std::sync::MutexGuard<'_, WireState> {
+fn lock<State>(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     // The state stays consistent line by line, so a panic elsewhere can't leave it half done.
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Passes a line for the SDK on, unless its answer is taken out for the thread.
+fn pass_to_sdk(state: &Mutex<WireState>, incoming: &IncomingLines, line: String) {
+    let taken = lock(state).note_received(&line);
+    let line = if taken {
+        marker_line(ANSWER_MARKER_SESSION)
+    } else {
+        line
+    };
+    incoming.unbounded_send(Ok(line)).ok();
+}
+
 /// Writes the SDK's lines to the agent, one whole line at a time, until stopped.
 async fn write_lines(
     mut writer: LineWriter,
     state: Arc<Mutex<WireState>>,
+    translator: Arc<Mutex<Translator>>,
+    incoming: IncomingLines,
     mut stopped: oneshot::Receiver<()>,
 ) -> LineWriter {
     loop {
@@ -389,8 +422,15 @@ async fn write_lines(
             }
         };
         lock(&state).note_sent(&line);
-        let mut bytes = line.into_bytes();
-        bytes.push(b'\n');
+        let translated = lock(&translator).outgoing(line);
+        for line in translated.to_sdk {
+            pass_to_sdk(&state, &incoming, line);
+        }
+        let mut bytes = Vec::new();
+        for line in translated.to_agent {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
         if let Err(error) = writer.pipe.write_all(&bytes).await {
             log::warn!("failed to write to the agent: {error}");
             return writer;
@@ -402,18 +442,16 @@ async fn write_lines(
 async fn read_agent_lines(
     mut reader: LineReader,
     state: Arc<Mutex<WireState>>,
+    translator: Arc<Mutex<Translator>>,
     incoming: IncomingLines,
     on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
     mut stopped: oneshot::Receiver<()>,
 ) -> LineReader {
     let closed = read_lines(&mut reader, &mut stopped, |line| {
-        let taken = lock(&state).note_received(&line);
-        let line = if taken {
-            marker_line(ANSWER_MARKER_SESSION)
-        } else {
-            line
-        };
-        incoming.unbounded_send(Ok(line)).ok();
+        let lines = lock(&translator).incoming(line);
+        for line in lines {
+            pass_to_sdk(&state, &incoming, line);
+        }
     })
     .await;
     if closed && let Some(on_exit) = on_exit {

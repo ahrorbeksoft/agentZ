@@ -7,6 +7,7 @@
 //! [`ThreadMessage`]s, which the thread's owner passes to [`AgentThread::handle`]. What the
 //! owner should hear about queues up as [`AgentThreadEvent`]s.
 
+mod acp_v2;
 mod attachments;
 mod wire;
 
@@ -46,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinSet;
 
+use crate::acp_v2::{PROMPT_TAKEN_NOTIFICATION, STEERED_PROMPT_META, Translator};
 use crate::wire::{ANSWER_MARKER_SESSION, PAUSE_MARKER_SESSION, Parked, Wire, marker_line};
 
 const STDERR_LINES_KEPT: usize = 20;
@@ -290,6 +292,38 @@ enum MessageKind {
         session: acp::SessionId,
         update: SubagentNotice,
     },
+    /// An agent on ACP v2 reported its foreground work in the session given.
+    AgentState {
+        session: String,
+        state: AgentState,
+    },
+    /// An agent on ACP v2 took in the oldest message sent into its turn, in the session given.
+    SteeredTaken {
+        session: String,
+    },
+    /// The agent answered a message sent into its turn on ACP v2.
+    SteeredPromptFinished {
+        id: u64,
+        result: std::result::Result<acp::PromptResponse, agent_client_protocol::Error>,
+    },
+}
+
+/// What an agent on ACP v2 reports of its foreground work (`state_update`). Background work
+/// goes on while it's idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentState {
+    Running,
+    RequiresAction,
+    Idle,
+}
+
+/// A message sent into the turn on ACP v2, as a prompt of its own.
+struct SteeredPrompt {
+    id: u64,
+    parts: Vec<MessagePart>,
+    /// The agent took it in, and it shows in the thread.
+    taken: bool,
 }
 
 /// A `session/update` by which Claude Agent reports its subagents' sessions (JetBrains AIR's
@@ -550,6 +584,11 @@ pub struct AgentThread {
     /// The thread is a subagent's ([`Self::subagent`]): it takes no messages, and only the
     /// parent's agent stops it.
     runs_in_parent: bool,
+    /// The agent's foreground work as it last reported it, on ACP v2.
+    agent_state: Option<AgentState>,
+    /// Messages sent into the turn on ACP v2, oldest first, until the agent answers them.
+    steered_prompts: VecDeque<SteeredPrompt>,
+    next_steered_prompt: u64,
 }
 
 /// The agent's process id, and whether stopping the thread stops it.
@@ -650,6 +689,12 @@ pub struct AgentSnapshot {
     unanswered: Vec<String>,
     stdout_rest: Vec<u8>,
     stderr_rest: Vec<u8>,
+    /// What's in flight in ACP v2's translation, for an agent on v2.
+    #[serde(default = "Translator::v1")]
+    translator: Translator,
+    /// [`AgentThread::agent_state`].
+    #[serde(default)]
+    agent_state: Option<AgentState>,
 }
 
 /// A thread's conversation as its server keeps it, as t3code keeps each thread's messages, so
@@ -953,6 +998,9 @@ impl AgentThread {
             stoppable_subagents: HashSet::new(),
             subagent_messages: HashMap::new(),
             runs_in_parent: false,
+            agent_state: None,
+            steered_prompts: VecDeque::new(),
+            next_steered_prompt: 0,
         };
         (this, inbox)
     }
@@ -1151,6 +1199,8 @@ impl AgentThread {
                 self.connection = Some(connected.connection);
                 self.view.state.capabilities = connected.capabilities;
                 self.view.state.supports_steering = connected.supports_steering;
+                self.agent_state = None;
+                self.steered_prompts.clear();
                 self.view.state.auth_methods = connected.auth_methods;
                 self.mark_key_method();
                 self.view.state.agent_info = connected.agent_info;
@@ -1370,11 +1420,17 @@ impl AgentThread {
                 self.background_task_stopped(task_id, result)
             }
             MessageKind::Subagent { session, update } => self.subagent_notice(session, update),
+            MessageKind::AgentState { session, state } => self.agent_state_reported(session, state),
+            MessageKind::SteeredTaken { session } => self.steered_prompt_taken(session),
+            MessageKind::SteeredPromptFinished { id, result } => {
+                self.steered_prompt_finished(id, result)
+            }
             // Unless a turn took over meanwhile.
             MessageKind::OwnWorkEnded if self.own_work_ending => self.own_work_ended(),
             MessageKind::OwnWorkEnded => {}
             MessageKind::OwnWorkQuiet(updates) => {
-                if !self.working_on_its_own {
+                // On v2, the agent says when its work ends.
+                if !self.working_on_its_own || self.is_v2() {
                     return;
                 }
                 let is_quiet = updates == self.own_work_updates;
@@ -1784,6 +1840,8 @@ impl AgentThread {
                 unanswered: wire.unanswered,
                 stdout_rest: wire.stdout_rest,
                 stderr_rest: wire.stderr_rest,
+                translator: wire.translator,
+                agent_state: self.agent_state,
             },
             stdin: wire.stdin,
             stdout: wire.stdout,
@@ -1855,6 +1913,7 @@ impl AgentThread {
         this.stderr_lines = snapshot.stderr_lines.into();
         this.subagent_sessions = snapshot.subagent_sessions;
         this.stoppable_subagents = snapshot.stoppable_subagents;
+        this.agent_state = snapshot.agent_state;
         this.terminal_host = terminal_host.clone();
         this.mcp_host = mcp_host.clone();
         if is_working {
@@ -1888,6 +1947,7 @@ impl AgentThread {
             outgoing,
             on_stderr,
             Some(on_exit),
+            snapshot.translator,
         )?;
         if let Some(id) = &snapshot.prompt_id {
             wire.take_answer(id);
@@ -2536,7 +2596,8 @@ impl AgentThread {
     /// Sends a message into the turn the agent is working on, when the agent takes one
     /// ([`ThreadState::supports_steering`]). It shows in the thread once the agent takes it.
     /// One it doesn't take goes once the turn ends, and one sent while the agent isn't working
-    /// goes at once, as [`Self::send_message`] sends it.
+    /// goes at once, as [`Self::send_message`] sends it. On ACP v2 it's an ordinary prompt,
+    /// which the agent takes in when it's ready (Claude Agent once the turn ends).
     pub fn steer_message(&mut self, parts: Vec<MessagePart>) {
         let parts = trim_message(parts);
         if parts.is_empty() || self.runs_in_parent {
@@ -2554,6 +2615,31 @@ impl AgentThread {
             self.after_turn.push_back(parts);
             return;
         };
+        if self.is_v2() {
+            let request = acp::PromptRequest::new(
+                session.session_id.clone(),
+                self.content_blocks(parts.clone()),
+            )
+            .meta(acp::Meta::from_iter([(
+                STEERED_PROMPT_META.to_string(),
+                true.into(),
+            )]));
+            let response = session.connection.send_request(request).block_task();
+            self.next_steered_prompt += 1;
+            let id = self.next_steered_prompt;
+            self.steered_prompts.push_back(SteeredPrompt {
+                id,
+                parts,
+                taken: false,
+            });
+            self.spawn(async move {
+                MessageKind::SteeredPromptFinished {
+                    id,
+                    result: response.await,
+                }
+            });
+            return;
+        }
         let request = agent_client_protocol::UntypedMessage::new(
             STEERING_REQUEST,
             serde_json::json!({
@@ -2808,8 +2894,12 @@ impl AgentThread {
         self.cancel_permission_requests();
         self.cancel_compactions();
         // No prompt's answer will end it. An agent that works on anyway (Factory Droid ignores
-        // a cancel when it has no prompt) is restarted, once it's had time to stop.
-        if self.working_on_its_own {
+        // a cancel when it has no prompt) is restarted, once it's had time to stop. On v2 the
+        // agent reports what it does next.
+        if self.working_on_its_own && self.is_v2() {
+            self.turn_outcome = TurnOutcome::Stopped;
+            self.end_own_work();
+        } else if self.working_on_its_own {
             self.turn_outcome = TurnOutcome::Stopped;
             self.detached_subagents.clear();
             self.process_wakes_due = 0;
@@ -3012,6 +3102,9 @@ impl AgentThread {
         if self.session.is_none() && self.pending_session.is_none() {
             return;
         }
+        // Claude Agent's v2 surface doesn't serve their stop, and on v2 a task that ends
+        // brings work the agent reports.
+        let is_v2 = self.is_v2();
         let tasks = &mut self.view.state.background_tasks;
         match update {
             BackgroundTaskUpdate::AsyncTaskSpawned {
@@ -3034,7 +3127,7 @@ impl AgentThread {
                     output_file: output_file_path,
                     progress: None,
                     paused: false,
-                    can_stop,
+                    can_stop: can_stop && !is_v2,
                     stopping: false,
                     started_at: SystemTime::now(),
                 };
@@ -3096,7 +3189,7 @@ impl AgentThread {
                     _ => {
                         let task = tasks.remove(index);
                         // A stop asked for here gets only the agent's note of it.
-                        if !task.stopping && !self.is_working() {
+                        if !task.stopping && !self.is_working() && !is_v2 {
                             self.expect_own_work();
                         }
                     }
@@ -3106,9 +3199,21 @@ impl AgentThread {
     }
 
     /// The agent's turn is over, but not its work: something it left running in the
-    /// background, or what it goes on with once that ends.
+    /// background, or what it goes on with once that ends. On ACP v2 the agent reports its
+    /// work, and what runs in the background while it's idle (a dev server) isn't waited for.
     pub fn is_waiting(&self) -> bool {
+        !self.is_v2() && self.has_background_work()
+    }
+
+    /// The agent left work running in the background, or is expected to go on once it ended,
+    /// on either version: the agent goes on running for it.
+    pub fn has_background_work(&self) -> bool {
         !self.view.state.background_tasks.is_empty() || self.own_work_due
+    }
+
+    /// Whether the agent answered `initialize` with ACP v2.
+    fn is_v2(&self) -> bool {
+        self.wire.as_ref().is_some_and(Wire::is_v2)
     }
 
     /// Watches the commands the agent left running every [`PROCESS_CHECK`], from now on.
@@ -3136,7 +3241,7 @@ impl AgentThread {
             );
             if self.working_on_its_own {
                 self.process_wakes_due += ended;
-            } else if self.can_work_on_its_own() {
+            } else if self.can_work_on_its_own() && !self.is_v2() {
                 self.process_wakes_due += ended;
                 self.start_own_work();
                 self.own_work_woke = true;
@@ -3200,7 +3305,9 @@ impl AgentThread {
     /// on once a background task it started ended. What follows a turn's end, or a session's
     /// loading, or a stop of a background task (the agent's note of it), doesn't count.
     fn starts_own_work(&self, update: &acp::SessionUpdate) -> bool {
-        self.can_work_on_its_own()
+        // On v2 the agent says so (`state_update`).
+        !self.is_v2()
+            && self.can_work_on_its_own()
             && match update {
                 acp::SessionUpdate::AgentMessageChunk(_)
                 | acp::SessionUpdate::AgentThoughtChunk(_)
@@ -3264,10 +3371,14 @@ impl AgentThread {
     /// the background (Claude Agent's background tasks) or sent subagents off to report later
     /// (Factory Droid's Task that doesn't wait). It's still working until all of that stops.
     fn turn_goes_on_in_background(&mut self) -> bool {
-        if self.turn_outcome != TurnOutcome::Completed
-            || self.session.is_none()
-            || self.view.state.status != ConnectionStatus::Ready
-        {
+        if self.session.is_none() || self.view.state.status != ConnectionStatus::Ready {
+            return false;
+        }
+        // The agent went on to a message sent into the turn, or to work of its own.
+        if self.is_v2() {
+            return self.goes_on_by_report();
+        }
+        if self.turn_outcome != TurnOutcome::Completed {
             return false;
         }
         self.count_background_work(self.turn_started_entries);
@@ -3302,6 +3413,9 @@ impl AgentThread {
     }
 
     fn check_own_work_later(&mut self) {
+        if self.is_v2() {
+            return;
+        }
         let updates = self.own_work_updates;
         self.spawn(async move {
             tokio::time::sleep(OWN_WORK_QUIET).await;
@@ -3343,6 +3457,110 @@ impl AgentThread {
         self.set_working(false);
         if let Some(parts) = self.after_turn.pop_front() {
             self.send_after_turn(parts);
+        }
+    }
+
+    /// On ACP v2 the thread works as the agent reports: work it starts with no prompt (going on
+    /// once a background task ended) is its own, and ends at `idle`. A turn whose prompt was
+    /// answered goes on while the agent works on, or has a message sent into the turn to take.
+    fn agent_state_reported(&mut self, session: String, state: AgentState) {
+        if !self.is_own_session(&session) {
+            return;
+        }
+        self.agent_state = Some(state);
+        match state {
+            AgentState::Running | AgentState::RequiresAction => {
+                if !self.is_working() && self.view.state.status == ConnectionStatus::Ready {
+                    self.start_own_work();
+                }
+            }
+            AgentState::Idle => {
+                if self.working_on_its_own && !self.own_work_ending && !self.goes_on_by_report() {
+                    self.end_own_work();
+                }
+            }
+        }
+    }
+
+    /// Whether the agent on v2 works on, by what it reported: it's running, or it has yet to
+    /// take in a message sent into the turn.
+    fn goes_on_by_report(&self) -> bool {
+        matches!(
+            self.agent_state,
+            Some(AgentState::Running | AgentState::RequiresAction)
+        ) || self.steered_prompts.iter().any(|prompt| !prompt.taken)
+    }
+
+    fn is_own_session(&self, session: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|open| &*open.session_id.0 == session)
+    }
+
+    /// The agent on v2 took in a message sent into its turn: it shows in the thread now, in the
+    /// turn it joined, or as a turn of its own once the one before it ended.
+    fn steered_prompt_taken(&mut self, session: String) {
+        if !self.is_own_session(&session) {
+            return;
+        }
+        let Some(prompt) = self.steered_prompts.iter_mut().find(|prompt| !prompt.taken) else {
+            return;
+        };
+        prompt.taken = true;
+        let message = message_markdown(&prompt.parts);
+        self.view
+            .state
+            .sent_times
+            .push((self.view.entries.len(), SystemTime::now()));
+        self.push_entry(Entry::UserMessage(message));
+        // The reply to it is a message of its own.
+        self.new_message_due = true;
+        if !self.is_working() && self.view.state.status == ConnectionStatus::Ready {
+            self.start_own_work();
+        }
+    }
+
+    /// The agent on v2 answered a message sent into its turn. One it took in ends with the
+    /// turn it's in, at the agent's `idle`. One it didn't (a stop ends it with `-32800`) goes
+    /// once the turn ends, as on v1.
+    fn steered_prompt_finished(
+        &mut self,
+        id: u64,
+        result: std::result::Result<acp::PromptResponse, agent_client_protocol::Error>,
+    ) {
+        let Some(index) = self
+            .steered_prompts
+            .iter()
+            .position(|prompt| prompt.id == id)
+        else {
+            return;
+        };
+        let Some(prompt) = self.steered_prompts.remove(index) else {
+            return;
+        };
+        if prompt.taken {
+            if let Err(error) = result {
+                log::warn!(
+                    "the agent's turn with a message sent into it failed: {}",
+                    error_message(&error)
+                );
+            }
+            return;
+        }
+        if let Err(error) = &result {
+            log::warn!(
+                "the agent didn't take a message into its turn: {}",
+                error_message(error)
+            );
+        }
+        if !self.is_working() {
+            self.send_message(prompt.parts);
+            return;
+        }
+        self.after_turn.push_back(prompt.parts);
+        // The turn waited for this message only.
+        if self.working_on_its_own && !self.own_work_ending && !self.goes_on_by_report() {
+            self.end_own_work();
         }
     }
 
@@ -3619,6 +3837,7 @@ impl AgentThread {
                 // Claude Agent reports its cost with each result, its own work's too. Work it
                 // left running (a background task, a tool call still going) isn't over, though.
                 let ends_own_work = self.working_on_its_own
+                    && !self.is_v2()
                     && self.view.state.background_tasks.is_empty()
                     && !self.has_running_tool_call_since(self.own_work_from)
                     && matches!(
@@ -4692,6 +4911,24 @@ fn subagent_notice(
         .map(|update| (acp::SessionId::new(session.to_string()), update))
 }
 
+/// The notification's v2 `state_update`, with the session it came in, if it's one. The
+/// translation passes it on as the agent sent it ([`crate::acp_v2`]); v1 has none.
+fn agent_state_update(
+    notification: &agent_client_protocol::UntypedMessage,
+) -> Option<(String, AgentState)> {
+    if notification.method != "session/update" {
+        return None;
+    }
+    let update = notification.params.get("update")?;
+    if update.get("sessionUpdate")?.as_str()? != "state_update" {
+        return None;
+    }
+    let session = notification.params.get("sessionId")?.as_str()?.to_string();
+    // A state v1 can't name yet goes unread.
+    let state = serde_json::from_value(update.get("state")?.clone()).ok()?;
+    Some((session, state))
+}
+
 /// The id of the card in the thread for the agent's own subagent running in `session`.
 fn subagent_card_id(session: &str) -> acp::ToolCallId {
     acp::ToolCallId::new(format!("subagent:{session}"))
@@ -4741,7 +4978,8 @@ fn login_links(line: &str) -> Vec<String> {
 }
 
 /// Spawns the agent and wires up and initializes the ACP connection. The agent's process and
-/// transport run in `agent_tasks`, and report through `sender`.
+/// transport run in `agent_tasks`, and report through `sender`. The agent is asked for ACP v2,
+/// and one that refuses it is started again on v1, as Zed's `AcpConnection` does.
 async fn connect(
     command: AgentCommand,
     cwd: PathBuf,
@@ -4750,6 +4988,55 @@ async fn connect(
     mcp_host: Option<McpHost>,
     agent_tasks: &mut JoinSet<()>,
 ) -> Result<Connected> {
+    let reports_exit = Arc::new(AtomicBool::new(true));
+    let asked = connect_with(
+        &command,
+        &cwd,
+        &sender,
+        terminal_host.clone(),
+        mcp_host.clone(),
+        agent_tasks,
+        Translator::asking(),
+        reports_exit.clone(),
+    )
+    .await?;
+    if let Some(connected) = asked {
+        return Ok(connected);
+    }
+    log::info!(
+        "{} refused ACP v2; starting it again on v1",
+        command.path.display()
+    );
+    // The first process isn't the thread's agent: its end isn't the agent's.
+    reports_exit.store(false, Ordering::SeqCst);
+    agent_tasks.abort_all();
+    while agent_tasks.join_next().await.is_some() {}
+    connect_with(
+        &command,
+        &cwd,
+        &sender,
+        terminal_host,
+        mcp_host,
+        agent_tasks,
+        Translator::v1(),
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await?
+    .context("the agent refused ACP v1")
+}
+
+/// [`connect`] with one process, or `None` when the agent refused v2 with `-32022`.
+#[allow(clippy::too_many_arguments)]
+async fn connect_with(
+    command: &AgentCommand,
+    cwd: &Path,
+    sender: &MessageSender,
+    terminal_host: Option<TerminalHost>,
+    mcp_host: Option<McpHost>,
+    agent_tasks: &mut JoinSet<()>,
+    translator: Translator,
+    reports_exit: Arc<AtomicBool>,
+) -> Result<Option<Connected>> {
     // Stopped by `ProcessGuard` rather than on drop, so a handed-off agent can outlive this
     // process. In a group of its own, so what it starts stops with it.
     let mut process_command = tokio::process::Command::new(&command.path);
@@ -4759,7 +5046,7 @@ async fn connect(
     let mut child = process_command
         .args(&command.args)
         .envs(&command.env)
-        .current_dir(&cwd)
+        .current_dir(cwd)
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4783,7 +5070,9 @@ async fn connect(
             };
             // Its id may be reused now.
             guard.0.armed.store(false, Ordering::SeqCst);
-            sender.send(MessageKind::Exited(message)).ok();
+            if reports_exit.load(Ordering::SeqCst) {
+                sender.send(MessageKind::Exited(message)).ok();
+            }
         }
     });
 
@@ -4800,13 +5089,14 @@ async fn connect(
         outgoing,
         stderr_reporter(sender.clone()),
         None,
+        translator,
     )?;
     wire.resume(&runtime);
 
     let supports_terminals = terminal_host.is_some();
     let transport = transport(outgoing_lines, incoming_lines);
     let (connection_future, connection) =
-        client_connection(transport, sender, terminal_host, mcp_host);
+        client_connection(transport, sender.clone(), terminal_host, mcp_host);
     agent_tasks.spawn(connection_future);
     let connection = connection
         .await
@@ -4819,23 +5109,30 @@ async fn connect(
                 .client_capabilities(client_capabilities(supports_terminals))
                 .client_info(acp::Implementation::new("agentZ", version)),
         )
-        .block_task()
-        .map(|result| result.map_err(|error| anyhow!(error_message(&error))));
-    let initialize_response = initialize.await.context("initializing the agent")?;
+        .block_task();
+    let initialize_response = match initialize.await {
+        Ok(response) => response,
+        Err(error) if refuses_v2(&error) => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(error_message(&error))).context("initializing the agent");
+        }
+    };
     anyhow::ensure!(
         initialize_response.protocol_version >= ProtocolVersion::V1,
         "the agent speaks an unsupported ACP version"
     );
-    // Beside `agentCapabilities` rather than in them, as Claude Agent and Codex send it.
-    let supports_steering = initialize_response
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.get("steering"))
-        .and_then(|steering| steering.get("supported"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // Beside `agentCapabilities` rather than in them, as Claude Agent and Codex send it. On v2,
+    // a prompt sent into a running turn is an ordinary one.
+    let supports_steering = wire.is_v2()
+        || initialize_response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("steering"))
+            .and_then(|steering| steering.get("supported"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-    Ok(Connected {
+    Ok(Some(Connected {
         connection,
         capabilities: initialize_response.agent_capabilities,
         supports_steering,
@@ -4843,7 +5140,26 @@ async fn connect(
         agent_info: initialize_response.agent_info,
         wire,
         process,
-    })
+    }))
+}
+
+/// Whether the agent refused ACP v2 and takes v1 (Zed's `v1_only_mismatch`).
+fn refuses_v2(error: &agent_client_protocol::Error) -> bool {
+    if i32::from(error.code) != crate::acp_v2::UNSUPPORTED_VERSION {
+        return false;
+    }
+    let Some(data) = error.data.as_ref() else {
+        return false;
+    };
+    let Some(supported) = data.get("supported").and_then(Value::as_array) else {
+        return false;
+    };
+    data.get("requested").and_then(Value::as_u64) == Some(2)
+        && supported
+            .iter()
+            .all(|value| value.as_u64().is_some_and(|version| version > 0))
+        && supported.iter().any(|value| value.as_u64() == Some(1))
+        && !supported.iter().any(|value| value.as_u64() == Some(2))
 }
 
 /// What agentZ supports, as Zed's `client_capabilities_for_agent` says it.
@@ -4954,6 +5270,24 @@ fn client_connection(
                     background_task_sender
                         .send(MessageKind::Subagent { session, update })
                         .ok();
+                    return Ok(agent_client_protocol::Handled::Yes);
+                }
+                if let Some((session, state)) = agent_state_update(&notification) {
+                    background_task_sender
+                        .send(MessageKind::AgentState { session, state })
+                        .ok();
+                    return Ok(agent_client_protocol::Handled::Yes);
+                }
+                if notification.method == PROMPT_TAKEN_NOTIFICATION {
+                    if let Some(session) =
+                        notification.params.get("sessionId").and_then(Value::as_str)
+                    {
+                        background_task_sender
+                            .send(MessageKind::SteeredTaken {
+                                session: session.to_string(),
+                            })
+                            .ok();
+                    }
                     return Ok(agent_client_protocol::Handled::Yes);
                 }
                 Ok(agent_client_protocol::Handled::No {
@@ -6070,6 +6404,194 @@ mod tests {
         assert_eq!(user_messages(&thread.thread), ["background-task 1", "next"]);
         // The command and what followed it are one turn, and the message sent after is another.
         assert_eq!(thread.thread.state.finished_turns.len(), 2);
+    }
+
+    fn v2_mock_agent(args: &[String]) -> Option<AgentCommand> {
+        let mut command = mock_agent(args)?;
+        command.env.insert("MOCK_ACP_V2".into(), "1".into());
+        Some(command)
+    }
+
+    /// An agent that answers v2 is spoken to in v2. Its turn ends at its `idle`, not at the
+    /// prompt's answer, and its echo of the prompt doesn't show the prompt twice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn speaks_acp_v2_with_an_agent_that_does() {
+        let Some(command) = v2_mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(thread.thread.is_v2());
+        assert!(thread.thread.state.supports_steering);
+        assert!(thread.thread.supports_logout());
+        assert_eq!(thread.thread.config_options().len(), 4);
+
+        thread.update(|thread| thread.send("hello".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working() && thread.agent_state == Some(AgentState::Idle)
+            })
+            .await;
+        assert_eq!(agent_text(&thread.thread), "Echo: hello");
+        assert_eq!(user_messages(&thread.thread), ["hello"]);
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
+        );
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+    }
+
+    /// An agent of v1 only refuses v2 (`-32022`), and a new process of it is spoken to in v1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn speaks_v1_with_an_agent_that_refuses_v2() {
+        let Some(mut command) = mock_agent(&[]) else {
+            return;
+        };
+        command.env.insert("MOCK_ACP_V2".into(), "reject".into());
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(!thread.thread.is_v2());
+        assert!(!thread.thread.state.supports_steering);
+        thread.update(|thread| thread.send("hello".into()));
+        thread
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+        assert_eq!(thread.thread.status(), &ConnectionStatus::Ready);
+    }
+
+    /// On v2 a message sent into the turn is a prompt of its own, which the agent takes in when
+    /// it's ready (the mock, as Claude Agent, once the turn ends). It shows then, and the
+    /// thread works on until the agent is done with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn steers_a_message_into_a_v2_turn() {
+        let Some(command) = v2_mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("permission".into()));
+        let tool_call_id = acp::ToolCallId::new("call-2");
+        thread
+            .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
+            .await;
+        thread.update(|thread| thread.steer("use tabs".into()));
+        thread.handle_messages_for(Duration::from_millis(300)).await;
+        assert_eq!(user_messages(&thread.thread), ["permission"]);
+        assert!(thread.thread.after_turn.is_empty());
+
+        thread.update(|thread| {
+            let allow = acp::PermissionOptionId::new("allow");
+            thread.respond_to_permission(&tool_call_id, allow);
+        });
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("Echo: use tabs")
+            })
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["permission", "use tabs"]);
+        assert_eq!(
+            agent_messages(&thread.thread),
+            ["Echo: permission", " (chose allow)", "Echo: use tabs"]
+        );
+        thread.handle_messages_for(Duration::from_millis(300)).await;
+        assert!(thread.thread.steered_prompts.is_empty());
+        assert!(!thread.thread.is_working());
+    }
+
+    /// On v2 a command left running in the background doesn't keep the thread working, as
+    /// Claude Agent's dev server did on v1: the agent says its turn ended. The command shows
+    /// until it ends, with no Stop (v2 has no request for it), and what the agent goes on with
+    /// once it ended is work of its own, until its next `idle`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_tasks_on_v2_dont_keep_the_thread_working() {
+        let Some(command) = v2_mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("background-task 2".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && thread.state.last_stop_reason.is_some()
+                    && !thread.state.background_tasks.is_empty()
+            })
+            .await;
+        let task = thread.thread.state.background_tasks[0].clone();
+        assert_eq!(task.name.as_ref(), "Sleep for 2 seconds");
+        assert!(!task.can_stop);
+        assert!(thread.thread.has_background_work());
+        assert!(!thread.thread.is_waiting());
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+
+        thread
+            .wait_up_to(Duration::from_secs(10), |thread| thread.works_on_its_own())
+            .await;
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("The command finished.")
+            })
+            .await;
+        assert!(thread.thread.state.background_tasks.is_empty());
+        assert!(!thread.thread.has_background_work());
+        assert_eq!(user_messages(&thread.thread), ["background-task 2"]);
+        assert_eq!(
+            agent_messages(&thread.thread),
+            ["Started in the background.", "The command finished."]
+        );
+    }
+
+    /// On v2 a session loads by resuming it with its replay, which shows as v1's does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loads_a_v2_session_with_its_replay() {
+        let history_dir = tempfile::tempdir().expect("temp dir");
+        let history_file = history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned();
+        let Some(command) = v2_mock_agent(&[history_file]) else {
+            return;
+        };
+        let mut first = start(command.clone(), None);
+        first
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        first.update(|thread| thread.send("hello".into()));
+        first
+            .wait_until(|thread| !thread.is_working() && agent_text(thread) == "Echo: hello")
+            .await;
+        let session = first
+            .thread
+            .session
+            .as_ref()
+            .map(|session| session.session_id.clone());
+        drop(first);
+
+        let mut thread = start(command, session);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        assert!(thread.thread.is_v2());
+        assert_eq!(user_messages(&thread.thread), ["hello"]);
+        assert_eq!(agent_text(&thread.thread), "Echo: hello");
+        thread.update(|thread| thread.send("next".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working() && last_agent_message(thread).as_deref() == Some("Echo: next")
+            })
+            .await;
+        assert_eq!(user_messages(&thread.thread), ["hello", "next"]);
     }
 
     /// Claude Agent runs each subagent in a session of its own once the client says it takes
@@ -7954,6 +8476,37 @@ mod tests {
         );
     }
 
+    /// An agent on v2 is handed off with what's in flight on v2: the turn streaming goes on,
+    /// and ends at its `idle`, on the new connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hands_off_a_v2_turn_in_progress() {
+        let Some(command) = v2_mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("slow".into()));
+        thread
+            .wait_until(|thread| agent_text(thread).contains("One"))
+            .await;
+        assert!(thread.thread.can_hand_off());
+
+        let mut thread = hand_to_new_thread(thread).await;
+        assert!(thread.thread.is_working(), "the turn goes on");
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(thread.thread.is_v2());
+        assert_eq!(agent_text(&thread.thread), "One two three four five");
+        assert_eq!(
+            thread.thread.last_stop_reason(),
+            Some(&acp::StopReason::EndTurn)
+        );
+        thread.update(|thread| thread.send("hello".into()));
+        thread.wait_until(|thread| !thread.is_working()).await;
+        assert!(agent_text(&thread.thread).ends_with("Echo: hello"));
+        assert_eq!(user_messages(&thread.thread), ["slow", "hello"]);
+    }
     /// A permission request the agent waits on is asked again on the new connection, which
     /// answers it.
     #[tokio::test(flavor = "multi_thread")]

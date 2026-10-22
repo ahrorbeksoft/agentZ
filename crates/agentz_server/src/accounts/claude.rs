@@ -68,7 +68,8 @@ pub(super) fn description() -> AgentDescription {
             "ANTHROPIC_AUTH_TOKEN".into(),
             "CLAUDE_CODE_OAUTH_TOKEN".into(),
         ],
-        variables: BTreeMap::new(),
+        // Its ACP v2 surface, which agentZ asks for, is behind this until it's done.
+        variables: BTreeMap::from([("CLAUDE_AGENT_ACP_EXPERIMENTAL_V2".into(), "1".into())]),
         skills_folders: vec!["skills".into()],
         outside_skills_folders: Vec::new(),
         // Its sessions open while it's logged out. `loggedIn` is also true on an API key or

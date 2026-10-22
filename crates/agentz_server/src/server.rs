@@ -2237,7 +2237,7 @@ impl Server {
             || self.moving_threads.contains_key(&thread_id)
             || self.has_waiting_prompt(thread_id)
             || self.has_running_agent_terminal(thread_id)
-            || thread.is_waiting()
+            || thread.has_background_work()
     }
 
     /// The thread's work goes on after its turn: in its agent's background, or in its
@@ -2268,7 +2268,7 @@ impl Server {
         let threads_work = self.threads.iter().any(|(thread_id, thread)| {
             let waits_on_user =
                 !thread.state.permission_requests.is_empty() || thread.is_awaiting_input();
-            ((thread.is_working() && !waits_on_user) || thread.is_waiting())
+            ((thread.is_working() && !waits_on_user) || thread.has_background_work())
                 && self
                     .projects
                     .thread(*thread_id)

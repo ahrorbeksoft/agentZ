@@ -106,10 +106,10 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   Change the protocol, requests, state files and settings freely: no fallbacks for older servers
   or apps, no old fields kept, no migrations. Only keep the user's data loading: a new field in a
   state file gets `#[serde(default)]`, so an old file doesn't lose their threads.
-- **ACP v2 with agents that support it.** agentZ asks for v2 and falls back to v1, without
-  waiting for Zed to enable v2 for everyone (the user's decision of October 22, 2026). Until
-  that's built ("Use ACP v2 with agents that support it" in `docs/backlog.md`), it
-  initializes with v1.
+- **ACP v2 with agents that support it.** agentZ asks every agent for v2 and falls back to
+  v1, without waiting for Zed to enable v2 for everyone (the user's decision of October 22,
+  2026). The SDK speaks v1, and `agent_thread/src/acp_v2.rs` rewrites the messages for an
+  agent that answers v2 (ACP v2 in `docs/architecture.md`).
 - **UI changes start on the design board.** Before changing the UI, give the user designs to
   pick from: a round on the local design board (`design/README.md`), with the current state
   screenshotted beside them. A round's `design/<round>/decisions.md` is the spec: build what
@@ -167,7 +167,9 @@ From Zed's guidelines, which this code follows:
   replay) it answers `session/list`, two sessions a page, and loads them, for thread import.
   With `MOCK_FORK` it forks sessions (`session/fork`; `fail` fails them), and `recall` names
   the messages the fork's source had ("Remembered: hello"), from the history path. With
-  `MOCK_RESUME` it resumes sessions (`session/resume`, no replay; `fail` fails them). Its
+  `MOCK_RESUME` it resumes sessions (`session/resume`, no replay; `fail` fails them). With
+  `MOCK_ACP_V2` it speaks ACP v2 to a client that asks for it, as Claude Agent's v2 surface
+  does (`reject` refuses v2 with `-32022`, as an agent of v1 only does). Its
   `mcp-servers` prompt names the MCP servers its session got ("MCP servers: github,
   linear (http)"), and with `MOCK_MCP_HTTP` it announces that it takes HTTP ones. With
   `MOCK_MCP_ACP` it takes MCP servers on its ACP connection (MCP-over-ACP), and its `mcp`

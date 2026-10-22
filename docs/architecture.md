@@ -139,7 +139,7 @@ runs in `agentz-server`, not the app.
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), the editors a folder opens in (`editors.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`), cloud providers and their machines (`cloud.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `cloud` | Cloud providers' CLIs: finding each one, running it and reading what it prints (`proton.rs`, `ssh_config.rs`). |
-| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`). `test_support/mock_agent.py` is the scripted test agent. |
+| `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`); ACP v2 under the SDK's v1 connection (`acp_v2.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
 | `paths` | Data locations (`AGENTZ_DATA_DIR` overrides). |
@@ -1041,7 +1041,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   take one prompt at a time, so Steer moves the message to the front and waits for the step
   the agent is on (`ThreadState::steering_queued`): once no tool call since the last message is
   running (or it asks for permission), the server cancels the turn and the queue sends the
-  message. Editing or removing the front message disarms it.
+  message. Editing or removing the front message disarms it. On ACP v2 every agent takes
+  Steer, as a prompt of its own (see ACP v2).
 - **Retry** (`AgentThread::retry_message`, `Request::RetryMessage`, `ThreadState::failed_message`,
   `agent_view.rs`'s `render_not_sent`; Zed's `retry_button`; login round topic 5, chat apps'
   "Not Delivered"): a message the agent didn't get through fails rather than waiting, and is
@@ -1065,8 +1066,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   AIR's `asyncTasks` (`_meta.jetbrains.air`). Its `async_task_*` session updates, which ACP's
   types don't read, are caught raw (`background_task_update`) into
   `ThreadState::background_tasks`, shown in the activity bar with how long each has run and
-  Stop (`Request::StopBackgroundTask`, the `_session/async_task/stop` request). Being AIR also
-  means read and search results come without the file's text, and that its subagents run in
+  Stop (`Request::StopBackgroundTask`, the `_session/async_task/stop` request; not on ACP v2).
+  Being AIR also means read and search results come without the file's text, and that its subagents run in
   sessions of their own (AIR's `nativeSubagentSessions`; see Agents' own subagents).
 - **Work after a turn** (`AgentThread::{starts_own_work, end_own_work}`): when a background
   task ends, Claude Agent goes on with no prompt. A message, thought or tool call while no turn
@@ -1098,8 +1099,32 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   mid-wake, where it folds it into its work and never answers the prompt. One left from an
   earlier turn (a dev server) doesn't hold later turns. Once awake with what its background
   work brought, Droid may pause for most of a minute as it writes its next call, so that work
-  ends only after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`).
-- **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
+  ends only after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`). On ACP v2 none of this is
+  inferred: the agent's `state_update` says when its work starts and ends (see ACP v2).
+- **ACP v2** (`agent_thread/src/acp_v2.rs`, `wire.rs`; Zed's `agent_servers/src/acp/v2.rs`,
+  without its `acp-beta` flag): agentZ asks every agent for v2 in `initialize` and speaks v1
+  with the SDK, rewriting each message between the two as it passes the wire (`Translator`).
+  An agent that answers v1 goes on unchanged on the same connection; one that refuses v2 with
+  `-32022` (Zed's `v1_only_mismatch`) gets a new process spoken to in v1. Of the installed
+  agents only Claude Agent has a v2 surface (0.94.0, behind `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2`,
+  which its description sets). On v2 a load is `session/resume` with `replayFrom` (whole
+  messages, replayed as v1's chunks), logins are `auth/login` and `auth/logout`, config options
+  go by `configId`, tool calls come as patches (`tool_call_update`, content chunks, and the
+  agent's own terminals, shown by their output), plans whole, and permission requests about a
+  subject. A prompt's answer there only says it was taken in, so the SDK gets v1's answer at
+  the `idle` `state_update` that ends its turn. The thread works as the agent reports
+  (`AgentThread::agent_state_reported`): what it starts with no prompt (going on once a
+  background task ended) is work of its own until its `idle`, and a background task doesn't
+  hold the turn (the inference above is off), so a dev server left running leaves the thread
+  idle. `AgentThread::is_waiting` is then false, while
+  `has_background_work` still keeps the agent from being stopped and the machine awake.
+  Steer shows for every agent on v2 and sends the message as a prompt of its own, marked for
+  the wire (`agentz/steered`); it shows in the thread once the agent takes it in (its
+  `user_message`, which the wire reports as `_agentz/prompt_taken`), and the thread works on
+  until then. Claude takes it in once the turn ends, and one cancelled before goes after the
+  turn. Background tasks have no Stop there (Claude's v2 doesn't serve
+  `_session/async_task/stop`). A handoff carries the translator's state with the wire.
+  `mock_agent.py` speaks v2 with `MOCK_ACP_V2`.- **Stop** (`AgentThread::{cancel, end_unanswered_turn, restart_stopped_agent}`; Zed's
   `cancel_inner` ends the turn at once): Stop sends `session/cancel` and the turn ends when the
   agent answers its prompt as cancelled. One that hasn't answered 5 seconds later
   (`STOP_TIMEOUT`) ends as stopped all the same, its running tool calls Stopped, and the agent
@@ -1931,7 +1956,8 @@ Designed in `design/sounds/` and `design/notifications/`.
   or a subthread's), `awaiting_input_threads` (a request for input waiting),
   `waiting_threads` (`Server::is_waiting`: the turn ended with a background task running, or
   within 15 seconds of one ending by itself, while the agent is due to go on with its result,
-  `AgentThread::is_waiting`; or with subthreads whose end it hasn't heard of), and each
+  `AgentThread::is_waiting`, never on ACP v2; or with subthreads whose end it hasn't heard
+  of), and each
   thread's `completed_at`, set once it's neither working nor waiting, so a thread completes
   (and its sound plays) once its work is over, not as each subthread's result reaches it.
   Each client
@@ -2349,7 +2375,8 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   thread's wire between lines, then sends a marker through the SDK; once the thread sees it,
   everything read before is applied. A thread whose session is open, waiting on nothing but
   its turn, goes in the manifest (its `ThreadView`, session, MCP token, the turn's request id,
-  the agent's unanswered requests and partial lines) with its stdin, stdout and stderr after
+  the agent's unanswered requests and partial lines, and on ACP v2 what's in flight between
+  the protocols and the agent's reported state) with its stdin, stdout and stderr after
   the PTYs, its ACP terminals too. The new server opens a new SDK connection on the pipes
   without `initialize` or loading the session, receives the unanswered requests again (a
   waiting permission shows again), and takes the turn's answer out of the wire, ending the
