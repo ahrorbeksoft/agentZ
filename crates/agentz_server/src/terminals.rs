@@ -42,6 +42,8 @@ use futures::channel::oneshot;
 use polling::{Event as PollEvent, PollMode, Poller};
 use serde::{Deserialize, Serialize};
 
+mod links;
+
 /// t3code keeps 5,000 lines of scrollback.
 const SCROLLBACK_LINES: usize = 5_000;
 /// How often an adopted terminal's process is checked for, since it isn't this server's child
@@ -924,6 +926,9 @@ impl Terminal {
         {
             line.runs.push(run);
         }
+        for (line, links) in rows.iter_mut().zip(links::screen_links(&*term)) {
+            line.links = links;
+        }
 
         let cursor = (content.cursor.shape != AlacCursorShape::Hidden)
             .then(|| {
@@ -1035,6 +1040,8 @@ fn style_from_cell(cell: &alacritty_terminal::term::cell::Cell) -> TerminalStyle
     set(cell.flags.intersects(Flags::DIM), TerminalStyle::DIM);
     set(cell.flags.contains(Flags::HIDDEN), TerminalStyle::HIDDEN);
     set(cell.flags.contains(Flags::WIDE_CHAR), TerminalStyle::WIDE);
+    // Zed underlines the hyperlinks a program sets.
+    set(cell.hyperlink().is_some(), TerminalStyle::UNDERLINE);
     TerminalStyle {
         foreground: color_from_alacritty(cell.fg),
         background: color_from_alacritty(cell.bg),

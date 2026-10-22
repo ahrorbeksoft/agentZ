@@ -10,8 +10,8 @@ use agentz_protocol::terminal_keys::{self, Keystroke as TerminalKeystroke};
 use anyhow::Result;
 use gpui::{
     Action, App, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent,
-    Subscription, Task, TouchPhase, Window, actions, px,
+    Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, Subscription, Task, TouchPhase, Window, actions, px,
 };
 use text_input::{TextInput, TextInputEvent};
 use ui::{Tooltip, prelude::*};
@@ -19,7 +19,7 @@ use util::ResultExt as _;
 
 use crate::app_settings::AppSettingsStore;
 use crate::controls::text_field;
-use crate::terminal_element::{self, GridLayout, TerminalElement, TerminalMode};
+use crate::terminal_element::{self, GridLayout, HoveredLink, TerminalElement, TerminalMode};
 use crate::terminal_entity::Terminal;
 use crate::terminal_mouse::{
     SelectionSide, alt_scroll, grid_point, grid_point_and_side, mouse_button_report,
@@ -216,6 +216,12 @@ pub struct TerminalView {
     /// views can be made without a window, as a thread's tool calls make them.
     was_focused: bool,
     find_bar: Option<FindBar>,
+    /// The link under the mouse while Cmd (Ctrl) is held, and where the mouse is, to find it
+    /// again as the screen changes.
+    hovered_link: Option<HoveredLink>,
+    link_position: Option<Point<Pixels>>,
+    /// The link a Cmd-press (Ctrl-press) was on: released on it, it opens.
+    mouse_down_link: Option<HoveredLink>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -233,6 +239,9 @@ impl TerminalView {
         let subscriptions = vec![
             cx.observe(&terminal, |this, _, cx| {
                 this.find_again(cx);
+                if let Some(position) = this.link_position {
+                    this.hovered_link = this.link_at(position, cx);
+                }
                 cx.notify();
             }),
             cx.on_release(move |_, cx| {
@@ -253,6 +262,9 @@ impl TerminalView {
             last_mouse: None,
             was_focused: false,
             find_bar: None,
+            hovered_link: None,
+            link_position: None,
+            mouse_down_link: None,
             _subscriptions: subscriptions,
         }
     }
@@ -613,7 +625,63 @@ impl TerminalView {
         self.selecting
     }
 
+    pub(crate) fn hovered_link(&self) -> Option<&HoveredLink> {
+        self.hovered_link.as_ref()
+    }
+
+    /// The link at a position in the window, if the grid is drawn there.
+    fn link_at(&self, position: Point<Pixels>, cx: &App) -> Option<HoveredLink> {
+        if !self.grid?.bounds.bounds.contains(&position) {
+            return None;
+        }
+        let point = self.point(position, cx)?;
+        let row = u16::try_from(point.line + self.display_offset(cx) as i32).ok()?;
+        terminal_element::link_at(self.terminal.read(cx).frame()?, row, point.column)
+    }
+
+    /// Zed's `schedule_find_hyperlink`: a link shows under the mouse while Cmd (Ctrl) is held,
+    /// and not while selecting.
+    fn hover_link(
+        &mut self,
+        modifiers: Modifiers,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let link = (modifiers.secondary() && !self.selecting)
+            .then(|| self.link_at(position, cx))
+            .flatten();
+        self.link_position = link.is_some().then_some(position);
+        if self.hovered_link != link {
+            self.hovered_link = link;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn modifiers_changed(
+        &mut self,
+        modifiers: Modifiers,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hover_link(modifiers, window.mouse_position(), cx);
+    }
+
+    pub(crate) fn leave_link(&mut self, cx: &mut Context<Self>) {
+        self.link_position = None;
+        if self.hovered_link.take().is_some() {
+            cx.notify();
+        }
+    }
+
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // As Zed's `open_links_in_mouse_mode`, on by default, also while the program takes the
+        // mouse: the press isn't reported to it.
+        if event.button == MouseButton::Left && event.modifiers.secondary() {
+            self.mouse_down_link = self.link_at(event.position, cx);
+            if self.mouse_down_link.is_some() {
+                return;
+            }
+        }
         if self.mouse_mode(event.modifiers.shift, cx) {
             let Some(point) = self.point(event.position, cx) else {
                 return;
@@ -667,6 +735,15 @@ impl TerminalView {
         if self.mouse_mode(event.modifiers.shift, cx) {
             return;
         }
+        let on_pressed_link = self
+            .mouse_down_link
+            .as_ref()
+            .map(|link| self.link_at(event.position, cx).as_ref() == Some(link));
+        match on_pressed_link {
+            Some(true) => return,
+            Some(false) => self.mouse_down_link = None,
+            None => {}
+        }
         // Ignore tiny pointer movements so that a click that jitters by a
         // pixel or two (e.g. the window-focusing click) does not begin a
         // selection.
@@ -707,6 +784,11 @@ impl TerminalView {
 
     pub(crate) fn mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         if !self.mouse_mode(event.modifiers.shift, cx) {
+            self.hover_link(event.modifiers, event.position, cx);
+            return;
+        }
+        // The program never saw the press on a link, so it sees none of that click.
+        if self.mouse_down_link.is_some() {
             return;
         }
         let Some((point, side)) = self.point_and_side(event.position, cx) else {
@@ -724,16 +806,38 @@ impl TerminalView {
     }
 
     pub(crate) fn mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if self.mouse_mode(event.modifiers.shift, cx)
-            && let Some(point) = self.point(event.position, cx)
-        {
-            let modes = self.modes(cx);
-            if let Some(bytes) =
-                mouse_button_report(point, event.button, event.modifiers, false, modes)
-            {
-                self.write(bytes, cx);
+        let mouse_mode = self.mouse_mode(event.modifiers.shift, cx);
+        if let Some(pressed) = self.mouse_down_link.take() {
+            let on_link = self.link_at(event.position, cx).as_ref() == Some(&pressed);
+            if on_link {
+                cx.open_url(&pressed.url);
+            }
+            if on_link || mouse_mode {
+                self.end_click();
+                return;
             }
         }
+        if mouse_mode {
+            if let Some(point) = self.point(event.position, cx) {
+                let modes = self.modes(cx);
+                if let Some(bytes) =
+                    mouse_button_report(point, event.button, event.modifiers, false, modes)
+                {
+                    self.write(bytes, cx);
+                }
+            }
+        } else if event.button == MouseButton::Left
+            && !self.selecting
+            && let Some(link) = self.link_at(event.position, cx)
+            && (link.explicit || event.modifiers.secondary())
+        {
+            // Zed opens a link the program set with a plain click.
+            cx.open_url(&link.url);
+        }
+        self.end_click();
+    }
+
+    fn end_click(&mut self) {
         self.selecting = false;
         self.last_mouse = None;
         self.mouse_down_position = None;
@@ -963,6 +1067,10 @@ impl Render for TerminalView {
             .on_action(|_: &ResetFontSize, _, cx| change_font_size(None, cx))
             .on_action(cx.listener(Self::select_all))
             .on_key_down(cx.listener(Self::key_down))
+            .when_some(
+                self.hovered_link.as_ref().map(|link| link.url.clone()),
+                |this, url| this.tooltip(Tooltip::text(url)),
+            )
             .child(TerminalElement::new(
                 self.terminal.clone(),
                 cx.entity(),
@@ -1006,7 +1114,10 @@ fn change_font_size(step: Option<f32>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::terminal::{TerminalFrame, TerminalKey, TerminalPoint, TerminalSelection};
+    use agentz_protocol::terminal::{
+        TerminalFrame, TerminalKey, TerminalLine, TerminalLink, TerminalPoint, TerminalRun,
+        TerminalSelection, TerminalStyle,
+    };
     use agentz_protocol::{Request, Response};
     use gpui::{TestAppContext, VisualTestContext};
     use projects::ThreadId;
@@ -1049,6 +1160,108 @@ mod tests {
         assert_eq!(size(cx), terminal_element::MIN_FONT_SIZE);
         cx.simulate_keystrokes(crate::platform_keys("cmd-0", "ctrl-0"));
         assert_eq!(size(cx), terminal_element::DEFAULT_FONT_SIZE);
+    }
+
+    #[gpui::test]
+    fn cmd_click_opens_a_link_and_a_plain_click_one_the_program_set(cx: &mut TestAppContext) {
+        let line = |text: &str, link: TerminalLink| TerminalLine {
+            runs: vec![TerminalRun {
+                column: 0,
+                text: text.into(),
+                style: TerminalStyle::default(),
+            }],
+            links: vec![link],
+        };
+        let frame = TerminalFrame {
+            full: true,
+            columns: 40,
+            screen_lines: 4,
+            lines: vec![
+                (
+                    0,
+                    line(
+                        "Local: http://localhost:5173/",
+                        TerminalLink {
+                            start: 7,
+                            end: 29,
+                            url: "http://localhost:5173/".into(),
+                            explicit: false,
+                        },
+                    ),
+                ),
+                (
+                    1,
+                    line(
+                        "docs",
+                        TerminalLink {
+                            start: 0,
+                            end: 4,
+                            url: "https://zed.dev/docs".into(),
+                            explicit: true,
+                        },
+                    ),
+                ),
+            ],
+            ..TerminalFrame::default()
+        };
+        let terminal = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, _| {
+                client.answer_for_test(move |request| match request {
+                    Request::SubscribeTerminal(_) => Some(Response::TerminalFrame(frame.clone())),
+                    _ => None,
+                })
+            });
+            Terminal::shared(&client, TerminalKey::Drawer(ThreadId(1)), cx)
+        });
+        let (view, cx) =
+            cx.add_window_view(|_, cx| TerminalView::new(terminal, TerminalMode::Scrollable, cx));
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle(cx), cx)
+        });
+        cx.run_until_parked();
+        let cell = |cx: &mut VisualTestContext, row: f32, column: f32| {
+            view.read_with(cx, |view, _| {
+                let bounds = view.grid.expect("the grid is drawn").bounds;
+                bounds.bounds.origin
+                    + gpui::point(
+                        bounds.cell_width * (column + 0.5),
+                        bounds.line_height * (row + 0.5),
+                    )
+            })
+        };
+        let hovered = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.hovered_link().map(|link| link.url.clone())
+            })
+        };
+        let secondary = Modifiers::secondary_key();
+
+        // Over a link, holding Cmd (Ctrl) shows it.
+        let url = cell(cx, 0., 10.);
+        cx.simulate_mouse_move(url, None, Modifiers::none());
+        assert_eq!(hovered(cx), None);
+        cx.simulate_modifiers_change(secondary);
+        assert_eq!(hovered(cx).as_deref(), Some("http://localhost:5173/"));
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert_eq!(hovered(cx), None);
+
+        // A plain click on a URL in the text doesn't open it; Cmd-click (Ctrl-click) does.
+        cx.simulate_click(url, Modifiers::none());
+        assert_eq!(cx.opened_url(), None);
+        cx.simulate_click(url, secondary);
+        assert_eq!(cx.opened_url().as_deref(), Some("http://localhost:5173/"));
+
+        // A link the program set opens with a plain click.
+        let docs = cell(cx, 1., 1.);
+        cx.simulate_click(docs, Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://zed.dev/docs"));
     }
 
     #[gpui::test]

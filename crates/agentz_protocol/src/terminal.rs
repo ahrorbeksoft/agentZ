@@ -169,6 +169,21 @@ pub struct TerminalRun {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalLine {
     pub runs: Vec<TerminalRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<TerminalLink>,
+}
+
+/// A link on a screen line, over columns `start..end`, as Zed's terminal finds them: a URL in
+/// the text, or a hyperlink the program set (OSC 8). One that wraps onto the next line is a
+/// link on each, with the same `url`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalLink {
+    pub start: u16,
+    pub end: u16,
+    pub url: String,
+    /// The program set it (OSC 8), so a plain click opens it too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

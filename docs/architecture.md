@@ -2215,6 +2215,16 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
   reads "n/total"; Enter and Shift-Enter step through, wrapping; Escape closes. It searches
   again as the output moves, one search at a time, and keeps the selected match. The bar sits
   outside the terminal's key context so its keys don't reach the shell.
+- **Links** (`terminals/links.rs`, `terminal_element::link_at`, `TerminalView::hover_link`;
+  Zed's `hyperlinks.rs` and its terminal's mouse handling): the server finds each screen
+  line's links as it draws the frame (`TerminalLine::links`): hyperlinks the program set (OSC
+  8, always underlined, as Zed does) and URLs in the text, with Zed's regex and its trimming of
+  trailing punctuation, followed across wrapped lines (up to 20 past the screen's edges).
+  Zed's file paths aren't found, since there's no editor to open them in. Holding Cmd (Ctrl)
+  over a link draws it in `link_text_hover`, underlined, with a pointing hand and its URL as
+  a tooltip; Cmd-click (Ctrl-click) opens it in the browser, also while the program takes the
+  mouse (Zed's `open_links_in_mouse_mode`, on by default), without reporting that click to
+  it. A plain click opens a link the program set.
 - **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
   Thread; Cmd-W closes one as it closes a Workspaces pane, deleting the thread and asking first
   while a program runs in front of its shell, as does the × at the right end of its header,

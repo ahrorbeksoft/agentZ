@@ -5,15 +5,15 @@
 //! because there's no editor to borrow them from.
 
 use agentz_protocol::terminal::{
-    TerminalColor, TerminalCursorShape, TerminalFrame, TerminalModes, TerminalRange, TerminalRun,
-    TerminalStyle,
+    TerminalColor, TerminalCursorShape, TerminalFrame, TerminalLink, TerminalModes, TerminalRange,
+    TerminalRun, TerminalStyle,
 };
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, Entity, FocusHandle,
     Font, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, InputHandler,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, MouseButton, MouseMoveEvent, Pixels,
-    Point, Rgba, ShapedLine, StrikethroughStyle, TextRun, UTF16Selection, UnderlineStyle, Window,
-    fill, outline, point, px, relative, size,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point, Rgba, ShapedLine, StrikethroughStyle, TextRun, UTF16Selection,
+    UnderlineStyle, Window, fill, outline, point, px, relative, size,
 };
 use theme::{ActiveTheme as _, Theme};
 use ui::utils::ensure_minimum_contrast;
@@ -98,6 +98,8 @@ pub struct LayoutState {
     font: Font,
     font_size: Pixels,
     foreground: Hsla,
+    /// A link is under the mouse with Cmd (Ctrl) held, so the pointer is a hand.
+    over_link: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -332,12 +334,13 @@ pub struct GridStyle {
     pub minimum_contrast: f32,
 }
 
-/// Lays out screen rows `rows` of the frame, drawn from line 0.
+/// Lays out screen rows `rows` of the frame, drawn from line 0, with `link` in its color.
 pub fn layout_grid(
     frame: &TerminalFrame,
     rows: std::ops::Range<u16>,
     grid_style: &GridStyle,
     theme: &Theme,
+    link: Option<(&HoveredLink, Hsla)>,
 ) -> (
     Vec<LayoutRect>,
     Vec<BatchedTextRun>,
@@ -389,7 +392,18 @@ pub fn layout_grid(
                     continue;
                 }
                 let first_char = cell.text.chars().next().unwrap_or(' ');
-                let cell_style = cell_style(first_char, style, fg, bg, theme, grid_style);
+                let mut cell_style = cell_style(first_char, style, fg, bg, theme, grid_style);
+                // Zed's link style for the link under the mouse.
+                if let Some((link, color)) = link
+                    && link.covers(row, cell.column)
+                {
+                    cell_style.color = color;
+                    cell_style.underline = Some(UnderlineStyle {
+                        color: Some(color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    });
+                }
                 let cell_point = LayoutPoint::new(display_line, cell.column as i32);
                 if collect_block_element_regions(
                     cell_point,
@@ -910,6 +924,64 @@ fn character_at(frame: &TerminalFrame, row: u16, column: u16) -> Option<(String,
     })
 }
 
+/// A link under the mouse, on each screen row it's on: one that wraps is on several.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoveredLink {
+    pub url: String,
+    /// The program set it (OSC 8), so a plain click opens it too.
+    pub explicit: bool,
+    /// The screen rows it's on, with its columns on each.
+    pub parts: Vec<(u16, std::ops::Range<u16>)>,
+}
+
+impl HoveredLink {
+    fn covers(&self, row: u16, column: u16) -> bool {
+        self.parts
+            .iter()
+            .any(|(part_row, columns)| *part_row == row && columns.contains(&column))
+    }
+}
+
+/// The link at a screen cell, with the rest of it on the rows it wraps across.
+pub fn link_at(frame: &TerminalFrame, row: u16, column: u16) -> Option<HoveredLink> {
+    let link = frame
+        .line(row)?
+        .links
+        .iter()
+        .find(|link| (link.start..link.end).contains(&column))?;
+    let part_on = |row: u16, matches: &dyn Fn(&TerminalLink) -> bool| {
+        frame.line(row).and_then(|line| {
+            line.links
+                .iter()
+                .find(|other| other.url == link.url && matches(other))
+        })
+    };
+    let mut parts = vec![(row, link.start..link.end)];
+    let (mut part, mut part_row) = (link, row);
+    while part.start == 0 && part_row > 0 {
+        let Some(above) = part_on(part_row - 1, &|other| other.end == frame.columns) else {
+            break;
+        };
+        part_row -= 1;
+        parts.insert(0, (part_row, above.start..above.end));
+        part = above;
+    }
+    let (mut part, mut part_row) = (link, row);
+    while part.end == frame.columns && part_row + 1 < frame.screen_lines {
+        let Some(below) = part_on(part_row + 1, &|other| other.start == 0) else {
+            break;
+        };
+        part_row += 1;
+        parts.push((part_row, below.start..below.end));
+        part = below;
+    }
+    Some(HoveredLink {
+        url: link.url.clone(),
+        explicit: link.explicit,
+        parts,
+    })
+}
+
 /// The selection as one rectangle per line, relative to the grid's origin.
 fn selection_rects(
     frame: &TerminalFrame,
@@ -1075,6 +1147,8 @@ impl TerminalElement {
                 }
                 if hovered {
                     view.update(cx, |view, cx| view.mouse_move(event, cx));
+                } else if view.read(cx).hovered_link().is_some() {
+                    view.update(cx, |view, cx| view.leave_link(cx));
                 }
             }
         });
@@ -1287,6 +1361,7 @@ impl Element for TerminalElement {
                         font: metrics.font,
                         font_size: metrics.font_size,
                         foreground: theme.colors().terminal_foreground,
+                        over_link: false,
                     };
                 };
 
@@ -1320,6 +1395,16 @@ impl Element for TerminalElement {
                     })
                 });
 
+                // As Zed shows a link, only while Cmd (Ctrl) is held.
+                let hovered_link = window
+                    .modifiers()
+                    .secondary()
+                    .then(|| self.view.read(cx).hovered_link().cloned())
+                    .flatten();
+                let link = hovered_link
+                    .as_ref()
+                    .map(|link| (link, theme.colors().link_text_hover));
+
                 // Only lay out the rows the parent shows, as inside a scrolling thread.
                 let visible_bounds = window.content_mask().bounds.intersect(&dimensions.bounds);
                 let (rects, batched_text_runs, block_element_rects) = if visible_bounds.size.height
@@ -1328,7 +1413,7 @@ impl Element for TerminalElement {
                 {
                     (Vec::new(), Vec::new(), Vec::new())
                 } else {
-                    layout_grid(&frame, rows, &grid_style, &theme)
+                    layout_grid(&frame, rows, &grid_style, &theme, link)
                 };
 
                 let match_rects = match_rects(
@@ -1409,6 +1494,7 @@ impl Element for TerminalElement {
                     font: metrics.font,
                     font_size: metrics.font_size,
                     foreground: theme.colors().terminal_foreground,
+                    over_link: hovered_link.is_some(),
                 }
             },
         )
@@ -1435,7 +1521,12 @@ impl Element for TerminalElement {
             };
 
             self.register_mouse_listeners(&layout.hitbox, window);
-            window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
+            let cursor_style = if layout.over_link {
+                gpui::CursorStyle::PointingHand
+            } else {
+                gpui::CursorStyle::IBeam
+            };
+            window.set_cursor_style(cursor_style, &layout.hitbox);
 
             let cursor = layout.cursor.take();
             self.interactivity.paint(
@@ -1447,6 +1538,17 @@ impl Element for TerminalElement {
                 cx,
                 |_, window, cx| {
                     window.handle_input(&self.focus, input_handler, cx);
+                    window.on_key_event({
+                        let view = self.view.clone();
+                        move |event: &ModifiersChangedEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
+                            }
+                            view.update(cx, |view, cx| {
+                                view.modifiers_changed(event.modifiers, window, cx)
+                            });
+                        }
+                    });
 
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
@@ -1738,6 +1840,7 @@ mod tests {
     fn character_at_finds_the_cell_under_a_column() {
         let frame = frame(vec![TerminalLine {
             runs: vec![run(0, "ab", 0), run(2, "漢", TerminalStyle::WIDE)],
+            ..TerminalLine::default()
         }]);
         assert_eq!(character_at(&frame, 0, 1), Some(("b".to_string(), 1)));
         assert_eq!(character_at(&frame, 0, 3), Some(("漢".to_string(), 2)));
@@ -1745,13 +1848,48 @@ mod tests {
     }
 
     #[test]
+    fn a_link_under_the_mouse_takes_the_rows_it_wraps_across() {
+        let line = |links: &[(u16, u16, &str)]| TerminalLine {
+            links: links
+                .iter()
+                .map(|&(start, end, url)| TerminalLink {
+                    start,
+                    end,
+                    url: url.to_string(),
+                    explicit: false,
+                })
+                .collect(),
+            ..TerminalLine::default()
+        };
+        let wrapped = "https://example.com/a";
+        let frame = frame(vec![
+            line(&[(0, 10, "https://other.dev")]),
+            line(&[(3, 10, wrapped)]),
+            line(&[(0, 10, wrapped)]),
+            line(&[(0, 4, wrapped), (5, 10, "https://next.dev")]),
+        ]);
+        let parts = vec![(1, 3..10), (2, 0..10), (3, 0..4)];
+        for (row, column) in [(1, 3), (2, 5), (3, 0)] {
+            let link = link_at(&frame, row, column).expect("a link");
+            assert_eq!((link.url.as_str(), &link.parts), (wrapped, &parts));
+        }
+        assert_eq!(link_at(&frame, 1, 2), None);
+        assert_eq!(
+            link_at(&frame, 3, 6).map(|link| link.parts),
+            Some(vec![(3, 5..10)])
+        );
+    }
+
+    #[test]
     fn inline_rows_end_at_the_last_output() {
         let mut frame = frame(vec![
             TerminalLine {
                 runs: vec![run(0, "one", 0)],
+                ..TerminalLine::default()
             },
             TerminalLine {
                 runs: vec![run(0, "two", 0)],
+                ..TerminalLine::default()
             },
             TerminalLine::default(),
             TerminalLine::default(),
