@@ -142,11 +142,6 @@ agentZ's transcript (`transcripts/535.json`) and the server log, which agree. It
 reproduced with the real Droid, since that means sending it prompts; the mock's `lost-turn`
 loses a turn as Droid does.
 
-### Factory Droid threads don't get an automatic title
-
-Auto title generation is not working on Droid, but Regenerate Title renames the thread
-correctly. Maybe enable it for every agent when it's enabled in the settings.
-
 ## Features
 
 ### Artifacts move with their thread to another machine

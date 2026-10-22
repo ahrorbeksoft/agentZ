@@ -10111,7 +10111,7 @@ async fn regenerates_a_title_on_request() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn titles_threads_their_agent_does_not_name() {
+async fn titles_threads_once_their_first_turn_ends() {
     use agentz_protocol::title_generation::{TitleGeneration, TitleProvider};
 
     let Some(command) = mock_agent() else {
@@ -10165,9 +10165,14 @@ async fn titles_threads_their_agent_does_not_name() {
         })
         .await;
 
-    // The agent's own title is kept, and so is the user's.
+    // The agent's own title is replaced, but not the user's.
     let agent_named = client.create_thread(&server).await;
     prompt_and_wait(&mut client, agent_named, "demo").await;
+    client
+        .wait_until(|client| {
+            thread_title(client, agent_named).as_deref() == Some("Login Redirect Fix")
+        })
+        .await;
     let user_named = client.create_thread(&server).await;
     client
         .ok(Request::RenameThread {
@@ -10185,8 +10190,8 @@ async fn titles_threads_their_agent_does_not_name() {
         })
         .await;
     let calls = title_cli_calls(clis.path());
-    let [call] = calls.as_slice() else {
-        panic!("expected one call, got {calls:#?}");
+    let [_, call] = calls.as_slice() else {
+        panic!("expected two calls, got {calls:#?}");
     };
     let args: Vec<&str> = call["args"]
         .as_array()
@@ -10221,16 +10226,43 @@ async fn titles_threads_their_agent_does_not_name() {
         call["cwd"].as_str().map(PathBuf::from),
         Some(server.project_dir.path().to_path_buf())
     );
-    assert_eq!(
-        thread_title(&client, agent_named).as_deref(),
-        Some("Checkout page with pay button")
-    );
     assert_eq!(thread_title(&client, user_named).as_deref(), Some("Mine"));
     assert_eq!(thread_title(&client, unnamed).as_deref(), Some("hello"));
 
     // Once a thread: its next turns keep the title.
     prompt_and_wait(&mut client, thread_id, "hello again").await;
-    assert_eq!(title_cli_calls(clis.path()).len(), 1);
+    assert_eq!(title_cli_calls(clis.path()).len(), 2);
+
+    // A message queued while the first turn works goes as it ends, and the title is still the
+    // first message's.
+    let queued = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(queued);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("slow"),
+        })
+        .await;
+    client
+        .wait_until(|client| client.thread(connection).is_working())
+        .await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("and then this"),
+        })
+        .await;
+    client
+        .wait_until(|client| thread_title(client, queued).as_deref() == Some("Login Redirect Fix"))
+        .await;
+    let calls = title_cli_calls(clis.path());
+    assert!(
+        calls[2]["stdin"]
+            .as_str()
+            .is_some_and(|prompt| prompt.ends_with("User message:\nslow")),
+        "{calls:#?}"
+    );
 
     // Claude, with the chosen model and effort, as t3code runs it.
     client

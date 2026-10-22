@@ -355,9 +355,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Settings › General › Thread titles; t3code's text generation): off by default, and kept per
   machine in `title-generation.json`. Once on, after a thread's first turn, the server asks
   the chosen CLI on its `PATH` (Codex, Claude or `agy`) for a title from the first message,
-  with t3code's prompt, output schema and arguments, run in an empty temporary folder. Only
-  threads whose agent never set a title (ACP's `session_info_update`) and the user didn't
-  rename get one, once each, as their automatic title. The server looks for the CLIs at
+  with t3code's prompt, output schema and arguments, run in an empty temporary folder. Every
+  agent's threads the user didn't rename get one, once each, as their automatic title, from
+  their first non-empty message (one queued as the first turn ended counts too); it replaces a
+  title the agent set (ACP's `session_info_update`, which Factory Droid sends), and the
+  agent's later titles don't replace it (`Server::takes_agents_title`). The server looks for the CLIs at
   start and whenever the setting changes, with Codex's models from `codex debug models` and
   the others' from t3code's lists; the page picks the provider, model and reasoning effort.
   While it's on, Regenerate Title (t3code's Regenerate title, after Rename in a card's menu

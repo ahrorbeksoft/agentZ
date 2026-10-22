@@ -1,6 +1,6 @@
-//! Titles written by a CLI ([`crate::title_generation`]) for threads whose agent gives them
-//! none: once each, after the thread's first turn, unless the user has named it, and again
-//! whenever the user asks.
+//! Titles written by a CLI ([`crate::title_generation`]) for every agent's threads, over any
+//! title the agent gives: once each, after the thread's first turn, unless the user has named
+//! it, and again whenever the user asks.
 
 use agentz_protocol::Response;
 use agentz_protocol::thread::{Entry, without_handoff};
@@ -33,15 +33,16 @@ impl Server {
         );
     }
 
-    pub(super) fn agent_titled_thread(&mut self, thread_id: ThreadId) {
-        self.agent_titled_threads.insert(thread_id);
+    /// Whether the agent's own title for the thread should show: not once one was generated.
+    pub(super) fn takes_agents_title(&self, thread_id: ThreadId) -> bool {
+        !self.generated_titles.contains(&thread_id)
     }
 
-    /// Asks the chosen CLI for a title once the thread's first turn has ended.
+    /// Asks the chosen CLI for a title, from the thread's first message, once its first turn
+    /// has ended.
     pub(super) fn title_after_first_turn(&mut self, thread_id: ThreadId) {
         let settings = self.title_generation.settings.clone();
         if !settings.enabled
-            || self.agent_titled_threads.contains(&thread_id)
             || self.generated_titles.contains(&thread_id)
             || self
                 .projects
@@ -53,26 +54,26 @@ impl Server {
         let Some(thread) = self.threads.get(&thread_id) else {
             return;
         };
-        let mut messages = thread.entries().iter().filter_map(|entry| match entry {
-            Entry::UserMessage(text) => Some(text),
-            _ => None,
-        });
-        let (Some(message), None) = (messages.next(), messages.next()) else {
+        // A message sent while the first turn worked may be in already, joined to the turn or
+        // sent as it ended.
+        let Some(message) = thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::UserMessage(text) => Some(without_handoff(text).trim()),
+                _ => None,
+            })
+            .find(|message| !message.is_empty())
+            .map(str::to_string)
+        else {
             return;
         };
-        let message = without_handoff(message).trim().to_string();
-        if message.is_empty() {
-            return;
-        }
         self.generated_titles.insert(thread_id);
         let search_path = self.title_generation_path.clone();
         self.spawn_then(
             title_generation::generate(settings, title_generation::prompt(&message), search_path),
             move |server, result| match result {
                 Ok(title) => {
-                    if server.agent_titled_threads.contains(&thread_id) {
-                        return;
-                    }
                     // Kept as the automatic title, so it never replaces the user's own.
                     server.projects.rename_thread(thread_id, title);
                     server.name_branch_after_title(thread_id);

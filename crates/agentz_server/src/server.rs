@@ -282,12 +282,11 @@ pub(crate) struct Server {
     spaces: SpaceStore,
     /// The kind of machine this is, as detected and as chosen.
     machine_icon: MachineIcon,
-    /// How threads their agent doesn't title are titled, and the CLIs found to do it.
+    /// How threads are titled, and the CLIs found to do it.
     title_generation: TitleGenerationState,
     title_generation_path: Option<std::ffi::OsString>,
-    /// Threads whose agent titled them, which a generated title doesn't replace.
-    agent_titled_threads: HashSet<ThreadId>,
-    /// Threads a title was generated for, or is being: once each.
+    /// Threads a title was generated for, or is being: once each, and then the agent's own
+    /// titles don't replace it.
     generated_titles: HashSet<ThreadId>,
     /// Days of inactivity after which threads are archived ([`Self::archive_stale_threads`]).
     auto_archive_days: Option<u32>,
@@ -491,7 +490,6 @@ impl Server {
             storage_sent: Storage::default(),
             cloud_revision_sent: 0,
             title_generation_path: config.title_generation_path,
-            agent_titled_threads: HashSet::default(),
             generated_titles: HashSet::default(),
             auto_archive_days,
             subthread_limit,
@@ -2493,10 +2491,11 @@ impl Server {
                     self.projects.set_session_login(thread_id, login)
                 }
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::TitleChanged(title)) => {
-                    self.projects
-                        .rename_thread(thread_id, thread_title_from_prompt(&title));
-                    self.agent_titled_thread(thread_id);
-                    self.name_branch_after_title(thread_id);
+                    if self.takes_agents_title(thread_id) {
+                        self.projects
+                            .rename_thread(thread_id, thread_title_from_prompt(&title));
+                        self.name_branch_after_title(thread_id);
+                    }
                 }
                 // Its first message, sent or queued, makes a draft a thread.
                 (ConnectionId::Thread(thread_id), AgentThreadEvent::FirstPrompt(title)) => {
