@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::machines::{MachineId, Machines, MachinesEvent, ProjectKey, Scope, ThreadKey};
 use crate::project_store::ThreadStatus;
 use agentz_protocol::accounts::AccountChoice;
-use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::agents::AgentId;
 use agentz_protocol::artifacts::{Artifact, ArtifactId, PageTheme};
 use agentz_protocol::cloud::CloudState;
 use agentz_protocol::layout::Node;
@@ -861,33 +861,7 @@ impl Shell {
     /// carries the user's last choice, or else the first installed.
     fn default_agent(&self, machine: MachineId, cx: &App) -> Option<AgentId> {
         let client = self.machines.read(cx).client(machine, cx)?;
-        let client = client.read(cx);
-        let registry = client.registry().read(cx);
-        let is_installed = |agent_id: &AgentId| {
-            matches!(
-                registry.install_state(agent_id),
-                InstallState::Installed { .. }
-            )
-        };
-        let last_used = client
-            .projects()
-            .read(cx)
-            .threads()
-            .iter()
-            .filter(|thread| thread.terminal.is_none() && thread.task.is_none())
-            .filter_map(|thread| {
-                let agent_id = AgentId::new(thread.agent_id.clone()?);
-                is_installed(&agent_id).then_some((thread.created_at, thread.id, agent_id))
-            })
-            .max_by_key(|(created_at, thread_id, _)| (*created_at, *thread_id))
-            .map(|(_, _, agent_id)| agent_id);
-        last_used.or_else(|| {
-            registry
-                .agents()
-                .iter()
-                .find(|agent| agent.supports_current_platform() && is_installed(agent.id()))
-                .map(|agent| agent.id().clone())
-        })
+        client.read(cx).default_agent(cx)
     }
 
     fn open_agent_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2796,6 +2770,7 @@ mod modal_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use agentz_protocol::agents::InstallState;
     use agentz_protocol::spaces::SpacesSnapshot;
     use gpui::{Modifiers, TestAppContext, point};
     use projects::{Project, ProjectId, ProjectsSnapshot};

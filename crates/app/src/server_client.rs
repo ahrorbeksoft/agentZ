@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
 use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts};
-use agentz_protocol::agents::{AgentId, AgentSettings, RegistrySnapshot};
+use agentz_protocol::agents::{AgentId, AgentSettings, InstallState, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
 };
@@ -312,6 +312,41 @@ impl ServerClient {
 
     pub fn is_online(&self) -> bool {
         self.status == MachineStatus::Online
+    }
+
+    pub fn is_installed(&self, agent_id: &AgentId, cx: &App) -> bool {
+        matches!(
+            self.registry.read(cx).install_state(agent_id),
+            InstallState::Installed { .. }
+        )
+    }
+
+    /// The agent a new draft on this machine starts with: that of its newest thread, as t3code
+    /// carries the user's last choice, or else the first installed.
+    pub fn default_agent(&self, cx: &App) -> Option<AgentId> {
+        let last_used = self
+            .projects
+            .read(cx)
+            .threads()
+            .iter()
+            .filter(|thread| thread.terminal.is_none() && thread.task.is_none())
+            .filter_map(|thread| {
+                let agent_id = AgentId::new(thread.agent_id.clone()?);
+                self.is_installed(&agent_id, cx)
+                    .then_some((thread.created_at, thread.id, agent_id))
+            })
+            .max_by_key(|(created_at, thread_id, _)| (*created_at, *thread_id))
+            .map(|(_, _, agent_id)| agent_id);
+        last_used.or_else(|| {
+            self.registry
+                .read(cx)
+                .agents()
+                .iter()
+                .find(|agent| {
+                    agent.supports_current_platform() && self.is_installed(agent.id(), cx)
+                })
+                .map(|agent| agent.id().clone())
+        })
     }
 
     /// The editors installed on this Mac, as last asked ([`Self::refresh_editors`]).

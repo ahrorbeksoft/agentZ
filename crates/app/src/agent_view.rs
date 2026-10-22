@@ -52,8 +52,9 @@ use projects::{
 use text_input::{ChipId, ChipPreview, CopiedChip, FittedImage, TextInput, TextInputEvent};
 use ui::{
     ButtonLike, Callout, Chip, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Disclosure,
-    IconPosition, LOOPING_ANIMATION_FPS, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
-    Severity, SpinnerLabel, Switch, ToggleState, Tooltip, WithScrollbar as _, prelude::*,
+    DocumentationAside, DocumentationSide, IconPosition, LOOPING_ANIMATION_FPS, PopoverMenu,
+    PopoverMenuHandle, ScrollAxes, Scrollbars, Severity, SpinnerLabel, Switch, ToggleState,
+    Tooltip, WithScrollbar as _, prelude::*,
 };
 use util::ResultExt as _;
 
@@ -81,7 +82,7 @@ use crate::controls::{ActionButton, ActionStyle, AgentIcon, account_fill_color};
 use crate::elicitation_card::{ElicitationCard, sync_elicitation_cards};
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::open_in_editor::{self, Choices, OpenWith};
-use crate::project_copies::{CopyRow, fetched_line, render_copy_row};
+use crate::project_copies::{CopyRow, render_copy_aside, render_copy_row};
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::project_switcher::compact_path;
@@ -13309,7 +13310,6 @@ impl AgentView {
         let machine = store.machine();
         let project_id = store.thread(self.thread_id)?.project_id;
         let agent_id = self.agent_id.clone()?;
-        let agent_name = self.agent_name(cx);
         let members = machines
             .group_of(machine, project_id, cx)
             .map(|group| group.members)
@@ -13328,17 +13328,7 @@ impl AgentView {
             .iter()
             .map(|(member_machine, project)| {
                 let client = machines.client(*member_machine, cx);
-                let unusable = match &client {
-                    Some(client) if client.read(cx).is_online() => {
-                        let registry = client.read(cx).registry().read(cx);
-                        let is_installed = matches!(
-                            registry.install_state(&agent_id),
-                            InstallState::Installed { .. }
-                        );
-                        (!is_installed).then(|| format!("{agent_name} isn't installed").into())
-                    }
-                    _ => Some("offline".into()),
-                };
+                let (unusable, uses_agent) = agent_on_machine(client.as_ref(), &agent_id, cx);
                 let key = ProjectKey {
                     machine: *member_machine,
                     project: project.id,
@@ -13361,6 +13351,7 @@ impl AgentView {
                     folder: folder.into(),
                     status,
                     unusable,
+                    uses_agent,
                     is_current: key == current,
                 };
                 (key, row)
@@ -13379,33 +13370,29 @@ impl AgentView {
                             let view = view.clone();
                             let project = *project;
                             let is_usable = row.unusable.is_none();
+                            let aside = row.status.clone().map(|status| {
+                                let row = row.clone();
+                                DocumentationAside::new(
+                                    DocumentationSide::Right,
+                                    Rc::new(move |_| {
+                                        render_copy_aside(&row, &status, SystemTime::now())
+                                    }),
+                                )
+                            });
                             let row = row.clone();
                             let first = first.clone();
                             menu = menu
-                                .custom_entry(
-                                    move |_, _| render_copy_row(&row, first.as_ref()),
+                                .custom_entry_with_docs(
+                                    move |_, cx| render_copy_row(&row, first.as_ref(), cx),
                                     move |_, cx| {
                                         view.update(cx, |view, cx| {
                                             view.change_new_thread_machine(project, cx)
                                         })
                                         .log_err();
                                     },
+                                    aside,
                                 )
                                 .selectable(is_usable);
-                        }
-                        let copies: Vec<CopyRow> =
-                            rows.iter().map(|(_, row)| row.clone()).collect();
-                        if let Some(fetched) = fetched_line(&copies, SystemTime::now()) {
-                            menu = menu.separator().custom_row(move |_, _| {
-                                div()
-                                    .max_w(px(330.))
-                                    .child(
-                                        Label::new(fetched.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .into_any_element()
-                            });
                         }
                         menu
                     }))
@@ -13432,28 +13419,19 @@ impl AgentView {
         }
         let machine = self.store.read(cx).machine();
         let agent_id = self.agent_id.clone()?;
-        let agent_name = self.agent_name(cx);
         let rows: Vec<(MachineId, CopyRow)> = machines
             .clients()
             .iter()
             .map(|client| {
-                let client = client.read(cx);
-                let member_machine = client.machine();
-                let unusable = if client.is_online() {
-                    let is_installed = matches!(
-                        client.registry().read(cx).install_state(&agent_id),
-                        InstallState::Installed { .. }
-                    );
-                    (!is_installed).then(|| format!("{agent_name} isn't installed").into())
-                } else {
-                    Some("offline".into())
-                };
+                let member_machine = client.read(cx).machine();
+                let (unusable, uses_agent) = agent_on_machine(Some(client), &agent_id, cx);
                 let row = CopyRow {
                     machine_icon: machines.machine_icon(member_machine, cx),
                     machine: machines.label(member_machine, cx),
                     folder: SharedString::default(),
                     status: None,
                     unusable,
+                    uses_agent,
                     is_current: member_machine == machine,
                 };
                 (member_machine, row)
@@ -13480,7 +13458,7 @@ impl AgentView {
                         let row = row.clone();
                         menu = menu
                             .custom_entry(
-                                move |_, _| render_copy_row(&row, None),
+                                move |_, cx| render_copy_row(&row, None, cx),
                                 move |_, cx| {
                                     view.update(cx, |view, cx| {
                                         view.change_new_thread_machine(chats, cx)
@@ -13798,13 +13776,26 @@ impl AgentView {
     }
 
     /// The thread moves to the project's checkout on another machine, in its own folder there,
-    /// on that machine's account for new threads: each machine has its own accounts.
+    /// on that machine's account for new threads: each machine has its own accounts. A machine
+    /// without the thread's agent gives it the one its own new threads start with.
     fn change_new_thread_machine(&mut self, project: ProjectKey, cx: &mut Context<Self>) {
         if Some(project) == self.current_project(cx) {
             return;
         }
-        let Some(agent_id) = self.agent_id.clone() else {
+        let (Some(agent_id), Some(client)) = (
+            self.agent_id.clone(),
+            Machines::global(cx).read(cx).client(project.machine, cx),
+        ) else {
             return;
+        };
+        let client = client.read(cx);
+        let agent_id = if client.is_installed(&agent_id, cx) {
+            agent_id
+        } else {
+            match client.default_agent(cx) {
+                Some(agent_id) => agent_id,
+                None => return,
+            }
         };
         self.replace_new_thread(
             project,
@@ -14293,6 +14284,36 @@ fn account_phrase(entry: &AccountEntry, starts_sentence: bool) -> String {
 enum PickerFor {
     NewThread,
     SentThread { can_switch: bool },
+}
+
+/// Whether a draft can move to `client`'s machine and, when that machine lacks `agent_id`, the
+/// agent it takes there, by its id and name: the one that machine's new threads start with.
+fn agent_on_machine(
+    client: Option<&Entity<ServerClient>>,
+    agent_id: &AgentId,
+    cx: &App,
+) -> (Option<SharedString>, Option<(AgentId, SharedString)>) {
+    let Some(client) = client
+        .map(|client| client.read(cx))
+        .filter(|client| client.is_online())
+    else {
+        return (Some("Offline".into()), None);
+    };
+    if client.is_installed(agent_id, cx) {
+        return (None, None);
+    }
+    match client.default_agent(cx) {
+        Some(other) => {
+            let name = client
+                .registry()
+                .read(cx)
+                .agent(&other)
+                .map(|agent| agent.name().clone())
+                .unwrap_or_else(|| other.0.clone());
+            (None, Some((other, name)))
+        }
+        None => (Some("No agents installed".into()), None),
+    }
 }
 
 /// A borderless button that opens one of the new thread's pickers.
@@ -21884,8 +21905,48 @@ mod tests {
         (view, cx)
     }
 
+    /// The registry of a test client, with `agents` installed, by id and name.
+    fn install_agents(client: &Entity<ServerClient>, agents: &[(&str, &str)], cx: &mut App) {
+        use agentz_protocol::agents::{AgentListing, RegistryAgentMetadata, RegistrySnapshot};
+
+        let agents = agents
+            .iter()
+            .map(|(id, name)| AgentListing {
+                metadata: RegistryAgentMetadata {
+                    id: AgentId::new(id.to_string()),
+                    name: name.to_string().into(),
+                    description: "For tests".into(),
+                    version: "1.0.0".into(),
+                    repository: None,
+                    website: None,
+                    license_url: None,
+                    icon: None,
+                },
+                supports_current_platform: true,
+                install_state: InstallState::Installed {
+                    version: "1.0.0".into(),
+                    update_available: false,
+                },
+                custom_command: None,
+                accounts: None,
+            })
+            .collect();
+        let registry = client.read(cx).registry().clone();
+        registry.update(cx, |registry, cx| {
+            registry.set_snapshot(
+                RegistrySnapshot {
+                    agents,
+                    is_fetching: false,
+                    fetch_error: None,
+                },
+                cx,
+            )
+        });
+    }
+
     /// A project on two machines is named as the project picker names it, and New Thread's
-    /// machine picker lists each copy with how it stands in git.
+    /// machine picker lists each copy. A machine without the draft's agent can be picked, and
+    /// the draft moves there with that machine's own agent.
     #[gpui::test]
     fn the_machine_picker_lists_each_copy(cx: &mut TestAppContext) {
         let repository = projects::RepositoryIdentity {
@@ -21912,7 +21973,8 @@ mod tests {
             )];
             snapshot
         };
-        let mac = cx.update(|cx| {
+        let created_with: Rc<RefCell<Vec<AgentId>>> = Rc::default();
+        let (mac, _devbox) = cx.update(|cx| {
             crate::init_for_test(cx);
             let [mac, devbox] = [
                 (MachineId::Local, "This Mac", copy("/tmp/demo", "main", 0)),
@@ -21934,8 +21996,20 @@ mod tests {
                 projects.update(cx, |store, cx| store.set_snapshot(snapshot, cx));
                 client
             });
-            crate::machines::init_for_test(vec![mac.clone(), devbox], cx);
-            mac
+            install_agents(&mac, &[("mock", "Mock")], cx);
+            install_agents(&devbox, &[("other", "Other")], cx);
+            let created_with = created_with.clone();
+            devbox.update(cx, |client, _| {
+                client.answer_for_test(move |request| match request {
+                    Request::CreateThread { agent_id, .. } => {
+                        created_with.borrow_mut().push(agent_id.clone());
+                        Some(Response::ThreadCreated(ThreadId(9)))
+                    }
+                    _ => None,
+                })
+            });
+            crate::machines::init_for_test(vec![mac.clone(), devbox.clone()], cx);
+            (mac, devbox)
         });
         let (_view, cx) = open_on(&mac, 3, cx);
         cx.update(|_, cx| {
@@ -21966,6 +22040,10 @@ mod tests {
             .debug_bounds("new-thread-copy-Devbox 1")
             .expect("Devbox 1's copy");
         assert!(mac_row.top() < devbox_row.top());
+
+        cx.simulate_click(devbox_row.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(*created_with.borrow(), vec![AgentId::new("other")]);
     }
 
     /// A task delegated to another machine is a row under its parent that names the machine.

@@ -1286,8 +1286,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   we work on?" and a continuation's "Continue “title”". The composer has the agent
   picker in it (installed agents, then Terminal, which replaces the draft with a shell, and
   Manage Agents…), and under it the checkout picker (Local, a new worktree or pasture, or an
-  existing one), the machine picker (each copy of a combined project with how it stands in
-  git, see Project copies in sync), the account picker and the branch, which reads "From main"
+  existing one), the machine picker (each copy of a combined project, see Project copies in
+  sync), the account picker and the branch, which reads "From main"
   for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
   only the draft's plan until its first message (`Request::PlanWorkspace`). In a small pane
   (under 480 px wide or 420 px high: `AgentView::is_new_thread_compact`) the screen is
@@ -2250,11 +2250,15 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   upstream with ahead and behind (or, tracking nothing, the commits no remote has), uncommitted
   files and lines, stashes, and when it last fetched (`FETCH_HEAD`'s time), with
   `GIT_OPTIONAL_LOCKS=0` and no fetch (`projects::CopyStatus`, sent as
-  `ProjectsSnapshot::copy_statuses`). New Thread's machine picker lists each copy as a row:
-  its machine and folder, then "main · → origin/main ↓12 · 3 files +42 −7 · 1 stash", what
-  differs from the first copy in the warning color, and a footer "As of each machine's last
-  fetch: This Mac 2h ago, Devbox 1 3d ago". A copy whose machine is offline or lacks the
-  agent says so and can't be picked.
+  `ProjectsSnapshot::copy_statuses`). New Thread's machine picker lists each copy on one line
+  (`project_copies::render_copy_row`, picked in `design/subthreads-machines/`): its machine's
+  icon and name, then at the right only what sets it apart from the first copy, in the
+  warning color ("↓2 · 3 files"), or "Offline". Hovering a row shows Zed's aside beside the
+  menu (`render_copy_aside`): the folder, the branch and its upstream, the changes and
+  stashes, and when it last fetched. An offline copy can't be picked. One whose machine lacks
+  the draft's agent says "Uses Claude Agent" (`agent_view::agent_on_machine`: the agent that
+  machine's new threads start with, `ServerClient::default_agent`), and picking it moves
+  the draft there with that agent, keeping what's typed (`change_new_thread_machine`).
 - **Machine icons** (`machine_kind.rs`, t3code's `ServerEnvironmentMachine.ts`): detected from
   the hardware, or chosen by clicking the machine's icon in Settings › Machines.
 - **Start at login** (`login_item.rs`): a launch agent that runs `agentz-server start` once.

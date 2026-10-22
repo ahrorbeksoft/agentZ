@@ -1,15 +1,19 @@
 //! The copies of a project on several machines as New Thread's machine picker lists them
-//! (`design/project-copies/decisions.md`): a row per copy with its machine and folder, then how
-//! its branch stands against what it tracks, its uncommitted files and lines, and its
-//! stashes, as the Workspaces view's git popover writes them. What differs from the first
-//! copy is in the warning color. Each machine's server reads its own copy
-//! ([`projects::CopyStatus`]) without fetching, so a footer says when each last fetched.
+//! (`design/subthreads-machines/decisions.md`, topics 9 and 10): a line per copy with its
+//! machine and, at its end, only what sets it apart from the first copy, in the warning color
+//! ("↓2 · 3 files"), or the agent the thread would take there. Hovering a row shows Zed's
+//! documentation aside: the folder, how its branch stands against what it tracks, its
+//! uncommitted files and lines and its stashes, as the Workspaces view's git popover writes
+//! them, and when its machine last fetched. Each machine's server reads its own copy
+//! ([`projects::CopyStatus`]) without fetching.
 
 use std::time::SystemTime;
 
+use agentz_protocol::agents::AgentId;
 use projects::CopyStatus;
 use ui::prelude::*;
 
+use crate::agent_icons::agent_icon;
 use crate::sidebar::format_relative_time;
 
 /// A copy of the project, as the picker shows it.
@@ -20,148 +24,137 @@ pub(crate) struct CopyRow {
     /// The copy's folder, as its machine would write it.
     pub(crate) folder: SharedString,
     pub(crate) status: Option<CopyStatus>,
-    /// Why the new thread can't move there, such as "offline".
+    /// Why the new thread can't move there, such as "Offline".
     pub(crate) unusable: Option<SharedString>,
+    /// The agent the new thread takes there, by its id and name, when that machine lacks the
+    /// thread's own.
+    pub(crate) uses_agent: Option<(AgentId, SharedString)>,
     pub(crate) is_current: bool,
 }
 
-/// One kind of thing a copy's line says, compared kind by kind with the first copy's.
-#[derive(Clone, Copy, PartialEq)]
-enum Kind {
-    Branch,
-    Upstream,
-    Changes,
-    Stash,
-}
-
-/// A copy's line: the branch, its upstream with ↑ and ↓, its changes and stashes, each part
-/// with its color. A part whose kind says something else in `first` is in the warning color.
-fn status_line(status: &CopyStatus, first: Option<&CopyStatus>) -> Vec<(String, Color)> {
-    let first_segments = first.map(segments);
-    let mut line = Vec::new();
-    for (index, (kind, parts)) in segments(status).into_iter().enumerate() {
-        let differs = first_segments.as_ref().is_some_and(|first| {
-            first
-                .iter()
-                .find(|(first_kind, _)| *first_kind == kind)
-                .map(|(_, first_parts)| text_of(first_parts))
-                != Some(text_of(&parts))
-        });
-        if index > 0 {
-            line.push((" · ".to_string(), Color::Muted));
-        }
-        for (text, color) in parts {
-            line.push((text, if differs { Color::Warning } else { color }));
-        }
-    }
-    line
-}
-
-fn text_of(parts: &[(String, Color)]) -> String {
-    parts.iter().map(|(text, _)| text.as_str()).collect()
-}
-
-fn segments(status: &CopyStatus) -> Vec<(Kind, Vec<(String, Color)>)> {
-    let branch = match (&status.branch, &status.commit) {
+fn branch_name(status: &CopyStatus) -> String {
+    match (&status.branch, &status.commit) {
         (Some(branch), _) => branch.clone(),
         (None, Some(commit)) => format!("detached at {commit}"),
         (None, None) => "detached".to_string(),
-    };
-    let mut upstream = match &status.upstream {
-        Some(upstream) => vec![(format!("→ {upstream}"), Color::Muted)],
-        None => vec![("no upstream".to_string(), Color::Muted)],
-    };
+    }
+}
+
+fn count(count: u32, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// What sets the copy apart from `first`, short: "payments · ↓2 · 3 files". Nothing for a copy
+/// that stands as `first` does.
+fn marks(status: &CopyStatus, first: &CopyStatus) -> Option<String> {
+    let mut marks = Vec::new();
+    if status.branch != first.branch || status.commit.is_none() != first.commit.is_none() {
+        marks.push(branch_name(status));
+    }
+    if status.upstream.is_none() && first.upstream.is_some() {
+        marks.push("no upstream".to_string());
+    }
+    if status.ahead > 0 && status.ahead != first.ahead {
+        marks.push(format!("↑{}", status.ahead));
+    }
+    if status.behind > 0 && status.behind != first.behind {
+        marks.push(format!("↓{}", status.behind));
+    }
+    if status.changed_files > 0 && status.changed_files != first.changed_files {
+        marks.push(count(status.changed_files, "file", "files"));
+    }
+    if status.stashes > 0 && status.stashes != first.stashes {
+        marks.push(count(status.stashes, "stash", "stashes"));
+    }
+    (!marks.is_empty()).then(|| marks.join(" · "))
+}
+
+/// The aside's lines about git: the branch and its upstream with ↑ and ↓, the changes, and the
+/// stashes, each part with its color.
+fn git_lines(status: &CopyStatus) -> Vec<(IconName, Vec<(String, Color)>)> {
+    let mut branch = vec![(branch_name(status), Color::Default)];
+    match &status.upstream {
+        Some(upstream) => branch.push((format!(" → {upstream}"), Color::Muted)),
+        None => branch.push((" · no upstream".to_string(), Color::Muted)),
+    }
     if status.ahead > 0 {
-        upstream.push((format!(" ↑{}", status.ahead), Color::Created));
+        branch.push((format!(" ↑{}", status.ahead), Color::Created));
     }
     if status.behind > 0 {
-        upstream.push((format!(" ↓{}", status.behind), Color::Deleted));
+        branch.push((format!(" ↓{}", status.behind), Color::Deleted));
     }
     if status.upstream.is_some() && status.ahead == 0 && status.behind == 0 {
-        upstream.push((" up to date".to_string(), Color::Muted));
+        branch.push((" up to date".to_string(), Color::Muted));
     }
     let changes = if status.changed_files == 0 {
-        vec![("no changes".to_string(), Color::Muted)]
+        vec![("No changes".to_string(), Color::Muted)]
     } else {
-        let files = if status.changed_files == 1 {
-            "file"
-        } else {
-            "files"
-        };
         vec![
-            (format!("{} {files}", status.changed_files), Color::Default),
+            (count(status.changed_files, "file", "files"), Color::Default),
             (format!(" +{}", status.added_lines), Color::Created),
             (format!(" −{}", status.removed_lines), Color::Deleted),
         ]
     };
-    let mut segments = vec![
-        (Kind::Branch, vec![(branch, Color::Default)]),
-        (Kind::Upstream, upstream),
-        (Kind::Changes, changes),
-    ];
+    let mut lines = vec![(IconName::GitBranch, branch), (IconName::Diff, changes)];
     if status.stashes > 0 {
-        let stashes = if status.stashes == 1 {
-            "stash"
-        } else {
-            "stashes"
-        };
-        segments.push((
-            Kind::Stash,
-            vec![(format!("{} {stashes}", status.stashes), Color::Warning)],
+        lines.push((
+            IconName::Archive,
+            vec![(count(status.stashes, "stash", "stashes"), Color::Warning)],
         ));
     }
-    segments
+    lines
 }
 
-/// "As of each machine's last fetch: This Mac 2h ago, Devbox 1 3d ago", for the copies that
-/// were read, each machine once.
-pub(crate) fn fetched_line(rows: &[CopyRow], now: SystemTime) -> Option<String> {
-    let mut machines: Vec<String> = Vec::new();
-    let mut seen: Vec<&SharedString> = Vec::new();
-    for row in rows {
-        let Some(status) = &row.status else {
-            continue;
-        };
-        if seen.contains(&&row.machine) {
-            continue;
-        }
-        seen.push(&row.machine);
-        machines.push(match status.fetched_at {
-            Some(fetched_at) => match format_relative_time(fetched_at, now).as_str() {
-                "now" => format!("{} just now", row.machine),
-                ago => format!("{} {ago} ago", row.machine),
-            },
-            None => format!("{} never", row.machine),
-        });
+/// "Fetched 9m ago", as of the copy's machine's last fetch.
+fn fetched(status: &CopyStatus, now: SystemTime) -> String {
+    match status.fetched_at {
+        Some(fetched_at) => match format_relative_time(fetched_at, now).as_str() {
+            "now" => "Fetched just now".to_string(),
+            ago => format!("Fetched {ago} ago"),
+        },
+        None => "Never fetched".to_string(),
     }
-    (!machines.is_empty())
-        .then(|| format!("As of each machine's last fetch: {}", machines.join(", ")))
 }
 
-/// The copy's row in the menu: its machine and folder, then its line (or why it can't be
-/// picked), and a check on the copy the thread is in now.
-pub(crate) fn render_copy_row(row: &CopyRow, first: Option<&CopyStatus>) -> AnyElement {
-    let is_usable = row.unusable.is_none();
-    let detail = match (&row.unusable, &row.status) {
-        (Some(reason), _) => h_flex()
+/// The copy's row in the menu: its machine, then what sets it apart, the agent it would take,
+/// or why it can't be picked, and a check on the copy the thread is in now.
+pub(crate) fn render_copy_row(row: &CopyRow, first: Option<&CopyStatus>, cx: &App) -> AnyElement {
+    let end = if let Some(reason) = &row.unusable {
+        Label::new(reason.clone())
+            .size(LabelSize::XSmall)
+            .color(Color::Disabled)
+            .into_any_element()
+    } else if let Some((agent_id, name)) = &row.uses_agent {
+        h_flex()
+            .gap_1()
             .child(
-                Label::new(reason.clone())
+                agent_icon(agent_id, cx)
+                    .map(Icon::from_svg_markup)
+                    .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(format!("Uses {name}"))
                     .size(LabelSize::XSmall)
-                    .color(Color::Disabled),
+                    .color(Color::Muted),
             )
-            .into_any_element(),
-        (None, Some(status)) => h_flex()
-            .min_w_0()
-            .overflow_hidden()
-            .children(
-                status_line(status, first)
-                    .into_iter()
-                    .map(|(text, color)| Label::new(text).size(LabelSize::XSmall).color(color)),
-            )
-            .into_any_element(),
-        (None, None) => div().into_any_element(),
+            .into_any_element()
+    } else {
+        let marks = row
+            .status
+            .as_ref()
+            .zip(first)
+            .and_then(|(status, first)| marks(status, first));
+        match marks {
+            Some(marks) => Label::new(marks)
+                .size(LabelSize::XSmall)
+                .color(Color::Warning)
+                .into_any_element(),
+            None => div().into_any_element(),
+        }
     };
-    let name_color = if is_usable {
+    let name_color = if row.unusable.is_none() {
         Color::Default
     } else {
         Color::Disabled
@@ -170,32 +163,20 @@ pub(crate) fn render_copy_row(row: &CopyRow, first: Option<&CopyStatus>) -> AnyE
     h_flex()
         .debug_selector(move || format!("new-thread-copy-{machine}"))
         .w_full()
-        .min_w(px(330.))
+        .min_w(px(240.))
         .gap_2()
-        .py_0p5()
         .child(
             Icon::new(row.machine_icon)
                 .size(IconSize::Small)
                 .color(Color::Muted),
         )
         .child(
-            v_flex()
+            div()
                 .flex_1()
                 .min_w_0()
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap_1p5()
-                        .child(Label::new(row.machine.clone()).color(name_color))
-                        .child(
-                            Label::new(row.folder.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Placeholder)
-                                .truncate(),
-                        ),
-                )
-                .child(detail),
+                .child(Label::new(row.machine.clone()).color(name_color).truncate()),
         )
+        .child(div().flex_none().child(end))
         .child(div().flex_none().w(px(14.)).when(row.is_current, |slot| {
             slot.child(
                 Icon::new(IconName::Check)
@@ -203,6 +184,43 @@ pub(crate) fn render_copy_row(row: &CopyRow, first: Option<&CopyStatus>) -> AnyE
                     .color(Color::Accent),
             )
         }))
+        .into_any_element()
+}
+
+/// Zed's aside beside a copy's row: its machine and folder, how it stands in git, and when its
+/// machine last fetched.
+pub(crate) fn render_copy_aside(row: &CopyRow, status: &CopyStatus, now: SystemTime) -> AnyElement {
+    v_flex()
+        .max_w(px(300.))
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_1p5()
+                .child(Label::new(row.machine.clone()).size(LabelSize::Small))
+                .child(
+                    Label::new(row.folder.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Placeholder)
+                        .truncate(),
+                ),
+        )
+        .children(git_lines(status).into_iter().map(|(icon, parts)| {
+            h_flex()
+                .gap_1()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                .child(
+                    h_flex().children(
+                        parts.into_iter().map(|(text, color)| {
+                            Label::new(text).size(LabelSize::Small).color(color)
+                        }),
+                    ),
+                )
+        }))
+        .child(
+            Label::new(fetched(status, now))
+                .size(LabelSize::Small)
+                .color(Color::Placeholder),
+        )
         .into_any_element()
 }
 
@@ -223,68 +241,48 @@ mod tests {
         }
     }
 
-    fn text(line: &[(String, Color)]) -> String {
-        line.iter().map(|(text, _)| text.as_str()).collect()
-    }
-
-    fn warned(line: &[(String, Color)]) -> String {
-        line.iter()
-            .filter(|(_, color)| *color == Color::Warning)
-            .map(|(text, _)| text.as_str())
-            .collect()
+    fn text(parts: &[(String, Color)]) -> String {
+        parts.iter().map(|(text, _)| text.as_str()).collect()
     }
 
     #[test]
-    fn a_copy_reads_as_the_workspaces_popover_writes_it() {
+    fn a_copy_is_marked_only_with_what_sets_it_apart() {
         let mac = copy("main", Some("origin/main"), 0, 0);
-        assert_eq!(
-            text(&status_line(&mac, Some(&mac))),
-            "main · → origin/main up to date · no changes"
-        );
-        assert_eq!(warned(&status_line(&mac, Some(&mac))), "");
+        assert_eq!(marks(&mac, &mac), None);
+
+        let mut agents = copy("main", Some("origin/main"), 0, 2);
+        agents.changed_files = 3;
+        assert_eq!(marks(&agents, &mac).as_deref(), Some("↓2 · 3 files"));
 
         let mut devbox = copy("payments", None, 3, 0);
-        devbox.changed_files = 1;
-        devbox.added_lines = 8;
-        devbox.removed_lines = 2;
-        let line = status_line(&devbox, Some(&mac));
-        assert_eq!(text(&line), "payments · no upstream ↑3 · 1 file +8 −2");
-        // Everything differs from This Mac's copy.
-        assert_eq!(warned(&line), "paymentsno upstream ↑31 file +8 −2");
-
-        let mut laptop = copy("main", Some("origin/main"), 0, 12);
-        laptop.stashes = 1;
-        let line = status_line(&laptop, Some(&mac));
+        devbox.stashes = 1;
         assert_eq!(
-            text(&line),
-            "main · → origin/main ↓12 · no changes · 1 stash"
+            marks(&devbox, &mac).as_deref(),
+            Some("payments · no upstream · ↑3 · 1 stash")
         );
-        assert_eq!(warned(&line), "→ origin/main ↓121 stash");
     }
 
     #[test]
-    fn the_footer_says_when_each_machine_fetched() {
+    fn the_aside_reads_as_the_workspaces_popover_writes_it() {
         let now = SystemTime::now();
-        let row = |machine: &str, fetched: Option<Duration>| CopyRow {
-            machine_icon: IconName::Server,
-            machine: machine.to_string().into(),
-            folder: "~/p".into(),
-            status: Some(CopyStatus {
-                fetched_at: fetched.map(|ago| now - ago),
-                ..CopyStatus::default()
-            }),
-            unusable: None,
-            is_current: false,
-        };
-        let rows = [
-            row("This Mac", Some(Duration::from_secs(2 * 3600))),
-            row("Devbox 1", None),
-            row("Devbox 1", Some(Duration::from_secs(60))),
-        ];
-        assert_eq!(
-            fetched_line(&rows, now).as_deref(),
-            Some("As of each machine's last fetch: This Mac 2h ago, Devbox 1 never")
-        );
-        assert_eq!(fetched_line(&[], now), None);
+        let mut agents = copy("main", Some("origin/main"), 0, 2);
+        agents.changed_files = 1;
+        agents.added_lines = 8;
+        agents.removed_lines = 2;
+        agents.fetched_at = Some(now - Duration::from_secs(9 * 60));
+        let lines: Vec<String> = git_lines(&agents)
+            .iter()
+            .map(|(_, parts)| text(parts))
+            .collect();
+        assert_eq!(lines, ["main → origin/main ↓2", "1 file +8 −2"]);
+        assert_eq!(fetched(&agents, now), "Fetched 9m ago");
+
+        let mac = copy("main", Some("origin/main"), 0, 0);
+        let lines: Vec<String> = git_lines(&mac)
+            .iter()
+            .map(|(_, parts)| text(parts))
+            .collect();
+        assert_eq!(lines, ["main → origin/main up to date", "No changes"]);
+        assert_eq!(fetched(&mac, now), "Never fetched");
     }
 }
