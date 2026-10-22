@@ -1,0 +1,100 @@
+{
+  "topics": {
+    "sidebar": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "sidebar-finished": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "agents-list": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "start": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "result": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "task": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "controls": {
+      "pick": null,
+      "picks": [
+        "A",
+        "C",
+        "D",
+        "F"
+      ],
+      "none": false,
+      "comments": {
+        "F": "idk, should be configurable i guess"
+      },
+      "note": "",
+      "also": []
+    },
+    "waiting": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "machine-menu": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "missing-agent": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "close": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-22T05:26:54.953Z"
+}
