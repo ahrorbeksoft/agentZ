@@ -106,8 +106,10 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   Change the protocol, requests, state files and settings freely: no fallbacks for older servers
   or apps, no old fields kept, no migrations. Only keep the user's data loading: a new field in a
   state file gets `#[serde(default)]`, so an old file doesn't lose their threads.
-- **ACP v2 waits for Zed.** Don't initialize with ACP v2 or use its features until Zed enables
-  it; agentZ stays on v1 until then.
+- **ACP v2 with agents that support it.** agentZ asks for v2 and falls back to v1, without
+  waiting for Zed to enable v2 for everyone (the user's decision of October 22, 2026). Until
+  that's built ("Use ACP v2 with agents that support it" in `docs/backlog.md`), it
+  initializes with v1.
 - **UI changes start on the design board.** Before changing the UI, give the user designs to
   pick from: a round on the local design board (`design/README.md`), with the current state
   screenshotted beside them. A round's `design/<round>/decisions.md` is the spec: build what
