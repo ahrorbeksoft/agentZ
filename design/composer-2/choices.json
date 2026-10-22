@@ -1,0 +1,99 @@
+{
+  "topics": {
+    "shape": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "B": ""
+      },
+      "note": "",
+      "also": []
+    },
+    "controls": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "A": "we need search for models"
+      },
+      "note": "",
+      "also": []
+    },
+    "send": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "markup-start": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "markup-tools": {
+      "pick": null,
+      "picks": [
+        "A",
+        "B",
+        "C",
+        "D",
+        "F",
+        "G",
+        "H"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "markup-result": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "picture-warning": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {
+        "A": ""
+      },
+      "note": "idk, i don't want it anymore, let's drop this feature implementation",
+      "also": []
+    },
+    "picture-setting": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {},
+      "note": "idk, i don't want it anymore, let's drop this feature implementation",
+      "also": []
+    },
+    "in-use": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "agent-usage": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-22T10:37:54.524Z"
+}
