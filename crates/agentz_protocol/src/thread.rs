@@ -825,6 +825,10 @@ pub struct ThreadState {
     /// and it goes then.
     #[serde(default)]
     pub steering_queued: bool,
+    /// Queued messages sent into the agent's turn that it hasn't taken in yet, oldest first.
+    /// The queue shows them as steering until they show in the thread.
+    #[serde(default)]
+    pub steering_messages: Vec<QueuedMessage>,
     /// What the agent left running in the background, oldest first.
     #[serde(default)]
     pub background_tasks: Vec<BackgroundTask>,

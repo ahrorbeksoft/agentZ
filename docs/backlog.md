@@ -39,12 +39,6 @@ session, so what agentZ does after the prompt's answer is inference. For compari
 doesn't let background commands hold a thread, but does let subagents and monitors hold it
 (`backgroundWorkHoldsCompletion`).
 
-### A steering prompt to Claude shows up only after a delay
-
-When a prompt is sent to Claude mid-turn and the user presses Steer, it doesn't show for a
-little while, then shows (it does work as steering). It seems to wait a little, maybe until
-the last turn finishes. Until it shows up, show it somewhere.
-
 ## Features
 
 ### Artifacts move with their thread to another machine

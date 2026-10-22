@@ -25,8 +25,8 @@ use agentz_protocol::diff::DiffScope;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
     Compaction, ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource,
-    LostHistory, ModeSwitch, PendingHandoff, PermissionOption, PlanItem, SessionRestore,
-    ThreadAgent, ToolAnswer, ToolCall, TurnTime, without_handoff,
+    LostHistory, ModeSwitch, PendingHandoff, PermissionOption, PlanItem, QueuedMessage,
+    SessionRestore, ThreadAgent, ToolAnswer, ToolCall, TurnTime, without_handoff,
 };
 use agentz_protocol::workspace::{
     PastureSupport, ProjectGit, SetupStepKind, SetupStepState, WorkspaceChoice, WorkspaceSetup,
@@ -2973,6 +2973,7 @@ impl AgentView {
         // wait behind it.
         if thread.is_working()
             || !thread.state.queued_messages.is_empty()
+            || !thread.state.steering_messages.is_empty()
             || thread.workspace_setup().is_some()
         {
             self.queue_expanded = true;
@@ -10428,7 +10429,9 @@ impl AgentView {
             return;
         };
         let prompt = PromptPart::text(text);
-        let waits = thread.is_working() || !thread.state.queued_messages.is_empty();
+        let waits = thread.is_working()
+            || !thread.state.queued_messages.is_empty()
+            || !thread.state.steering_messages.is_empty();
         if waits {
             self.queue_expanded = true;
         }
@@ -11125,11 +11128,13 @@ impl AgentView {
         let thread = self.thread.read(cx);
         let messages = thread.state.queued_messages.clone();
         let is_steering = thread.state.steering_queued;
-        if messages.is_empty() {
+        // Sent into the turn already, so there's nothing left to do with them but wait.
+        let steering_messages = thread.state.steering_messages.clone();
+        if messages.is_empty() && steering_messages.is_empty() {
             return None;
         }
         let colors = cx.theme().colors();
-        let count = messages.len();
+        let count = steering_messages.len() + messages.len();
         let expanded = self.queue_expanded;
         let title = if count == 1 {
             "1 Queued Message".to_string()
@@ -11156,19 +11161,17 @@ impl AgentView {
                         cx.notify();
                     })),
             )
-            .child(
-                Button::new("clear-queue", "Clear All")
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.thread.update(cx, |thread, cx| thread.clear_queue(cx));
-                    })),
-            );
+            .when(!messages.is_empty(), |this| {
+                this.child(
+                    Button::new("clear-queue", "Clear All")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.thread.update(cx, |thread, cx| thread.clear_queue(cx));
+                        })),
+                )
+            });
 
-        let mut rows = Vec::new();
-        for (index, message) in messages.iter().enumerate() {
-            let is_next = index == 0;
-            let id = message.id;
-            let text = self.prompt_text(&message.prompt, cx);
+        let message_images = |row: usize, message: &QueuedMessage| -> Vec<AnyElement> {
             let image_ids: Vec<AttachmentId> = message
                 .prompt
                 .iter()
@@ -11177,9 +11180,63 @@ impl AgentView {
                     _ => None,
                 })
                 .collect();
-            let images: Vec<AnyElement> = (0..image_ids.len())
-                .map(|image_index| self.render_queued_image(index, &image_ids, image_index, cx))
-                .collect();
+            (0..image_ids.len())
+                .map(|image_index| self.render_queued_image(row, &image_ids, image_index, cx))
+                .collect()
+        };
+        let mut rows = Vec::new();
+        for (row, message) in steering_messages.iter().enumerate() {
+            let text = self.prompt_text(&message.prompt, cx);
+            let images = message_images(row, message);
+            rows.push(
+                h_flex()
+                    .id(("steering-message", row))
+                    .debug_selector(move || format!("steering-message-{row}"))
+                    .w_full()
+                    .p_1p5()
+                    .gap_1()
+                    .bg(colors.editor_background)
+                    .when(row + 1 < count, |this| {
+                        this.border_b_1().border_color(colors.border_variant)
+                    })
+                    .child(
+                        div()
+                            .id(("steering-message-dot", row))
+                            .child(
+                                Icon::new(IconName::Circle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent),
+                            )
+                            .tooltip(Tooltip::text("Sent into the Turn")),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(text.lines().next().unwrap_or_default().to_string()),
+                            )
+                            .children(images),
+                    )
+                    .child(
+                        Label::new("Steering…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+        }
+        for (index, message) in messages.iter().enumerate() {
+            let row = steering_messages.len() + index;
+            let is_next = index == 0;
+            let id = message.id;
+            let text = self.prompt_text(&message.prompt, cx);
+            let images = message_images(row, message);
             rows.push(
                 h_flex()
                     .group("queue-entry")
@@ -11187,7 +11244,7 @@ impl AgentView {
                     .p_1p5()
                     .gap_1()
                     .bg(colors.editor_background)
-                    .when(index + 1 < count, |this| {
+                    .when(row + 1 < count, |this| {
                         this.border_b_1().border_color(colors.border_variant)
                     })
                     .child(
@@ -11269,7 +11326,8 @@ impl AgentView {
                                         });
                                     })),
                             ),
-                    ),
+                    )
+                    .into_any_element(),
             );
         }
         Some(
@@ -17543,7 +17601,6 @@ fn summarize_work(entries: &[Entry]) -> String {
 #[cfg(test)]
 mod tests {
     use agentz_protocol::spaces::SpacesSnapshot;
-    use agentz_protocol::thread::QueuedMessage;
     use gpui::{TestAppContext, VisualTestContext};
     use projects::{Project, ProjectsSnapshot};
 
@@ -22469,6 +22526,50 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("enter");
         assert_eq!(steers(cx), 1, "steering again would stop it");
+    }
+
+    /// A steered message the agent hasn't taken in yet stays in the queue, marked steering,
+    /// until it shows in the thread, and what's typed meanwhile queues behind it.
+    #[gpui::test]
+    fn a_steered_message_stays_in_the_queue_until_the_agent_takes_it(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Run the tests".into())], cx);
+            thread.set_steering_messages_for_test(
+                vec![QueuedMessage {
+                    id: 3,
+                    prompt: PromptPart::text("Use tabs"),
+                }],
+                cx,
+            );
+        });
+        view.update(cx, |view, _| view.queue_expanded = true);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("queued-messages").is_some());
+        assert!(cx.debug_bounds("steering-message-0").is_some());
+
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+        cx.simulate_input("Then the docs");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let sent = sent(&client, cx);
+        assert!(sent.iter().any(|request| matches!(request,
+            Request::QueueMessage { prompt, .. } if *prompt == PromptPart::text("Then the docs"))));
+        assert!(
+            !sent
+                .iter()
+                .any(|request| matches!(request, Request::Prompt { .. }))
+        );
+
+        thread.update(cx, |thread, cx| {
+            thread.set_steering_messages_for_test(Vec::new(), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("steering-message-0").is_none());
+        assert!(cx.debug_bounds("queued-messages").is_none());
     }
 
     /// The queue shows what the server keeps. Editing a message takes it out of the queue and

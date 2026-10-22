@@ -330,6 +330,16 @@ impl AgentThread {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_steering_messages_for_test(
+        &mut self,
+        messages: Vec<agentz_protocol::thread::QueuedMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        self.view.state.steering_messages = messages;
+        cx.notify();
+    }
+
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.queued_updates = None;
         self.view.state.status = ConnectionStatus::Failed(error.into());

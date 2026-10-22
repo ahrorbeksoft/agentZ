@@ -23,7 +23,7 @@ use agentz_protocol::terminal::{
 };
 use agentz_protocol::thread::{
     ConnectionStatus, Entry, FailedMessage, HandoffSource, LoginInput, LostHistory, ModeSwitch,
-    SessionRestore, ThreadView, api_key_meta, login_input,
+    QueuedMessage, SessionRestore, ThreadView, api_key_meta, login_input,
 };
 use agentz_protocol::workspace::{WorkspaceChoice, WorkspaceRemoval};
 use agentz_protocol::{
@@ -9793,6 +9793,64 @@ async fn steering_sends_a_queued_message_into_the_turn() {
                 && agent_text(client.thread(connection)).ends_with("(steered: also this)")
         })
         .await;
+    assert!(client.thread(connection).state.steering_messages.is_empty());
+}
+
+/// A steered message the agent doesn't take in yet shows as steering, out of the queue, until
+/// it shows in the thread: here once the turn ends, as the mock refuses "refuse".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steered_message_shows_as_steering_until_it_goes() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_STEERING".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let thread_id = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.wait_until_ready(thread_id).await;
+    client.start_waiting_turn(thread_id).await;
+    client.queue(thread_id, "refuse").await;
+    client
+        .wait_until(|client| client.queued_texts(thread_id).len() == 1)
+        .await;
+    let id = client.thread(connection).state.queued_messages[0].id;
+    client
+        .ok(Request::SteerQueuedMessage { connection, id })
+        .await;
+    // Out of the queue at once, and shown as steering in the same change.
+    let state = &client.thread(connection).state;
+    assert!(state.queued_messages.is_empty());
+    assert_eq!(
+        state.steering_messages,
+        [QueuedMessage {
+            id,
+            prompt: PromptPart::text("refuse"),
+        }]
+    );
+    let shown_until = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.wait_until(|client| client.thread(connection).state.steering_messages.is_empty()),
+    )
+    .await;
+    assert!(shown_until.is_err(), "it shows until the turn ends");
+    assert_eq!(client.user_messages(thread_id), ["permission"]);
+
+    client.answer_permission(thread_id).await;
+    client
+        .wait_until(|client| {
+            client.user_messages(thread_id) == ["permission", "refuse"]
+                && !client.thread(connection).is_working()
+        })
+        .await;
+    assert!(client.thread(connection).state.steering_messages.is_empty());
 }
 
 /// ACP v2 is experimental: agents are asked for it only once it's on, and the server keeps the

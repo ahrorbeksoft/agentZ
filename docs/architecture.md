@@ -1062,7 +1062,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the agent is on (`ThreadState::steering_queued`): once no tool call since the last message is
   running (or it asks for permission), the server cancels the turn and the queue sends the
   message. Editing or removing the front message disarms it. On ACP v2 every agent takes
-  Steer, as a prompt of its own (see ACP v2).
+  Steer, as a prompt of its own (see ACP v2). A message sent into the turn stays in the queue,
+  above the queued ones, marked "Steering…" and with no buttons, until it shows in the thread
+  (`ThreadState::steering_messages`, from `AgentThread::show_steering`): while its mentions
+  and images are read, until the agent answers `injected` (v1) or takes it in (v2), and while
+  it waits for the turn to end. Messages typed meanwhile queue behind it.
 - **Retry** (`AgentThread::retry_message`, `Request::RetryMessage`, `ThreadState::failed_message`,
   `agent_view.rs`'s `render_not_sent`; Zed's `retry_button`; login round topic 5, chat apps'
   "Not Delivered"): a message the agent didn't get through fails rather than waiting, and is

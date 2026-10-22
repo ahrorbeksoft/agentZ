@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use agent_thread::{Attachments, MessagePart};
+use agent_thread::{Attachments, MessagePart, QueuedMessage};
 use agentz_protocol::agents::AgentId;
 use agentz_protocol::attachments::AttachmentId;
 use agentz_protocol::thread::{ConnectionStatus, mentioned_thread};
@@ -25,9 +25,9 @@ const MENTIONED_FILE_LIMIT: u64 = 1024 * 1024;
 pub(super) struct PendingPrompt {
     connection: ConnectionId,
     prompt: Vec<PromptPart>,
-    /// Sent into the turn the agent is working on, as a steered queued message is
+    /// The queued message it is when it goes into the turn the agent is working on
     /// ([`agentz_protocol::Request::SteerQueuedMessage`]).
-    steer: bool,
+    steer: Option<u64>,
     deadline: Instant,
 }
 
@@ -41,13 +41,13 @@ pub(super) struct PendingMentionRead {
 }
 
 impl Server {
-    /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or into the
-    /// turn it's working on.
+    /// Sends a message to a thread's agent ([`agentz_protocol::Request::Prompt`]), or, as the
+    /// queued message `steer`, into the turn it's working on.
     pub(super) fn prompt(
         &mut self,
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
-        steer: bool,
+        steer: Option<u64>,
     ) -> Result<Response> {
         if let ConnectionId::Thread(thread_id) = connection
             && self
@@ -80,6 +80,10 @@ impl Server {
             }
             ConnectionId::LoginSession(_) => prompt,
         };
+        let steering = steer.map(|id| QueuedMessage {
+            id,
+            prompt: prompt.clone(),
+        });
         if prompt
             .iter()
             .all(|part| matches!(part, PromptPart::Text(_)))
@@ -91,17 +95,22 @@ impl Server {
                     _ => String::new(),
                 })
                 .collect();
-            self.update_thread(connection, |thread| {
-                if steer {
-                    thread.steer(text)
-                } else {
-                    thread.send(text)
+            self.update_thread(connection, |thread| match steering {
+                Some(message) => {
+                    let id = message.id;
+                    thread.show_steering(message);
+                    thread.steer(id, text)
                 }
+                None => thread.send(text),
             })?;
         } else {
             // Starts the thread's agent first, as plain text does.
             self.update_thread(connection, |_| ())?;
             self.queue_prompt(connection, prompt, steer)?;
+            // It shows as steering while what it mentions is read.
+            if let Some(message) = steering {
+                self.update_thread(connection, |thread| thread.show_steering(message))?;
+            }
         }
         Ok(Response::Ok)
     }
@@ -112,7 +121,7 @@ impl Server {
         &mut self,
         connection: ConnectionId,
         prompt: Vec<PromptPart>,
-        steer: bool,
+        steer: Option<u64>,
     ) -> Result<()> {
         for part in &prompt {
             if let PromptPart::Thread(thread_id) = part {
@@ -232,7 +241,12 @@ impl Server {
 
     /// Takes the mentioned threads' conversations now, reads the mentioned files and the
     /// images off the server's task, then sends.
-    fn send_prompt(&mut self, connection: ConnectionId, prompt: Vec<PromptPart>, steer: bool) {
+    fn send_prompt(
+        &mut self,
+        connection: ConnectionId,
+        prompt: Vec<PromptPart>,
+        steer: Option<u64>,
+    ) {
         let attachments = match connection {
             ConnectionId::Thread(thread_id) => {
                 Some(Attachments::for_thread(&self.data_dir, thread_id))
@@ -278,12 +292,9 @@ impl Server {
                     server.reading_prompts.remove(index);
                 }
                 server
-                    .update_thread(connection, |thread| {
-                        if steer {
-                            thread.steer_message(parts)
-                        } else {
-                            thread.send_after_turn(parts)
-                        }
+                    .update_thread(connection, |thread| match steer {
+                        Some(id) => thread.steer_message(id, parts),
+                        None => thread.send_after_turn(parts),
                     })
                     .log_err();
             },

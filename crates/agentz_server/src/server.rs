@@ -1203,7 +1203,7 @@ impl Server {
                 Ok(Response::Ok)
             }
 
-            Request::Prompt { connection, prompt } => self.prompt(connection, prompt, false),
+            Request::Prompt { connection, prompt } => self.prompt(connection, prompt, None),
             Request::Cancel(connection) => {
                 let is_subagent = match connection {
                     ConnectionId::Thread(thread_id) => self.stop_subagent(thread_id),

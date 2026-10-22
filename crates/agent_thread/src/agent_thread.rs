@@ -249,6 +249,8 @@ enum MessageKind {
     PromptFinished(std::result::Result<acp::PromptResponse, agent_client_protocol::Error>),
     /// The agent answered a message sent into its turn ([`AgentThread::steer_message`]).
     Steered {
+        /// The queued message it is ([`ThreadState::steering_messages`]).
+        id: u64,
         parts: Vec<MessagePart>,
         result: std::result::Result<Value, agent_client_protocol::Error>,
     },
@@ -318,9 +320,19 @@ enum AgentState {
     Idle,
 }
 
+/// A message waiting for the turn to end.
+struct AfterTurn {
+    parts: Vec<MessagePart>,
+    /// The queued message sent into the turn that it is, shown as steering until it goes
+    /// ([`ThreadState::steering_messages`]).
+    steering: Option<u64>,
+}
+
 /// A message sent into the turn on ACP v2, as a prompt of its own.
 struct SteeredPrompt {
     id: u64,
+    /// The queued message it is ([`ThreadState::steering_messages`]).
+    steering: u64,
     parts: Vec<MessagePart>,
     /// The agent took it in, and it shows in the thread.
     taken: bool,
@@ -456,7 +468,7 @@ pub struct AgentThread {
     pending_title: Option<String>,
     queued_prompts: Vec<Vec<MessagePart>>,
     /// Messages sent into a turn that the agent didn't take, sent one a turn as turns end.
-    after_turn: VecDeque<Vec<MessagePart>>,
+    after_turn: VecDeque<AfterTurn>,
     /// The first entry that changed since the server last sent this thread's changes, so it
     /// doesn't compare a long conversation's every entry on each update.
     entries_changed_from: Option<usize>,
@@ -1212,7 +1224,11 @@ impl AgentThread {
                 self.view.state.capabilities = connected.capabilities;
                 self.view.state.supports_steering = connected.supports_steering;
                 self.agent_state = None;
-                self.steered_prompts.clear();
+                for prompt in std::mem::take(&mut self.steered_prompts) {
+                    if !prompt.taken {
+                        self.steering_ended(prompt.steering);
+                    }
+                }
                 self.view.state.auth_methods = connected.auth_methods;
                 self.mark_key_method();
                 self.view.state.agent_info = connected.agent_info;
@@ -1421,12 +1437,12 @@ impl AgentThread {
                     self.linger_for_background_work();
                 } else {
                     self.set_working(false);
-                    if let Some(parts) = self.after_turn.pop_front() {
-                        self.send_after_turn(parts);
+                    if let Some(message) = self.after_turn.pop_front() {
+                        self.send_after(message);
                     }
                 }
             }
-            MessageKind::Steered { parts, result } => self.steered(parts, result),
+            MessageKind::Steered { id, parts, result } => self.steered(id, parts, result),
             MessageKind::BackgroundTask(update) => self.apply_background_task_update(update),
             MessageKind::BackgroundTaskStopped { task_id, result } => {
                 self.background_task_stopped(task_id, result)
@@ -1558,7 +1574,7 @@ impl AgentThread {
         self.cancel_permission_requests();
         self.cancel_elicitations(|_| true);
         self.queued_prompts.clear();
-        self.after_turn.clear();
+        self.clear_after_turn();
         // They stop with the agent, or at least won't wake the new one.
         self.view.state.background_tasks.clear();
         self.background_processes.clear();
@@ -2601,21 +2617,42 @@ impl AgentThread {
         }
     }
 
-    pub fn steer(&mut self, text: String) {
-        self.steer_message(vec![MessagePart::Text(text)]);
+    pub fn steer(&mut self, id: u64, text: String) {
+        self.steer_message(id, vec![MessagePart::Text(text)]);
     }
 
-    /// Sends a message into the turn the agent is working on, when the agent takes one
-    /// ([`ThreadState::supports_steering`]). It shows in the thread once the agent takes it.
-    /// One it doesn't take goes once the turn ends, and one sent while the agent isn't working
-    /// goes at once, as [`Self::send_message`] sends it. On ACP v2 it's an ordinary prompt,
-    /// which the agent takes in when it's ready (Claude Agent once the turn ends).
-    pub fn steer_message(&mut self, parts: Vec<MessagePart>) {
+    /// Shows a queued message sent into the turn as steering
+    /// ([`ThreadState::steering_messages`]) until it shows in the thread, from before its
+    /// mentions and images are read. [`Self::steer_message`] sends it, by its id.
+    pub fn show_steering(&mut self, message: QueuedMessage) {
+        let steering = &mut self.view.state.steering_messages;
+        if !steering.iter().any(|shown| shown.id == message.id) {
+            steering.push(message);
+        }
+    }
+
+    /// The steered message went, or it's gone.
+    fn steering_ended(&mut self, id: u64) {
+        self.view
+            .state
+            .steering_messages
+            .retain(|message| message.id != id);
+    }
+
+    /// Sends the queued message `id` into the turn the agent is working on, when the agent
+    /// takes one ([`ThreadState::supports_steering`]). It shows in the thread once the agent
+    /// takes it, and as steering until then. One it doesn't take goes once the turn ends, and
+    /// one sent while the agent isn't working goes at once, as [`Self::send_message`] sends it.
+    /// On ACP v2 it's an ordinary prompt, which the agent takes in when it's ready (Claude
+    /// Agent once the turn ends).
+    pub fn steer_message(&mut self, id: u64, parts: Vec<MessagePart>) {
         let parts = trim_message(parts);
         if parts.is_empty() || self.runs_in_parent {
+            self.steering_ended(id);
             return;
         }
         if !self.is_working() {
+            self.steering_ended(id);
             self.send_message(parts);
             return;
         }
@@ -2624,7 +2661,10 @@ impl AgentThread {
             .as_ref()
             .filter(|_| self.view.state.supports_steering)
         else {
-            self.after_turn.push_back(parts);
+            self.after_turn.push_back(AfterTurn {
+                parts,
+                steering: Some(id),
+            });
             return;
         };
         if self.is_v2() {
@@ -2638,15 +2678,16 @@ impl AgentThread {
             )]));
             let response = session.connection.send_request(request).block_task();
             self.next_steered_prompt += 1;
-            let id = self.next_steered_prompt;
+            let prompt_id = self.next_steered_prompt;
             self.steered_prompts.push_back(SteeredPrompt {
-                id,
+                id: prompt_id,
+                steering: id,
                 parts,
                 taken: false,
             });
             self.spawn(async move {
                 MessageKind::SteeredPromptFinished {
-                    id,
+                    id: prompt_id,
                     result: response.await,
                 }
             });
@@ -2666,13 +2707,17 @@ impl AgentThread {
             Ok(request) => request,
             Err(error) => {
                 log::error!("failed to write the message into the turn: {error:?}");
-                self.after_turn.push_back(parts);
+                self.after_turn.push_back(AfterTurn {
+                    parts,
+                    steering: Some(id),
+                });
                 return;
             }
         };
         let response = session.connection.send_request(request).block_task();
         self.spawn(async move {
             MessageKind::Steered {
+                id,
                 parts,
                 result: response.await,
             }
@@ -2684,6 +2729,7 @@ impl AgentThread {
     /// started a turn with it instead (Codex), or `failed`.
     fn steered(
         &mut self,
+        id: u64,
         parts: Vec<MessagePart>,
         result: std::result::Result<Value, agent_client_protocol::Error>,
     ) {
@@ -2691,15 +2737,21 @@ impl AgentThread {
             Ok(response) => response.get("outcome").and_then(Value::as_str),
             Err(_) => None,
         };
+        let after_turn = AfterTurn {
+            parts,
+            steering: Some(id),
+        };
         match outcome {
             Some("injected" | "startedNewTurn") => {
+                self.steering_ended(id);
+                let parts = after_turn.parts;
                 self.view
                     .state
                     .sent_times
                     .push((self.view.entries.len(), SystemTime::now()));
                 self.push_entry(Entry::UserMessage(message_markdown(&parts)));
             }
-            Some("promptRequired") => self.send_after_turn(parts),
+            Some("promptRequired") => self.send_after(after_turn),
             _ => {
                 match &result {
                     Ok(response) => {
@@ -2710,17 +2762,36 @@ impl AgentThread {
                         error_message(error)
                     ),
                 }
-                self.send_after_turn(parts);
+                self.send_after(after_turn);
             }
         }
     }
 
     /// Sends a message once no turn is running.
     pub fn send_after_turn(&mut self, parts: Vec<MessagePart>) {
+        self.send_after(AfterTurn {
+            parts,
+            steering: None,
+        });
+    }
+
+    fn send_after(&mut self, message: AfterTurn) {
         if self.is_working() {
-            self.after_turn.push_back(parts);
-        } else {
-            self.send_message(parts);
+            self.after_turn.push_back(message);
+            return;
+        }
+        if let Some(id) = message.steering {
+            self.steering_ended(id);
+        }
+        self.send_message(message.parts);
+    }
+
+    /// Drops the messages waiting for the turn to end, with the agent they were for.
+    fn clear_after_turn(&mut self) {
+        for message in std::mem::take(&mut self.after_turn) {
+            if let Some(id) = message.steering {
+                self.steering_ended(id);
+            }
         }
     }
 
@@ -2965,8 +3036,8 @@ impl AgentThread {
         let after_turn = std::mem::take(&mut self.after_turn);
         self.restart_with(command, None);
         self.after_turn = after_turn;
-        if let Some(parts) = self.after_turn.pop_front() {
-            self.send_after_turn(parts);
+        if let Some(message) = self.after_turn.pop_front() {
+            self.send_after(message);
         }
     }
 
@@ -3467,8 +3538,8 @@ impl AgentThread {
                 )
         });
         self.set_working(false);
-        if let Some(parts) = self.after_turn.pop_front() {
-            self.send_after_turn(parts);
+        if let Some(message) = self.after_turn.pop_front() {
+            self.send_after(message);
         }
     }
 
@@ -3520,6 +3591,8 @@ impl AgentThread {
         };
         prompt.taken = true;
         let message = message_markdown(&prompt.parts);
+        let steering = prompt.steering;
+        self.steering_ended(steering);
         self.view
             .state
             .sent_times
@@ -3565,11 +3638,14 @@ impl AgentThread {
                 error_message(error)
             );
         }
-        if !self.is_working() {
-            self.send_message(prompt.parts);
+        let was_working = self.is_working();
+        self.send_after(AfterTurn {
+            parts: prompt.parts,
+            steering: Some(prompt.steering),
+        });
+        if !was_working {
             return;
         }
-        self.after_turn.push_back(prompt.parts);
         // The turn waited for this message only.
         if self.working_on_its_own && !self.own_work_ending && !self.goes_on_by_report() {
             self.end_own_work();
@@ -3745,7 +3821,7 @@ impl AgentThread {
         self.return_handoff();
         self.end_subagents();
         self.queued_prompts.clear();
-        self.after_turn.clear();
+        self.clear_after_turn();
         self.view.state.background_tasks.clear();
         self.stops_in_flight = 0;
         self.view.state.authenticating = None;
@@ -6330,10 +6406,21 @@ mod tests {
         thread
             .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
             .await;
-        thread.update(|thread| thread.steer("use tabs".into()));
+        thread.update(|thread| {
+            thread.show_steering(QueuedMessage {
+                id: 1,
+                prompt: agentz_protocol::PromptPart::text("use tabs"),
+            });
+            thread.steer(1, "use tabs".into());
+        });
+        assert_eq!(thread.thread.state.steering_messages.len(), 1);
         thread
             .wait_until(|thread| user_messages(thread) == ["permission", "use tabs"])
             .await;
+        assert!(
+            thread.thread.state.steering_messages.is_empty(),
+            "it shows in the thread now"
+        );
         thread.update(|thread| {
             let allow = acp::PermissionOptionId::new("allow");
             thread.respond_to_permission(&tool_call_id, allow);
@@ -6363,12 +6450,19 @@ mod tests {
         thread
             .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
             .await;
-        thread.update(|thread| thread.steer("refuse".into()));
+        thread.update(|thread| {
+            thread.show_steering(QueuedMessage {
+                id: 1,
+                prompt: agentz_protocol::PromptPart::text("refuse"),
+            });
+            thread.steer(1, "refuse".into());
+        });
         thread
             .wait_until(|thread| !thread.after_turn.is_empty())
             .await;
-        // It shows once it's sent.
+        // It shows once it's sent, and as steering until then.
         assert_eq!(user_messages(&thread.thread), ["permission"]);
+        assert_eq!(thread.thread.state.steering_messages.len(), 1);
         thread.update(|thread| {
             let allow = acp::PermissionOptionId::new("allow");
             thread.respond_to_permission(&tool_call_id, allow);
@@ -6380,6 +6474,7 @@ mod tests {
             })
             .await;
         assert_eq!(user_messages(&thread.thread), ["permission", "refuse"]);
+        assert!(thread.thread.state.steering_messages.is_empty());
     }
 
     fn agent_messages(thread: &AgentThread) -> Vec<String> {
@@ -6433,7 +6528,7 @@ mod tests {
                 last_agent_message(thread).as_deref() == Some("The command finished.")
             })
             .await;
-        thread.update(|thread| thread.steer("next".into()));
+        thread.update(|thread| thread.steer(1, "next".into()));
         thread
             .wait_until(|thread| {
                 !thread.is_working()
@@ -6541,10 +6636,21 @@ mod tests {
         thread
             .wait_until(|thread| thread.permission_request(&tool_call_id).is_some())
             .await;
-        thread.update(|thread| thread.steer("use tabs".into()));
+        thread.update(|thread| {
+            thread.show_steering(QueuedMessage {
+                id: 1,
+                prompt: agentz_protocol::PromptPart::text("use tabs"),
+            });
+            thread.steer(1, "use tabs".into());
+        });
         thread.handle_messages_for(Duration::from_millis(300)).await;
         assert_eq!(user_messages(&thread.thread), ["permission"]);
         assert!(thread.thread.after_turn.is_empty());
+        assert_eq!(
+            thread.thread.state.steering_messages.len(),
+            1,
+            "it shows as steering until the agent takes it in"
+        );
 
         thread.update(|thread| {
             let allow = acp::PermissionOptionId::new("allow");
@@ -6557,6 +6663,7 @@ mod tests {
             })
             .await;
         assert_eq!(user_messages(&thread.thread), ["permission", "use tabs"]);
+        assert!(thread.thread.state.steering_messages.is_empty());
         assert_eq!(
             agent_messages(&thread.thread),
             ["Echo: permission", " (chose allow)", "Echo: use tabs"]
@@ -7894,7 +8001,7 @@ mod tests {
             .wait_until(|thread| thread.state.last_stop_reason.is_some())
             .await;
         assert!(thread.thread.is_working(), "its command still runs");
-        thread.update(|thread| thread.steer("are you here?".into()));
+        thread.update(|thread| thread.steer(1, "are you here?".into()));
         thread
             .wait_up_to(Duration::from_secs(30), |thread| {
                 last_agent_message(thread).as_deref() == Some("The command finished.")

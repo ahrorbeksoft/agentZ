@@ -267,7 +267,7 @@ impl Server {
         }
         let connection = ConnectionId::Thread(thread_id);
         self.update_thread(connection, |thread| thread.set_workspace_setup(None))?;
-        self.prompt(connection, run.prompt, false)
+        self.prompt(connection, run.prompt, None)
     }
 
     /// Runs the next step, or starts the agent in the workspace once they're all done.
@@ -455,7 +455,7 @@ impl Server {
             self.forget_removed_workspace(&workspace.path);
             // The agent starts there now, and goes on in its session.
             self.stop_agent(thread_id);
-            self.prompt(ConnectionId::Thread(thread_id), run.prompt, false)
+            self.prompt(ConnectionId::Thread(thread_id), run.prompt, None)
                 .log_err();
             return;
         }
@@ -490,7 +490,7 @@ impl Server {
             .retain(|_, session_thread| *session_thread != thread_id);
         // Its session was opened in the old folder, and never had a message.
         self.projects.forget_thread_session(thread_id);
-        self.prompt(ConnectionId::Thread(thread_id), run.prompt, false)
+        self.prompt(ConnectionId::Thread(thread_id), run.prompt, None)
             .log_err();
     }
 

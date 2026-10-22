@@ -227,7 +227,11 @@ impl Server {
                 queue.steering = false;
             }
             self.queue_changed(thread_id);
-            self.prompt(ConnectionId::Thread(thread_id), message.prompt, true)?;
+            self.prompt(
+                ConnectionId::Thread(thread_id),
+                message.prompt,
+                Some(message.id),
+            )?;
             return Ok(());
         }
         if index == 0 && queue.steering {
@@ -312,7 +316,7 @@ impl Server {
             let message = queue.messages.remove(0);
             queue.steering = false;
             self.queue_changed(thread_id);
-            self.prompt(ConnectionId::Thread(thread_id), message.prompt, false)
+            self.prompt(ConnectionId::Thread(thread_id), message.prompt, None)
                 .log_err();
         }
     }
