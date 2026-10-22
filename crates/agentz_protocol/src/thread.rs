@@ -425,6 +425,16 @@ pub struct BackgroundTask {
     pub started_at: SystemTime,
 }
 
+impl BackgroundTask {
+    /// Whether the agent's turn waits for it, as t3code's `backgroundWorkHoldsCompletion`
+    /// decides: a command (a dev server, a watcher) doesn't, as the agent is done and may leave
+    /// it running for hours. Workflows, monitors and kinds agentZ doesn't know do, as the agent
+    /// goes on with what they bring.
+    pub fn holds_turn(&self) -> bool {
+        self.kind.as_ref() != "shell"
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PermissionOption {
     pub id: acp::PermissionOptionId,

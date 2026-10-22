@@ -1474,7 +1474,7 @@ impl AgentThread {
                 // lasts. What it only seems to be doing (a call it never ended, subagents it
                 // sent off that may have reported already, commands it left running, the wake
                 // a command's end brings) is given up on after a while.
-                let is_reported = !self.view.state.background_tasks.is_empty()
+                let is_reported = self.background_tasks_hold_turn()
                     || !self.view.state.permission_requests.is_empty()
                     || !self.view.state.elicitations.is_empty();
                 let holds_turn = self.holds_turn_in_background();
@@ -3173,7 +3173,7 @@ impl AgentThread {
             && self.stops_in_flight == 0
             && !self.holds_turn_in_background()
             && self.process_wakes_due == 0
-            && self.view.state.background_tasks.is_empty()
+            && !self.background_tasks_hold_turn()
             && !self.has_running_tool_call_since(self.own_work_from)
         {
             self.end_own_work();
@@ -3282,10 +3282,21 @@ impl AgentThread {
     }
 
     /// The agent's turn is over, but not its work: something it left running in the
-    /// background, or what it goes on with once that ends. On ACP v2 the agent reports its
-    /// work, and what runs in the background while it's idle (a dev server) isn't waited for.
+    /// background that it goes on with ([`BackgroundTask::holds_turn`]), or what it goes on
+    /// with once that ended. A command it left running (a dev server) isn't waited for, and
+    /// on ACP v2 the agent reports its work.
     pub fn is_waiting(&self) -> bool {
-        !self.is_v2() && self.has_background_work()
+        !self.is_v2() && (self.background_tasks_hold_turn() || self.own_work_due)
+    }
+
+    /// Whether a task the agent left running holds its turn on v1, as the agent will go on
+    /// with what it brings.
+    fn background_tasks_hold_turn(&self) -> bool {
+        self.view
+            .state
+            .background_tasks
+            .iter()
+            .any(BackgroundTask::holds_turn)
     }
 
     /// The agent left work running in the background, or is expected to go on once it ended,
@@ -3451,8 +3462,9 @@ impl AgentThread {
     }
 
     /// Whether the turn whose prompt was just answered goes on: the agent left work running in
-    /// the background (Claude Agent's background tasks) or sent subagents off to report later
-    /// (Factory Droid's Task that doesn't wait). It's still working until all of that stops.
+    /// the background that it goes on with (Claude Agent's workflows and monitors, not its
+    /// commands) or sent subagents off to report later (Factory Droid's Task that doesn't
+    /// wait). It's still working until all of that stops.
     fn turn_goes_on_in_background(&mut self) -> bool {
         if self.session.is_none() || self.view.state.status != ConnectionStatus::Ready {
             return false;
@@ -3465,7 +3477,7 @@ impl AgentThread {
             return false;
         }
         self.count_background_work(self.turn_started_entries);
-        !self.view.state.background_tasks.is_empty() || self.holds_turn_in_background()
+        self.background_tasks_hold_turn() || self.holds_turn_in_background()
     }
 
     /// Keeps the thread working past its prompt's answer, as the agent's work of its own, so
@@ -3923,10 +3935,11 @@ impl AgentThread {
                     self.start_own_work();
                 }
                 // Claude Agent reports its cost with each result, its own work's too. Work it
-                // left running (a background task, a tool call still going) isn't over, though.
+                // left running that it goes on with (a background task, a tool call still
+                // going) isn't over, though.
                 let ends_own_work = self.working_on_its_own
                     && !self.is_v2()
-                    && self.view.state.background_tasks.is_empty()
+                    && !self.background_tasks_hold_turn()
                     && !self.has_running_tool_call_since(self.own_work_from)
                     && matches!(
                         &notification.update,
@@ -6488,10 +6501,11 @@ mod tests {
             .collect()
     }
 
-    /// A command the agent sends to the background shows until it ends, as Claude Agent reports
-    /// it (JetBrains AIR's async tasks). The turn doesn't end with its prompt's answer: the
-    /// thread works while the command runs and then through what the agent goes on with, with
-    /// no prompt, until its result, all one turn. What was sent meanwhile goes after.
+    /// Work the agent sends to the background and goes on with (a monitor) shows until it
+    /// ends, as Claude Agent reports it (JetBrains AIR's async tasks). The turn doesn't end
+    /// with its prompt's answer: the thread works while it runs and then through what the agent
+    /// goes on with, with no prompt, until its result, all one turn. What was sent meanwhile
+    /// goes after.
     #[tokio::test(flavor = "multi_thread")]
     async fn shows_background_tasks_and_the_work_after_them() {
         let Some(command) = mock_agent(&[]) else {
@@ -6501,7 +6515,7 @@ mod tests {
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;
-        thread.update(|thread| thread.send("background-task 1".into()));
+        thread.update(|thread| thread.send("background-task 1 monitor".into()));
         thread
             .wait_until(|thread| {
                 thread.state.last_stop_reason.is_some() && !thread.state.background_tasks.is_empty()
@@ -6509,7 +6523,7 @@ mod tests {
             .await;
         let task = thread.thread.state.background_tasks[0].clone();
         assert_eq!(task.name.as_ref(), "Sleep for 1 seconds");
-        assert_eq!(task.kind.as_ref(), "shell");
+        assert_eq!(task.kind.as_ref(), "monitor");
         assert_eq!(task.tool_call_id, Some(acp::ToolCallId::new("bash-1")));
         assert!(task.can_stop);
         assert!(
@@ -6539,9 +6553,56 @@ mod tests {
             agent_messages(&thread.thread)[..2],
             ["Started in the background.", "The command finished."]
         );
-        assert_eq!(user_messages(&thread.thread), ["background-task 1", "next"]);
-        // The command and what followed it are one turn, and the message sent after is another.
+        assert_eq!(
+            user_messages(&thread.thread),
+            ["background-task 1 monitor", "next"]
+        );
+        // The task and what followed it are one turn, and the message sent after is another.
         assert_eq!(thread.thread.state.finished_turns.len(), 2);
+    }
+
+    /// A command left running in the background (Claude's dev server) doesn't hold the turn on
+    /// v1, as t3code doesn't let it: the thread is done at the prompt's answer while the command
+    /// shows, with its Stop. What the agent goes on with once it ended joins that turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_left_running_doesnt_hold_the_turn() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("background-task 2".into()));
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && thread.state.last_stop_reason.is_some()
+                    && !thread.state.background_tasks.is_empty()
+            })
+            .await;
+        let task = thread.thread.state.background_tasks[0].clone();
+        assert_eq!(task.kind.as_ref(), "shell");
+        assert!(task.can_stop);
+        assert!(thread.thread.has_background_work());
+        assert!(!thread.thread.is_waiting());
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+
+        thread
+            .wait_up_to(Duration::from_secs(10), |thread| thread.works_on_its_own())
+            .await;
+        thread
+            .wait_until(|thread| {
+                !thread.is_working()
+                    && last_agent_message(thread).as_deref() == Some("The command finished.")
+            })
+            .await;
+        assert!(!thread.thread.has_background_work());
+        assert_eq!(
+            agent_messages(&thread.thread),
+            ["Started in the background.", "The command finished."]
+        );
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
     }
 
     fn v2_mock_agent(args: &[String]) -> Option<AgentCommand> {
@@ -7186,7 +7247,7 @@ mod tests {
         thread
             .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
             .await;
-        thread.update(|thread| thread.send("background-task 30".into()));
+        thread.update(|thread| thread.send("background-task 30 monitor".into()));
         thread
             .wait_until(|thread| {
                 thread.state.last_stop_reason.is_some() && !thread.state.background_tasks.is_empty()

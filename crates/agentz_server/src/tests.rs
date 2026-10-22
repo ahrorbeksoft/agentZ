@@ -1249,8 +1249,9 @@ async fn keeps_an_agent_with_a_background_task() {
     );
 }
 
-/// A turn that leaves a command in the background doesn't complete its thread: the thread
-/// goes on working, and completes once the agent's work with the command's result has ended.
+/// A turn that leaves work in the background that the agent goes on with (a monitor) doesn't
+/// complete its thread: the thread goes on working, and completes once the agent's work with
+/// the task's result has ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_thread_with_a_background_task_completes_after_it() {
     let Some(server) = TestServer::start() else {
@@ -1274,7 +1275,7 @@ async fn a_thread_with_a_background_task_completes_after_it() {
     client
         .ok(Request::Prompt {
             connection,
-            prompt: PromptPart::text("background-task 2"),
+            prompt: PromptPart::text("background-task 2 monitor"),
         })
         .await;
     client
@@ -1296,6 +1297,49 @@ async fn a_thread_with_a_background_task_completes_after_it() {
                 && completed_at(client).is_some()
         })
         .await;
+}
+
+/// A command left running in the background (a dev server) doesn't hold its thread: it
+/// completes with its turn while the command shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_with_a_command_left_running_completes_with_its_turn() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    client.ok(Request::SubscribeSession).await;
+    let thread_id = client.create_thread(&server).await;
+    let connection = ConnectionId::Thread(thread_id);
+    client.subscribe_thread(connection).await;
+    client
+        .ok(Request::Prompt {
+            connection,
+            prompt: PromptPart::text("background-task 60"),
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            let thread = client.thread(connection);
+            !thread.is_working()
+                && !thread.state.background_tasks.is_empty()
+                && client
+                    .projects
+                    .as_ref()
+                    .and_then(|projects| {
+                        projects
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == thread_id)
+                    })
+                    .is_some_and(|thread| thread.completed_at.is_some())
+        })
+        .await;
+    assert!(
+        !client
+            .projects
+            .as_ref()
+            .is_some_and(|projects| projects.waiting_threads.contains(&thread_id))
+    );
 }
 
 /// A new thread is a draft until its first message, as in t3code: one left with nothing typed

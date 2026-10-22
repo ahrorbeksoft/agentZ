@@ -17,8 +17,9 @@ async tasks (`_meta.jetbrains.air.capabilities` has "asyncTasks"), it reports th
 Claude Agent does, and stops it on `_session/async_task/stop`, noting the stop in the
 conversation. Once the command is done, it says so a word at a time with no prompt, as Claude
 Agent goes on when a background task ends, and ends with a usage update with its cost.
-"background-task [seconds] limit" uses the account's limit up as its turn ends, which fails
-with "Usage limit reached", the command still running. "subagents [seconds]" runs two subagents at once, as Claude Agent does: to a client that takes
+"background-task [seconds] monitor" (or "workflow") reports the task as that kind of work
+instead of a command ("shell"). "background-task [seconds] limit" uses the account's limit up
+as its turn ends, which fails with "Usage limit reached", the command still running. "subagents [seconds]" runs two subagents at once, as Claude Agent does: to a client that takes
 its native subagent sessions (`_meta.jetbrains.air.capabilities` has "nativeSubagentSessions"),
 it announces each (`subagent_spawned`), sends their searches, reads and reports in their own
 sessions, a step every 0.2 seconds (or the seconds given), and ends each with
@@ -1611,6 +1612,9 @@ for message in incoming():
             seconds = float(words[1]) if len(words) > 1 else 1
             # "limit" uses the account up as the turn ends, with the command still running.
             runs_into_limit = words[-1] == "limit"
+            # Claude Agent's other kinds of background work, which it goes on with.
+            task_type = next((word for word in words[2:] if word in ("monitor", "workflow")),
+                             "shell")
             background_task_count += 1
             task_id = f"task-{background_task_count}"
             tool_call_id = f"bash-{background_task_count}"
@@ -1628,7 +1632,7 @@ for message in incoming():
             if async_tasks:
                 send_task_update(session_id, {
                     "sessionUpdate": "async_task_spawned", "asyncTaskId": task_id, "name": name,
-                    "taskType": "shell", "description": name, "showInTranscript": True,
+                    "taskType": task_type, "description": name, "showInTranscript": True,
                     "canStop": True, "toolCallId": tool_call_id,
                     "outputFilePath": f"/tmp/mock-tasks/{task_id}.output"})
             update(session_id, text_chunk("agent_message_chunk", "Started in the background."))

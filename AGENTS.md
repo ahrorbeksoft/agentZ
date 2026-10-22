@@ -151,7 +151,8 @@ From Zed's guidelines, which this code follows:
   a page. `notice` sends ACP notices, and `/compact` compacts the context with a summary
   (`compact-fail` fails to). `background-task [seconds]` leaves a command running
   as Claude Agent does, reported with JetBrains AIR's async tasks, then goes on with no prompt
-  once it ends (`background-task 4 limit` uses the account's limit up as its turn ends, the
+  once it ends (`background-task 1 monitor` or `workflow` reports it as that kind of work,
+  which holds the turn; `background-task 4 limit` uses the account's limit up as its turn ends, the
   command still running). `subagents [seconds]` runs two subagents at once in sessions of their own, as
   Claude Agent does with AIR's native subagent sessions (`subagents permission` has the first
   ask for permission; `subagents standard` runs them in ACP's subagent sessions, and

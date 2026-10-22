@@ -20,25 +20,6 @@ method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane
 terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
 which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
 
-### Claude's background dev server keeps its thread Working, on ACP v1
-
-Requested October 21, 2026: "sometimes claude runs a background task and forget about it and
-it shows it is still working … like a dev server". Asked whether to follow t3code, the user
-said: "t3-code implement their own thing we use acp, we gotta find acp way of doing".
-
-Fixed for agents on ACP v2 (October 22, 2026), the ACP way: the agent's `idle` `state_update`
-ends its turn while a background task runs, and its follow-up once the task ends shows as work
-of its own. Claude Agent 0.94.0 is on v2 while the experimental ACP v2 switch is on, with
-`CLAUDE_AGENT_ACP_EXPERIMENTAL_V2` set.
-
-Still to decide: what agents on v1 do (a Claude Agent without its v2 surface). There a running
-background task still counts as reported work (`is_reported` in `AgentThread`'s
-`OwnWorkQuiet` handling), waited for with no limit, as built for bug 3 of
-`design/feedback/plan.md` (a build Claude said it would wait for). v1 has no state for a
-session, so what agentZ does after the prompt's answer is inference. For comparison, t3code
-doesn't let background commands hold a thread, but does let subagents and monitors hold it
-(`backgroundWorkHoldsCompletion`).
-
 ## Features
 
 ### Artifacts move with their thread to another machine

@@ -1097,14 +1097,18 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   task ends, Claude Agent goes on with no prompt. A message, thought or tool call while no turn
   runs (and the session is open, and no stop is in flight, whose note doesn't count) makes the
   thread work as for a turn, with its reply as a new message, until the agent's result (a
-  usage update with its cost, which doesn't end it while a background task or a tool call is
-  still running) or 30 seconds without updates or running tool calls. Messages sent meanwhile
+  usage update with its cost, which doesn't end it while a background task that holds the turn
+  or a tool call is still running) or 30 seconds without updates or running tool calls. Messages sent meanwhile
   wait for it, as for a turn; Stop cancels it. Its permission requests and questions go with
   it, so a request nobody can answer any more doesn't keep "Waiting for you" up.
-  A turn that ends while background work goes on (a background task running, or a subagent
-  sent to the background by Factory Droid's Task with `await: false`, `ToolCall::
-  sends_subagent_to_background`) stays working (`linger_for_background_work`) as work of its
-  own: ACP says nothing while it runs, and the agent wakes by itself with the result. It ends
+  A turn that ends while background work goes on (a background task that holds the turn
+  running, or a subagent sent to the background by Factory Droid's Task with `await: false`,
+  `ToolCall::sends_subagent_to_background`) stays working (`linger_for_background_work`) as
+  work of its own: ACP says nothing while it runs, and the agent wakes by itself with the
+  result. As t3code's `backgroundWorkHoldsCompletion` decides (`BackgroundTask::holds_turn`),
+  a command (`shell`, Claude's dev server) doesn't hold the turn, as the agent may leave it
+  running for hours; its workflows, monitors and kinds agentZ doesn't know do. The command
+  still shows with its Stop, and keeps the agent running. It ends
   as the work does (the last background task stopping or the agent's result), or after 20
   minutes of 30-second checks (`OWN_WORK_QUIET_ROUNDS`) for work that only seems to run, such
   as a tool call never closed. The sidebar has no Waiting status for it: the thread shows
@@ -1987,7 +1991,8 @@ Designed in `design/sounds/` and `design/notifications/`.
 
 - The server sends facts: `working_threads`, `blocked_threads` (a permission waiting, its own
   or a subthread's), `awaiting_input_threads` (a request for input waiting),
-  `waiting_threads` (`Server::is_waiting`: the turn ended with a background task running, or
+  `waiting_threads` (`Server::is_waiting`: the turn ended with a background task that holds
+  it running (not a command), or
   within 15 seconds of one ending by itself, while the agent is due to go on with its result,
   `AgentThread::is_waiting`, never on ACP v2; or with subthreads whose end it hasn't heard
   of), and each
