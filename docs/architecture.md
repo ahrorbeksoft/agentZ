@@ -2150,7 +2150,8 @@ Zed's `terminal` and `terminal_view`, t3code's drawer, herdr's surface interest.
   outside the terminal's key context so its keys don't reach the shell.
 - **Where they appear**: terminal threads (`terminal_thread_view.rs`, a login shell from New
   Thread; Cmd-W closes one as it closes a Workspaces pane, deleting the thread and asking first
-  while a program runs in front of its shell); the thread's terminal drawer (`terminal_drawer.rs`, t3code's with Zed's terminal tabs,
+  while a program runs in front of its shell, as does the × at the right end of its header,
+  "Close Terminal"); the thread's terminal drawer (`terminal_drawer.rs`, t3code's with Zed's terminal tabs,
   picked in `design/thread-terminals/`: Cmd-J, a 30-pixel strip with a tab for each shell,
   named by what runs in front of it as the server reports it (`drawer_commands`, else
   "Shell"), then New Terminal and Full Screen; a tab's × asks first while a program runs; a

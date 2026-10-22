@@ -174,6 +174,7 @@ impl TerminalThreadView {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.view.focus_handle(cx);
         let terminal = self.terminal.read(cx);
         let exit = terminal.frame().and_then(|frame| frame.exited.clone());
         let window_title = terminal
@@ -238,6 +239,20 @@ impl TerminalThreadView {
                 )
             })
             .child(render_changes_button(self.changes, self.is_diff_open))
+            .child(
+                div().debug_selector(|| "close-terminal".into()).child(
+                    IconButton::new("close-terminal", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::for_action_title_in(
+                            "Close Terminal",
+                            &CloseTerminal,
+                            &focus_handle,
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close(&CloseTerminal, window, cx)
+                        })),
+                ),
+            )
     }
 }
 
@@ -346,5 +361,21 @@ mod tests {
         cx.simulate_prompt_answer("Close");
         cx.run_until_parked();
         assert_eq!(deletes(cx), 2);
+
+        // The header's close button does the same: it asks while the program runs.
+        let close = cx.debug_bounds("close-terminal").expect("a close button");
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
+        assert_eq!(
+            cx.pending_prompt().map(|(title, _)| title),
+            Some("Close “npm”?".to_string())
+        );
+        cx.simulate_prompt_answer("Close");
+        cx.run_until_parked();
+        assert_eq!(deletes(cx), 3);
+        cx.update(|_, cx| set_running(None, cx));
+        cx.simulate_click(close.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_eq!(deletes(cx), 4);
     }
 }
