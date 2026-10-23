@@ -20,8 +20,15 @@ method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane
 terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
 which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
 
-## Features
+### Clicking a file link in a thread says "The application can't be opened"
 
+Reported October 23, 2026: pressing a file link an agent gave opens a macOS dialog, "The
+application can't be opened. -50", instead of the file. In the screenshot, it's the `AUDIT.md`
+link in a Codex thread's "Saved the full report at AUDIT.md".
+
+![The "application can't be opened, -50" dialog after clicking a file link in a thread](backlog/file-link-cant-be-opened.png)
+
+## Features
 ### Artifacts move with their thread to another machine
 
 From the Artifacts 2 round (`design/artifacts-2/`, decided in its intro and topic 7): an
