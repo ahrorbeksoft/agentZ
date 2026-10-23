@@ -57,7 +57,7 @@ default-members = ["crates/app", "crates/agentz_server"]
 
 [workspace.package]
 # agentZ's version, the app's and agentz-server's alike. The release's tag must match it.
-version = "0.4.2"
+version = "0.4.3"
 publish = false
 edition = "2024"
 
