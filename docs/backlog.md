@@ -101,3 +101,9 @@ for 13m 58s" at the end of its turn, while its running shell is in a separate "1
 Task" panel above the composer.
 
 ![A Claude Agent thread's Working label, with its background shell in a panel above the composer](backlog/shells-beside-working-label.png)
+
+### Redesign chats
+
+Requested October 23, 2026: redesign chats. They don't need their own grouping any more: a chat
+should be just like any other thread, but show "Chat" or something like it in place of a
+project name. In the project selector, it should be possible to select Chat to show only chats.
