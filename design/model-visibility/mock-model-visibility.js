@@ -69,9 +69,11 @@ const mvSearch = (query = '') => `<div class="row" style="height:38px;padding:0 
 const mvEffort = (current = 'Extra High') => `<div style="border-top:1px solid var(--bv);padding:4px;flex:none"><div class="sm mu" style="padding:2px 8px">Reasoning Effort</div>${MV_EFFORTS.map((level) => mvRow(level, { current: level === current })).join('')}</div>`;
 const mvFootRow = (icon, label, { end = '', hover = false } = {}) => `<div style="border-top:1px solid var(--bv);padding:4px;flex:none"><div class="row" style="height:28px;padding:0 8px;gap:8px;border-radius:6px;${hover ? 'background:var(--hov);' : ''}">${ic(icon, 'sm mu')}<span class="grow">${label}</span>${end}</div></div>`;
 const mvManage = () => mvFootRow('settings', 'Manage Models…');
-// The picker (model_picker.rs): 18rem wide, the search, nine models at a time, then the effort's
-// levels.
-const mvPicker = ({ query = '', rows, above = '', below = '', effort = true, w = 288, maxH = 260, lead = '' } = {}) => `<div class="pop" style="position:relative;width:${w}px;display:flex;overflow:hidden"><div style="display:flex;flex:none">${lead}</div><div class="col grow" style="min-width:0">${mvSearch(query)}${above}<div style="max-height:${maxH}px;overflow:hidden;padding:4px;display:flex;flex-direction:column">${rows}</div>${below}${effort ? mvEffort() : ''}</div></div>`;
+// The effort as one row whose levels open in a submenu (topic 13's A).
+const mvEffortRow = ({ hover = false, current = 'Extra High' } = {}) => `<div style="border-top:1px solid var(--bv);padding:4px;flex:none"><div class="row" style="height:28px;padding:0 8px;gap:8px;border-radius:6px;${hover ? 'background:var(--hov);' : ''}"><span class="grow">Reasoning Effort</span><span class="mu">${current}</span>${ic('chev-right', 'xs mu')}</div></div>`;
+// The picker (model_picker.rs): 18rem wide, the search, the models (eight at a time, topic 14's A),
+// then the effort: its row (topic 13's A), or `effort: 'list'` for today's levels under the models.
+const mvPicker = ({ query = '', rows, above = '', below = '', effort = true, w = 288, maxH = 232, lead = '' } = {}) => `<div class="pop" style="position:relative;width:${w}px;display:flex;overflow:hidden"><div style="display:flex;flex:none">${lead}</div><div class="col grow" style="min-width:0">${mvSearch(query)}${above}<div style="max-height:${maxH}px;overflow:hidden;padding:4px;display:flex;flex-direction:column">${rows}</div>${below}${effort === 'list' ? mvEffort() : effort ? mvEffortRow(effort === true ? {} : effort) : ''}</div></div>`;
 
 // The thread under it: its header, the end of the conversation, and the composer's card with
 // the agent chip at the left and the model chip beside Send, the machine under it.
@@ -79,7 +81,7 @@ const mvChip = (label = 'Opus 5.5 · Extra High', { open = true } = {}) => `<spa
 const mvSend = () => `<span style="width:24px;height:24px;border-radius:50%;background:var(--sel);color:var(--ph);display:inline-grid;place-items:center;flex:none">${ic('arrow-up', 'xs')}</span>`;
 const mvAgentChip = () => `<span class="row none" style="gap:5px;height:24px;padding:0 6px;font-size:12.5px;color:var(--mu)">${glyph('droid', 'sm')}Factory Droid${ic('chev-down', 'xs')}</span>`;
 const mvTalk = () => `<div style="display:flex;justify-content:flex-end;padding:0 0 12px"><div style="max-width:70%;background:#3a3f4b;border-radius:10px;padding:8px 12px;line-height:21px">The checkout page takes 3 seconds to load. Find out why.</div></div><div style="line-height:22px">Most of it is the order summary, which asks for each item’s price one at a time. I’ll batch those into one request.</div>`;
-function mvScene(over, { w = 640, h = 660, chip = mvChip(), talk = mvTalk(), bottom = 70, right = 50, extra = '' } = {}) {
+function mvScene(over, { w = 640, h = 560, chip = mvChip(), talk = mvTalk(), bottom = 70, right = 50, extra = '' } = {}) {
   return frame(`<div class="col" style="position:absolute;inset:0;background:var(--ed)">
     <div class="row g15" style="height:36px;flex:none;padding:0 12px;border-bottom:1px solid var(--bv);font-size:13px"><span class="mono" style="background:#4b3034;color:#e06c75">AZ</span><span class="mu">agentZ</span><span class="mu">/</span><span>Speed up the checkout page</span>${ic('chev-down', 'xs mu')}</div>
     <div style="padding:20px 22px">${talk}</div></div>

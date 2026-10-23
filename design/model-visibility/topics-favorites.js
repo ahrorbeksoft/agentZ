@@ -29,7 +29,7 @@ TOPICS.push({
     { key: 'D', name: 'From the row’s menu', from: 'new',
       desc: 'Right-clicking a model opens a small menu: Add to Favorites, and Hide from Picker (topic 1).',
       good: 'Both, where you see the model.', cost: 'Nobody looks for a right-click menu in a picker.',
-      mock: () => mvScene(mvPicker({ rows: mvZedRows({ all: (name) => (name === 'Fable 5.1' ? { hover: true } : {}) }), below: mvManage() }), { extra: mvMenu([[mvStar(false), 'Add to Favorites'], [ic('eye-off', 'sm'), 'Hide from Picker']], 'left:420px;top:316px', 190) }) },
+      mock: () => mvScene(mvPicker({ rows: mvZedRows({ all: (name) => (name === 'Fable 5.1' ? { hover: true } : {}) }), below: mvManage() }), { extra: mvMenu([[mvStar(false), 'Add to Favorites'], [ic('eye-off', 'sm'), 'Hide from Picker']], 'left:420px;top:366px', 190) }) },
     { key: 'E', name: 'No favorites', from: 'today',
       desc: 'Hiding alone keeps the list short.', good: 'Nothing more to learn.', cost: 'The models you use most sit where the agent puts them.',
       mock: () => mvFavPicker(mvRows(mvShown())) },
@@ -63,7 +63,7 @@ TOPICS.push({
 
 // Favorites across agents: Droid’s, then Claude Agent’s and Codex’s.
 const mvOtherRows = ({ hoverFirst = false } = {}) => MV_OTHER_FAVORITES.map((favorite, index) => mvRow(favorite.model, { current: false, lead: glyph(favorite.kind, 'sm'), after: `<span class="xs ph trunc">${favorite.agent}</span>`, hover: hoverFirst && index === 0, })).join('');
-const mvSwitchTip = () => mvTip('Switch the thread to Claude Agent on Opus 5.5', 'position:absolute;right:346px;top:236px');
+const mvSwitchTip = () => mvTip('Switch the thread to Claude Agent on Opus 5.5', 'position:absolute;right:346px;top:294px');
 const mvDroidFavRows = () => mvRows(mvFavorites(), { each: () => ({ lead: glyph('droid', 'sm') }) });
 const mvRail = () => `<div class="col" style="width:40px;flex:none;border-right:1px solid var(--bv);padding:6px 0;gap:4px;align-items:center"><span class="ibtn on">${mvStar(true)}</span>${['droid', 'claude', 'codex'].map((kind) => `<span class="ibtn">${glyph(kind, 'sm')}</span>`).join('')}</div>`;
 const mvNewThread = () => '<div class="col" style="padding-top:150px;gap:6px;width:240px"><span style="font-size:18px">New thread</span><span class="sm mu">agentZ · main</span></div>';

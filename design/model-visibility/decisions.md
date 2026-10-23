@@ -78,7 +78,19 @@ Picked on the design board (`design/model-visibility/`, see `design/README.md`).
 
 **Today:** No key opens the model picker or changes the model; hovering the chip shows the setting’s name and description. In Zed, ⌥⌘/ opens the model selector, ⌥⇥ moves to the next favorite, and the chip’s tooltip names both (the second only with favorites).
 
-## 13. Where else the list applies: Not decided yet
+## 13. Reasoning Effort in a submenu: Not decided yet
+
+*The picker*
+
+**Today:** The picker lists the effort’s levels under the models, under a “Reasoning Effort” heading (composer-2, topic 2 A), so five more rows follow the models every time it opens. You asked for them in a submenu. agentZ’s agent picker already has submenus: an agent with accounts has a chevron at its row’s end, and its accounts open beside it on hover. Zed has the effort in a chip of its own beside the model’s (“Change Thinking Effort”), t3code in a menu of its own. Each mock opens the submenu to the left, where there’s room beside the composer.
+
+## 14. How tall the picker is: Not decided yet
+
+*The picker*
+
+**Today:** The models list is at most 18rem tall, nine rows, and then scrolls. The effort’s levels under it add six rows more. With the effort in a submenu (topic 13’s A) the picker is already about 130px shorter. You asked for it a little smaller. The mocks show the whole picker, with topic 13’s A and Manage Models….
+
+## 15. Where else the list applies: Not decided yet
 
 *Beyond the composer · pick any*
 

@@ -29,7 +29,7 @@ TOPICS.push({
       mock: () => mvPickerScene(mvPicker({ rows: mvRows(mvShown(), { each: (name) => (name === 'Sonnet 5.5' ? { hover: true, end: mvHoverEye() } : {}) }), below: mvFootRow('eye', 'Show 50 hidden') })) },
     { key: 'E', name: 'As it is', from: 'today',
       desc: 'Every model shows; search finds the one you want.', good: 'Nothing to manage.', cost: 'Ten of 66 at a time, and 111 for OpenCode.',
-      mock: () => mvPickerScene(mvPicker({ rows: mvRows(MV_MODELS) })) },
+      mock: () => mvPickerScene(mvPicker({ rows: mvRows(MV_MODELS), effort: 'list', maxH: 260 }), { h: 660 }) },
   ],
 });
 
@@ -52,7 +52,7 @@ TOPICS.push({
       mock: () => mvPickerScene(mvPicker({ rows: mvRows(mvShown().slice(-9), { each: () => ({ selected: false }) }) + mvFold(50), below: mvManage() })) },
     { key: 'D', name: 'As it is', from: 'today',
       desc: 'Nothing is hidden: “gpt” finds all 20.', good: 'Nothing new.', cost: 'Fast Mode twins and old versions crowd every search.',
-      mock: () => mvPickerScene(mvPicker({ query: 'gpt', rows: mvRows(mvMatches(MV_MODELS, 'gpt'), { query: 'gpt' }) })) },
+      mock: () => mvPickerScene(mvPicker({ query: 'gpt', rows: mvRows(mvMatches(MV_MODELS, 'gpt'), { query: 'gpt' }), effort: 'list', maxH: 260 }), { h: 660 }) },
   ],
 });
 
