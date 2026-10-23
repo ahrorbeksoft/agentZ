@@ -35,10 +35,17 @@ workflow" (2 left).
 
 ![A Factory Droid turn shown as ended while its release watcher runs](backlog/droid-turn-ends-during-background-work.png)
 
+And also, when the work is finished, it shows it's still working. In the second screenshot,
+Droid has woken, published 0.4.1 and given its final answer, its plan is All Done, but the
+thread still shows "Working for 1h 34m 32s" (circled), Working in the sidebar and the Stop
+button.
+
+![The same Droid thread, finished, still showing Working for 1h 34m 32s](backlog/droid-still-working-after-finishing.png)
+
 Earlier entries on Droid's background work ("Turns split without user messages", "A message
 sent while Factory Droid wakes by itself is never answered") were built in a7a4262 ("Keep
 Droid's turns whole while its background work runs", in v0.4.0 and v0.4.1). The account's
-email in the composer is covered in the screenshot.
+email in the composer is covered in both screenshots.
 
 ## Features
 
