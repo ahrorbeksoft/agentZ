@@ -49,6 +49,9 @@ const CARD_HEIGHT: Pixels = px(78.);
 const SUBTHREAD_ROW_INDENT: Pixels = px(24.);
 /// Where the tree line from a parent's card to its subthreads runs: under the card's icon.
 const SUBTHREAD_CONNECTOR_LEFT: Pixels = px(18.);
+/// t3code's Lineage shows a parent's first 6 related threads, then pages 12 at a time.
+pub(crate) const SUBTHREADS_INITIAL_COUNT: usize = 6;
+pub(crate) const SUBTHREADS_PAGE_COUNT: usize = 12;
 pub(crate) const DETAILS_DELAY: Duration = Duration::from_millis(500);
 pub const SIDEBAR_WIDTH: Pixels = px(290.);
 const RENAME_KEY_CONTEXT: &str = "SidebarRename";
@@ -367,6 +370,9 @@ pub struct Sidebar {
     active_subthread: Option<ThreadKey>,
     /// How the user left each parent's subthread rows, while it still applies.
     subthread_folds: HashMap<ThreadKey, SubthreadFold>,
+    /// How many of each parent's subthread rows show, once the user asked for more than
+    /// [`SUBTHREADS_INITIAL_COUNT`].
+    subthreads_shown: HashMap<ThreadKey, usize>,
     /// The open draft's row as it was when the draft was opened. Like t3code, the row doesn't
     /// repaint while you type in it, and a draft never left has none.
     frozen_draft: Option<(ThreadKey, Thread)>,
@@ -441,6 +447,7 @@ impl Sidebar {
             active_thread: None,
             active_subthread: None,
             subthread_folds: HashMap::default(),
+            subthreads_shown: HashMap::default(),
             frozen_draft: None,
             search,
             search_index: 0,
@@ -2263,20 +2270,44 @@ impl Sidebar {
                     .child(div().flex_none().child(icon.size(IconSize::Small))),
             );
         let rows: Vec<AnyElement> = if shows_subthreads {
-            let last = listed.len().saturating_sub(1);
-            listed
+            let shown = self
+                .subthreads_shown
+                .get(&thread_id)
+                .copied()
+                .unwrap_or(SUBTHREADS_INITIAL_COUNT);
+            // As t3code's Show more does, the open one shows even past the cap.
+            let visible: Vec<&Thread> = listed
                 .iter()
+                .enumerate()
+                .filter(|(index, subthread)| {
+                    *index < shown
+                        || self.active_subthread
+                            == Some(ThreadKey {
+                                machine,
+                                thread: subthread.id,
+                            })
+                })
+                .map(|(_, subthread)| subthread)
+                .collect();
+            let hidden_count = listed.len() - visible.len();
+            let last = visible.len().saturating_sub(1);
+            let mut rows: Vec<AnyElement> = visible
+                .into_iter()
                 .enumerate()
                 .map(|(index, subthread)| {
                     self.render_subthread_row(
                         machine,
                         subthread,
-                        index == last,
+                        index == last && hidden_count == 0,
                         raised.is_some(),
                         cx,
                     )
                 })
-                .collect()
+                .collect();
+            if hidden_count > 0 {
+                rows.push(self.render_show_more_subthreads(thread_id, hidden_count, cx));
+            }
+            rows
         } else {
             Vec::new()
         };
@@ -2496,37 +2527,11 @@ impl Sidebar {
                         ),
                 )
             });
-        // herdr's tree lines, as the Workspaces view draws them to a workspace's worktrees: ├
-        // for a row with more below, └ for the last, meeting the row at its first line.
-        let elbow = px(14.);
-        let connector = div()
-            .absolute()
-            .top_0()
-            .left(SUBTHREAD_CONNECTOR_LEFT)
-            .w(px(8.))
-            .map(|this| {
-                if is_last {
-                    this.h(elbow)
-                } else {
-                    this.h_full()
-                }
-            })
-            .border_l_1()
-            .border_color(border)
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(elbow)
-                    .w_full()
-                    .border_t_1()
-                    .border_color(border),
-            );
         let is_dragging = self.thread_drag.is_some();
         div()
             .relative()
             .pl(SUBTHREAD_ROW_INDENT)
-            .child(connector)
+            .child(render_subthread_connector(is_last, border))
             .child(
                 v_flex()
                     .id(thread_element_id("subthread-row", key))
@@ -2550,6 +2555,53 @@ impl Sidebar {
             .into_any_element()
     }
 
+    /// "+ Show 12 more" as the last row in a parent's subthread tree, t3code's Lineage paging:
+    /// 6 rows, then 12 more each time.
+    fn render_show_more_subthreads(
+        &self,
+        parent: ThreadKey,
+        hidden_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let hover_background = colors.ghost_element_hover;
+        div()
+            .relative()
+            .pl(SUBTHREAD_ROW_INDENT)
+            .child(render_subthread_connector(true, colors.border))
+            .child(
+                h_flex()
+                    .id(thread_element_id("subthread-show-more", parent))
+                    .debug_selector(move || format!("subthread-show-more-{}", parent.thread.0))
+                    .h(px(28.))
+                    .px_2()
+                    .gap_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(hover_background))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "Show {} more",
+                            hidden_count.min(SUBTHREADS_PAGE_COUNT)
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        *this
+                            .subthreads_shown
+                            .entry(parent)
+                            .or_insert(SUBTHREADS_INITIAL_COUNT) += SUBTHREADS_PAGE_COUNT;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
     /// t3code's draft row: a new thread with something typed and nothing sent, as its project
     /// and the first line of the text, marked Draft as a card with unsent text is.
     fn render_draft_row(
@@ -5356,8 +5408,8 @@ mod view_tests {
         thread
     }
 
-    /// A parent's subthreads are rows under its card, newest first, not cards of their own,
-    /// and a row opens its subthread. A queued one says so.
+    /// A parent's subthreads are rows under its card, not cards of their own, and a row opens
+    /// its subthread. A queued one says so, and comes after the running ones.
     #[gpui::test]
     fn subthreads_are_rows_under_their_parent(cx: &mut TestAppContext) {
         let (sidebar, store, cx) = new_sidebar(cx);
@@ -5373,10 +5425,10 @@ mod view_tests {
         assert!(cx.debug_bounds("thread-card-2").is_none());
         assert!(cx.debug_bounds("thread-card-3").is_none());
         let card = bounds(cx, "thread-card-1");
-        let newest = bounds(cx, "subthread-row-3");
-        let older = bounds(cx, "subthread-row-2");
-        assert!(card.bottom() <= newest.top());
-        assert!(newest.bottom() <= older.top());
+        let running = bounds(cx, "subthread-row-2");
+        let queued = bounds(cx, "subthread-row-3");
+        assert!(card.bottom() <= running.top());
+        assert!(running.bottom() <= queued.top());
 
         let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         cx.update(|_, cx| {
@@ -5392,6 +5444,41 @@ mod view_tests {
         assert_eq!(*opened.borrow(), [ThreadId(2)]);
     }
 
+    /// `design/subthreads-3/decisions.md`, topics 2 and 3: the ended subthreads come last,
+    /// newest first among the rest, and a parent shows its first 6, then "Show 3 more".
+    #[gpui::test]
+    fn subthread_rows_end_with_the_ended_ones_and_show_more(cx: &mut TestAppContext) {
+        let (_, store, cx) = new_sidebar(cx);
+        let mut threads = vec![
+            thread(1, false, None),
+            subthread(2, Some(projects::TaskEnd::Completed)),
+        ];
+        threads.extend((3..=10).map(|id| subthread(id, None)));
+        show(&store, threads, cx);
+        for row in [
+            "subthread-row-5",
+            "subthread-row-6",
+            "subthread-row-7",
+            "subthread-row-8",
+            "subthread-row-9",
+            "subthread-row-10",
+        ] {
+            assert!(cx.debug_bounds(row).is_some(), "{row} shows");
+        }
+        assert!(cx.debug_bounds("subthread-row-4").is_none());
+        assert!(cx.debug_bounds("subthread-row-2").is_none());
+        let newest = bounds(cx, "subthread-row-10");
+        let sixth = bounds(cx, "subthread-row-5");
+        let more = bounds(cx, "subthread-show-more-1");
+        assert!(newest.bottom() <= sixth.top());
+        assert!(sixth.bottom() <= more.top());
+
+        click_on("subthread-show-more-1", cx);
+        assert!(cx.debug_bounds("subthread-show-more-1").is_none());
+        let last_running = bounds(cx, "subthread-row-3");
+        let ended = bounds(cx, "subthread-row-2");
+        assert!(last_running.bottom() <= ended.top());
+    }
     /// The count on a parent's card folds its subthread rows and opens them again. They fold
     /// on their own once the last one ends, and open again when another starts.
     #[gpui::test]
@@ -5508,8 +5595,9 @@ pub(crate) fn thread_account_color(machine: MachineId, thread: &Thread, cx: &App
 /// one, and `Color::Player` skips the first (the local user's).
 pub(crate) const AWAITING_INPUT_COLOR: Color = Color::Player(2);
 
-/// A parent's subthreads as rows under its card, newest first: the agent's own subagents only
-/// while they run.
+/// A parent's subthreads as rows under its card (`design/subthreads-3/decisions.md`, topics 2
+/// and 3): those waiting for the user, then running, then queued, then ended, each newest first.
+/// The agent's own subagents show only while they run.
 fn listed_subthreads(store: &projects::ProjectStore, thread: projects::ThreadId) -> Vec<Thread> {
     let mut subthreads: Vec<Thread> = store
         .subthreads(thread)
@@ -5517,10 +5605,62 @@ fn listed_subthreads(store: &projects::ProjectStore, thread: projects::ThreadId)
         .filter(|thread| thread.task.as_ref().is_some_and(projects::Task::is_listed))
         .cloned()
         .collect();
-    subthreads.sort_by_key(|thread| std::cmp::Reverse((thread.created_at, thread.id)));
+    subthreads.sort_by_key(|thread| {
+        (
+            subthread_rank(store, thread),
+            std::cmp::Reverse((thread.created_at, thread.id)),
+        )
+    });
     subthreads
 }
 
+/// Where a subthread goes among its parent's: waiting for the user first, then running, then
+/// queued, and ended ones last.
+pub(crate) fn subthread_rank(store: &projects::ProjectStore, thread: &projects::Thread) -> u8 {
+    let Some(task) = thread.task.as_ref() else {
+        return 3;
+    };
+    if task.outcome.is_some() {
+        3
+    } else if task.is_queued() {
+        2
+    } else if store.is_thread_or_subthread_blocked(thread.id)
+        || store.is_thread_awaiting_input(thread.id)
+    {
+        0
+    } else {
+        1
+    }
+}
+
+/// herdr's tree lines, as the Workspaces view draws them to a workspace's worktrees: ├ for a
+/// row with more below, └ for the last, meeting the row at its first line.
+fn render_subthread_connector(is_last: bool, border: gpui::Hsla) -> gpui::Div {
+    let elbow = px(14.);
+    div()
+        .absolute()
+        .top_0()
+        .left(SUBTHREAD_CONNECTOR_LEFT)
+        .w(px(8.))
+        .map(|this| {
+            if is_last {
+                this.h(elbow)
+            } else {
+                this.h_full()
+            }
+        })
+        .border_l_1()
+        .border_color(border)
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top(elbow)
+                .w_full()
+                .border_t_1()
+                .border_color(border),
+        )
+}
 /// How the user left a parent's subthread rows, which holds until another subthread starts or
 /// the last one ends (`design/subthreads-machines/decisions.md`, topic 2).
 #[derive(Clone, Copy, PartialEq)]

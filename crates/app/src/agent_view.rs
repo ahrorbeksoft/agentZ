@@ -99,6 +99,7 @@ use crate::server_client::{MachineStatus, ServerClient};
 use crate::settings_page::{
     AccountEntry, account_entries, account_entry, account_selector, render_entry_avatar,
 };
+use crate::sidebar::{SUBTHREADS_INITIAL_COUNT, SUBTHREADS_PAGE_COUNT, subthread_rank};
 use crate::snooze;
 use crate::terminal_drawer::{TerminalDrawer, TerminalDrawerEvent};
 use crate::terminal_element::TerminalMode;
@@ -667,6 +668,9 @@ pub struct AgentView {
     /// The rows of subthreads' results that are open: a row of several results by its notice's
     /// entry, and a result's own row, to its summary, by that entry and its subthread.
     opened_results: HashSet<(usize, Option<ThreadId>)>,
+    /// How many rows the card of started subthreads, or the row of several results, shows, by
+    /// its entry, once the user asked for more than [`SUBTHREADS_INITIAL_COUNT`].
+    shown_subthreads: HashMap<usize, usize>,
     /// The thread's terminals (t3code's drawer). Kept while hidden, so its layout stays.
     drawer: Option<(Entity<TerminalDrawer>, Subscription)>,
     is_drawer_open: bool,
@@ -917,6 +921,7 @@ impl AgentView {
             delegated_subthreads: BTreeMap::new(),
             opened_subthread_previews: HashSet::default(),
             opened_results: HashSet::default(),
+            shown_subthreads: HashMap::default(),
             drawer: None,
             is_drawer_open: false,
             drawer_height: DRAWER_HEIGHT,
@@ -8706,14 +8711,61 @@ impl AgentView {
                         .color(Color::Muted),
                 )
             });
+        // As the sidebar lists them (`design/subthreads-3/decisions.md`, topic 3), in the
+        // order the agent gave them within each state.
+        let mut subthreads = subthreads;
+        {
+            let store = self.store.read(cx);
+            subthreads.sort_by_key(|(_, _, thread_id)| {
+                store
+                    .thread(*thread_id)
+                    .map_or(u8::MAX, |thread| subthread_rank(store, thread))
+            });
+        }
+        let shown = self
+            .shown_subthreads
+            .get(&start)
+            .copied()
+            .unwrap_or(SUBTHREADS_INITIAL_COUNT);
+        let hidden_count = subthreads.len().saturating_sub(shown);
         let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let rows: Vec<AnyElement> = subthreads
             .into_iter()
+            .take(shown)
             .filter_map(|(index, position, thread_id)| {
                 self.render_started_subthread(start, (index, position), thread_id, &style, cx)
             })
             .collect();
         let border = Self::tool_card_border_color(cx);
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        let show_more = (hidden_count > 0).then(|| {
+            h_flex()
+                .id(("subthread-batch-show-more", start))
+                .debug_selector(move || format!("subthread-batch-show-more-{start}"))
+                .h(px(28.))
+                .px_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(|style| style.bg(hover_background))
+                .child(
+                    Icon::new(IconName::Plus)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!(
+                        "Show {} more",
+                        hidden_count.min(SUBTHREADS_PAGE_COUNT)
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    this.show_more_subthreads(start, cx)
+                }))
+        });
         v_flex()
             .mx_5()
             .child(
@@ -8726,9 +8778,20 @@ impl AgentView {
                     .bg(cx.theme().colors().editor_background)
                     .overflow_hidden()
                     .child(header)
-                    .children(rows),
+                    .children(rows)
+                    .children(show_more),
             )
             .into_any_element()
+    }
+
+    /// 12 more of the rows in the card or results row whose entry is `entry`.
+    fn show_more_subthreads(&mut self, entry: usize, cx: &mut Context<Self>) {
+        *self
+            .shown_subthreads
+            .entry(entry)
+            .or_insert(SUBTHREADS_INITIAL_COUNT) += SUBTHREADS_PAGE_COUNT;
+        self.list_state.remeasure_items(entry + 1..entry + 2);
+        cx.notify();
     }
 
     /// A subthread's row in the card of those started together: its state, the agent's icon,
@@ -8988,14 +9051,63 @@ impl AgentView {
                 let is_open = self.opened_results.contains(&(notice, None));
                 let mut rows = vec![self.render_task_results_row(notice, tasks, is_open, cx)];
                 if is_open {
-                    rows.extend(tasks.iter().enumerate().filter_map(|(position, task)| {
-                        self.render_task_result(notice, position, *task, &style, cx)
-                    }));
+                    let shown = self
+                        .shown_subthreads
+                        .get(&notice)
+                        .copied()
+                        .unwrap_or(SUBTHREADS_INITIAL_COUNT);
+                    rows.extend(tasks.iter().take(shown).enumerate().filter_map(
+                        |(position, task)| {
+                            self.render_task_result(notice, position, *task, &style, cx)
+                        },
+                    ));
+                    let hidden_count = tasks.len().saturating_sub(shown);
+                    if hidden_count > 0 {
+                        rows.push(self.render_show_more_results(notice, hidden_count, cx));
+                    }
                 }
                 rows
             }
         };
         v_flex().mx_5().children(rows).into_any_element()
+    }
+
+    /// "+ Show 12 more" under the first 6 of several results.
+    fn render_show_more_results(
+        &self,
+        notice: usize,
+        hidden_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover_background = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .id(("task-results-show-more", notice))
+            .debug_selector(move || format!("task-results-show-more-{notice}"))
+            .min_h(px(24.))
+            .gap_1p5()
+            .px_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(hover_background))
+            .child(
+                h_flex().w(px(24.)).flex_none().justify_center().child(
+                    Icon::new(IconName::Plus)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            )
+            .child(
+                Label::new(format!(
+                    "Show {} more",
+                    hidden_count.min(SUBTHREADS_PAGE_COUNT)
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                this.show_more_subthreads(notice, cx)
+            }))
+            .into_any_element()
     }
 
     /// The row of several results that came together: "4 subthreads finished", and how many
@@ -20854,6 +20966,104 @@ mod tests {
         assert_eq!(*opened.borrow(), vec![ThreadId(11)]);
     }
 
+    /// Thread 2's subthreads 10 (running) and 11 (done), and copies of 10 for each of `more`.
+    fn many_subthreads_snapshot(more: std::ops::RangeInclusive<u64>) -> ProjectsSnapshot {
+        let mut snapshot = subthreads_snapshot(&[10]);
+        let running = snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == ThreadId(10))
+            .cloned()
+            .expect("subthread 10");
+        for id in more {
+            let mut copy = running.clone();
+            copy.id = ThreadId(id);
+            copy.title = format!("Task {id}");
+            snapshot.threads.push(copy);
+        }
+        snapshot
+    }
+
+    /// `design/subthreads-3/decisions.md`, topic 3: a card of 9 shows its first 6, running
+    /// before ended, then "Show 3 more".
+    #[gpui::test]
+    fn a_card_of_many_subthreads_shows_6_then_more(cx: &mut TestAppContext) {
+        let (view, cx) = open_in(many_subthreads_snapshot(12..=18), 2, false, cx);
+        let ids: Vec<u64> = [10, 11].into_iter().chain(12..=18).collect();
+        let tasks: Vec<String> = ids.iter().map(|_| r#"{"task": "Do it"}"#.into()).collect();
+        let results: Vec<String> = ids
+            .iter()
+            .map(|id| format!(r#"{{"taskId": {id}, "childThreadId": {id}}}"#))
+            .collect();
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Delegate it".into()),
+                    mcp_call(
+                        "agentz___delegate_tasks",
+                        &format!(r#"{{"tasks": [{}]}}"#, tasks.join(", ")),
+                        &format!(r#"{{"tasks": [{}]}}"#, results.join(", ")),
+                    ),
+                ],
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        for row in [
+            "subthread-batch-row-10",
+            "subthread-batch-row-12",
+            "subthread-batch-row-16",
+        ] {
+            assert!(cx.debug_bounds(row).is_some(), "{row} shows");
+        }
+        for row in ["subthread-batch-row-17", "subthread-batch-row-11"] {
+            assert!(cx.debug_bounds(row).is_none(), "{row} is hidden");
+        }
+        click("subthread-batch-show-more-1", cx);
+        assert!(cx.debug_bounds("subthread-batch-show-more-1").is_none());
+        let running = cx
+            .debug_bounds("subthread-batch-row-18")
+            .expect("the last running one");
+        let ended = cx
+            .debug_bounds("subthread-batch-row-11")
+            .expect("the ended one");
+        assert!(running.top() < ended.top());
+    }
+
+    /// `design/subthreads-3/decisions.md`, topic 3: a row of 8 results opens to 6, then
+    /// "Show 2 more".
+    #[gpui::test]
+    fn many_results_open_to_6_then_more(cx: &mut TestAppContext) {
+        let (view, cx) = open_in(many_subthreads_snapshot(12..=17), 2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.update_state_for_test(
+                |state| {
+                    state.task_notices = vec![1];
+                    state.announced_tasks = vec![(
+                        1,
+                        [10, 11].into_iter().chain(12..=17).map(ThreadId).collect(),
+                    )];
+                },
+                cx,
+            );
+            thread.set_entries_for_test(
+                vec![
+                    Entry::UserMessage("Spawn some".into()),
+                    Entry::UserMessage("Subthreads ended.".into()),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        click("task-results-1", cx);
+        assert!(cx.debug_bounds("task-result-1-15").is_some());
+        assert!(cx.debug_bounds("task-result-1-16").is_none());
+        click("task-results-show-more-1", cx);
+        assert!(cx.debug_bounds("task-result-1-17").is_some());
+        assert!(cx.debug_bounds("task-results-show-more-1").is_none());
+    }
     /// Subthreads started by calls one after another share the first one's card.
     #[gpui::test]
     fn calls_one_after_another_share_a_card(cx: &mut TestAppContext) {

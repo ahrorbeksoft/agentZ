@@ -30,31 +30,6 @@ thread to another machine yet (Continue with Another Agent, workspace handoff an
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
 
-### Improve subthreads again
-
-Requested October 23, 2026, after the subthreads redesign (09f27b1), which made it clear to
-agents that they can just end their turn once they delegate:
-
-- While subthreads are working, show the agent as still working, as if it weren't the end of
-  its turn.
-- When a subthread's result comes back, steer the agent with it if the agent has steering of
-  its own (not agentZ's custom implementation, and only if it really exists); otherwise just
-  queue it.
-- On the left side, show only the running agents; done ones go inside a completed tasks button
-  or something like it. If none are working, all of them can be shown.
-- Users should be able to work with hundreds of subthreads, if they want to finish one whole
-  project in one go.
-
-Built: a result steers into the parent's running turn when its agent has steering of its own
-(Claude Agent's and Codex's `_session/steering` on ACP v1; de71e44), and the server sends the
-app only the threads that changed, with `delegate_tasks` taking up to 100 tasks (fb98ec2).
-Decided on the design board (`design/subthreads-3/decisions.md`). Built: the parent shows
-"Working for 4m 12s · 3 subthreads running" while they work (topic 1 B). Left: the sidebar's
-rows with the completed ones last (topic 2), and caps with Show more for hundreds of
-subthreads (topic 3). Measured before fb98ec2, in a debug build's headless test, a sidebar with 1,000
-threads and 300 subthreads took about 0.9 s per redraw, as did 1,300 plain threads, so the
-sidebar's cost is the number of rows, not subthreads as such.
-
 ### Improve the subagent view
 
 Improve the subagent view: its Cancel and Open Parent buttons look bad. Maybe there shouldn't

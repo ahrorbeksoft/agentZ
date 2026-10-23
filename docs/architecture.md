@@ -2193,8 +2193,12 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   which becomes blocked, without a sound. The parent waits for its subthreads and completes
   once, after the last one's end reaches it.
 - **In the sidebar** (`sidebar::render_subthread_row`, picked in
-  `design/subthreads-machines/`): each subthread is a row under its parent's card, newest
-  first, with herdr's tree lines as the Workspaces view draws worktrees: the agent's icon, the
+  `design/subthreads-machines/`, ordered and capped in `design/subthreads-3` topics 2 and 3):
+  each subthread is a row under its parent's card (`listed_subthreads`: waiting for the user,
+  then running, then queued, then ended, each newest first; `subthread_rank`), the first 6
+  and then t3code Lineage's "Show 12 more", 12 at a time (`SUBTHREADS_INITIAL_COUNT`,
+  `SUBTHREADS_PAGE_COUNT`; the open one shows past the cap), with herdr's tree lines as the
+  Workspaces view draws worktrees: the agent's icon, the
   title and its state (Working, Queued, a status pill, or how long ago it ended), then the
   agent, the model, the machine it runs on, its worktree or pasture and the lines it changed
   (`Task::changes`). A click opens it, and while it's open its row is marked in place of the
@@ -2231,12 +2235,14 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   its work under it (`render_subagent_work`, with `sync_subagent_threads` following it):
   its last 8 steps, its summary once it ended (`TaskOutcome::summary` as markdown,
   `SUMMARY_PART`) and the strip that opens it full screen. Delegations aren't work, so a
-  finished run doesn't fold them.
+  finished run doesn't fold them. The rows go in the sidebar's order (the agent's within
+  each state), the first 6, then "Show 12 more" (`shown_subthreads`).
 - **The results** (`render_task_results`): the notice that tells the parent its subthreads
   ended shows in its place as their rows (`ThreadView::announced_tasks`): one row for one
   result, and for several "4 subthreads finished · 1 failed" (the failures in red), which
-  opens to a row each. A row has the task's end ("Subthread finished: <title>"), the lines
-  it changed, how long it ran and Open, and opens to its summary.
+  opens to a row each, the first 6, then "Show 12 more". A row has the task's end
+  ("Subthread finished: <title>"), the lines it changed, how long it ran and Open, and opens
+  to its summary.
 - **Working while they work** (`subthreads_at_work`, `render_generating`;
   `design/subthreads-3` topic 1 B): once the parent's turn ends while subthreads it started
   still work, its conversation goes on ending with "Working for 4m 12s · 3 subthreads
