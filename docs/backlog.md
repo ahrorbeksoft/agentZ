@@ -56,3 +56,18 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
+
+### Improve subthreads again
+
+Requested October 23, 2026, after the subthreads redesign (09f27b1), which made it clear to
+agents that they can just end their turn once they delegate:
+
+- While subthreads are working, show the agent as still working, as if it weren't the end of
+  its turn.
+- When a subthread's result comes back, steer the agent with it if the agent has steering of
+  its own (not agentZ's custom implementation, and only if it really exists); otherwise just
+  queue it.
+- On the left side, show only the running agents; done ones go inside a completed tasks button
+  or something like it. If none are working, all of them can be shown.
+- Users should be able to work with hundreds of subthreads, if they want to finish one whole
+  project in one go.
