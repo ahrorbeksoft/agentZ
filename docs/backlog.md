@@ -112,3 +112,11 @@ other".
   limit mid-turn, and roles beyond the four.
 - Neither Zed nor t3code has this. It's a settings change (likely beside Subthreads at once in
   Settings › General › Threads), so it starts on the design board.
+
+### Reorganize Settings
+
+The whole Settings page is a mess; organize it better now that there are so many settings.
+Also:
+
+- For machine-specific settings, a general setting that applies to all machines when set.
+- Likewise for profile-specific settings: a general one for all profiles.
