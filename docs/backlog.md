@@ -71,3 +71,8 @@ agents that they can just end their turn once they delegate:
   or something like it. If none are working, all of them can be shown.
 - Users should be able to work with hundreds of subthreads, if they want to finish one whole
   project in one go.
+
+### Improve the subagent view
+
+Improve the subagent view: its Cancel and Open Parent buttons look bad. Maybe there shouldn't
+be buttons like that at all, maybe there should; to be decided.
