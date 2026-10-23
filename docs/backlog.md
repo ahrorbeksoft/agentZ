@@ -85,12 +85,23 @@ researchers etc per agent provider and we also introduce clever selction that (i
 system that chooses the agent/acount with the most usage for the selected subthread type or
 something idk". Agreed in the conversation that followed:
 
-- **Templates per role, not per agent.** `delegate_task` already takes a `role`
+Then, on the roles: "we have research, review, worker, and other. users should be able choose
+for these. no agent overrides, agents see these availabe ones and use them if not or asked other
+agents to do things they use those", and "call them better, researcher, reviewer, worker and
+other".
+
+- **Four roles: researcher, reviewer, worker and other.** They replace today's six
   (implementation, research, review, design, test, general: `TASK_ROLES` in
-  `server/tools.rs`), but it's only a label. Let the user give each role an ordered list of
-  agent, model (and effort or mode), e.g. Research: Codex · gpt-5 · high, then Claude ·
-  Sonnet. The parent only picks the role; a role with a template runs as it says, whatever
-  agent, model or account the parent named. A role without one works as today.
+  `server/tools.rs`), which are only a label on the task's message. A task the parent gives no
+  role is other.
+- **The user picks what each role runs on**, per role and not per agent: an ordered list of
+  agent and model (and effort or mode), e.g. Researcher: Codex · gpt-5 · high, then Claude ·
+  Sonnet.
+- **No agent overrides.** Agents see the four roles and the user's picks for them
+  (`orchestrator_capabilities`), and delegate by role. They name an agent or model themselves
+  only when the role has no pick, or when the user asked for other agents to do the work; then
+  they use those. (That's my reading of "use them if not or asked other agents to do things
+  they use those".)
 - **The account is picked for the user, the agent isn't.** Vendors' limits can't be compared
   (Claude's 40% left isn't Codex's), so the role's list orders the agents. Within an agent,
   skip accounts logged out or used up, and prefer the one that would waste the most at its
@@ -98,6 +109,6 @@ something idk". Agreed in the conversation that followed:
   projection the limit rows already make (`usage_limits::pace`). When all of an agent's
   accounts are used up, go to the role's next entry.
 - **Left out for now:** moving a running subthread to another account when it reaches its
-  limit mid-turn, and roles beyond the six.
+  limit mid-turn, and roles beyond the four.
 - Neither Zed nor t3code has this. It's a settings change (likely beside Subthreads at once in
   Settings › General › Threads), so it starts on the design board.
