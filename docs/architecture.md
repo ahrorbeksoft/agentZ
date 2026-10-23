@@ -222,7 +222,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `artifacts/server.json`, `artifacts/theme.json`, `artifacts/design-defaults.json` | server | The pages server's port and token, kept so links keep working, the app's theme for pages, and the design defaults from Settings |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
-| `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts |
+| `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts, Shared settings and what each machine takes from them |
+| `shared-skills/<name>/` | app | Shared's skills (Settings › Skills on Shared), given to each machine that uses shared settings |
 | `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
 | `logs/input-latency.txt`, `logs/hangs.jsonl` | app | The last input-latency report, and the hangs the hang monitor saw (Developer diagnostics) |
@@ -494,14 +495,35 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   notifications, see Attention states). Threads: Threads (order, sending, thinking, the
   Working group, auto-archive, the composer's usage window, and Chats), Subthreads
   (Subthreads at once, and the roles: `settings_page/subthread_roles.rs`, see Subthreads),
-  Thread titles (its machine picker in the header, as
-  Agents has) and Artifacts. Agents: Agents, Usage, Skills, MCP Servers. Machines: Machines,
+  Thread titles (its machine picker in the header, with Shared, below) and Artifacts.
+  Agents: Agents, Usage, Skills, MCP Servers. Machines: Machines,
   Storage. Then Projects, a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
   are rows of their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
   nested flex columns took taffy a measure of each label twice per column around it, and an
   agent with seven accounts scrolled at 20 to 30 fps. The rows out of view are measured again
   on each frame that isn't a scroll, since anything else may have changed their height.
+- **Shared** (`shared_settings.rs`, `settings_page/sharing.rs`, `Machines::sync_shared_settings`;
+  `design/settings-2` topic 2, t3code's scope menu): the machine picker of Thread titles,
+  Skills, MCP Servers and Storage starts with Shared (the layers icon) over a line, then each
+  machine. Shared is what every machine that doesn't set its own takes, kept in the app's
+  settings (`AppSettings::shared`), its skills' files in `shared-skills/` in the app's data
+  directory. Thread titles open on Shared, the others on a machine; with only this Mac, the
+  picker goes, and Skills and MCP Servers offer Shared only while it has some. On a machine,
+  each section starts with "Use shared settings" (`render_use_shared_row`): off, the machine
+  keeps what it has as its own to change; back on, Shared's replace it. On Shared, a row some
+  machine sets differently says "Set on Devbox 1" (or how many machines) after its title, as
+  Zed's "Modified in", and its popover lists each machine's value, a click opening a machine
+  that sets its own (`render_set_on`); Shared's Storage holds only the cleanup rules. A machine
+  added since takes everything from Shared (`MachineSharing::following`). One saved before
+  Shared is decided the first time its session arrives: the first machine's titles and rules
+  start Shared, and another whose differ keeps them as its own. Titles and rules are sent with
+  their requests. Skills and MCP servers are added beside the machine's own, one request at a
+  time (`list_steps`, `Request::AddSkill`, `SaveMcpServer`, `DeleteSkill`, `DeleteMcpServer`):
+  what's new or changed (a skill by its revision) replaces the machine's of its name, what
+  Shared lost goes, and the accounts a server is kept off stay the machine's. What each machine
+  was given is noted (`MachineSharing::{skills_given, mcp_servers_given}`), and on it those rows
+  are tagged Shared, with no Delete, Configure or switch. Agents and Usage stay each machine's.
 - **Project settings** (`SettingsPage::{render_project_header, render_project}`, the user's
   picks in `design/settings-projects/`): the settings sidebar lists each project once, as
   combined by Merged projects (`Machines::project_groups`), by its name; one only on another
@@ -646,7 +668,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the accounts skipping them (`Event::Skills`). Devin reads Claude's `~/.claude/skills`, so
   Claude's accounts are linked first and Devin skips a skill it finds linked there. Only links
   into `skills/` are ever removed. Each row's accounts menu keeps a skill off some accounts
-  (below). With more than one machine, the Agents page's machine picker sits in the header.
+  (below). With more than one machine, a machine picker with Shared (above) sits in the header.
 - **Settings › MCP Servers** (`settings_page/mcp_servers.rs`, `agentz_server::mcp_servers`,
   `server/mcp_server_requests.rs`; Zed's MCP Servers page and form, accounts topic 19):
   agentZ's own MCP servers on the machine, kept in `mcp-servers.json`, which every agent and
@@ -669,7 +691,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   adapters) get none. What each agent announced is kept in its own settings
   (`AgentSettings::mcp_capabilities`) when a thread or login session starts it, so the page
   can say "Not given to Factory Droid, which takes local servers only." for remote servers.
-  With more than one machine, the Agents page's machine picker sits in the header.
+  With more than one machine, a machine picker with Shared (above) sits in the header.
 - **The accounts menu on skills and MCP servers** (`settings_page/accounts_menu.rs`; accounts
   topic 20): a menu on each skill's and server's row, "Every account" or "2 of 5", listing
   the accounts of the installed agents that could load it (for a server, those that get it),
@@ -699,7 +721,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   files or a pasture's own commits are listed with a Working or Has changes tag and no trash.
   Node.js has Delete (off while a running agent uses it) and the cache and log have Clear
   (`Request::ClearStorage`). Only the cleanup rules (below) delete anything on their own. With
-  more than one machine, the Agents page's machine picker sits in the header. The server
+  more than one machine, a machine picker with Shared (above) sits in the header. The server
   measures as `du` does, on a blocking thread (`storage::measure`), only while an app is
   subscribed: threads again at most every 5 seconds after they change, worktrees, pastures and
   agents every 5 minutes or when an agent is installed or removed, and sends it in the session

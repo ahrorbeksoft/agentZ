@@ -6,6 +6,7 @@
 //! they stay.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use agentz_protocol::storage::{
@@ -18,8 +19,12 @@ use projects::{ProjectId, Thread, ThreadId, WorkspaceKind};
 use ui::{ContextMenu, DropdownMenu, IconPosition, Switch, Tooltip, prelude::*};
 use util::ResultExt as _;
 
+use super::sharing::MachineScope;
 use super::skills::render_error;
-use super::{SettingsPage, SettingsPageEvent, render_row, render_rows, render_section_with_note};
+use super::{
+    SettingsPage, SettingsPageEvent, render_row, render_row_with_note, render_rows,
+    render_section_with_note,
+};
 use crate::agent_icons::agent_icon;
 use crate::confirm_dialog::ConfirmRequest;
 use crate::controls::ACCOUNT_COLORS;
@@ -27,6 +32,7 @@ use crate::machines::MachineId;
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_store::ProjectStore;
 use crate::server_client::ServerClient;
+use crate::shared_settings::SharedSection;
 use crate::sidebar::format_relative_time;
 
 /// An open project's biggest threads shown at first, and how many more Show more adds, as the
@@ -42,6 +48,65 @@ const SLOT_WIDTH: Pixels = px(22.);
 const THREAD_INDENT: Pixels = px(34.);
 /// The last cleanup run's results shown; the rest are counted.
 const CLEANUP_RESULTS_SHOWN: usize = 50;
+const NEVER_REMOVED: &str = "Workspaces with changes, and ones a working thread or another \
+                             thread still uses, are never removed.";
+
+/// What a cleanup rule's row changes.
+type SetRules = Rc<dyn Fn(CleanupRules, &mut App)>;
+
+/// A cleanup rule's row, for its "Set on" note.
+#[derive(Clone, Copy, PartialEq)]
+enum CleanupRule {
+    Archived,
+    Deleted,
+    Inactive,
+    Merged,
+    Unchanged,
+}
+
+impl CleanupRule {
+    const ALL: [CleanupRule; 5] = [
+        CleanupRule::Archived,
+        CleanupRule::Deleted,
+        CleanupRule::Inactive,
+        CleanupRule::Merged,
+        CleanupRule::Unchanged,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            CleanupRule::Archived => "cleanup-archived",
+            CleanupRule::Deleted => "cleanup-deleted",
+            CleanupRule::Inactive => "cleanup-inactive",
+            CleanupRule::Merged => "cleanup-merged",
+            CleanupRule::Unchanged => "cleanup-unchanged",
+        }
+    }
+
+    fn is_on(self, rules: &CleanupRules) -> bool {
+        match self {
+            CleanupRule::Archived => rules.archived != ArchivedCleanup::Never,
+            CleanupRule::Deleted => rules.deleted,
+            CleanupRule::Inactive => rules.inactive_days.is_some(),
+            CleanupRule::Merged => rules.merged,
+            CleanupRule::Unchanged => rules.unchanged,
+        }
+    }
+
+    /// The rule's value as its row shows it.
+    fn value(self, rules: &CleanupRules) -> SharedString {
+        match self {
+            CleanupRule::Archived => rules.archived.label().into(),
+            CleanupRule::Inactive => match rules.inactive_days {
+                Some(1) => "1 day".into(),
+                Some(days) => format!("{days} days").into(),
+                None => "Off".into(),
+            },
+            rule if rule.is_on(rules) => "On".into(),
+            _ => "Off".into(),
+        }
+    }
+}
 
 /// What Settings › Storage remembers while it's open.
 #[derive(Default)]
@@ -138,7 +203,7 @@ struct StorageRow {
 }
 
 impl SettingsPage {
-    /// The page's title, and the machine it shows, as on the Agents page.
+    /// The page's title, and the machine it shows or Shared, whose cleanup rules machines take.
     pub(super) fn render_storage_header(
         &self,
         window: &mut Window,
@@ -150,7 +215,13 @@ impl SettingsPage {
             .justify_between()
             .child(Headline::new("Storage").size(HeadlineSize::Small))
             .when(self.machines.read(cx).has_remotes(), |header| {
-                header.child(self.render_agents_machine_picker(window, cx))
+                header.child(self.render_scope_picker(
+                    "storage-machine",
+                    self.storage_view(cx),
+                    |this, scope, cx| this.show_storage(scope, cx),
+                    window,
+                    cx,
+                ))
             })
             .into_any_element()
     }
@@ -160,6 +231,10 @@ impl SettingsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        // Sizes are each machine's, so Shared has only the cleanup rules.
+        if self.storage_view(cx) == MachineScope::Shared {
+            return vec![self.render_shared_cleanup(window, cx)];
+        }
         let machine = self.agents_machine;
         let client = self.agents_client(cx);
         let label = self.machines.read(cx).label(machine, cx);
@@ -306,7 +381,8 @@ impl SettingsPage {
     }
 
     /// Cleaning up (design/archive-cleanup): t3code's cleanup rules, every one off at first,
-    /// then Clean Up Now and what the last run did.
+    /// then Clean Up Now and what the last run did. With other machines, "Use shared settings"
+    /// comes first, and the rules show once the machine sets its own.
     fn render_cleanup(
         &self,
         machine: MachineId,
@@ -316,119 +392,38 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rules = cleanup.rules.clone();
-        let set = |rules: CleanupRules| {
-            let client = client.clone();
-            move |cx: &mut App| {
-                client.update(cx, |client, cx| client.set_cleanup_rules(rules.clone(), cx))
-            }
-        };
         let colors = cx.theme().colors().clone();
-
-        let archived = rules.archived;
-        let menu = {
+        let has_remotes = self.machines.read(cx).has_remotes();
+        let follows = !self.sets_own(machine, SharedSection::CleanupRules, cx);
+        let mut rows = Vec::new();
+        if has_remotes {
+            let shared = self
+                .shared_settings(cx)
+                .cleanup_rules
+                .clone()
+                .unwrap_or_default();
+            rows.push(self.render_use_shared_row(
+                machine,
+                SharedSection::CleanupRules,
+                cleanup_summary(&shared),
+                cx,
+            ));
+        }
+        if !has_remotes || !follows {
             let client = client.clone();
-            ContextMenu::build(window, cx, move |mut menu, _, _| {
-                for value in ArchivedCleanup::ALL {
-                    let client = client.clone();
-                    let rules = CleanupRules {
-                        archived: value,
-                        ..rules
-                    };
-                    menu = menu.toggleable_entry(
-                        value.label(),
-                        archived == value,
-                        IconPosition::End,
-                        None,
-                        move |_, cx| {
-                            client.update(cx, |client, cx| {
-                                client.set_cleanup_rules(rules.clone(), cx)
-                            })
-                        },
-                    );
+            let store = self.app_settings.clone();
+            // With only this Mac, its rules are Shared's while it follows them.
+            let writes_shared = follows;
+            let set: SetRules = Rc::new(move |rules: CleanupRules, cx: &mut App| {
+                client.update(cx, |client, cx| client.set_cleanup_rules(rules.clone(), cx));
+                if writes_shared {
+                    store.update(cx, |store, cx| {
+                        store.update(|app| app.shared.cleanup_rules = Some(rules), cx)
+                    });
                 }
-                menu
-            })
-        };
-        let switch = |id: &'static str, on: bool, toggle: Box<dyn Fn(&mut App)>| {
-            div()
-                .debug_selector(move || id.to_string())
-                .child(Switch::new(id, on.into()).on_click(move |_, _, cx| toggle(cx)))
-                .into_any_element()
-        };
-
-        let inactive = match rules.inactive_days {
-            Some(days) => {
-                let fewer = set(CleanupRules {
-                    inactive_days: Some(days.saturating_sub(1).max(1)),
-                    ..rules
-                });
-                let more = set(CleanupRules {
-                    inactive_days: Some((days + 1).min(CleanupRules::MAX_INACTIVE_DAYS)),
-                    ..rules
-                });
-                h_flex()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .debug_selector(|| "cleanup-inactive-days".into())
-                            .h(px(28.))
-                            .px_0p5()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .child(
-                                div().debug_selector(|| "cleanup-fewer-days".into()).child(
-                                    IconButton::new("cleanup-fewer-days", IconName::Dash)
-                                        .icon_size(IconSize::Small)
-                                        .disabled(days <= 1)
-                                        .on_click(move |_, _, cx| fewer(cx)),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .min_w(px(16.))
-                                    .flex()
-                                    .justify_center()
-                                    .child(Label::new(days.to_string())),
-                            )
-                            .child(
-                                div().debug_selector(|| "cleanup-more-days".into()).child(
-                                    IconButton::new("cleanup-more-days", IconName::Plus)
-                                        .icon_size(IconSize::Small)
-                                        .disabled(days >= CleanupRules::MAX_INACTIVE_DAYS)
-                                        .on_click(move |_, _, cx| more(cx)),
-                                ),
-                            ),
-                    )
-                    .child(
-                        Label::new("days")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element()
-            }
-            None => Label::new("Off")
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element(),
-        };
-        let inactive = h_flex()
-            .gap_3()
-            .child(inactive)
-            .child(switch(
-                "cleanup-inactive",
-                rules.inactive_days.is_some(),
-                Box::new(set(CleanupRules {
-                    inactive_days: match rules.inactive_days {
-                        Some(_) => None,
-                        None => Some(CleanupRules::DEFAULT_INACTIVE_DAYS),
-                    },
-                    ..rules
-                })),
-            ))
-            .into_any_element();
+            });
+            rows.extend(self.render_cleanup_rules(&rules, set, false, window, cx));
+        }
 
         let is_running = cleanup.running || self.storage_page.cleaning_up.contains(&machine);
         let last_run = if !rules.any() {
@@ -470,72 +465,7 @@ impl SettingsPage {
                 )
                 .into_any_element()
         };
-
-        let mut rows = vec![
-            render_row(
-                "Remove archived threads’ workspaces",
-                "Removes the worktree or pasture of a thread archived this long ago. Its branch \
-                 and conversation stay.",
-                div()
-                    .debug_selector(|| "cleanup-archived".into())
-                    .child(DropdownMenu::new(
-                        "cleanup-archived",
-                        archived.label(),
-                        menu,
-                    ))
-                    .into_any_element(),
-                cx,
-            ),
-            render_row(
-                "Remove deleted threads’ workspaces",
-                "Removes the worktree or pasture of a thread you delete, once no other thread \
-                 uses it.",
-                switch(
-                    "cleanup-deleted",
-                    rules.deleted,
-                    Box::new(set(CleanupRules {
-                        deleted: !rules.deleted,
-                        ..rules
-                    })),
-                ),
-                cx,
-            ),
-            render_row(
-                "Remove inactive threads’ workspaces",
-                "Removes the worktree or pasture of a thread inactive this long, archived or \
-                 not. Its branch and conversation stay.",
-                inactive,
-                cx,
-            ),
-            render_row(
-                "Remove merged worktrees",
-                "Removes worktrees whose branch is merged into the project’s default branch.",
-                switch(
-                    "cleanup-merged",
-                    rules.merged,
-                    Box::new(set(CleanupRules {
-                        merged: !rules.merged,
-                        ..rules
-                    })),
-                ),
-                cx,
-            ),
-            render_row(
-                "Remove workspaces with nothing of their own",
-                "Removes worktrees and pastures with no commits beyond the default branch and no \
-                 changes.",
-                switch(
-                    "cleanup-unchanged",
-                    rules.unchanged,
-                    Box::new(set(CleanupRules {
-                        unchanged: !rules.unchanged,
-                        ..rules
-                    })),
-                ),
-                cx,
-            ),
-            render_row("Clean up now", last_run, clean_up, cx),
-        ];
+        rows.push(render_row("Clean up now", last_run, clean_up, cx));
         if let Some(report) = &cleanup.last_run {
             let is_open = self.storage_page.report_open;
             let mut summary = format!(
@@ -597,13 +527,257 @@ impl SettingsPage {
             .child(render_section_with_note(
                 "Cleaning up",
                 rows,
-                "Workspaces with changes, and ones a working thread or another thread still \
-                 uses, are never removed.",
+                NEVER_REMOVED,
                 cx,
             ))
             .into_any_element()
     }
 
+    /// Shared's cleanup rules, which every machine that uses shared settings runs. Each runs
+    /// them itself, so Clean Up Now is on each machine's page.
+    fn render_shared_cleanup(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let rules = self
+            .shared_settings(cx)
+            .cleanup_rules
+            .clone()
+            .unwrap_or_default();
+        let store = self.app_settings.clone();
+        let set: SetRules = Rc::new(move |rules: CleanupRules, cx: &mut App| {
+            store.update(cx, |store, cx| {
+                store.update(|app| app.shared.cleanup_rules = Some(rules), cx)
+            })
+        });
+        let rows = self.render_cleanup_rules(&rules, set, true, window, cx);
+        let mut note =
+            format!("Machines that use shared settings clean up this way. {NEVER_REMOVED}");
+        if let Some(own) = self.own_note(SharedSection::CleanupRules, cx) {
+            note.push(' ');
+            note.push_str(&own);
+        }
+        div()
+            .debug_selector(|| "storage-cleanup".into())
+            .child(render_section_with_note("Cleaning up", rows, note, cx))
+            .into_any_element()
+    }
+
+    /// The rules' rows, on Shared with "Set on Devbox 1" after a rule a machine sets
+    /// differently.
+    fn render_cleanup_rules(
+        &self,
+        rules: &CleanupRules,
+        set: SetRules,
+        on_shared: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let rules = rules.clone();
+        let change = |rules: CleanupRules| {
+            let set = set.clone();
+            move |cx: &mut App| set(rules.clone(), cx)
+        };
+        let colors = cx.theme().colors().clone();
+
+        let archived = rules.archived;
+        let menu = {
+            let set = set.clone();
+            ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for value in ArchivedCleanup::ALL {
+                    let set = set.clone();
+                    let rules = CleanupRules {
+                        archived: value,
+                        ..rules
+                    };
+                    menu = menu.toggleable_entry(
+                        value.label(),
+                        archived == value,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| set(rules.clone(), cx),
+                    );
+                }
+                menu
+            })
+        };
+        let switch = |id: &'static str, on: bool, toggle: Box<dyn Fn(&mut App)>| {
+            div()
+                .debug_selector(move || id.to_string())
+                .child(Switch::new(id, on.into()).on_click(move |_, _, cx| toggle(cx)))
+                .into_any_element()
+        };
+
+        let inactive = match rules.inactive_days {
+            Some(days) => {
+                let fewer = change(CleanupRules {
+                    inactive_days: Some(days.saturating_sub(1).max(1)),
+                    ..rules
+                });
+                let more = change(CleanupRules {
+                    inactive_days: Some((days + 1).min(CleanupRules::MAX_INACTIVE_DAYS)),
+                    ..rules
+                });
+                h_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .debug_selector(|| "cleanup-inactive-days".into())
+                            .h(px(28.))
+                            .px_0p5()
+                            .gap_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .child(
+                                div().debug_selector(|| "cleanup-fewer-days".into()).child(
+                                    IconButton::new("cleanup-fewer-days", IconName::Dash)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(days <= 1)
+                                        .on_click(move |_, _, cx| fewer(cx)),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(16.))
+                                    .flex()
+                                    .justify_center()
+                                    .child(Label::new(days.to_string())),
+                            )
+                            .child(
+                                div().debug_selector(|| "cleanup-more-days".into()).child(
+                                    IconButton::new("cleanup-more-days", IconName::Plus)
+                                        .icon_size(IconSize::Small)
+                                        .disabled(days >= CleanupRules::MAX_INACTIVE_DAYS)
+                                        .on_click(move |_, _, cx| more(cx)),
+                                ),
+                            ),
+                    )
+                    .child(
+                        Label::new("days")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            }
+            None => Label::new("Off")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
+        let inactive = h_flex()
+            .gap_3()
+            .child(inactive)
+            .child(switch(
+                "cleanup-inactive",
+                rules.inactive_days.is_some(),
+                Box::new(change(CleanupRules {
+                    inactive_days: match rules.inactive_days {
+                        Some(_) => None,
+                        None => Some(CleanupRules::DEFAULT_INACTIVE_DAYS),
+                    },
+                    ..rules
+                })),
+            ))
+            .into_any_element();
+
+        vec![
+            render_row_with_note(
+                "Remove archived threads’ workspaces",
+                self.cleanup_set_on(CleanupRule::Archived, &rules, on_shared, cx),
+                "Removes the worktree or pasture of a thread archived this long ago. Its branch \
+                 and conversation stay.",
+                div()
+                    .debug_selector(|| "cleanup-archived".into())
+                    .child(DropdownMenu::new(
+                        "cleanup-archived",
+                        archived.label(),
+                        menu,
+                    ))
+                    .into_any_element(),
+                cx,
+            ),
+            render_row_with_note(
+                "Remove deleted threads’ workspaces",
+                self.cleanup_set_on(CleanupRule::Deleted, &rules, on_shared, cx),
+                "Removes the worktree or pasture of a thread you delete, once no other thread \
+                 uses it.",
+                switch(
+                    "cleanup-deleted",
+                    rules.deleted,
+                    Box::new(change(CleanupRules {
+                        deleted: !rules.deleted,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+            render_row_with_note(
+                "Remove inactive threads’ workspaces",
+                self.cleanup_set_on(CleanupRule::Inactive, &rules, on_shared, cx),
+                "Removes the worktree or pasture of a thread inactive this long, archived or \
+                 not. Its branch and conversation stay.",
+                inactive,
+                cx,
+            ),
+            render_row_with_note(
+                "Remove merged worktrees",
+                self.cleanup_set_on(CleanupRule::Merged, &rules, on_shared, cx),
+                "Removes worktrees whose branch is merged into the project’s default branch.",
+                switch(
+                    "cleanup-merged",
+                    rules.merged,
+                    Box::new(change(CleanupRules {
+                        merged: !rules.merged,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+            render_row_with_note(
+                "Remove workspaces with nothing of their own",
+                self.cleanup_set_on(CleanupRule::Unchanged, &rules, on_shared, cx),
+                "Removes worktrees and pastures with no commits beyond the default branch and no \
+                 changes.",
+                switch(
+                    "cleanup-unchanged",
+                    rules.unchanged,
+                    Box::new(change(CleanupRules {
+                        unchanged: !rules.unchanged,
+                        ..rules
+                    })),
+                ),
+                cx,
+            ),
+        ]
+    }
+
+    /// "Set on Devbox 1" after a rule's title on Shared.
+    fn cleanup_set_on(
+        &self,
+        rule: CleanupRule,
+        shared: &CleanupRules,
+        on_shared: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !on_shared {
+            return None;
+        }
+        let key = rule.value(shared).to_string();
+        let entries = self.set_on_entries(
+            SharedSection::CleanupRules,
+            |client| {
+                let value = rule.value(&client.storage().cleanup.rules);
+                Some((value.to_string(), value))
+            },
+            &key,
+            cx,
+        );
+        self.render_set_on(
+            rule.id(),
+            entries,
+            |this, machine, cx| this.show_storage(MachineScope::Machine(machine), cx),
+            cx,
+        )
+    }
     fn clean_up_now(
         &mut self,
         machine: MachineId,
@@ -1520,6 +1694,18 @@ fn render_cleanup_entry(entry: &CleanupEntry, cx: &App) -> AnyElement {
 }
 
 /// A line under the last run's results.
+/// What "Use shared settings" means for cleanup: "2 of 5 rules on".
+fn cleanup_summary(rules: &CleanupRules) -> String {
+    match CleanupRule::ALL
+        .into_iter()
+        .filter(|rule| rule.is_on(rules))
+        .count()
+    {
+        0 => "Every rule off".to_string(),
+        on => format!("{on} of {} rules on", CleanupRule::ALL.len()),
+    }
+}
+
 fn render_cleanup_note(text: String) -> AnyElement {
     div()
         .pl_8()

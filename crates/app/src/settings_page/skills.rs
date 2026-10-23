@@ -1,18 +1,14 @@
 //! Settings › Skills: Zed's Skills page for agentZ's own skills on a machine (design/accounts
 //! decisions.md §17, §18), which every agent and account loads. Add Skill offers Add from
-//! Folder… and Zed's Create a Skill.
+//! Folder… and Zed's Create a Skill. Shared's skills (design/settings-2, topic 2) are kept in
+//! the app's data directory and given to every machine that uses shared settings.
 
-use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use agentz_protocol::Request;
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
 use agentz_protocol::agents::AgentId;
-use agentz_protocol::skills::{
-    FOLDER_TOO_LARGE, MAX_FOLDER_SIZE, Skill, SkillFile, validate_description, validate_name,
-};
-use anyhow::{Context as _, Result};
-use base64::Engine as _;
+use agentz_protocol::skills::{SKILL_FILE_NAME, Skill, validate_description, validate_name};
 use gpui::{
     AnyElement, App, Context, Entity, Focusable, PathPromptOptions, Subscription, Task, Window,
 };
@@ -21,8 +17,9 @@ use ui::{ContextMenu, ContextMenuEntry, Divider, PopoverMenu, Tooltip, prelude::
 use util::ResultExt as _;
 
 use super::accounts_menu::{KeptOffItem, account_groups, render_accounts_menu};
+use super::sharing::{MachineScope, count_summary};
 use super::{
-    SettingsPage, SettingsPageEvent, account_entry, new_text_input, on_page,
+    SettingsPage, SettingsPageEvent, account_entry, account_tag, new_text_input, on_page,
     render_section_with_actions,
 };
 use crate::confirm_dialog::ConfirmRequest;
@@ -30,6 +27,7 @@ use crate::controls::{ActionButton, ActionStyle, field_frame, field_label, text_
 use crate::machines::MachineId;
 use crate::project_switcher::compact_path;
 use crate::server_client::ServerClient;
+use crate::shared_settings::{self, SharedSection, SharedSkill, read_skill_folder};
 
 /// The key context of Create a Skill's body, where Enter starts a new line (bound in
 /// [`super::init`]).
@@ -44,6 +42,8 @@ pub(super) enum SkillsPage {
 }
 
 pub(super) struct SkillForm {
+    /// Where the skill goes: Shared, or the machine it was opened on.
+    scope: MachineScope,
     name: Entity<TextInput>,
     description: Entity<TextInput>,
     body: Entity<TextInput>,
@@ -106,13 +106,17 @@ impl SettingsPage {
                 .size(HeadlineSize::Small)
                 .into_any_element()
         };
-        let machine = if !self.machines.read(cx).has_remotes() {
-            None
-        } else if is_creating {
-            // The form belongs to the machine it was opened on.
-            Some(self.render_machine_label(cx))
-        } else {
-            Some(self.render_agents_machine_picker(window, cx))
+        let machine = match &self.skills_page {
+            _ if !self.offers_shared_list(SharedSection::Skills, cx) => None,
+            // The form belongs to where it was opened.
+            SkillsPage::Create(form) => Some(self.render_scope_label(form.scope, cx)),
+            SkillsPage::List => Some(self.render_scope_picker(
+                "skills-machine",
+                self.lists_view(SharedSection::Skills, cx),
+                |this, scope, cx| this.show_lists(scope, cx),
+                window,
+                cx,
+            )),
         };
         h_flex()
             .h(px(28.))
@@ -134,39 +138,33 @@ impl SettingsPage {
         }
     }
 
+    /// A machine's skills, after "Use shared settings" once Shared is offered.
     fn render_skill_list(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let skills = self.agents_client(cx).read(cx).skills().to_vec();
-        let rows = if skills.is_empty() {
-            vec![
-                v_flex()
-                    .px_4()
-                    .py_6()
-                    .items_center()
-                    .gap_2()
-                    .child(Label::new("No global skills installed.").color(Color::Muted))
-                    .child(
-                        div().debug_selector(|| "skill-create-empty".into()).child(
-                            Button::new("skill-create-empty", "Create a Skill")
-                                .style(ButtonStyle::Outlined)
-                                .start_icon(
-                                    Icon::new(IconName::Plus)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_skill_form(window, cx)
-                                })),
-                        ),
-                    )
-                    .into_any_element(),
-            ]
-        } else {
-            skills
-                .iter()
-                .enumerate()
-                .map(|(index, skill)| self.render_skill_row(index, skill, window, cx))
-                .collect()
+        let machine = match self.lists_view(SharedSection::Skills, cx) {
+            MachineScope::Shared => return self.render_shared_skill_list(cx),
+            MachineScope::Machine(machine) => machine,
         };
+        let skills = self.agents_client(cx).read(cx).skills().to_vec();
+        let mut rows = Vec::new();
+        if self.offers_shared_list(SharedSection::Skills, cx) {
+            let count = self.shared_settings(cx).skills.len();
+            rows.push(self.render_use_shared_row(
+                machine,
+                SharedSection::Skills,
+                count_summary(count, "shared skill", "shared skills"),
+                cx,
+            ));
+        }
+        if skills.is_empty() {
+            rows.push(render_no_skills("No global skills installed.", cx));
+        } else {
+            rows.extend(
+                skills
+                    .iter()
+                    .enumerate()
+                    .map(|(index, skill)| self.render_skill_row(index, skill, window, cx)),
+            );
+        }
         let list = render_section_with_actions(
             "Every agent and account loads these in agentZ threads.",
             rows,
@@ -180,8 +178,115 @@ impl SettingsPage {
         std::iter::once(list).chain(error).collect()
     }
 
+    /// Shared's skills, which every machine that uses shared settings is given.
+    fn render_shared_skill_list(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let skills = self.shared_settings(cx).skills.clone();
+        let rows = if skills.is_empty() {
+            vec![render_no_skills("No shared skills yet.", cx)]
+        } else {
+            skills
+                .iter()
+                .enumerate()
+                .map(|(index, skill)| self.render_shared_skill_row(index, skill, cx))
+                .collect()
+        };
+        let list = v_flex()
+            .gap_2()
+            .child(render_section_with_actions(
+                "Every machine that uses shared settings loads these, for every agent and account.",
+                rows,
+                self.render_add_skill_menu(cx),
+                cx,
+            ))
+            .children(
+                self.own_note(SharedSection::Skills, cx)
+                    .map(|note| Label::new(note).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .into_any_element();
+        let error = self
+            .skill_error
+            .clone()
+            .map(|error| render_error(error, "skill-error"));
+        std::iter::once(list).chain(error).collect()
+    }
+
+    /// A shared skill's row: its name and description, then delete and Open ↗. Which accounts
+    /// load it is each machine's.
+    fn render_shared_skill_row(
+        &self,
+        index: usize,
+        skill: &SharedSkill,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let skill_path = shared_settings::skill_folder(
+            self.app_settings.read(cx).shared_skills_folder(),
+            &skill.name,
+        )
+        .join(SKILL_FILE_NAME);
+        let selector = format!("skill-{}", skill.name);
+        h_flex()
+            .debug_selector(move || selector)
+            .px_4()
+            .py_3()
+            .gap_4()
+            .justify_between()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(Label::new(skill.name.clone()))
+                    .child(
+                        Label::new(skill.description.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .line_clamp(5),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        div()
+                            .debug_selector(move || format!("skill-delete-{index}"))
+                            .child(
+                                IconButton::new(("skill-delete", index), IconName::Trash)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Delete Skill"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirm_delete_skill(index, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        Button::new(("skill-open", index), "Open")
+                            .style(ButtonStyle::OutlinedGhost)
+                            .size(ButtonSize::Medium)
+                            .end_icon(
+                                Icon::new(IconName::ArrowUpRight)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(move |_, _, cx| cx.open_with_system(&skill_path)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// A skill Shared gave the machine while it uses shared settings, which changes there.
+    fn is_given_skill(&self, name: &str, cx: &App) -> bool {
+        let machine = self.agents_machine;
+        let shared = self.shared_settings(cx);
+        !shared.sets_own(machine, SharedSection::Skills)
+            && shared
+                .sharing(machine)
+                .is_some_and(|sharing| sharing.skills_given.contains_key(name))
+    }
+
     /// Zed's row: the name, with a warning when an agent skips the skill and why, the
-    /// description, then delete and Open ↗.
+    /// description, then delete and Open ↗. One Shared gave the machine says so, and is
+    /// deleted there.
     fn render_skill_row(
         &self,
         index: usize,
@@ -215,6 +320,7 @@ impl SettingsPage {
             window,
             cx,
         );
+        let is_given = self.is_given_skill(&skill.name, cx);
         let is_local = self.agents_machine == MachineId::Local;
         let machine = self.machines.read(cx).label(self.agents_machine, cx);
         let skill_path = skill.path.clone();
@@ -231,16 +337,21 @@ impl SettingsPage {
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(h_flex().gap_1().child(Label::new(skill.name.clone())).when(
-                        !reasons.is_empty(),
-                        |title| {
-                            title.child(
-                                Icon::new(IconName::Warning)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Warning),
-                            )
-                        },
-                    ))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new(skill.name.clone()))
+                            .when(is_given, |title| {
+                                title.child(account_tag("Shared", Color::Muted, cx))
+                            })
+                            .when(!reasons.is_empty(), |title| {
+                                title.child(
+                                    Icon::new(IconName::Warning)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            }),
+                    )
                     .child(
                         Label::new(skill.description.clone())
                             .size(LabelSize::Small)
@@ -258,18 +369,20 @@ impl SettingsPage {
                     .flex_none()
                     .gap_2()
                     .children(accounts_menu)
-                    .child(
-                        div()
-                            .debug_selector(move || format!("skill-delete-{index}"))
-                            .child(
-                                IconButton::new(("skill-delete", index), IconName::Trash)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Delete Skill"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.confirm_delete_skill(index, cx)
-                                    })),
-                            ),
-                    )
+                    .when(!is_given, |actions| {
+                        actions.child(
+                            div()
+                                .debug_selector(move || format!("skill-delete-{index}"))
+                                .child(
+                                    IconButton::new(("skill-delete", index), IconName::Trash)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Delete Skill"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.confirm_delete_skill(index, cx)
+                                        })),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new(("skill-open", index), "Open")
                             .style(ButtonStyle::OutlinedGhost)
@@ -376,12 +489,16 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// Add from Folder…: a folder on this Mac with a `SKILL.md`, copied to the machine.
+    /// Add from Folder…: a folder on this Mac with a `SKILL.md`, copied to the machine, or
+    /// kept for Shared.
     fn add_skill_from_folder(&mut self, cx: &mut Context<Self>) {
         if self.adding_skill.is_some() {
             return;
         }
         let client = self.agents_client(cx);
+        let scope = self.lists_view(SharedSection::Skills, cx);
+        let store = self.app_settings.clone();
+        let root = store.read(cx).shared_skills_folder().clone();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -403,14 +520,26 @@ impl SettingsPage {
                     let files = cx
                         .background_spawn(async move { read_skill_folder(&folder) })
                         .await;
-                    match files {
-                        Ok(files) => {
+                    match (files, scope) {
+                        (Ok(files), MachineScope::Machine(_)) => {
                             let request = client.read_with(cx, |client, _| {
                                 client.request(Request::AddSkill(files))
                             });
                             request.await.map(|_| ())
                         }
-                        Err(error) => Err(error),
+                        (Ok(files), MachineScope::Shared) => {
+                            let added = cx
+                                .background_spawn(async move {
+                                    shared_settings::add_skill(&root, &files)
+                                })
+                                .await;
+                            added.map(|skill| {
+                                store.update(cx, |store, cx| {
+                                    store.update(|settings| settings.shared.put_skill(skill), cx)
+                                })
+                            })
+                        }
+                        (Err(error), _) => Err(error),
                     }
                 }
                 None => Ok(()),
@@ -428,6 +557,28 @@ impl SettingsPage {
     }
 
     fn confirm_delete_skill(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.lists_view(SharedSection::Skills, cx) == MachineScope::Shared {
+            let Some(skill) = self.shared_settings(cx).skills.get(index).cloned() else {
+                return;
+            };
+            let folder = shared_settings::skill_folder(
+                self.app_settings.read(cx).shared_skills_folder(),
+                &skill.name,
+            );
+            let page = cx.weak_entity();
+            let name = skill.name.clone();
+            let request = ConfirmRequest::delete_shared_skill(
+                &skill.name,
+                &compact_path(&folder),
+                move |_, cx| {
+                    let name = name.clone();
+                    page.update(cx, |page, cx| page.delete_shared_skill(name, cx))
+                        .log_err();
+                },
+            );
+            cx.emit(SettingsPageEvent::Confirm(request));
+            return;
+        }
         let client = self.agents_client(cx);
         let Some(skill) = client.read(cx).skills().get(index).cloned() else {
             return;
@@ -460,6 +611,39 @@ impl SettingsPage {
             "Couldn't delete the skill",
             cx,
         );
+    }
+
+    /// Deletes one of Shared's skills, which the machines that use shared settings then delete.
+    fn delete_shared_skill(&mut self, name: String, cx: &mut Context<Self>) {
+        self.skill_error = None;
+        let store = self.app_settings.clone();
+        let root = store.read(cx).shared_skills_folder().clone();
+        cx.spawn(async move |this, cx| {
+            let deleted = cx
+                .background_spawn({
+                    let name = name.clone();
+                    async move { shared_settings::delete_skill(&root, &name) }
+                })
+                .await;
+            match deleted {
+                Ok(()) => store.update(cx, |store, cx| {
+                    store.update(
+                        |settings| settings.shared.skills.retain(|skill| skill.name != name),
+                        cx,
+                    )
+                }),
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.skill_error =
+                            Some(format!("Couldn't delete the skill: {error:#}").into());
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Sends a change to the machine the skill was listed on, to say why if it fails.
@@ -513,6 +697,7 @@ impl SettingsPage {
         .collect();
         window.focus(&name.focus_handle(cx), cx);
         self.skills_page = SkillsPage::Create(SkillForm {
+            scope: self.lists_view(SharedSection::Skills, cx),
             name,
             description,
             body,
@@ -534,6 +719,8 @@ impl SettingsPage {
 
     fn save_skill_form(&mut self, cx: &mut Context<Self>) {
         let client = self.agents_client(cx);
+        let store = self.app_settings.clone();
+        let root = store.read(cx).shared_skills_folder().clone();
         let SkillsPage::Create(form) = &mut self.skills_page else {
             return;
         };
@@ -547,13 +734,35 @@ impl SettingsPage {
             cx.notify();
             return;
         }
-        let request = client.read(cx).request(Request::CreateSkill {
-            name: form.name.read(cx).text().to_string(),
-            description: form.description.read(cx).text().to_string(),
-            body: form.body.read(cx).text().to_string(),
-        });
+        let name = form.name.read(cx).text().to_string();
+        let description = form.description.read(cx).text().to_string();
+        let body = form.body.read(cx).text().to_string();
+        let scope = form.scope;
         form.saving = Some(cx.spawn(async move |this, cx| {
-            let saved = request.await;
+            let saved = match scope {
+                MachineScope::Machine(_) => {
+                    let request = client.read_with(cx, |client, _| {
+                        client.request(Request::CreateSkill {
+                            name,
+                            description,
+                            body,
+                        })
+                    });
+                    request.await.map(|_| ())
+                }
+                MachineScope::Shared => {
+                    let created = cx
+                        .background_spawn(async move {
+                            shared_settings::create_skill(&root, &name, &description, &body)
+                        })
+                        .await;
+                    created.map(|skill| {
+                        store.update(cx, |store, cx| {
+                            store.update(|settings| settings.shared.put_skill(skill), cx)
+                        })
+                    })
+                }
+            };
             this.update(cx, |this, cx| {
                 let SkillsPage::Create(form) = &mut this.skills_page else {
                     return;
@@ -662,6 +871,29 @@ impl SettingsPage {
     }
 }
 
+/// What a list without skills says, with Create a Skill.
+fn render_no_skills(message: &'static str, cx: &mut Context<SettingsPage>) -> AnyElement {
+    v_flex()
+        .px_4()
+        .py_6()
+        .items_center()
+        .gap_2()
+        .child(Label::new(message).color(Color::Muted))
+        .child(
+            div().debug_selector(|| "skill-create-empty".into()).child(
+                Button::new("skill-create-empty", "Create a Skill")
+                    .style(ButtonStyle::Outlined)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.open_skill_form(window, cx))),
+            ),
+        )
+        .into_any_element()
+}
+
 /// "Claude Agent has its own skill named frontend-design, so it keeps that one.", naming the
 /// accounts when only some of the agent's do.
 fn skip_reason(
@@ -704,75 +936,6 @@ pub(super) fn render_error(error: SharedString, selector: &'static str) -> AnyEl
         )
         .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
         .into_any_element()
-}
-
-/// The files of a skill's folder, as the server takes them. A clone's `.git` and Finder's
-/// `.DS_Store` aren't part of the skill, and linked folders aren't followed, so a link back up
-/// can't loop.
-fn read_skill_folder(folder: &Path) -> Result<Vec<SkillFile>> {
-    let mut files = Vec::new();
-    let mut size = 0;
-    let mut pending = vec![PathBuf::new()];
-    while let Some(relative) = pending.pop() {
-        let directory = folder.join(&relative);
-        let entries = std::fs::read_dir(&directory)
-            .with_context(|| format!("reading {}", directory.display()))?;
-        for entry in entries {
-            let entry = entry.with_context(|| format!("reading {}", directory.display()))?;
-            let name = entry.file_name();
-            if name == ".git" || name == ".DS_Store" {
-                continue;
-            }
-            let path = entry.path();
-            let metadata =
-                std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
-            if metadata.is_dir() {
-                if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
-                    pending.push(relative.join(&name));
-                }
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-            size += metadata.len() as usize;
-            anyhow::ensure!(size <= MAX_FOLDER_SIZE, FOLDER_TOO_LARGE);
-            let data =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            files.push(SkillFile {
-                path: slash_path(&relative.join(&name))?,
-                data: base64::engine::general_purpose::STANDARD.encode(data),
-                executable: is_executable(&metadata),
-            });
-        }
-    }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
-}
-
-/// `path`'s names with `/` between them, as the server takes them on any machine.
-fn slash_path(path: &Path) -> Result<String> {
-    let names = path
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => name
-                .to_str()
-                .with_context(|| format!("{} isn't a name agentZ can send", path.display())),
-            _ => anyhow::bail!("{} isn't a path in the folder", path.display()),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(names.join("/"))
-}
-
-#[cfg(unix)]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_: &std::fs::Metadata) -> bool {
-    false
 }
 
 #[cfg(test)]
@@ -826,36 +989,6 @@ mod tests {
             "Claude Agent on External, Work and Team has its own skill named review, so \
              it keeps that one."
         );
-    }
-
-    #[test]
-    fn a_folder_is_read_without_git_finder_or_linked_folders() -> Result<()> {
-        let folder = tempfile::tempdir()?;
-        let outside = tempfile::tempdir()?;
-        std::fs::write(folder.path().join("SKILL.md"), "---\nname: x\n---\n")?;
-        std::fs::create_dir_all(folder.path().join("scripts"))?;
-        std::fs::write(folder.path().join("scripts/run.sh"), "#!/bin/sh\n")?;
-        std::fs::create_dir_all(folder.path().join(".git"))?;
-        std::fs::write(folder.path().join(".git/config"), "")?;
-        std::fs::write(folder.path().join(".DS_Store"), "")?;
-        std::fs::write(outside.path().join("secret.md"), "")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(
-                folder.path().join("scripts/run.sh"),
-                std::fs::Permissions::from_mode(0o755),
-            )?;
-            std::os::unix::fs::symlink(outside.path(), folder.path().join("linked"))?;
-        }
-
-        let files = read_skill_folder(folder.path())?;
-        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
-        assert_eq!(paths, ["SKILL.md", "scripts/run.sh"]);
-        assert!(!files[0].executable);
-        assert_eq!(files[1].executable, cfg!(unix));
-        assert_eq!(files[1].data, "IyEvYmluL3NoCg==");
-        Ok(())
     }
 
     #[gpui::test]
@@ -1077,5 +1210,106 @@ mod tests {
                 account: Some(AccountId(2)),
             }],
         }));
+    }
+
+    /// Shared's skills are written in the app's data directory and listed there; a machine
+    /// that was given one marks it, and it's deleted on Shared, which asks first.
+    #[gpui::test]
+    fn shared_skills_are_kept_by_the_app_and_marked_on_a_machine(cx: &mut TestAppContext) {
+        use super::super::sharing::tests::{DEVBOX, click, shared, update_shared};
+
+        let (_, devbox) = super::super::tests::machines_with_copies(cx);
+        cx.update(|cx| super::super::init(cx));
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        let confirms: Rc<RefCell<Vec<ConfirmRequest>>> = Rc::default();
+        cx.update(|_, cx| {
+            let confirms = confirms.clone();
+            cx.subscribe(&page, move |_, event: &SettingsPageEvent, _| {
+                if let SettingsPageEvent::Confirm(request) = event {
+                    confirms.borrow_mut().push(request.clone());
+                }
+            })
+            .detach();
+        });
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::Skills, window, cx)
+        });
+        cx.run_until_parked();
+
+        // It opens on Shared, which has none yet.
+        assert!(cx.debug_bounds("skills-machine").is_some());
+        assert!(cx.debug_bounds("use-shared-skills").is_none());
+        click("skill-create-empty", cx);
+        page.update(cx, |page, cx| {
+            if let SkillsPage::Create(form) = &page.skills_page {
+                form.name
+                    .update(cx, |input, cx| input.set_text("review", cx));
+                form.description
+                    .update(cx, |input, cx| input.set_text("Reviews a change.", cx));
+                form.body
+                    .update(cx, |input, cx| input.set_text("Read the diff.", cx));
+            }
+        });
+        click("skill-save", cx);
+        assert!(page.read_with(cx, |page, _| matches!(page.skills_page, SkillsPage::List)));
+        let folder = cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx)
+                .read(cx)
+                .shared_skills_folder()
+                .join("review")
+        });
+        let names: Vec<String> = shared(cx)
+            .skills
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(names, ["review"]);
+        assert!(folder.join("SKILL.md").exists());
+        assert!(cx.debug_bounds("skill-review").is_some());
+
+        // Devbox 1 was given it, so it says so and has no delete there.
+        let revision = shared(cx).skills[0].revision;
+        update_shared(
+            |shared| {
+                shared
+                    .sharing_mut(DEVBOX)
+                    .skills_given
+                    .insert("review".into(), revision);
+            },
+            cx,
+        );
+        devbox.update(cx, |client, cx| {
+            client.set_skills_for_test(
+                vec![Skill {
+                    name: "review".into(),
+                    description: "Reviews a change.".into(),
+                    path: "/root/.agentz/skills/review/SKILL.md".into(),
+                    skipped: Vec::new(),
+                    kept_off: Vec::new(),
+                }],
+                cx,
+            )
+        });
+        page.update(cx, |page, cx| {
+            page.show_lists(MachineScope::Machine(DEVBOX), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("use-shared-skills").is_some());
+        assert!(cx.debug_bounds("skill-review").is_some());
+        assert!(cx.debug_bounds("skill-delete-0").is_none());
+
+        page.update(cx, |page, cx| page.show_lists(MachineScope::Shared, cx));
+        cx.run_until_parked();
+        click("skill-delete-0", cx);
+        let confirm = confirms.borrow_mut().pop().expect("deleting asks first");
+        assert!(
+            confirm
+                .message
+                .contains("every machine that uses shared settings")
+        );
+        cx.update(|window, cx| (confirm.on_confirm)(window, cx));
+        cx.run_until_parked();
+        assert!(shared(cx).skills.is_empty());
+        assert!(!folder.exists());
     }
 }

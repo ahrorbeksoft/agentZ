@@ -40,8 +40,8 @@ Also:
 - Likewise for profile-specific settings: a general one for all profiles.
 
 Decided on the design board (`design/settings-2/decisions.md`). Built: topic 1 A, headings in
-the sidebar and General split into Threads, Subthreads, Thread titles and Artifacts. Left: the
-shared settings for machines (topic 2) and for accounts (topic 3).
+the sidebar and General split into Threads, Subthreads, Thread titles and Artifacts, and topic
+2, Shared settings for machines. Left: the shared settings for accounts (topic 3).
 
 
 ### Redesign chats

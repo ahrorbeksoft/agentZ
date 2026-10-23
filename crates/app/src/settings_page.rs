@@ -8,6 +8,7 @@ mod cloud_machine_page;
 mod cloud_providers;
 mod mcp_servers;
 mod new_cloud_machine;
+mod sharing;
 mod skills;
 mod storage;
 mod subthread_roles;
@@ -32,7 +33,9 @@ use agentz_protocol::agents::{
 };
 use agentz_protocol::artifacts::{DesignDefaults, DesignSizes, VariantsAs};
 use agentz_protocol::cloud::{MachineAction, Provider};
-use agentz_protocol::title_generation::{TitleGeneration, TitleProvider, effort_label};
+use agentz_protocol::title_generation::{
+    TitleGeneration, TitleProvider, TitleProviderInfo, effort_label,
+};
 use agentz_protocol::workspace::WorkspaceRemoval;
 use agentz_protocol::{CAPABILITY_IMPORT_SESSIONS, Request, Response};
 use gpui::{
@@ -75,6 +78,7 @@ use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
 use crate::registry_store::AgentRegistryStore;
 use crate::server_client::{MachineStatus, ServerClient, ServerUpdate};
+use crate::shared_settings::SharedSection;
 use crate::sidebar::{SIDEBAR_WIDTH, format_relative_time, render_footer_item};
 use crate::slider::Slider;
 use crate::sound::{self, Sound};
@@ -245,8 +249,12 @@ pub struct SettingsPage {
     /// The Usage timeline's tracks' width when last drawn, which says whose bars fit their
     /// words.
     usage_timeline_width: Pixels,
-    /// The machine whose thread titles Settings › Thread titles shows.
-    titles_machine: MachineId,
+    /// What Settings › Thread titles shows: Shared, or a machine's own.
+    titles_scope: sharing::MachineScope,
+    /// Skills and MCP Servers show Shared rather than `agents_machine`'s.
+    lists_shared: bool,
+    /// Storage shows Shared's cleanup rules rather than `agents_machine`.
+    storage_shared: bool,
     agent_search: Entity<TextInput>,
     /// Machines whose server is being updated, so a second click doesn't restart it midway.
     updating: HashSet<MachineId>,
@@ -326,14 +334,6 @@ impl SettingsPage {
                 {
                     this.agents_machine = MachineId::Local;
                 }
-                if this
-                    .machines
-                    .read(cx)
-                    .client(this.titles_machine, cx)
-                    .is_none()
-                {
-                    this.titles_machine = MachineId::Local;
-                }
                 this.sync_machine_page(cx);
                 cx.notify();
             }),
@@ -373,7 +373,9 @@ impl SettingsPage {
             agents_machine: MachineId::Local,
             usage_timeline_zoom: TimelineZoom::default(),
             usage_timeline_width: px(488.),
-            titles_machine: MachineId::Local,
+            titles_scope: sharing::MachineScope::Shared,
+            lists_shared: true,
+            storage_shared: false,
             agent_search,
             updating: Default::default(),
             starts_at_login: crate::login_item::is_enabled(),
@@ -1177,18 +1179,161 @@ impl SettingsPage {
             .justify_between()
             .child(Headline::new("Thread titles").size(HeadlineSize::Small))
             .when(self.machines.read(cx).has_remotes(), |header| {
-                header.child(self.render_titles_machine_picker(window, cx))
+                header.child(self.render_scope_picker(
+                    "titles-machine",
+                    self.titles_view(cx),
+                    |this, scope, cx| {
+                        this.titles_scope = scope;
+                        cx.notify();
+                    },
+                    window,
+                    cx,
+                ))
             })
             .into_any_element()
     }
 
+    /// Shared's way of titling threads, or a machine's: on one machine, with "Use shared
+    /// settings" first, and its rows once it sets its own. With only this Mac there's no
+    /// switch, and its rows change Shared too while it follows it.
     fn render_thread_titles(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let store = self.app_settings.clone();
+        let machine = match self.titles_view(cx) {
+            sharing::MachineScope::Shared => {
+                let settings = self
+                    .shared_settings(cx)
+                    .title_generation
+                    .clone()
+                    .unwrap_or_default();
+                let providers = self.shared_title_providers(cx);
+                let choose: ChooseTitles = Rc::new(move |settings, cx| {
+                    store.update(cx, |store, cx| {
+                        store.update(|app| app.shared.title_generation = Some(settings), cx)
+                    })
+                });
+                let rows = self
+                    .render_title_generation_rows(&settings, &providers, choose, true, window, cx);
+                let mut note = "Machines that use shared settings title their threads this way, \
+                                with the CLIs installed on each."
+                    .to_string();
+                if let Some(own) = self.own_note(SharedSection::ThreadTitles, cx) {
+                    note.push(' ');
+                    note.push_str(&own);
+                }
+                return vec![render_section_with_note("Thread titles", rows, note, cx)];
+            }
+            sharing::MachineScope::Machine(machine) => machine,
+        };
+        let Some(client) = self.machines.read(cx).client(machine, cx) else {
+            return Vec::new();
+        };
+        let has_remotes = self.machines.read(cx).has_remotes();
+        let follows = !self.sets_own(machine, SharedSection::ThreadTitles, cx);
+        let mut rows = Vec::new();
+        if has_remotes {
+            let shared = self
+                .shared_settings(cx)
+                .title_generation
+                .clone()
+                .unwrap_or_default();
+            let summary = titles_summary(&shared, &self.shared_title_providers(cx));
+            rows.push(self.render_use_shared_row(
+                machine,
+                SharedSection::ThreadTitles,
+                summary,
+                cx,
+            ));
+        }
+        if !has_remotes || !follows {
+            let state = client.read(cx).title_generation().clone();
+            let writes_shared = follows;
+            let choose: ChooseTitles = Rc::new(move |settings, cx| {
+                client.update(cx, |client, cx| {
+                    client.choose_title_generation(settings.clone(), cx)
+                });
+                if writes_shared {
+                    store.update(cx, |store, cx| {
+                        store.update(|app| app.shared.title_generation = Some(settings), cx)
+                    });
+                }
+            });
+            rows.extend(self.render_title_generation_rows(
+                &state.settings,
+                &state.providers,
+                choose,
+                false,
+                window,
+                cx,
+            ));
+        }
         vec![render_section_with_note(
             "Thread titles",
-            self.render_title_generation_rows(window, cx),
+            rows,
             "Each machine titles its own threads, with the CLIs installed on it.",
             cx,
         )]
+    }
+
+    /// The providers Shared's rows offer: each as the first machine that has its CLI has it.
+    fn shared_title_providers(&self, cx: &App) -> Vec<TitleProviderInfo> {
+        let clients = self.machines.read(cx).clients();
+        TitleProvider::ALL
+            .into_iter()
+            .filter_map(|provider| {
+                let infos: Vec<&TitleProviderInfo> = clients
+                    .iter()
+                    .filter_map(|client| {
+                        client
+                            .read(cx)
+                            .title_generation()
+                            .providers
+                            .iter()
+                            .find(|info| info.provider == provider)
+                    })
+                    .collect();
+                infos
+                    .iter()
+                    .find(|info| info.installed)
+                    .or(infos.first())
+                    .map(|info| (*info).clone())
+            })
+            .collect()
+    }
+
+    /// "Set on Devbox 1" after a row's title on Shared.
+    fn titles_set_on(
+        &self,
+        row: TitleRow,
+        shared: &TitleGeneration,
+        on_shared: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !on_shared {
+            return None;
+        }
+        let (key, _) = title_value(row, shared, &[]);
+        let entries = self.set_on_entries(
+            SharedSection::ThreadTitles,
+            |client| {
+                let state = client.title_generation();
+                // Its other rows don't apply while it titles nothing.
+                if !state.settings.enabled && row != TitleRow::Generate {
+                    return Some((key.clone(), "Off".into()));
+                }
+                Some(title_value(row, &state.settings, &state.providers))
+            },
+            &key,
+            cx,
+        );
+        self.render_set_on(
+            row.id(),
+            entries,
+            |this, machine, cx| {
+                this.titles_scope = sharing::MachineScope::Machine(machine);
+                cx.notify();
+            },
+            cx,
+        )
     }
 
     /// Asks agents for ACP v2 on every machine, which most agents don't speak reliably yet.
@@ -1653,22 +1798,18 @@ impl SettingsPage {
     /// its own, since the CLIs are installed on it.
     fn render_title_generation_rows(
         &self,
+        settings: &TitleGeneration,
+        providers: &[TitleProviderInfo],
+        choose: ChooseTitles,
+        on_shared: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut rows = Vec::new();
-        let Some(client) = self.machines.read(cx).client(self.titles_machine, cx) else {
-            return rows;
-        };
-        let state = client.read(cx).title_generation().clone();
-        let settings = state.settings.clone();
-        let choose = move |settings: TitleGeneration, cx: &mut App| {
-            client.update(cx, |client, cx| {
-                client.choose_title_generation(settings, cx)
-            })
-        };
-        rows.push(render_row(
+        let settings = settings.clone();
+        rows.push(render_row_with_note(
             "Generate thread titles",
+            self.titles_set_on(TitleRow::Generate, &settings, on_shared, cx),
             "Titles a thread from its first message when its agent doesn't name it, with a \
              coding agent's CLI installed on the machine.",
             div()
@@ -1695,23 +1836,26 @@ impl SettingsPage {
             return rows;
         }
 
-        let info = state
-            .providers
+        let info = providers
             .iter()
             .find(|info| info.provider == settings.provider);
         let provider_description: SharedString = match info {
-            None if state.providers.is_empty() => "Looking for the CLIs installed…".into(),
+            None if providers.is_empty() => "Looking for the CLIs installed…".into(),
             Some(info) if !info.installed => format!(
-                "{} isn't installed on this machine, so threads keep their first message as \
-                 their title.",
-                settings.provider.program().unwrap_or("Its CLI")
+                "{} isn't installed on {}, so threads keep their first message as their title.",
+                settings.provider.program().unwrap_or("Its CLI"),
+                if on_shared {
+                    "any machine"
+                } else {
+                    "this machine"
+                }
             )
             .into(),
             _ => "The CLI that writes the titles.".into(),
         };
         let menu = ContextMenu::build(window, cx, {
             let settings = settings.clone();
-            let providers = state.providers.clone();
+            let providers = providers.to_vec();
             let choose = choose.clone();
             move |mut menu, _, _| {
                 for provider in TitleProvider::ALL {
@@ -1739,8 +1883,9 @@ impl SettingsPage {
                 menu
             }
         });
-        rows.push(render_row(
+        rows.push(render_row_with_note(
             "Provider",
+            self.titles_set_on(TitleRow::Provider, &settings, on_shared, cx),
             provider_description,
             div()
                 .debug_selector(|| "title-provider".into())
@@ -1788,8 +1933,9 @@ impl SettingsPage {
                 menu
             }
         });
-        rows.push(render_row(
+        rows.push(render_row_with_note(
             "Model",
+            self.titles_set_on(TitleRow::Model, &settings, on_shared, cx),
             "The model the CLI writes titles with.",
             div()
                 .debug_selector(|| "title-model".into())
@@ -1829,8 +1975,9 @@ impl SettingsPage {
                     menu
                 }
             });
-            rows.push(render_row(
+            rows.push(render_row_with_note(
                 "Reasoning effort",
+                self.titles_set_on(TitleRow::Effort, &settings, on_shared, cx),
                 "How much the model thinks before it writes a title.",
                 div()
                     .debug_selector(|| "title-effort".into())
@@ -1844,49 +1991,6 @@ impl SettingsPage {
             ));
         }
         rows
-    }
-
-    fn render_titles_machine_picker(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let machines: Vec<(MachineId, SharedString)> = self
-            .machines
-            .read(cx)
-            .clients()
-            .iter()
-            .map(|client| (client.read(cx).machine(), client.read(cx).label().clone()))
-            .collect();
-        let current = self.titles_machine;
-        let label = self.machines.read(cx).label(current, cx);
-        let icon = self.machines.read(cx).machine_icon(current, cx);
-        let this = cx.entity().downgrade();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for (machine, label) in machines {
-                let this = this.clone();
-                menu = menu.toggleable_entry(
-                    label,
-                    machine == current,
-                    IconPosition::End,
-                    None,
-                    move |_, cx| {
-                        this.update(cx, |this, cx| {
-                            this.titles_machine = machine;
-                            cx.notify();
-                        })
-                        .ok();
-                    },
-                );
-            }
-            menu
-        });
-        let trigger = h_flex()
-            .gap_1p5()
-            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-            .child(Label::new(label))
-            .into_any_element();
-        DropdownMenu::new_with_element("titles-machine", trigger, menu).into_any_element()
     }
 
     /// t3code's "Combine matching repositories" switch, which turns grouping off or back to
@@ -9478,6 +9582,17 @@ fn render_row(
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     control: AnyElement,
+    cx: &App,
+) -> AnyElement {
+    render_row_with_note(title, None, description, control, cx)
+}
+
+/// A row with a note after its title, as Zed's rows say where a value was set.
+fn render_row_with_note(
+    title: impl Into<SharedString>,
+    note: Option<AnyElement>,
+    description: impl Into<SharedString>,
+    control: AnyElement,
     _cx: &App,
 ) -> AnyElement {
     let description = description.into();
@@ -9491,7 +9606,12 @@ fn render_row(
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(Label::new(title))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(Label::new(title.into()))
+                        .children(note),
+                )
                 .when(!description.is_empty(), |column| {
                     column.child(
                         Label::new(description)
@@ -9502,6 +9622,79 @@ fn render_row(
         )
         .child(div().flex_none().child(control))
         .into_any_element()
+}
+
+/// What a thread titles row changes.
+type ChooseTitles = Rc<dyn Fn(TitleGeneration, &mut App)>;
+
+/// A Thread titles row, for its "Set on" note.
+#[derive(Clone, Copy, PartialEq)]
+enum TitleRow {
+    Generate,
+    Provider,
+    Model,
+    Effort,
+}
+
+impl TitleRow {
+    fn id(self) -> &'static str {
+        match self {
+            TitleRow::Generate => "generate-titles",
+            TitleRow::Provider => "title-provider",
+            TitleRow::Model => "title-model",
+            TitleRow::Effort => "title-effort",
+        }
+    }
+}
+
+/// A row's value, to compare and to show: the model's name from what `providers` offer.
+fn title_value(
+    row: TitleRow,
+    settings: &TitleGeneration,
+    providers: &[TitleProviderInfo],
+) -> (String, SharedString) {
+    match row {
+        TitleRow::Generate => (
+            settings.enabled.to_string(),
+            if settings.enabled { "On" } else { "Off" }.into(),
+        ),
+        TitleRow::Provider => (
+            settings.provider.label().to_string(),
+            settings.provider.label().into(),
+        ),
+        TitleRow::Model => {
+            let name = providers
+                .iter()
+                .filter(|info| info.provider == settings.provider)
+                .flat_map(|info| &info.models)
+                .find(|model| model.id == settings.model())
+                .map_or_else(|| settings.model().to_string(), |model| model.name.clone());
+            (settings.model().to_string(), name.into())
+        }
+        TitleRow::Effort => (
+            settings.effort().unwrap_or_default().to_string(),
+            settings
+                .effort()
+                .map_or_else(|| "Default".to_string(), effort_label)
+                .into(),
+        ),
+    }
+}
+
+/// What "Use shared settings" means for thread titles: "On · Claude · Haiku 4.5 · Low".
+fn titles_summary(settings: &TitleGeneration, providers: &[TitleProviderInfo]) -> String {
+    if !settings.enabled {
+        return "Off".to_string();
+    }
+    let mut parts = vec![
+        "On".to_string(),
+        settings.provider.label().to_string(),
+        title_value(TitleRow::Model, settings, providers)
+            .1
+            .to_string(),
+    ];
+    parts.extend(settings.effort().map(effort_label));
+    parts.join(" · ")
 }
 
 /// A setting under an account card's hairline, in the body's size so it doesn't read as a

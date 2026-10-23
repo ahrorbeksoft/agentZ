@@ -185,6 +185,27 @@ impl ConfirmRequest {
         }
     }
 
+    /// A skill of Shared's, which the machines that use shared settings delete too.
+    pub fn delete_shared_skill(
+        skill_name: &str,
+        folder: &str,
+        on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            icon: IconName::Trash,
+            title: format!("Delete the skill \"{skill_name}\"?").into(),
+            message: format!(
+                "This will delete {folder} for good, and every machine that uses shared settings \
+                 will delete its copy."
+            )
+            .into(),
+            confirm_label: "Delete".into(),
+            on_confirm: Rc::new(on_confirm),
+            checkbox: None,
+            is_charge: false,
+        }
+    }
+
     /// Settings › Storage's trash on a row: what goes and its size, deleted for good
     /// (design/storage §10).
     pub fn delete_storage(

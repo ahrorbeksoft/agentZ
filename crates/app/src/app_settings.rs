@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use theme::{ActiveTheme as _, DEFAULT_DARK_THEME, GlobalTheme, ThemeRegistry};
 use util::ResultExt as _;
 
-use crate::machines::{GroupKey, ProjectGroupingMode, Scope};
+use crate::machines::{GroupKey, MachineId, ProjectGroupingMode, Scope};
+use crate::shared_settings::{MachineSharing, SharedMachineSettings};
 use crate::window_background;
 
 const DEFAULT_LIGHT_THEME: &str = "One Light";
@@ -315,6 +316,9 @@ pub struct AppSettings {
     pub opened_over_ssh: bool,
     /// Cloud accounts whose charges were confirmed once with "Don't ask again".
     pub charges_without_asking: Vec<CloudAccount>,
+    /// What machines share: Settings' Shared, which each machine follows unless it sets its
+    /// own (`design/settings-2`, topic 2).
+    pub shared: SharedMachineSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -362,6 +366,7 @@ impl Default for AppSettings {
             opened_over_ssh: false,
             saved_layouts: Vec::new(),
             charges_without_asking: Vec::new(),
+            shared: SharedMachineSettings::default(),
         }
     }
 }
@@ -382,6 +387,8 @@ impl AppSettings {
             enabled: true,
             cloud: None,
         });
+        // A machine added now takes Shared's, as it would have from the start.
+        *self.shared.sharing_mut(MachineId::Remote(id)) = MachineSharing::following();
         id
     }
 
@@ -438,6 +445,8 @@ impl AppSettings {
 pub struct AppSettingsStore {
     settings: AppSettings,
     path: PathBuf,
+    /// Where Shared's skills keep their files.
+    shared_skills_folder: PathBuf,
     _save: Option<Task<()>>,
 }
 
@@ -454,6 +463,7 @@ pub fn init(cx: &mut App) {
     let store = cx.new(|_| AppSettingsStore {
         settings,
         path,
+        shared_skills_folder: paths::data_dir().join("shared-skills"),
         _save: None,
     });
     cx.set_global(GlobalAppSettings(store));
@@ -464,9 +474,15 @@ pub fn init(cx: &mut App) {
 pub fn init_for_test(cx: &mut App) {
     let settings = AppSettings::default();
     apply_theme(&settings, cx);
+    static NEXT_FOLDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let folder = NEXT_FOLDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let store = cx.new(|_| AppSettingsStore {
         settings,
         path: std::env::temp_dir().join("agentz-test-settings.json"),
+        shared_skills_folder: std::env::temp_dir().join(format!(
+            "agentz-test-shared-skills-{}-{folder}",
+            std::process::id()
+        )),
         _save: None,
     });
     cx.set_global(GlobalAppSettings(store));
@@ -479,6 +495,10 @@ impl AppSettingsStore {
 
     pub fn settings(&self) -> &AppSettings {
         &self.settings
+    }
+
+    pub fn shared_skills_folder(&self) -> &PathBuf {
+        &self.shared_skills_folder
     }
 
     pub fn update(&mut self, change: impl FnOnce(&mut AppSettings), cx: &mut Context<Self>) {

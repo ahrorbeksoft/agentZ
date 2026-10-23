@@ -34,6 +34,7 @@ mod registry_store;
 mod save_layout_modal;
 mod server_client;
 mod settings_page;
+mod shared_settings;
 mod shell;
 mod shortcut_sheet;
 mod sidebar;

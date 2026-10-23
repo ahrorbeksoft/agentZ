@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::time::SystemTime;
 
 use collections::{HashMap, HashSet};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Subscription, Task};
 pub use projects::project_at;
 use projects::{
     Project, ProjectId, RemoteThread, Thread, ThreadId, ThreadOrder, ThreadSection, order_key,
@@ -21,6 +21,7 @@ use crate::app_settings::{AppSettingsStore, CloudLink, MachineProfile};
 use crate::cloud_machines;
 use crate::project_store::{ProjectStore, ProjectStoreEvent, ThreadStatus};
 use crate::server_client::{ServerClient, ServerClientEvent, Transport};
+use crate::shared_settings::{self, ListStep, SharedMachineSettings, SharedSection, list_steps};
 use crate::spaces_view::PaneKey;
 use agentz_client::ssh::Ssh;
 use agentz_protocol::artifacts::{
@@ -214,6 +215,10 @@ pub struct Machines {
     open_machines: HashSet<MachineId>,
     /// The last of this Mac's server's cloud notices told to the user.
     cloud_notices_told: u64,
+    /// Requests giving a machine Shared's skills and MCP servers, while they're sent.
+    shared_list_syncs: HashMap<MachineId, Task<()>>,
+    /// The steps last tried for each machine's lists, this connection.
+    shared_list_attempts: HashMap<MachineId, Vec<ListStep>>,
     _settings_subscription: Subscription,
     _wake_subscription: Subscription,
 }
@@ -251,6 +256,8 @@ pub fn init(cx: &mut App) {
             ssh_addresses: HashMap::default(),
             open_machines: HashSet::default(),
             cloud_notices_told: 0,
+            shared_list_syncs: HashMap::default(),
+            shared_list_attempts: HashMap::default(),
             _settings_subscription: cx
                 .observe(&settings, |this: &mut Machines, _, cx| this.sync(cx)),
             _wake_subscription: Machines::observe_wake(cx),
@@ -279,6 +286,8 @@ pub fn init_for_test(clients: Vec<Entity<ServerClient>>, cx: &mut App) {
             ssh_addresses: HashMap::default(),
             open_machines: HashSet::default(),
             cloud_notices_told: 0,
+            shared_list_syncs: HashMap::default(),
+            shared_list_attempts: HashMap::default(),
             _settings_subscription: cx.observe(&settings, |this: &mut Machines, _, cx| {
                 this.sync_servers(cx)
             }),
@@ -680,6 +689,164 @@ impl Machines {
         self.sync_subthread_roles(cx);
         self.sync_acp_v2(cx);
         self.sync_cloud_activity(cx);
+        self.sync_shared_settings(cx);
+    }
+
+    /// Gives each machine that follows Shared its thread titles, cleanup rules, skills and MCP
+    /// servers, once its session has arrived. A machine saved before Shared is decided the
+    /// first time it's seen: values of its own are kept as its own, and the first machine's
+    /// start Shared.
+    fn sync_shared_settings(&mut self, cx: &mut Context<Self>) {
+        let store = AppSettingsStore::global(cx);
+        let before = store.read(cx).settings().shared.clone();
+        let mut shared = before.clone();
+        let mut loaded = Vec::new();
+        for client in self.clients.clone() {
+            let machine = client.read(cx).machine();
+            if !client.read(cx).is_session_loaded() {
+                self.shared_list_attempts.remove(&machine);
+                continue;
+            }
+            loaded.push(client.clone());
+
+            let titles = client.read(cx).title_generation().settings.clone();
+            match shared.decision(machine, SharedSection::ThreadTitles) {
+                None => {
+                    let own = match &shared.title_generation {
+                        None => {
+                            shared.title_generation = Some(titles);
+                            false
+                        }
+                        Some(start) => *start != titles,
+                    };
+                    shared
+                        .sharing_mut(machine)
+                        .own
+                        .insert(SharedSection::ThreadTitles, own);
+                }
+                Some(false) => {
+                    if let Some(titles) = &shared.title_generation {
+                        client.update(cx, |client, cx| client.follow_shared_titles(titles, cx));
+                    }
+                }
+                Some(true) => {}
+            }
+
+            let rules = client.read(cx).storage().cleanup.rules.clone();
+            match shared.decision(machine, SharedSection::CleanupRules) {
+                None => {
+                    let own = match &shared.cleanup_rules {
+                        None => {
+                            shared.cleanup_rules = Some(rules);
+                            false
+                        }
+                        Some(start) => *start != rules,
+                    };
+                    shared
+                        .sharing_mut(machine)
+                        .own
+                        .insert(SharedSection::CleanupRules, own);
+                }
+                Some(false) => {
+                    if let Some(rules) = &shared.cleanup_rules {
+                        client.update(cx, |client, cx| client.follow_shared_cleanup(rules, cx));
+                    }
+                }
+                Some(true) => {}
+            }
+        }
+        if shared != before {
+            // Storing it runs this again, which gives the machines just decided theirs.
+            store.update(cx, |store, cx| {
+                store.update(|settings| settings.shared = shared, cx)
+            });
+            return;
+        }
+        for client in loaded {
+            self.sync_shared_lists(&client, &shared, cx);
+        }
+    }
+
+    /// Sends a machine the requests that give it Shared's skills and MCP servers, one at a
+    /// time, noting each that's done. Steps that failed aren't tried again until something
+    /// changes, or the machine connects again.
+    fn sync_shared_lists(
+        &mut self,
+        client: &Entity<ServerClient>,
+        shared: &SharedMachineSettings,
+        cx: &mut Context<Self>,
+    ) {
+        let machine = client.read(cx).machine();
+        if self.shared_list_syncs.contains_key(&machine) {
+            return;
+        }
+        let steps = list_steps(
+            shared,
+            machine,
+            client.read(cx).skills(),
+            client.read(cx).mcp_servers(),
+        );
+        if steps.is_empty() {
+            self.shared_list_attempts.remove(&machine);
+            return;
+        }
+        // Until the machine's lists arrive, what was just done reads as still to do.
+        if self.shared_list_attempts.get(&machine) == Some(&steps) {
+            return;
+        }
+        self.shared_list_attempts.insert(machine, steps.clone());
+        let store = AppSettingsStore::global(cx);
+        let folder = store.read(cx).shared_skills_folder().clone();
+        let client = client.clone();
+        let task = cx.spawn(async move |this, cx| {
+            for step in steps {
+                let request = match &step {
+                    ListStep::AddSkill(skill) => {
+                        let skill_folder = shared_settings::skill_folder(&folder, &skill.name);
+                        let files = cx
+                            .background_spawn(async move {
+                                shared_settings::read_skill_folder(&skill_folder)
+                            })
+                            .await;
+                        match files {
+                            Ok(files) => Some(Request::AddSkill(files)),
+                            Err(error) => {
+                                log::error!("reading the shared skill {}: {error:#}", skill.name);
+                                continue;
+                            }
+                        }
+                    }
+                    ListStep::DeleteSkill(name) => Some(Request::DeleteSkill(name.clone())),
+                    ListStep::SaveMcpServer { replacing, server } => Some(Request::SaveMcpServer {
+                        replacing: replacing.clone(),
+                        server: server.clone(),
+                    }),
+                    ListStep::DeleteMcpServer(name) => Some(Request::DeleteMcpServer(name.clone())),
+                    ListStep::ForgetSkill(_)
+                    | ListStep::KeepMcpServer(_)
+                    | ListStep::ForgetMcpServer(_) => None,
+                };
+                if let Some(request) = request {
+                    let response = client.read_with(cx, |client, _| client.request(request));
+                    if let Err(error) = response.await {
+                        log::error!("giving a machine Shared's {step:?} failed: {error:#}");
+                        continue;
+                    }
+                }
+                store.update(cx, |store, cx| {
+                    store.update(
+                        |settings| settings.shared.sharing_mut(machine).record(&step),
+                        cx,
+                    )
+                });
+            }
+            this.update(cx, |this, cx| {
+                this.shared_list_syncs.remove(&machine);
+                this.sync_servers(cx);
+            })
+            .ok();
+        });
+        self.shared_list_syncs.insert(machine, task);
     }
 
     /// Gives each server the ACP v2 setting, which it keeps.
@@ -1844,6 +2011,184 @@ mod tests {
 
     use super::{GroupKey, MachineId, ProjectGroupingMode, ProjectKey, build_project_groups};
 
+    /// A machine that uses shared settings is given Shared's thread titles, cleanup rules,
+    /// skills and MCP servers once its session arrives. The first machine seen starts Shared,
+    /// and one saved before Shared whose values differ keeps them as its own.
+    #[gpui::test]
+    fn machines_that_use_shared_settings_are_given_them(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use agentz_protocol::mcp_servers::{McpServer, McpTransport};
+        use agentz_protocol::spaces::SpacesSnapshot;
+        use agentz_protocol::storage::{CleanupRules, Storage};
+        use agentz_protocol::title_generation::{TitleGeneration, TitleGenerationState};
+        use agentz_protocol::{Request, Response};
+
+        use crate::app_settings::AppSettingsStore;
+        use crate::server_client::ServerClient;
+        use crate::shared_settings::{self, MachineSharing, SharedSection};
+
+        let titles = TitleGeneration {
+            enabled: true,
+            ..TitleGeneration::default()
+        };
+        let own_rules = CleanupRules {
+            merged: true,
+            ..CleanupRules::default()
+        };
+        let github = McpServer {
+            name: "github".into(),
+            enabled: true,
+            transport: McpTransport::Local {
+                command: "npx".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+            },
+            kept_off: Vec::new(),
+        };
+        let requests: Rc<RefCell<Vec<(MachineId, Request)>>> = Rc::default();
+        let devbox_2 = MachineId::Remote(2);
+        let clients = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let clients: Vec<_> = [
+                (MachineId::Local, "This Mac"),
+                (MachineId::Remote(1), "Devbox 1"),
+                (devbox_2, "Devbox 2"),
+            ]
+            .into_iter()
+            .map(|(machine, label)| {
+                let client = ServerClient::new_for_test(
+                    machine,
+                    label.into(),
+                    SpacesSnapshot::default(),
+                    cx,
+                );
+                let requests = requests.clone();
+                client.update(cx, |client, _| {
+                    client.answer_for_test(move |request| {
+                        requests.borrow_mut().push((machine, request.clone()));
+                        matches!(
+                            request,
+                            Request::AddSkill(_) | Request::SaveMcpServer { .. }
+                        )
+                        .then_some(Response::Ok)
+                    })
+                });
+                client
+            })
+            .collect();
+            clients[0].update(cx, |client, cx| {
+                client.set_title_generation_for_test(
+                    TitleGenerationState {
+                        settings: titles.clone(),
+                        providers: Vec::new(),
+                    },
+                    cx,
+                )
+            });
+            // Devbox 1 was saved before Shared, with rules of its own.
+            clients[1].update(cx, |client, cx| {
+                let mut storage = Storage::default();
+                storage.cleanup.rules = own_rules.clone();
+                client.set_storage_for_test(storage, cx)
+            });
+            let store = AppSettingsStore::global(cx);
+            let folder = store.read(cx).shared_skills_folder().clone();
+            let review =
+                shared_settings::create_skill(&folder, "review", "Reviews a change.", "Read it.")
+                    .expect("the shared skill is written");
+            store.update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings.shared.put_skill(review);
+                        settings.shared.mcp_servers.push(github.clone());
+                        // Devbox 2 was added since.
+                        *settings.shared.sharing_mut(devbox_2) = MachineSharing::following();
+                    },
+                    cx,
+                )
+            });
+            super::init_for_test(clients.clone(), cx);
+            clients
+        });
+        let shared = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                AppSettingsStore::global(cx)
+                    .read(cx)
+                    .settings()
+                    .shared
+                    .clone()
+            })
+        };
+
+        // Nothing is decided before a machine's session arrives.
+        cx.run_until_parked();
+        assert_eq!(shared(cx).title_generation, None);
+        assert!(requests.borrow().is_empty());
+        for client in &clients {
+            client.update(cx, |client, cx| client.set_session_loaded_for_test(cx));
+            cx.run_until_parked();
+        }
+
+        let shared = shared(cx);
+        assert_eq!(shared.title_generation, Some(titles.clone()));
+        assert_eq!(shared.cleanup_rules, Some(CleanupRules::default()));
+        assert!(!shared.sets_own(MachineId::Local, SharedSection::ThreadTitles));
+        for section in [SharedSection::ThreadTitles, SharedSection::CleanupRules] {
+            assert!(shared.sets_own(MachineId::Remote(1), section));
+            assert!(!shared.sets_own(devbox_2, section));
+        }
+        let sent = |client: &gpui::Entity<ServerClient>, cx: &mut gpui::TestAppContext| {
+            client.read_with(cx, |client, _| {
+                client
+                    .sent_for_test()
+                    .into_iter()
+                    .filter(|request| {
+                        matches!(
+                            request,
+                            Request::SetTitleGeneration(_) | Request::SetCleanupRules(_)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(sent(&clients[2], cx), [Request::SetTitleGeneration(titles)]);
+        assert!(sent(&clients[1], cx).is_empty());
+        assert_eq!(
+            clients[1].read_with(cx, |client, _| client.storage().cleanup.rules.clone()),
+            own_rules
+        );
+
+        // Every machine follows Shared's lists unless it says otherwise, so each is given
+        // the skill and the server once.
+        for client in &clients {
+            let machine = client.read_with(cx, |client, _| client.machine());
+            let given: Vec<String> = requests
+                .borrow()
+                .iter()
+                .filter(|(to, _)| *to == machine)
+                .filter_map(|(_, request)| match request {
+                    Request::AddSkill(files) => Some(format!("skill {}", files.len())),
+                    Request::SaveMcpServer { replacing, server } => {
+                        Some(format!("server {} {replacing:?}", server.name))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(given, ["skill 1", "server github None"], "{machine:?}");
+            let sharing = shared.sharing(machine).cloned().unwrap_or_default();
+            assert!(sharing.skills_given.contains_key("review"));
+            assert!(sharing.mcp_servers_given.contains("github"));
+        }
+        let folder = cx.update(|cx| {
+            AppSettingsStore::global(cx)
+                .read(cx)
+                .shared_skills_folder()
+                .clone()
+        });
+        std::fs::remove_dir_all(folder).ok();
+    }
     /// This Mac's server hears what's working on each provider machine and whether anything of
     /// it is open, each time that changes. Each of its cloud notices is shown once and then
     /// dismissed, and a notification's Add Credit opens the provider's billing page.

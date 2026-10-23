@@ -1,6 +1,7 @@
 //! Settings › MCP Servers: Zed's MCP Servers page for agentZ's own MCP servers on a machine
 //! (design/accounts decisions.md §19), which every agent and account gets in agentZ threads.
 //! Add Server offers Zed's Add Local Server and Add Remote Server, each a form like Zed's.
+//! Shared's servers (design/settings-2, topic 2) go to every machine that uses shared settings.
 
 use std::rc::Rc;
 
@@ -15,6 +16,7 @@ use ui::{ContextMenu, ContextMenuEntry, PopoverMenu, Switch, ToggleState, Toolti
 use util::ResultExt as _;
 
 use super::accounts_menu::{KeptOffItem, account_groups, render_accounts_menu};
+use super::sharing::{MachineScope, count_summary};
 use super::skills::{join_with_and, render_error};
 use super::{
     EnvRow, SettingsPage, account_tag, new_text_input, new_variable_row, on_page, render_row,
@@ -22,6 +24,7 @@ use super::{
 };
 use crate::controls::{ActionButton, ActionStyle, text_field};
 use crate::server_client::ServerClient;
+use crate::shared_settings::SharedSection;
 
 /// What Settings › MCP Servers shows.
 pub(super) enum McpServersPage {
@@ -31,6 +34,8 @@ pub(super) enum McpServersPage {
 }
 
 pub(super) struct McpServerForm {
+    /// Where the server goes: Shared, or the machine the form was opened on.
+    scope: MachineScope,
     remote: bool,
     /// The server being configured; `None` adds one.
     replacing: Option<String>,
@@ -46,6 +51,17 @@ pub(super) struct McpServerForm {
     headers: Vec<EnvRow>,
     error: Option<SharedString>,
     saving: Option<Task<()>>,
+}
+
+/// Whose server a row is.
+#[derive(Clone, Copy, PartialEq)]
+enum ServerRow {
+    /// The machine's own.
+    Own,
+    /// Given to the machine by Shared while it uses shared settings, so changed there.
+    Given,
+    /// One of Shared's.
+    Shared,
 }
 
 #[derive(Clone, Copy)]
@@ -124,13 +140,17 @@ impl SettingsPage {
                 .size(HeadlineSize::Small)
                 .into_any_element(),
         };
-        let machine = if !self.machines.read(cx).has_remotes() {
-            None
-        } else if let McpServersPage::Form(_) = self.mcp_servers_page {
-            // The form belongs to the machine it was opened on.
-            Some(self.render_machine_label(cx))
-        } else {
-            Some(self.render_agents_machine_picker(window, cx))
+        let machine = match &self.mcp_servers_page {
+            _ if !self.offers_shared_list(SharedSection::McpServers, cx) => None,
+            // The form belongs to where it was opened.
+            McpServersPage::Form(form) => Some(self.render_scope_label(form.scope, cx)),
+            McpServersPage::List => Some(self.render_scope_picker(
+                "mcp-servers-machine",
+                self.lists_view(SharedSection::McpServers, cx),
+                |this, scope, cx| this.show_lists(scope, cx),
+                window,
+                cx,
+            )),
         };
         h_flex()
             .h(px(28.))
@@ -152,37 +172,42 @@ impl SettingsPage {
         }
     }
 
+    /// A machine's servers, after "Use shared settings" once Shared is offered.
     fn render_mcp_server_list(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let machine = match self.lists_view(SharedSection::McpServers, cx) {
+            MachineScope::Shared => return self.render_shared_mcp_server_list(window, cx),
+            MachineScope::Machine(machine) => machine,
+        };
         let servers = self.agents_client(cx).read(cx).mcp_servers().to_vec();
-        let rows = if servers.is_empty() {
-            vec![
-                h_flex()
-                    .debug_selector(|| "mcp-servers-empty".into())
-                    .p_4()
-                    .justify_center()
-                    .child(
-                        Label::new(
-                            "No MCP servers added yet. Click \"Add Server\" to get started.",
-                        )
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    )
-                    .into_any_element(),
-            ]
+        let mut rows = Vec::new();
+        if self.offers_shared_list(SharedSection::McpServers, cx) {
+            let count = self.shared_settings(cx).mcp_servers.len();
+            rows.push(self.render_use_shared_row(
+                machine,
+                SharedSection::McpServers,
+                count_summary(count, "shared server", "shared servers"),
+                cx,
+            ));
+        }
+        if servers.is_empty() {
+            rows.push(render_no_servers(
+                "No MCP servers added yet. Click \"Add Server\" to get started.",
+            ));
         } else {
             let agents = self.mcp_agents(cx);
-            servers
-                .iter()
-                .enumerate()
-                .map(|(index, server)| {
-                    self.render_mcp_server_row(index, server, &agents, window, cx)
-                })
-                .collect()
-        };
+            rows.extend(servers.iter().enumerate().map(|(index, server)| {
+                let row = if self.is_given_mcp_server(&server.name, cx) {
+                    ServerRow::Given
+                } else {
+                    ServerRow::Own
+                };
+                self.render_mcp_server_row(index, server, &agents, row, window, cx)
+            }));
+        }
         let list = render_section_with_actions(
             "Every agent and account gets these in agentZ threads.",
             rows,
@@ -194,6 +219,78 @@ impl SettingsPage {
             .clone()
             .map(|error| render_error(error, "mcp-server-error"));
         std::iter::once(list).chain(error).collect()
+    }
+
+    /// Shared's servers, which every machine that uses shared settings is given.
+    fn render_shared_mcp_server_list(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let servers = self.shared_settings(cx).mcp_servers.clone();
+        let rows = if servers.is_empty() {
+            vec![render_no_servers(
+                "No shared MCP servers yet. Click \"Add Server\" to get started.",
+            )]
+        } else {
+            servers
+                .iter()
+                .enumerate()
+                .map(|(index, server)| {
+                    self.render_mcp_server_row(index, server, &[], ServerRow::Shared, window, cx)
+                })
+                .collect()
+        };
+        let list = v_flex()
+            .gap_2()
+            .child(render_section_with_actions(
+                "Every machine that uses shared settings gives these to every agent and account.",
+                rows,
+                self.render_add_mcp_server_menu(cx),
+                cx,
+            ))
+            .children(
+                self.own_note(SharedSection::McpServers, cx)
+                    .map(|note| Label::new(note).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .into_any_element();
+        let error = self
+            .mcp_server_error
+            .clone()
+            .map(|error| render_error(error, "mcp-server-error"));
+        std::iter::once(list).chain(error).collect()
+    }
+
+    /// A server Shared gave the machine while it uses shared settings.
+    fn is_given_mcp_server(&self, name: &str, cx: &App) -> bool {
+        let machine = self.agents_machine;
+        let shared = self.shared_settings(cx);
+        !shared.sets_own(machine, SharedSection::McpServers)
+            && shared
+                .sharing(machine)
+                .is_some_and(|sharing| sharing.mcp_servers_given.contains(name))
+    }
+
+    /// Changes one of Shared's servers, which the machines that use shared settings are then
+    /// given.
+    fn change_shared_mcp_server(
+        &self,
+        name: &str,
+        change: impl FnOnce(&mut Vec<McpServer>, usize),
+        cx: &mut App,
+    ) {
+        self.update_shared(
+            |shared| {
+                if let Some(index) = shared
+                    .mcp_servers
+                    .iter()
+                    .position(|server| server.name == name)
+                {
+                    change(&mut shared.mcp_servers, index);
+                }
+            },
+            cx,
+        );
     }
 
     /// The installed agents, with what each said it takes when it last started.
@@ -216,45 +313,51 @@ impl SettingsPage {
     }
 
     /// Zed's row: the name, Local or Remote, the command or URL, and the agents that don't get
-    /// it; then configure, delete and its switch.
+    /// it; then configure, delete and its switch. One Shared gave the machine is changed there,
+    /// and Shared's have no accounts, which are each machine's.
     fn render_mcp_server_row(
         &self,
         index: usize,
         server: &McpServer,
         agents: &[McpAgent],
+        row: ServerRow,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let client = self.agents_client(cx);
-        let groups = account_groups(
-            self.registry(cx).read(cx).agents(),
-            client.read(cx),
-            |agent| {
-                agents
-                    .iter()
-                    .find(|other| other.id == *agent.id())
-                    .is_some_and(|agent| agent.gets(server))
-            },
-        );
-        let page = cx.weak_entity();
-        let accounts_menu = render_accounts_menu(
-            KeptOffItem::McpServer(server.name.clone()),
-            groups,
-            client,
-            Rc::new(move |request, cx| {
-                page.update(cx, |page, cx| {
-                    page.send_mcp_server_request(request, "Couldn't change the server", cx)
-                })
-                .log_err();
-            }),
-            window,
-            cx,
-        );
+        let accounts_menu = if row == ServerRow::Shared {
+            None
+        } else {
+            let client = self.agents_client(cx);
+            let groups = account_groups(
+                self.registry(cx).read(cx).agents(),
+                client.read(cx),
+                |agent| {
+                    agents
+                        .iter()
+                        .find(|other| other.id == *agent.id())
+                        .is_some_and(|agent| agent.gets(server))
+                },
+            );
+            let page = cx.weak_entity();
+            render_accounts_menu(
+                KeptOffItem::McpServer(server.name.clone()),
+                groups,
+                client,
+                Rc::new(move |request, cx| {
+                    page.update(cx, |page, cx| {
+                        page.send_mcp_server_request(request, "Couldn't change the server", cx)
+                    })
+                    .log_err();
+                }),
+                window,
+                cx,
+            )
+        };
         let selector = format!("mcp-server-{}", server.name);
         let name = server.name.clone();
         let configured = server.clone();
         // agentZ's own server is only switched, as Zed lists an extension's without Configure.
-        let editable = !server.is_agentz();
+        let editable = !server.is_agentz() && row != ServerRow::Given;
         h_flex()
             .debug_selector(move || selector)
             .px_4()
@@ -280,7 +383,10 @@ impl SettingsPage {
                                 },
                                 Color::Muted,
                                 cx,
-                            )),
+                            ))
+                            .when(row == ServerRow::Given, |title| {
+                                title.child(account_tag("Shared", Color::Muted, cx))
+                            }),
                     )
                     .child(
                         div().min_w_0().overflow_hidden().child(
@@ -339,11 +445,21 @@ impl SettingsPage {
                                         .tooltip(Tooltip::text("Uninstall MCP Server"))
                                         .on_click(
                                             cx.listener(move |this, _, _, cx| {
-                                                this.send_mcp_server_request(
-                                                    Request::DeleteMcpServer(name.clone()),
-                                                    "Couldn't delete the server",
-                                                    cx,
-                                                )
+                                                if row == ServerRow::Shared {
+                                                    this.change_shared_mcp_server(
+                                                        &name,
+                                                        |servers, index| {
+                                                            servers.remove(index);
+                                                        },
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.send_mcp_server_request(
+                                                        Request::DeleteMcpServer(name.clone()),
+                                                        "Couldn't delete the server",
+                                                        cx,
+                                                    )
+                                                }
                                             }),
                                         )
                                     }),
@@ -354,15 +470,25 @@ impl SettingsPage {
                             .debug_selector(move || format!("mcp-server-switch-{index}"))
                             .child(
                                 Switch::new(("mcp-server-switch", index), server.enabled.into())
+                                    .disabled(row == ServerRow::Given)
                                     .on_click(cx.listener(move |this, state, _, cx| {
-                                        this.send_mcp_server_request(
-                                            Request::SetMcpServerEnabled {
-                                                name: name.clone(),
-                                                enabled: *state == ToggleState::Selected,
-                                            },
-                                            "Couldn't change the server",
-                                            cx,
-                                        )
+                                        let enabled = *state == ToggleState::Selected;
+                                        if row == ServerRow::Shared {
+                                            this.change_shared_mcp_server(
+                                                &name,
+                                                |servers, index| servers[index].enabled = enabled,
+                                                cx,
+                                            );
+                                        } else {
+                                            this.send_mcp_server_request(
+                                                Request::SetMcpServerEnabled {
+                                                    name: name.clone(),
+                                                    enabled,
+                                                },
+                                                "Couldn't change the server",
+                                                cx,
+                                            )
+                                        }
                                     })),
                             ),
                     ),
@@ -479,6 +605,7 @@ impl SettingsPage {
         );
         window.focus(&name.focus_handle(cx), cx);
         self.mcp_servers_page = McpServersPage::Form(McpServerForm {
+            scope: self.lists_view(SharedSection::McpServers, cx),
             remote,
             replacing: server.map(|server| server.name.clone()),
             enabled: server.is_none_or(|server| server.enabled),
@@ -508,6 +635,10 @@ impl SettingsPage {
         let McpServersPage::Form(form) = &mut self.mcp_servers_page else {
             return;
         };
+        if form.scope == MachineScope::Shared {
+            self.save_shared_mcp_server(cx);
+            return;
+        }
         if form.saving.is_some() {
             return;
         }
@@ -543,6 +674,42 @@ impl SettingsPage {
             })
             .log_err();
         }));
+        cx.notify();
+    }
+
+    /// Keeps the form's server in Shared, in place of the one configured.
+    fn save_shared_mcp_server(&mut self, cx: &mut Context<Self>) {
+        let McpServersPage::Form(form) = &mut self.mcp_servers_page else {
+            return;
+        };
+        let server = form.server(cx);
+        let replacing = form.replacing.clone();
+        let others = self
+            .app_settings
+            .read(cx)
+            .settings()
+            .shared
+            .mcp_servers
+            .iter()
+            .map(|other| other.name.as_str())
+            .filter(|other| Some(*other) != replacing.as_deref());
+        if let Err(error) = server.validate(others) {
+            form.error = Some(error.into());
+            cx.notify();
+            return;
+        }
+        self.update_shared(
+            |shared| {
+                let servers = &mut shared.mcp_servers;
+                match replacing.and_then(|name| servers.iter().position(|other| other.name == name))
+                {
+                    Some(index) => servers[index] = server,
+                    None => servers.push(server),
+                }
+            },
+            cx,
+        );
+        self.mcp_servers_page = McpServersPage::List;
         cx.notify();
     }
 
@@ -742,6 +909,20 @@ impl SettingsPage {
     }
 }
 
+/// What a list without servers says.
+fn render_no_servers(message: &'static str) -> AnyElement {
+    h_flex()
+        .debug_selector(|| "mcp-servers-empty".into())
+        .p_4()
+        .justify_center()
+        .child(
+            Label::new(message)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .into_any_element()
+}
+
 /// An installed agent, for the agents a server doesn't reach.
 struct McpAgent {
     id: AgentId,
@@ -833,6 +1014,7 @@ mod tests {
     use super::super::tests::listing;
     use super::*;
     use crate::machines::MachineId;
+    use crate::settings_page::sharing::MachineScope;
 
     fn installed(id: &str, name: &str) -> agentz_protocol::agents::AgentListing {
         listing(
@@ -1237,5 +1419,88 @@ mod tests {
         assert!(sent(kept_off(&[(&claude, None), (&droid, Some(1))])));
         click(work, cx);
         assert!(sent(kept_off(&[(&claude, None)])));
+    }
+
+    /// Shared's servers are kept by the app: added, switched and deleted there. A machine
+    /// that was given one marks it, and it's changed on Shared.
+    #[gpui::test]
+    fn shared_servers_are_kept_by_the_app_and_marked_on_a_machine(cx: &mut TestAppContext) {
+        use super::super::sharing::tests::{DEVBOX, click, shared, update_shared};
+
+        let (_, devbox) = super::super::tests::machines_with_copies(cx);
+        cx.update(|cx| super::super::init(cx));
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        page.update_in(cx, |page, window, cx| {
+            page.select(Section::McpServers, window, cx)
+        });
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("mcp-servers-machine").is_some());
+        assert!(cx.debug_bounds("mcp-servers-empty").is_some());
+        page.update_in(cx, |page, window, cx| {
+            page.open_mcp_server_form(false, None, window, cx)
+        });
+        page.update(cx, |page, cx| {
+            if let McpServersPage::Form(form) = &page.mcp_servers_page {
+                form.name
+                    .update(cx, |input, cx| input.set_text("github", cx));
+                form.command
+                    .update(cx, |input, cx| input.set_text("npx", cx));
+                form.args.update(cx, |input, cx| {
+                    input.set_text("-y @modelcontextprotocol/server-github", cx)
+                });
+            }
+        });
+        cx.run_until_parked();
+        click("mcp-server-add-env", cx);
+        cx.simulate_input("GITHUB_TOKEN");
+        page.update(cx, |page, cx| {
+            if let McpServersPage::Form(form) = &page.mcp_servers_page {
+                form.env[0]
+                    .value
+                    .update(cx, |input, cx| input.set_text("secret", cx));
+            }
+        });
+        click("mcp-server-save", cx);
+        assert_eq!(shared(cx).mcp_servers, [github()]);
+        assert!(page.read_with(cx, |page, _| matches!(
+            page.mcp_servers_page,
+            McpServersPage::List
+        )));
+        click("mcp-server-switch-0", cx);
+        assert!(!shared(cx).mcp_servers[0].enabled);
+
+        // Devbox 1 was given it, so it says so, and only its accounts menu changes it there.
+        update_shared(
+            |shared| {
+                shared
+                    .sharing_mut(DEVBOX)
+                    .mcp_servers_given
+                    .insert("github".into());
+            },
+            cx,
+        );
+        devbox.update(cx, |client, cx| {
+            client.set_mcp_servers_for_test(vec![McpServer::agentz(), github()], cx)
+        });
+        page.update(cx, |page, cx| {
+            page.show_lists(MachineScope::Machine(DEVBOX), cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("use-shared-mcp-servers").is_some());
+        assert!(cx.debug_bounds("mcp-server-github").is_some());
+        assert!(cx.debug_bounds("mcp-server-configure-1").is_none());
+        assert!(cx.debug_bounds("mcp-server-delete-1").is_none());
+
+        page.update(cx, |page, cx| page.show_lists(MachineScope::Shared, cx));
+        cx.run_until_parked();
+        click("mcp-server-delete-0", cx);
+        assert!(shared(cx).mcp_servers.is_empty());
+        assert!(
+            devbox
+                .read_with(cx, |client, _| client.sent_for_test())
+                .iter()
+                .all(|request| !matches!(request, Request::DeleteMcpServer(_)))
+        );
     }
 }

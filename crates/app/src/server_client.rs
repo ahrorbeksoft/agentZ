@@ -191,6 +191,8 @@ pub struct ServerClient {
     terminals: HashMap<TerminalKey, WeakEntity<Terminal>>,
     /// Session events that arrived while the session snapshot was on its way.
     queued_session_events: Option<Vec<Event>>,
+    /// The session snapshot arrived this connection, so what's kept reads as the server has it.
+    session_loaded: bool,
     /// How far installing the server on the machine is, while connecting.
     upload_progress: Option<UploadProgress>,
     /// Cuts the wait before the next attempt short.
@@ -215,6 +217,10 @@ pub struct ServerClient {
     acp_v2_sent: Option<bool>,
     /// What this Mac's server was last told of the provider machines' use, this connection.
     cloud_activity_sent: Option<Vec<CloudActivity>>,
+    /// Shared's thread titles and cleanup rules as last given, this connection, while the
+    /// machine follows Shared.
+    shared_titles_sent: Option<TitleGeneration>,
+    shared_cleanup_sent: Option<CleanupRules>,
     #[cfg(test)]
     sent_for_test: std::cell::RefCell<Vec<Request>>,
     /// Answers requests as the server would, for a test client.
@@ -262,6 +268,7 @@ impl ServerClient {
                 threads: HashMap::default(),
                 terminals: HashMap::default(),
                 queued_session_events: None,
+                session_loaded: false,
                 upload_progress: None,
                 retry_now: None,
                 ssh: None,
@@ -274,6 +281,8 @@ impl ServerClient {
                 subthread_roles_sent: None,
                 acp_v2_sent: None,
                 cloud_activity_sent: None,
+                shared_titles_sent: None,
+                shared_cleanup_sent: None,
                 #[cfg(test)]
                 sent_for_test: Default::default(),
                 #[cfg(test)]
@@ -328,6 +337,11 @@ impl ServerClient {
 
     pub fn is_online(&self) -> bool {
         self.status == MachineStatus::Online
+    }
+
+    /// Whether what's kept of the machine's settings is the server's, this connection.
+    pub fn is_session_loaded(&self) -> bool {
+        self.is_online() && self.session_loaded
     }
 
     pub fn is_installed(&self, agent_id: &AgentId, cx: &App) -> bool {
@@ -835,9 +849,25 @@ impl ServerClient {
     /// Changes how the machine titles threads. Shown at once; the server's answer, with the
     /// providers it found again, follows.
     pub fn choose_title_generation(&mut self, settings: TitleGeneration, cx: &mut Context<Self>) {
+        self.shared_titles_sent = None;
         self.send(Request::SetTitleGeneration(settings.clone()), cx);
         self.title_generation.settings = settings;
         cx.notify();
+    }
+
+    /// Gives a machine that follows Shared its thread titles, when they differ.
+    pub(crate) fn follow_shared_titles(
+        &mut self,
+        settings: &TitleGeneration,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title_generation.settings == *settings
+            || self.shared_titles_sent.as_ref() == Some(settings)
+        {
+            return;
+        }
+        self.choose_title_generation(settings.clone(), cx);
+        self.shared_titles_sent = Some(settings.clone());
     }
 
     fn set_title_generation(&mut self, state: TitleGenerationState, cx: &mut Context<Self>) {
@@ -920,9 +950,20 @@ impl ServerClient {
 
     /// Settings › Storage's cleanup rules, shown at once as the server will have them.
     pub fn set_cleanup_rules(&mut self, rules: CleanupRules, cx: &mut Context<Self>) {
+        self.shared_cleanup_sent = None;
         self.storage.cleanup.rules = rules.clone();
         cx.notify();
         self.send(Request::SetCleanupRules(rules), cx);
+    }
+
+    /// Gives a machine that follows Shared its cleanup rules, when they differ.
+    pub(crate) fn follow_shared_cleanup(&mut self, rules: &CleanupRules, cx: &mut Context<Self>) {
+        if self.storage.cleanup.rules == *rules || self.shared_cleanup_sent.as_ref() == Some(rules)
+        {
+            return;
+        }
+        self.set_cleanup_rules(rules.clone(), cx);
+        self.shared_cleanup_sent = Some(rules.clone());
     }
 
     /// Runs the cleanup rules now. Resolves once the run ends.
@@ -1095,6 +1136,14 @@ impl ServerClient {
         cx.notify();
     }
 
+    /// Reads as connected with the server's session, as Shared's settings wait for.
+    #[cfg(test)]
+    pub fn set_session_loaded_for_test(&mut self, cx: &mut Context<Self>) {
+        self.status = MachineStatus::Online;
+        self.session_loaded = true;
+        cx.notify();
+    }
+
     fn connected(&mut self, connection: Connection, is_outdated: bool, cx: &mut Context<Self>) {
         log::info!(
             "connected to agentz-server {} on {} (pid {})",
@@ -1110,6 +1159,9 @@ impl ServerClient {
         self.subthread_roles_sent = None;
         self.acp_v2_sent = None;
         self.cloud_activity_sent = None;
+        self.shared_titles_sent = None;
+        self.shared_cleanup_sent = None;
+        self.session_loaded = false;
         self.is_outdated = is_outdated;
         self.status = MachineStatus::Online;
         self.upload_progress = None;
@@ -1146,6 +1198,7 @@ impl ServerClient {
         self.status = status;
         self.upload_progress = None;
         self.queued_session_events = None;
+        self.session_loaded = false;
         if changed {
             cx.notify();
         }
@@ -1179,6 +1232,8 @@ impl ServerClient {
         for event in self.queued_session_events.take().unwrap_or_default() {
             self.handle_event(event, cx);
         }
+        self.session_loaded = true;
+        cx.notify();
         // The providers' CLIs are installed here, so only this Mac's server runs them, and it
         // watches them once an app asks.
         if self.machine == MachineId::Local {

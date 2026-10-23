@@ -10,19 +10,16 @@ use std::path::{Component, Path, PathBuf};
 
 use agentz_protocol::accounts::{AccountId, AgentAccount};
 use agentz_protocol::agents::AgentId;
+pub use agentz_protocol::skills::SKILL_FILE_NAME;
 use agentz_protocol::skills::{
-    FOLDER_TOO_LARGE, MAX_FOLDER_SIZE, Skill, SkillFile, SkippedSkill, validate_description,
-    validate_name,
+    FOLDER_TOO_LARGE, MAX_FOLDER_SIZE, Skill, SkillFile, SkippedSkill, format_skill_file,
+    parse_frontmatter, validate_description, validate_name,
 };
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_settings::{read_json, write_json};
-
-pub const SKILL_FILE_NAME: &str = "SKILL.md";
-/// Zed's limit.
-const MAX_SKILL_FILE_SIZE: usize = 100 * 1024;
 
 /// Where agentZ keeps its skills.
 pub fn folder(data_dir: &Path) -> PathBuf {
@@ -56,13 +53,6 @@ pub fn set_kept_off(data_dir: &Path, name: &str, kept_off: Vec<AgentAccount>) ->
         choices.insert(name.to_string(), SkillChoices { kept_off });
     }
     write_json(&choices_path(data_dir), &choices)
-}
-
-/// A `SKILL.md`'s frontmatter, as Zed reads and writes it.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-struct Frontmatter {
-    name: String,
-    description: String,
 }
 
 /// The skills in `folder`, by name, with no account skipping them yet. A folder whose
@@ -99,80 +89,10 @@ pub fn list(folder: &Path) -> Result<Vec<Skill>> {
     Ok(skills)
 }
 
-fn read_frontmatter(path: &Path) -> Result<Frontmatter> {
+fn read_frontmatter(path: &Path) -> Result<agentz_protocol::skills::Frontmatter> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse_frontmatter(&content)
-}
-
-/// Zed's `extract_frontmatter`: the YAML between the first `---` line and the `---` line that
-/// ends it, with Zed's checks of the name and description.
-fn parse_frontmatter(content: &str) -> Result<Frontmatter> {
-    if content.len() > MAX_SKILL_FILE_SIZE {
-        bail!(
-            "SKILL.md file exceeds maximum size of {}KB",
-            MAX_SKILL_FILE_SIZE / 1024
-        );
-    }
-    let content = content.trim_start();
-    if !content.starts_with("---") {
-        bail!("SKILL.md must start with YAML frontmatter (---)");
-    }
-    let bytes = content.as_bytes();
-    let mut ends = Vec::new();
-    for (index, byte) in bytes.iter().enumerate() {
-        let line_start = index + 1;
-        if *byte != b'\n' || bytes.get(line_start..line_start + 3) != Some(b"---") {
-            continue;
-        }
-        let after = line_start + 3;
-        match &bytes[after..] {
-            [] => ends.push(after),
-            [b'\n', ..] => ends.push(after + 1),
-            [b'\r', b'\n', ..] => ends.push(after + 2),
-            _ => {}
-        }
-    }
-    if ends.is_empty() {
-        bail!("SKILL.md missing closing frontmatter delimiter (---)");
-    }
-    // A `---` line can sit inside a quoted value, so the first end that parses is the real one.
-    let mut last_error = None;
-    for end in ends {
-        let Some(document) = serde_yaml_ng::Deserializer::from_str(&content[..end]).next() else {
-            continue;
-        };
-        match Frontmatter::deserialize(document) {
-            Ok(frontmatter) => {
-                validate_name(&frontmatter.name).map_err(anyhow::Error::msg)?;
-                if frontmatter.description.trim().is_empty() {
-                    bail!("Skill description cannot be empty");
-                }
-                return Ok(frontmatter);
-            }
-            Err(error) => last_error = Some(anyhow::Error::new(error)),
-        }
-    }
-    Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("could not parse YAML frontmatter"))
-        .context("Invalid YAML frontmatter"))
-}
-
-/// Zed's `format_skill_file`.
-fn format_skill_file(name: &str, description: &str, body: &str) -> Result<String> {
-    let frontmatter = serde_yaml_ng::to_string(&Frontmatter {
-        name: name.to_string(),
-        description: description.to_string(),
-    })
-    .context("failed to serialize skill frontmatter as YAML")?;
-    let mut content = format!("---\n{frontmatter}---\n");
-    let body = body.trim();
-    if !body.is_empty() {
-        content.push('\n');
-        content.push_str(body);
-        content.push('\n');
-    }
-    Ok(content)
 }
 
 /// Add from Folder…: `files` as a skill in `folder`, named as their `SKILL.md` says. Returns

@@ -3,12 +3,15 @@
 
 use std::path::PathBuf;
 
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::{AccountId, AgentAccount};
 use crate::agents::AgentId;
 
+pub const SKILL_FILE_NAME: &str = "SKILL.md";
 /// Zed's limits.
+pub const MAX_SKILL_FILE_SIZE: usize = 100 * 1024;
 pub const MAX_NAME_LEN: usize = 64;
 pub const MAX_DESCRIPTION_LEN: usize = 1024;
 /// What Add from Folder… sends at most, well inside a message once in base64.
@@ -82,4 +85,81 @@ pub fn validate_description(description: &str) -> Result<(), &'static str> {
         return Err("Skill description must be at most 1024 characters");
     }
     Ok(())
+}
+
+/// A `SKILL.md`'s frontmatter, as Zed reads and writes it.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Frontmatter {
+    pub name: String,
+    pub description: String,
+}
+
+/// Zed's `extract_frontmatter`: the YAML between the first `---` line and the `---` line that
+/// ends it, with Zed's checks of the name and description.
+pub fn parse_frontmatter(content: &str) -> Result<Frontmatter> {
+    if content.len() > MAX_SKILL_FILE_SIZE {
+        bail!(
+            "SKILL.md file exceeds maximum size of {}KB",
+            MAX_SKILL_FILE_SIZE / 1024
+        );
+    }
+    let content = content.trim_start();
+    if !content.starts_with("---") {
+        bail!("SKILL.md must start with YAML frontmatter (---)");
+    }
+    let bytes = content.as_bytes();
+    let mut ends = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        let line_start = index + 1;
+        if *byte != b'\n' || bytes.get(line_start..line_start + 3) != Some(b"---") {
+            continue;
+        }
+        let after = line_start + 3;
+        match &bytes[after..] {
+            [] => ends.push(after),
+            [b'\n', ..] => ends.push(after + 1),
+            [b'\r', b'\n', ..] => ends.push(after + 2),
+            _ => {}
+        }
+    }
+    if ends.is_empty() {
+        bail!("SKILL.md missing closing frontmatter delimiter (---)");
+    }
+    // A `---` line can sit inside a quoted value, so the first end that parses is the real one.
+    let mut last_error = None;
+    for end in ends {
+        let Some(document) = serde_yaml_ng::Deserializer::from_str(&content[..end]).next() else {
+            continue;
+        };
+        match Frontmatter::deserialize(document) {
+            Ok(frontmatter) => {
+                validate_name(&frontmatter.name).map_err(anyhow::Error::msg)?;
+                if frontmatter.description.trim().is_empty() {
+                    bail!("Skill description cannot be empty");
+                }
+                return Ok(frontmatter);
+            }
+            Err(error) => last_error = Some(anyhow::Error::new(error)),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("could not parse YAML frontmatter"))
+        .context("Invalid YAML frontmatter"))
+}
+
+/// Zed's `format_skill_file`.
+pub fn format_skill_file(name: &str, description: &str, body: &str) -> Result<String> {
+    let frontmatter = serde_yaml_ng::to_string(&Frontmatter {
+        name: name.to_string(),
+        description: description.to_string(),
+    })
+    .context("failed to serialize skill frontmatter as YAML")?;
+    let mut content = format!("---\n{frontmatter}---\n");
+    let body = body.trim();
+    if !body.is_empty() {
+        content.push('\n');
+        content.push_str(body);
+        content.push('\n');
+    }
+    Ok(content)
 }
