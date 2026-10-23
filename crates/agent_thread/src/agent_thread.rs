@@ -137,6 +137,9 @@ pub enum AgentThreadEvent {
     /// The user went on without a conversation the next message would have brought, or the
     /// agent knows it already (a fork's, once its session is forked).
     HandoffDropped,
+    /// A notice of these ended tasks waited for the turn to end, and went with the agent it
+    /// was for ([`AgentThread::steer_task_notice`]): they're still to tell.
+    TaskNoticeDropped(Vec<projects::ThreadId>),
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     /// The agent is logged out: agentZ logged it out, or it asked for a login.
@@ -260,11 +263,13 @@ enum MessageKind {
         result: std::result::Result<(), agent_client_protocol::Error>,
     },
     PromptFinished(std::result::Result<acp::PromptResponse, agent_client_protocol::Error>),
-    /// The agent answered a message sent into its turn ([`AgentThread::steer_message`]).
+    /// The agent answered a message sent into its turn ([`AgentThread::steer_message`],
+    /// [`AgentThread::steer_task_notice`]).
     Steered {
-        /// The queued message it is ([`ThreadState::steering_messages`]).
-        id: u64,
+        /// The queued message it is ([`ThreadState::steering_messages`]), if it is one.
+        id: Option<u64>,
         parts: Vec<MessagePart>,
+        notice: Option<TaskNotice>,
         result: std::result::Result<Value, agent_client_protocol::Error>,
     },
     /// The pause's marker made it through the SDK.
@@ -342,6 +347,17 @@ struct AfterTurn {
     /// The queued message sent into the turn that it is, shown as steering until it goes
     /// ([`ThreadState::steering_messages`]).
     steering: Option<u64>,
+    /// The notice of ended tasks it is ([`AgentThread::steer_task_notice`]), marked as one once
+    /// the agent has it.
+    notice: Option<TaskNotice>,
+}
+
+/// Who a notice of ended tasks is from, and the tasks it announces
+/// ([`AgentThread::send_task_notice`]).
+#[derive(Clone)]
+struct TaskNotice {
+    from: projects::ThreadCreator,
+    tasks: Vec<projects::ThreadId>,
 }
 
 /// A message sent into the turn on ACP v2, as a prompt of its own.
@@ -1463,7 +1479,12 @@ impl AgentThread {
                     }
                 }
             }
-            MessageKind::Steered { id, parts, result } => self.steered(id, parts, result),
+            MessageKind::Steered {
+                id,
+                parts,
+                notice,
+                result,
+            } => self.steered(id, parts, notice, result),
             MessageKind::BackgroundTask(update) => self.apply_background_task_update(update),
             MessageKind::BackgroundTaskStopped { task_id, result } => {
                 self.background_task_stopped(task_id, result)
@@ -2717,6 +2738,7 @@ impl AgentThread {
             self.after_turn.push_back(AfterTurn {
                 parts,
                 steering: Some(id),
+                notice: None,
             });
             return;
         };
@@ -2746,35 +2768,50 @@ impl AgentThread {
             });
             return;
         }
+        let Some(response) = self.steering_request(&parts) else {
+            self.after_turn.push_back(AfterTurn {
+                parts,
+                steering: Some(id),
+                notice: None,
+            });
+            return;
+        };
+        self.spawn(async move {
+            MessageKind::Steered {
+                id: Some(id),
+                parts,
+                notice: None,
+                result: response.await,
+            }
+        });
+    }
+
+    /// Sends the message into the running turn with the agent's own steering
+    /// ([`STEERING_REQUEST`]), for its answer.
+    fn steering_request(
+        &self,
+        parts: &[MessagePart],
+    ) -> Option<
+        impl Future<Output = std::result::Result<Value, agent_client_protocol::Error>> + use<>,
+    > {
+        let session = self.session.as_ref()?;
         let request = agent_client_protocol::UntypedMessage::new(
             STEERING_REQUEST,
             serde_json::json!({
                 "sessionId": session.session_id,
-                "prompt": self.content_blocks(parts.clone()),
+                "prompt": self.content_blocks(parts.to_vec()),
                 // Otherwise Claude Agent starts a turn of its own when the turn has just
                 // ended, one that no `session/prompt` waits for.
                 "_meta": {"steering": {"idleBehavior": "promptRequired"}},
             }),
         );
-        let request = match request {
-            Ok(request) => request,
+        match request {
+            Ok(request) => Some(session.connection.send_request(request).block_task()),
             Err(error) => {
                 log::error!("failed to write the message into the turn: {error:?}");
-                self.after_turn.push_back(AfterTurn {
-                    parts,
-                    steering: Some(id),
-                });
-                return;
+                None
             }
-        };
-        let response = session.connection.send_request(request).block_task();
-        self.spawn(async move {
-            MessageKind::Steered {
-                id,
-                parts,
-                result: response.await,
-            }
-        });
+        }
     }
 
     /// The agent's answer to [`Self::steer_message`]: `injected` when the message joined the
@@ -2782,8 +2819,9 @@ impl AgentThread {
     /// started a turn with it instead (Codex), or `failed`.
     fn steered(
         &mut self,
-        id: u64,
+        id: Option<u64>,
         parts: Vec<MessagePart>,
+        notice: Option<TaskNotice>,
         result: std::result::Result<Value, agent_client_protocol::Error>,
     ) {
         let outcome = match &result {
@@ -2792,17 +2830,20 @@ impl AgentThread {
         };
         let after_turn = AfterTurn {
             parts,
-            steering: Some(id),
+            steering: id,
+            notice,
         };
         match outcome {
             Some("injected" | "startedNewTurn") => {
-                self.steering_ended(id);
-                let parts = after_turn.parts;
-                self.view
-                    .state
-                    .sent_times
-                    .push((self.view.entries.len(), SystemTime::now()));
-                self.push_entry(Entry::UserMessage(message_markdown(&parts)));
+                if let Some(id) = id {
+                    self.steering_ended(id);
+                }
+                let index = self.view.entries.len();
+                self.view.state.sent_times.push((index, SystemTime::now()));
+                self.push_entry(Entry::UserMessage(message_markdown(&after_turn.parts)));
+                if let Some(notice) = after_turn.notice {
+                    self.mark_task_notice(index, notice);
+                }
             }
             Some("promptRequired") => self.send_after(after_turn),
             _ => {
@@ -2825,6 +2866,7 @@ impl AgentThread {
         self.send_after(AfterTurn {
             parts,
             steering: None,
+            notice: None,
         });
     }
 
@@ -2836,7 +2878,13 @@ impl AgentThread {
         if let Some(id) = message.steering {
             self.steering_ended(id);
         }
+        let index = self.view.entries.len();
         self.send_message(message.parts);
+        if let Some(notice) = message.notice
+            && self.view.entries.len() > index
+        {
+            self.mark_task_notice(index, notice);
+        }
     }
 
     /// Drops the messages waiting for the turn to end, with the agent they were for.
@@ -2844,6 +2892,9 @@ impl AgentThread {
         for message in std::mem::take(&mut self.after_turn) {
             if let Some(id) = message.steering {
                 self.steering_ended(id);
+            }
+            if let Some(notice) = message.notice {
+                self.emit(AgentThreadEvent::TaskNoticeDropped(notice.tasks));
             }
         }
     }
@@ -2864,12 +2915,72 @@ impl AgentThread {
         from: projects::ThreadCreator,
         tasks: Vec<projects::ThreadId>,
     ) {
-        let index = self.view.entries.len();
-        self.send_from(text, from);
-        if self.view.entries.len() > index {
-            self.view.state.task_notices.push(index);
-            self.view.state.announced_tasks.push((index, tasks));
+        self.send_after(AfterTurn {
+            parts: vec![MessagePart::Text(text)],
+            steering: None,
+            notice: Some(TaskNotice { from, tasks }),
+        });
+    }
+
+    /// Whether a message can go into the running turn by the agent's own steering: a prompt is
+    /// in flight, and the agent takes messages into it on ACP v1 (Claude Agent's and Codex's
+    /// `_session/steering`). On v2 a steered message is only a prompt of agentZ's making, which
+    /// the agent takes once the turn ends.
+    pub fn steers_its_turn(&self) -> bool {
+        self.is_working()
+            && !self.working_on_its_own
+            && !self.is_v2()
+            && !self.is_paused()
+            && self.view.state.supports_steering
+            && self.session.is_some()
+    }
+
+    /// Tells the agent its delegated tasks ended, in its running turn when it
+    /// [steers its turn](Self::steers_its_turn), so it goes on with the results rather than
+    /// waiting for the turn to end. A notice the agent doesn't take in goes once the turn
+    /// ends, as [`Self::send_task_notice`] sends it.
+    pub fn steer_task_notice(
+        &mut self,
+        text: String,
+        from: projects::ThreadCreator,
+        tasks: Vec<projects::ThreadId>,
+    ) {
+        let parts = vec![MessagePart::Text(text)];
+        let notice = Some(TaskNotice { from, tasks });
+        if !self.steers_its_turn() {
+            self.send_after(AfterTurn {
+                parts,
+                steering: None,
+                notice,
+            });
+            return;
         }
+        match self.steering_request(&parts) {
+            Some(response) => self.spawn(async move {
+                MessageKind::Steered {
+                    id: None,
+                    parts,
+                    notice,
+                    result: response.await,
+                }
+            }),
+            None => self.after_turn.push_back(AfterTurn {
+                parts,
+                steering: None,
+                notice,
+            }),
+        }
+    }
+
+    /// Marks the message at `index` as a notice of ended tasks: not the user's, and shown as
+    /// the tasks' results.
+    fn mark_task_notice(&mut self, index: usize, notice: TaskNotice) {
+        self.view
+            .state
+            .prompts_from_agents
+            .push((index, notice.from));
+        self.view.state.task_notices.push(index);
+        self.view.state.announced_tasks.push((index, notice.tasks));
     }
 
     /// Keeps the open session as the one to restore. A new session is only worth restoring once it
@@ -3737,6 +3848,7 @@ impl AgentThread {
         self.send_after(AfterTurn {
             parts: prompt.parts,
             steering: Some(prompt.steering),
+            notice: None,
         });
         if !was_working {
             return;

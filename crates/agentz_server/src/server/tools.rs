@@ -65,8 +65,9 @@ pub(super) const MAX_LAST_MESSAGE_CHARS: usize = 8_000;
 const MAX_NOTICE_RESULT_BYTES: usize = 16_000;
 /// Said with every delegation, as t3code's tools say it: the parent hears of each end.
 const END_TURN_NOTE: &str = "This thread is sent a message with each task's result once it \
-     ends, queued until this turn ends, so end the turn instead of polling, waiting or spawning \
-     watchers. Use task_status only when the result is needed mid-turn.";
+     ends, sent into this turn if this agent takes messages mid-turn and otherwise queued until \
+     it ends, so end the turn instead of polling, waiting or spawning watchers. Use task_status \
+     only when the result is needed mid-turn.";
 const MAX_TOOL_RESULTS_KEPT: usize = 1_000;
 const DEFAULT_PATCH_CHARS: u64 = 50_000;
 const MAX_PATCH_CHARS: u64 = 1_000_000;
@@ -363,18 +364,35 @@ impl Server {
             if thread.is_paused() {
                 continue;
             }
+            // Tasks' results go into a running turn when the agent steers it by itself
+            // (Claude Agent and Codex on ACP v1), so it goes on with them; other messages,
+            // and results to any other agent, wait for the turn to end.
+            let steers = thread.steers_its_turn();
             match thread.status() {
                 ConnectionStatus::Failed(_) => {
                     self.follow_ups.remove(&thread_id);
                     continue;
                 }
                 ConnectionStatus::Ready if !thread.is_working() && !thread.waits_for_resend() => {}
+                ConnectionStatus::Ready if steers => {}
                 _ => continue,
             }
             let Some(queue) = self.follow_ups.get_mut(&thread_id) else {
                 continue;
             };
-            let Some(follow_up) = queue.pop_front() else {
+            if steers && !queue.iter().any(|follow_up| follow_up.task.is_some()) {
+                continue;
+            }
+            let follow_up = if steers {
+                let Some(position) = queue.iter().position(|follow_up| follow_up.task.is_some())
+                else {
+                    continue;
+                };
+                queue.remove(position)
+            } else {
+                queue.pop_front()
+            };
+            let Some(follow_up) = follow_up else {
                 continue;
             };
             let (text, from, ended_tasks) = match follow_up.task {
@@ -401,6 +419,8 @@ impl Server {
             };
             if ended_tasks.is_empty() {
                 thread.send_from(text, from);
+            } else if steers {
+                thread.steer_task_notice(text, from, ended_tasks.clone());
             } else {
                 thread.send_task_notice(text, from, ended_tasks.clone());
             }
@@ -3188,7 +3208,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
         {
             "name": "delegate_task",
             "title": "Delegate a child task",
-            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. For several tasks at once, use delegate_tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows under this thread. A thread runs a few tasks at once (the user's setting); more are queued (status queued) and start in order as others end. It returns at once: when the task ends, this thread is sent a message with its result, queued until this turn ends, so end the turn instead of polling or waiting; use task_status only when the result is needed mid-turn. A child can't delegate tasks of its own unless canDelegate is true. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status, task_send and task_cancel without machine. Keep the taskId for task_status, task_send and task_cancel.",
+            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. For several tasks at once, use delegate_tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows under this thread. A thread runs a few tasks at once (the user's setting); more are queued (status queued) and start in order as others end. It returns at once: when the task ends, this thread is sent a message with its result, sent into this turn if this agent takes messages mid-turn and otherwise queued until it ends, so end the turn instead of polling or waiting; use task_status only when the result is needed mid-turn. A child can't delegate tasks of its own unless canDelegate is true. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status, task_send and task_cancel without machine. Keep the taskId for task_status, task_send and task_cancel.",
             "inputSchema": {
                 "type": "object",
                 "properties": delegated_task_properties(true),
@@ -3200,7 +3220,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
         {
             "name": "delegate_tasks",
             "title": "Delegate child tasks",
-            "description": "Delegate several tasks at once, each to its own agentZ-owned child agent of THIS thread, as delegate_task does for one. Each task gets only its own task prompt, followed by the shared instructions when given (context or rules every child needs). Each entry may choose its title, role, agent, account, model, workspace and machine; parallel tasks that edit files should each get a worktree or pasture. They start together, up to the number of tasks a thread runs at once (the user's setting); the rest are queued and start in order as others end. The result lists every task in order with its taskId. When they end, this thread is sent one message with their results, queued until this turn ends, so end the turn instead of polling or waiting. clientRequestId makes retries idempotent.",
+            "description": "Delegate several tasks at once, each to its own agentZ-owned child agent of THIS thread, as delegate_task does for one. Each task gets only its own task prompt, followed by the shared instructions when given (context or rules every child needs). Each entry may choose its title, role, agent, account, model, workspace and machine; parallel tasks that edit files should each get a worktree or pasture. They start together, up to the number of tasks a thread runs at once (the user's setting); the rest are queued and start in order as others end. The result lists every task in order with its taskId. When they end, this thread is sent one message with their results, sent into this turn if this agent takes messages mid-turn and otherwise queued until it ends, so end the turn instead of polling or waiting. clientRequestId makes retries idempotent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

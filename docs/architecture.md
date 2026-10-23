@@ -2129,6 +2129,14 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   telling the agent to end its turn: the end of each task reaches it as a message. There's no
   blocking wait; `agentz_thread_wait` on one's own task answers at once with its status and
   that note, and `task_status` reads it mid-turn.
+- **Results in a running turn** (`send_follow_ups`, `AgentThread::steer_task_notice`): a
+  task that ends while its parent's turn runs is told to the parent in that turn when its
+  agent steers its turn by itself (`AgentThread::steers_its_turn`: Claude Agent's and
+  Codex's `_session/steering` on ACP v1, not the prompt agentZ marks as steered on v2), so it
+  goes on with the result; the notice is marked as one as when it starts a turn. One the agent
+  doesn't take in (its turn just ended), and results to any other agent, wait for the turn
+  to end. A notice still waiting when the agent restarts or fails is told again
+  (`AgentThreadEvent::TaskNoticeDropped`).
 - **The subthread limit** (`start_task_here`, `start_queued_tasks`, `running_tasks`): a
   parent runs as many tasks at once as the setting allows (Subthreads at once, 4 by default);
   more wait their turn (`Task::queued`, with the model and mode to start with:

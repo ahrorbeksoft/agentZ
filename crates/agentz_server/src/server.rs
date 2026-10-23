@@ -2565,6 +2565,13 @@ impl Server {
                     ConnectionId::Thread(_),
                     AgentThreadEvent::HandoffSent | AgentThreadEvent::HandoffDropped,
                 ) => {}
+                // Told again once the agent is back.
+                (ConnectionId::Thread(_), AgentThreadEvent::TaskNoticeDropped(tasks)) => {
+                    for task in tasks {
+                        self.projects
+                            .update_task(task, |task| task.delivered = false);
+                    }
+                }
                 (
                     ConnectionId::Thread(_),
                     event @ (AgentThreadEvent::SubagentStarted(_)

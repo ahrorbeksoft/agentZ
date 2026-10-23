@@ -9840,6 +9840,69 @@ async fn steering_sends_a_queued_message_into_the_turn() {
     assert!(client.thread(connection).state.steering_messages.is_empty());
 }
 
+/// A task that ends while its parent's turn runs is told to the parent in that turn, when its
+/// agent steers its turn by itself, so it goes on with the result rather than waiting for the
+/// turn to end. The notice is marked as one, as when it starts a turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tasks_result_steers_its_parents_running_turn() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    command.env.insert("MOCK_STEERING".into(), "1".into());
+    let Some(server) = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    ) else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    let connection = ConnectionId::Thread(parent);
+    client.wait_until_ready(parent).await;
+    client.start_waiting_turn(parent).await;
+    let delegated = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "hello", "title": "Helper"}),
+        )
+        .await;
+    let helper = task_id(&delegated);
+    let notice = task_notice(&mut client, parent, helper).await;
+    assert!(
+        client.thread(connection).is_working(),
+        "the turn still runs"
+    );
+    client
+        .wait_until(|client| client.task(helper).is_some_and(|task| task.delivered))
+        .await;
+
+    client.answer_permission(parent).await;
+    client
+        .wait_until(|client| !client.thread(connection).is_working())
+        .await;
+    let view = client.thread(connection);
+    assert!(
+        agent_text(view).ends_with(&format!("(steered: {notice})")),
+        "{}",
+        agent_text(view)
+    );
+    let notice_index = view
+        .entries()
+        .iter()
+        .position(|entry| matches!(entry, Entry::UserMessage(text) if *text == notice))
+        .expect("the notice's entry");
+    assert!(view.is_task_notice(notice_index));
+    assert_eq!(view.announced_tasks(notice_index), [helper]);
+    assert_eq!(view.state.finished_turns.len(), 1, "it went into the turn");
+}
+
 /// A steered message the agent doesn't take in yet shows as steering, out of the queue, until
 /// it shows in the thread: here once the turn ends, as the mock refuses "refuse".
 #[tokio::test(flavor = "multi_thread")]
