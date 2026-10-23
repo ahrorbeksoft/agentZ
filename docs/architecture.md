@@ -211,8 +211,8 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `machine.json` | server | The machine icon chosen in Settings › Machines |
 | `cloud.json` | server | The cloud providers found, their machines and usage as last listed, each machine's Stop when idle, and the notices not yet shown |
 | `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
-| `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
-| `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › General › Threads › Subthreads at once), a number |
+| `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › Threads), a number or null |
+| `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › Subthreads › Subthreads at once), a number |
 | `subthread-roles.json` | server | What each role of delegated task runs on (researcher, reviewer, worker, other): the user's picks of agent, model and effort, in the order to try |
 | `acp-v2.json` | server | Whether agents are asked for ACP v2 (Settings › General › Experimental › ACP v2), true or false |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
@@ -367,7 +367,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Color menu stays. They're drawn at 60% of their saturation (`controls::account_color`,
   `account_fill_color`), as Tailwind's shades glowed beside the theme's grays.
 - **Generated titles** (`agentz_server/src/title_generation.rs`, `server/title_requests.rs`,
-  Settings › General › Thread titles; t3code's text generation): off by default, and kept per
+  Settings › Thread titles; t3code's text generation): off by default, and kept per
   machine in `title-generation.json`. Once on, after a thread's first turn, the server asks
   the chosen CLI on its `PATH` (Codex, Claude or `agy`) for a title from the first message,
   with t3code's prompt, output schema and arguments, run in an empty temporary folder. Every
@@ -406,13 +406,13 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   unarchives. An agent CLI card moves only among the rest. Archiving unpins and drops a
   thread's keys. Agents pin and unpin with `agentz_thread_organize`.
 - **Working group** (`Sidebar::render_threads`, `AppSettings::working_group`; t3code's Working
-  shelf, off by default, Settings › General › Threads › Group working threads): the cards of
+  shelf, off by default, Settings › Threads › Group working threads): the cards of
   threads whose agents are working and need nothing from the user (`ThreadStatus::Working`:
   not blocked on a permission, not awaiting input, subthreads counted) fold out of the list
   into a Working group under the other cards, with the normal card style and a header like
   Archived's (open or closed in this window alone). Pinned cards stay put, and while a card is
   dragged the list is left as it is.
-- **Auto-archive** (`AppSettings::auto_archive`, Settings › General › Threads › Auto-archive
+- **Auto-archive** (`AppSettings::auto_archive`, Settings › Threads › Auto-archive
   threads: Never, After a day, After 3 days, After a week; `agentz_server::server::auto_archive`):
   the app gives every server the days (`Request::SetAutoArchive`, from `Machines::sync_servers`
   as it changes and as it connects), and the server keeps them in `auto-archive.json`, so threads
@@ -421,7 +421,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   whose last activity (or creation) is older than that, unless pinned, working, blocked,
   awaiting input or waiting, open in some client, or with something for their agent to do.
   Chats, Workspaces threads, drafts, subthreads and terminal threads are never archived.
-- **Subthreads at once** (`AppSettings::subthread_limit`, Settings › General › Threads, a
+- **Subthreads at once** (`AppSettings::subthread_limit`, Settings › Subthreads, a
   stepper from 1 to 16, 4 by default, `DEFAULT_SUBTHREAD_LIMIT`;
   `agentz_server::server::subthread_limit`): sent to every server as auto-archive's days are
   (`Request::SetSubthreadLimit`, `Machines::sync_subthread_limit`) and kept in
@@ -487,11 +487,15 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   that's working or waiting for the user, at full strength with its state's dot. Pinned ones
   lead. The row menu is Pin, Rename and Delete…: chats aren't archived. Search lists chats
   among the threads, by last activity, with the chat icon.
-- **Settings** (`settings_page.rs`, t3code's layout): General (Update Server, Restart Server, start at login,
-  chats, combining repositories), Appearance (Zed's theme modes, a picture behind the
-  window, and Zed's Reduce motion), Notifications (sounds and system
-  notifications, see Attention states), Agents, Usage, Skills, MCP Servers, Machines, Storage,
-  and a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
+- **Settings** (`settings_page.rs`, t3code's layout; `design/settings-2` topic 1 A): the
+  sidebar's pages sit under small muted headings (`render_nav_heading`). agentZ: General
+  (combining repositories, start at login, Experimental), Appearance (Zed's theme modes, a
+  picture behind the window, and Zed's Reduce motion), Notifications (sounds and system
+  notifications, see Attention states). Threads: Threads (order, sending, thinking, the
+  Working group, auto-archive, the composer's usage window, and Chats), Subthreads
+  (Subthreads at once and the roles), Thread titles (its machine picker in the header, as
+  Agents has) and Artifacts. Agents: Agents, Usage, Skills, MCP Servers. Machines: Machines,
+  Storage. Then Projects, a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
   are rows of their own: a frame lays out only the rows in view, each on its own. Laid out whole, a page of
   nested flex columns took taffy a measure of each label twice per column around it, and an
@@ -897,7 +901,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`window_background::solid_editor_background`), as a background picture's see-through
   theme makes it clear.
   The text is one line, growing with the text to eight, then scrolling. Shift-Enter
-  makes a new line and Enter sends; with Settings › General's "Use modifier to send" (Zed's
+  makes a new line and Enter sends; with Settings › Threads' "Use modifier to send" (Zed's
   `use_modifier_to_send`), Cmd-Enter sends and Enter makes a new line. Pasted text keeps its
   line breaks, and Up/Down move between rows, unless a menu is open for the composer
   (`TextInput && menu`). Right-click gives Zed's Cut, Copy, Paste and Paste as Plain Text.
@@ -964,7 +968,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
   "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
-  opening to the text; Settings › General's "Show thinking" (`AppSettings::show_thinking`, Zed's
+  opening to the text; Settings › Threads' "Show thinking" (`AppSettings::show_thinking`, Zed's
   `thinking_display` as expanded or collapsed) opens them all. Each run of two or more tool
   calls and thoughts folds into one line that opens to them once the agent writes a message
   after it, also mid-turn (t3code's work groups, `AgentView::folded_run`), saying what it did in
@@ -1417,7 +1421,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   a started thread's composer card, what's left of one of its account's windows ("62%", leaving out
   windows past their reset) on a borderless button like the pickers' beside it, yellow at 15%
   or less and red when used up, with the window's name in its tooltip ("Weekly: 3% left").
-  Which window is Settings › General › Threads › Usage shown in the composer
+  Which window is Settings › Threads › Usage shown in the composer
   (`AppSettings::usage_window`, `usage_limits::shown_window`), which the account picker's rows
   follow too: the current session, the account's shortest window (the 5-hour one), unless a
   longer window is used up (then the one that resets last, since nothing works until it does),
@@ -1846,7 +1850,7 @@ as picked in `design/chats/`.
   diffs and workspaces, and delegated tasks, terminals and commands in its own folder; nothing
   that starts or changes a project's thread. On other machines, through the app, only the
   reading ones (`CHAT_RELAYED_TOOLS`, run there as `ToolCaller::RelayedChat`).
-- **The setting** (`AppSettings::chats`, Settings › General › Chats, on by default): while
+- **The setting** (`AppSettings::chats`, Settings › Threads › Chats, on by default): while
   it's off, the Chats shelf, New Chat, Chat in the pickers and chats in search and Go To are
   gone. Chats are kept, and one that's working finishes its turn.
 
@@ -1872,7 +1876,7 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   don't apply to it (`deviations` skips it).
   `artifactId` adds a version. 16 MiB a file at most, Claude Code's limit, 128 MiB a design.
   The design tool's description ends with the design defaults (`DesignDefaults::instructions`:
-  how many variants, today's, the pictures' sizes, pictures or pages), the project's or General's
+  how many variants, today's, the pictures' sizes, pictures or pages), the project's or Settings › Artifacts'
   (`DesignSettings::for_project`, `Request::SetDesignDefaults`), so its tool list is made per
   caller (`Request::ListTools { caller }`). Any thread's or chat's agent can publish.
   Agents treat a description as advice, and a session lists its tools once, so the defaults are
@@ -1991,16 +1995,16 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   `agentz_artifact_read` call that reads it.
 - **Design defaults** (`AppSettings::{design_defaults, project_design_defaults}`,
   `SettingsPage::{render_design_default_rows, render_project_design_defaults}`,
-  `Machines::sync_design_defaults`; `design/artifacts-2` topic 21 B): Settings › General ›
+  `Machines::sync_design_defaults`; `design/artifacts-2` topic 21 B): Settings ›
   Artifacts has Variants (a stepper, 3 at first), Include today's, Sizes (Desktop · Phone ·
   Both) and Variants as (Pictures · Live pages · Both). Sizes size the pictures only
   (`design/live-preview` topic 3 A): with Variants as › Live pages it's greyed and does
   nothing, its line saying "Pictures only: a live page is one responsive page." Each
   project's page has Design
-  defaults: "Use General's" (on at first, saying General's in a line); off, the same four rows
-  for that project, kept by its combined project's key. Every server gets General's and its
+  defaults: "Use Artifacts defaults" (on at first, saying what they are in a line); off, the same four rows
+  for that project, kept by its combined project's key. Every server gets Artifacts' and its
   own copies' (`Request::SetDesignDefaults`) as they change and as it connects.
-- **Opening on publish** (`Shell::open_published_artifact`, Settings › General › Artifacts ›
+- **Opening on publish** (`Shell::open_published_artifact`, Settings › Artifacts ›
   "Open in the browser", `ArtifactAutoOpen`): when its thread is on screen (the default), on an
   artifact's first publish, or never. Only a publish the app hears while connected counts
   (`ServerClientEvent::ArtifactPublished`), not the list a machine sends on connecting.

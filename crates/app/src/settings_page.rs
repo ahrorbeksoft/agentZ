@@ -1,6 +1,7 @@
-//! The settings page, laid out like t3code's: a list of sections on the left (General,
-//! Appearance, Notifications, Agents, Usage, Skills, MCP Servers, Machines, Storage, then one
-//! entry per project) and the chosen section's rows on the right.
+//! The settings page, laid out like t3code's: a list of pages on the left under small headings
+//! (agentZ: General, Appearance, Notifications; Threads: Threads, Subthreads, Thread titles,
+//! Artifacts; Agents: Agents, Usage, Skills, MCP Servers; Machines: Machines, Storage; then one
+//! entry per project) and the chosen page's rows on the right.
 
 mod accounts_menu;
 mod cloud_machine_page;
@@ -109,7 +110,7 @@ pub(crate) const ADD_ACCOUNT_DIALOG_WIDTH: Pixels = px(480.);
 /// a time, as the sidebar shows archived threads.
 const SESSIONS_INITIAL_COUNT: usize = 10;
 const SESSIONS_PAGE_COUNT: usize = 25;
-/// The range of General's Subthreads at once.
+/// The range of Subthreads at once.
 const MIN_SUBTHREAD_LIMIT: u32 = 1;
 const MAX_SUBTHREAD_LIMIT: u32 = 16;
 
@@ -195,6 +196,10 @@ enum Section {
     General,
     Appearance,
     Notifications,
+    Threads,
+    Subthreads,
+    ThreadTitles,
+    Artifacts,
     Agents,
     Usage,
     Skills,
@@ -239,7 +244,7 @@ pub struct SettingsPage {
     /// The Usage timeline's tracks' width when last drawn, which says whose bars fit their
     /// words.
     usage_timeline_width: Pixels,
-    /// The machine whose thread titles Settings › General shows.
+    /// The machine whose thread titles Settings › Thread titles shows.
     titles_machine: MachineId,
     agent_search: Entity<TextInput>,
     /// Machines whose server is being updated, so a second click doesn't restart it midway.
@@ -875,53 +880,48 @@ impl SettingsPage {
     fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let projects = self.machines.read(cx).project_groups(cx);
-        let mut items = vec![
-            self.render_nav_item(
-                "General",
-                Some(IconName::Settings),
-                None,
-                Section::General,
-                cx,
+        let groups: [(&str, &[(&str, IconName, Section)]); 4] = [
+            (
+                "agentZ",
+                &[
+                    ("General", IconName::Settings, Section::General),
+                    ("Appearance", IconName::Eye, Section::Appearance),
+                    ("Notifications", IconName::Bell, Section::Notifications),
+                ],
             ),
-            self.render_nav_item(
-                "Appearance",
-                Some(IconName::Eye),
-                None,
-                Section::Appearance,
-                cx,
+            (
+                "Threads",
+                &[
+                    ("Threads", IconName::Chat, Section::Threads),
+                    ("Subthreads", IconName::UserGroup, Section::Subthreads),
+                    ("Thread titles", IconName::Pencil, Section::ThreadTitles),
+                    ("Artifacts", IconName::File, Section::Artifacts),
+                ],
             ),
-            self.render_nav_item(
-                "Notifications",
-                Some(IconName::Bell),
-                None,
-                Section::Notifications,
-                cx,
+            (
+                "Agents",
+                &[
+                    ("Agents", IconName::Sparkle, Section::Agents),
+                    ("Usage", IconName::Gauge, Section::Usage),
+                    ("Skills", IconName::Book, Section::Skills),
+                    ("MCP Servers", IconName::ToolHammer, Section::McpServers),
+                ],
             ),
-            self.render_nav_item("Agents", Some(IconName::Sparkle), None, Section::Agents, cx),
-            self.render_nav_item("Usage", Some(IconName::Gauge), None, Section::Usage, cx),
-            self.render_nav_item("Skills", Some(IconName::Book), None, Section::Skills, cx),
-            self.render_nav_item(
-                "MCP Servers",
-                Some(IconName::ToolHammer),
-                None,
-                Section::McpServers,
-                cx,
-            ),
-            self.render_nav_item(
+            (
                 "Machines",
-                Some(IconName::Server),
-                None,
-                Section::Machines,
-                cx,
-            ),
-            self.render_nav_item(
-                "Storage",
-                Some(IconName::DatabaseZap),
-                None,
-                Section::Storage,
-                cx,
+                &[
+                    ("Machines", IconName::Server, Section::Machines),
+                    ("Storage", IconName::DatabaseZap, Section::Storage),
+                ],
             ),
         ];
+        let mut items = Vec::new();
+        for (heading, pages) in groups {
+            items.push(render_nav_heading(heading));
+            for (label, icon, section) in pages {
+                items.push(self.render_nav_item(*label, Some(*icon), None, *section, cx));
+            }
+        }
         let fixed_count = items.len();
         let mut project_items = Vec::with_capacity(projects.len());
         // One row per project, however many copies it combines: it opens on the copy shown,
@@ -1000,13 +1000,7 @@ impl SettingsPage {
                             .gap_px()
                             .children(items.drain(..fixed_count))
                             .when(!projects.is_empty(), |nav| {
-                                nav.child(
-                                    div().px_2().pt_3().pb_1().child(
-                                        Label::new("Projects")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    ),
-                                )
+                                nav.child(render_nav_heading("Projects"))
                             })
                             .children(items),
                     )
@@ -1036,6 +1030,10 @@ impl SettingsPage {
             Section::General => SharedString::from("settings-nav-general"),
             Section::Appearance => "settings-nav-appearance".into(),
             Section::Notifications => "settings-nav-notifications".into(),
+            Section::Threads => "settings-nav-threads".into(),
+            Section::Subthreads => "settings-nav-subthreads".into(),
+            Section::ThreadTitles => "settings-nav-thread-titles".into(),
+            Section::Artifacts => "settings-nav-artifacts".into(),
             Section::Agents => "settings-nav-agents".into(),
             Section::Usage => "settings-nav-usage".into(),
             Section::Skills => "settings-nav-skills".into(),
@@ -1071,7 +1069,36 @@ impl SettingsPage {
             .into_any_element()
     }
 
+    /// General keeps what's about agentZ itself: combining projects, the server and what's
+    /// experimental.
     fn render_general(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![
+            render_section("Projects", self.render_grouping_rows(window, cx), cx),
+            render_section(
+                "Server",
+                vec![render_row(
+                    "Start at login",
+                    "Starts the server when you log in, before agentZ opens, so scripts \
+                         using agentz-server call can reach it.",
+                    Switch::new("start-at-login", self.starts_at_login.into())
+                        .on_click(cx.listener(|this, state, _, cx| {
+                            let enabled = *state == ToggleState::Selected;
+                            if crate::login_item::set_enabled(enabled).log_err().is_some() {
+                                this.starts_at_login = enabled;
+                                cx.notify();
+                            }
+                        }))
+                        .into_any_element(),
+                    cx,
+                )],
+                cx,
+            ),
+            render_section("Experimental", vec![self.render_acp_v2_row(cx)], cx),
+        ]
+    }
+
+    /// The threads' own settings, and Chats.
+    fn render_threads(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let current = self.machines.read(cx).thread_order(cx);
         let store = Machines::local(cx).read(cx).projects().clone();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
@@ -1108,48 +1135,60 @@ impl SettingsPage {
                     self.render_show_thinking_row(cx),
                     self.render_working_group_row(cx),
                     self.render_auto_archive_row(window, cx),
-                    self.render_subthread_limit_row(cx),
                     self.render_usage_window_row(window, cx),
                 ],
                 cx,
             ),
             render_section("Chats", vec![self.render_chats_row(cx)], cx),
-            render_section_with_note(
-                "Artifacts",
-                std::iter::once(self.render_artifact_auto_open_row(window, cx))
-                    .chain(self.render_design_default_rows(None, cx))
-                    .collect(),
-                "Given to agents as defaults for their designs; they may change them for a \
-                 project.",
-                cx,
-            ),
-            render_section(
-                "Thread titles",
-                self.render_title_generation_rows(window, cx),
-                cx,
-            ),
-            render_section("Projects", self.render_grouping_rows(window, cx), cx),
-            render_section(
-                "Server",
-                vec![render_row(
-                    "Start at login",
-                    "Starts the server when you log in, before agentZ opens, so scripts \
-                         using agentz-server call can reach it.",
-                    Switch::new("start-at-login", self.starts_at_login.into())
-                        .on_click(cx.listener(|this, state, _, cx| {
-                            let enabled = *state == ToggleState::Selected;
-                            if crate::login_item::set_enabled(enabled).log_err().is_some() {
-                                this.starts_at_login = enabled;
-                                cx.notify();
-                            }
-                        }))
-                        .into_any_element(),
-                    cx,
-                )],
-                cx,
-            ),
-            render_section("Experimental", vec![self.render_acp_v2_row(cx)], cx),
         ]
+    }
+
+    /// How subthreads run: how many at once, and what each role runs on.
+    fn render_subthreads(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![render_section(
+            "Subthreads",
+            vec![self.render_subthread_limit_row(cx)],
+            cx,
+        )]
+    }
+
+    /// What a publish opens, and the design defaults given to agents.
+    fn render_artifacts(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![render_section_with_note(
+            "Artifacts",
+            std::iter::once(self.render_artifact_auto_open_row(window, cx))
+                .chain(self.render_design_default_rows(None, cx))
+                .collect(),
+            "Given to agents as defaults for their designs; they may change them for a \
+             project.",
+            cx,
+        )]
+    }
+
+    /// The page's title, and the machine whose titles it shows, as on the Agents page.
+    fn render_thread_titles_header(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .h(px(28.))
+            .gap_4()
+            .justify_between()
+            .child(Headline::new("Thread titles").size(HeadlineSize::Small))
+            .when(self.machines.read(cx).has_remotes(), |header| {
+                header.child(self.render_titles_machine_picker(window, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_thread_titles(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![render_section_with_note(
+            "Thread titles",
+            self.render_title_generation_rows(window, cx),
+            "Each machine titles its own threads, with the CLIs installed on it.",
+            cx,
+        )]
     }
 
     /// Asks agents for ACP v2 on every machine, which most agents don't speak reliably yet.
@@ -1408,7 +1447,7 @@ impl SettingsPage {
         )
     }
 
-    /// The design defaults' rows (`design/artifacts-2`, topic 21): General's, or with `project`
+    /// The design defaults' rows (`design/artifacts-2`, topic 21): Settings › Artifacts', or with `project`
     /// a project's own.
     fn render_design_default_rows(
         &self,
@@ -1618,14 +1657,6 @@ impl SettingsPage {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut rows = Vec::new();
-        if self.machines.read(cx).has_remotes() {
-            rows.push(render_row(
-                "Machine",
-                "Each machine titles its own threads, with the CLIs installed on it.",
-                self.render_titles_machine_picker(window, cx),
-                cx,
-            ));
-        }
         let Some(client) = self.machines.read(cx).client(self.titles_machine, cx) else {
             return rows;
         };
@@ -8060,8 +8091,8 @@ impl SettingsPage {
         .collect()
     }
 
-    /// A project's design defaults (`design/artifacts-2`, topic 21 B): General's at first, or
-    /// its own once "Use General's" is off, for every copy of it.
+    /// A project's design defaults (`design/artifacts-2`, topic 21 B): Settings › Artifacts' at
+    /// first, or its own once "Use Artifacts defaults" is off, for every copy of it.
     fn render_project_design_defaults(
         &self,
         key: ProjectKey,
@@ -8098,7 +8129,7 @@ impl SettingsPage {
             )
         };
         let mut rows = vec![render_row(
-            "Use General's",
+            "Use Artifacts defaults",
             general.summary(),
             div()
                 .debug_selector(|| "project-design-use-general".to_string())
@@ -8114,7 +8145,7 @@ impl SettingsPage {
         render_section_with_note(
             "Design defaults",
             rows,
-            format!("For {name}'s threads, in place of General's."),
+            format!("For {name}'s threads, in place of the Artifacts defaults."),
             cx,
         )
     }
@@ -9342,6 +9373,16 @@ fn connection_line(client: &Entity<ServerClient>, cx: &App) -> ConnectionLine {
     line
 }
 
+/// A small muted heading over a group of the settings sidebar's pages.
+fn render_nav_heading(title: &'static str) -> AnyElement {
+    div()
+        .px_2()
+        .pt_3()
+        .pb_1()
+        .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+        .into_any_element()
+}
+
 /// t3code's settings section: a small heading over a bordered group of rows.
 fn render_section(title: impl Into<SharedString>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
     render_section_with_actions(title, rows, gpui::Empty.into_any_element(), cx)
@@ -9559,6 +9600,16 @@ impl SettingsPage {
             Section::Notifications => (
                 headline("Notifications".into()),
                 self.render_notifications(window, cx),
+            ),
+            Section::Threads => (headline("Threads".into()), self.render_threads(window, cx)),
+            Section::Subthreads => (headline("Subthreads".into()), self.render_subthreads(cx)),
+            Section::ThreadTitles => (
+                self.render_thread_titles_header(window, cx),
+                self.render_thread_titles(window, cx),
+            ),
+            Section::Artifacts => (
+                headline("Artifacts".into()),
+                self.render_artifacts(window, cx),
             ),
             Section::Agents => {
                 return (
@@ -9957,10 +10008,8 @@ mod tests {
             client
         });
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
-        // Thread titles is below the window's first screen.
-        cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         page.update_in(cx, |page, window, cx| {
-            page.select(Section::General, window, cx)
+            page.select(Section::ThreadTitles, window, cx)
         });
         cx.run_until_parked();
         let click = |name: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -12066,8 +12115,8 @@ mod tests {
         assert!(cx.debug_bounds("project-copy-local-2").is_some());
     }
 
-    /// `design/artifacts-2` topic 21 B: General's design defaults go to every machine, and a
-    /// project's own, once "Use General's" is off, to each machine one of its copies is on.
+    /// `design/artifacts-2` topic 21 B: Settings › Artifacts' design defaults go to every machine, and a
+    /// project's own, once "Use Artifacts defaults" is off, to each machine one of its copies is on.
     #[gpui::test]
     fn design_defaults_go_to_every_machine_and_a_projects_to_its_copies(cx: &mut TestAppContext) {
         let (local, devbox) = machines_with_copies(cx);
@@ -12079,7 +12128,7 @@ mod tests {
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         page.update_in(cx, |page, window, cx| {
-            page.select(Section::General, window, cx)
+            page.select(Section::Artifacts, window, cx)
         });
         cx.run_until_parked();
         let click = |name: &'static str, cx: &mut gpui::VisualTestContext| {
@@ -12161,7 +12210,7 @@ mod tests {
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         page.update_in(cx, |page, window, cx| {
-            page.select(Section::General, window, cx)
+            page.select(Section::Artifacts, window, cx)
         });
         let variants_as = |variants_as, cx: &mut gpui::VisualTestContext| {
             cx.update(|_, cx| {
@@ -12246,7 +12295,7 @@ mod tests {
         let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
         cx.simulate_resize(gpui::size(px(1100.), px(2000.)));
         page.update_in(cx, |page, window, cx| {
-            page.select(Section::General, window, cx)
+            page.select(Section::Subthreads, window, cx)
         });
         cx.run_until_parked();
         let last_sent = |client: &Entity<ServerClient>, cx: &mut gpui::VisualTestContext| {

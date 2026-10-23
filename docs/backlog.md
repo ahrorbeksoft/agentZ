@@ -99,8 +99,15 @@ other".
 
 Built (3b4bf5a): the four roles, the picks the app sends every server
 (`Request::SetSubthreadRoles`, `subthread-roles.json`), `orchestrator_capabilities` listing
-them, and the account choice by spare usage. Left: the Settings screen for the picks, on the
-design board (`design/settings-2/`).
+them, and the account choice by spare usage. Left: the Settings screen for the picks, decided
+on the design board (`design/settings-2/` topic 4 D: a role per row, its picks as chips; an
+account selector with All under the agent).
+
+Requested October 23, 2026, after the board: "we should need a optional clever selection that
+chooses the agent (and account) with the most usage for subthreads if there are more agents
+selected, or if one agent but with all accounts, maybe accounts also should be selectable […]
+if that option is turned off then it uses in an added order depending on availablity (if
+there is usage left)". One switch on the Subthreads page (the user's answer), for every role.
 
 ### Reorganize Settings
 
@@ -110,8 +117,9 @@ Also:
 - For machine-specific settings, a general setting that applies to all machines when set.
 - Likewise for profile-specific settings: a general one for all profiles.
 
-On the design board: `design/settings-2/`. "Profile" isn't a term in agentZ; the board reads it
-as an agent's accounts and asks.
+Decided on the design board (`design/settings-2/decisions.md`). Built: topic 1 A, headings in
+the sidebar and General split into Threads, Subthreads, Thread titles and Artifacts. Left: the
+shared settings for machines (topic 2) and for accounts (topic 3).
 
 ### Show shells next to the Working label
 

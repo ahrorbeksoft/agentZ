@@ -418,7 +418,7 @@ impl ArtifactStore {
         Ok(())
     }
 
-    /// The design defaults for a project's agents: its own, or General's.
+    /// The design defaults for a project's agents: its own, or Settings › Artifacts'.
     pub fn design_defaults(&self, project_id: Option<ProjectId>) -> DesignDefaults {
         self.design_settings.for_project(project_id)
     }

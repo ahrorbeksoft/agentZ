@@ -601,7 +601,7 @@ pub struct AgentView {
     /// The running turn's folded last run and the entry its live line showed when the rows were
     /// last measured.
     synced_live_line: Option<LiveLine>,
-    /// Settings › General's "Show thinking", as the rows were last measured with it.
+    /// Settings › Threads' "Show thinking", as the rows were last measured with it.
     synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
     /// The compactions whose summary is open.
@@ -768,7 +768,7 @@ impl AgentView {
                 this.sync_composer_placeholder(cx);
                 cx.notify()
             }),
-            // Settings › General's "Show thinking" opens or closes every thought.
+            // Settings › Threads' "Show thinking" opens or closes every thought.
             cx.observe(
                 &crate::app_settings::AppSettingsStore::global(cx),
                 |this, settings, cx| {
@@ -7178,7 +7178,7 @@ impl AgentView {
     }
 
     /// A thought, as a row among the tool calls (t3code's reasoning row): "Thinking" with a
-    /// shimmer while the agent thinks, then "Thought", opening to the text. Settings › General's
+    /// shimmer while the agent thinks, then "Thought", opening to the text. Settings › Threads'
     /// "Show thinking" opens every thought by default (Zed's `thinking_display`).
     fn render_thinking_block(
         &self,

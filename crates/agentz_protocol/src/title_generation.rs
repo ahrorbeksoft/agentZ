@@ -114,7 +114,7 @@ pub struct TitleProviderInfo {
     pub models: Vec<TitleModel>,
 }
 
-/// The machine's setting, with the providers it has, for Settings › General.
+/// The machine's setting, with the providers it has, for Settings › Thread titles.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TitleGenerationState {
     #[serde(default)]

@@ -545,7 +545,7 @@ impl DesignDefaults {
     }
 }
 
-/// The design defaults the app sends each server: General's, and those of the projects there
+/// The design defaults the app sends each server: Settings › Artifacts', and those of the projects there
 /// that have their own.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DesignSettings {
@@ -555,7 +555,7 @@ pub struct DesignSettings {
 }
 
 impl DesignSettings {
-    /// A project's: its own, or General's.
+    /// A project's: its own, or Settings › Artifacts'.
     pub fn for_project(&self, project_id: Option<ProjectId>) -> DesignDefaults {
         project_id
             .and_then(|project_id| {

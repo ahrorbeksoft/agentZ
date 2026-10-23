@@ -1,4 +1,4 @@
-//! What each kind of delegated task runs on (Settings › General › Threads): the four roles
+//! What each kind of delegated task runs on (Settings › Subthreads): the four roles
 //! agents delegate by, each with the user's picks of agent, model and effort in the order to
 //! try them. Agents see the picks (`orchestrator_capabilities`) and name an agent or model only
 //! when a role has none, or when the user asked for other agents. Within a pick's agent, the

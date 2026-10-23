@@ -418,7 +418,7 @@ impl Sidebar {
                     this.offer_undo(*thread, cx);
                 }
             }),
-            // Turning chats on or off in Settings › General.
+            // Turning chats on or off in Settings › Threads.
             cx.observe(&AppSettingsStore::global(cx), |_, _, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &TextInputEvent, cx| {
                 this.search_index = 0;

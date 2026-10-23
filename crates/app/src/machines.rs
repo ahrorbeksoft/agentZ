@@ -724,7 +724,7 @@ impl Machines {
         }
     }
 
-    /// Gives each server General's design defaults, and those of its projects whose combined
+    /// Gives each server Settings › Artifacts' design defaults, and those of its projects whose combined
     /// project has its own (`design/artifacts-2`, topic 21 B).
     fn sync_design_defaults(&mut self, cx: &mut Context<Self>) {
         let settings = AppSettingsStore::global(cx).read(cx).settings();
@@ -1330,7 +1330,7 @@ impl Machines {
         Some(local.artifacts().pages.as_ref()?.home_link(project))
     }
 
-    /// Settings › General's Chats: while it's off, chats are hidden and kept.
+    /// Settings › Threads' Chats: while it's off, chats are hidden and kept.
     pub fn chats_enabled(cx: &App) -> bool {
         AppSettingsStore::global(cx).read(cx).settings().chats
     }
