@@ -76,3 +76,28 @@ agents that they can just end their turn once they delegate:
 
 Improve the subagent view: its Cancel and Open Parent buttons look bad. Maybe there shouldn't
 be buttons like that at all, maybe there should; to be decided.
+
+### Subthread templates per role, on the account with the most to spare
+
+Requested October 23, 2026: "we have subthreads, but now agents choose the models themselves,
+but i am thinking why not let users choose subthread templates like idk, they choose workers,
+researchers etc per agent provider and we also introduce clever selction that (idk some kinda
+system that chooses the agent/acount with the most usage for the selected subthread type or
+something idk". Agreed in the conversation that followed:
+
+- **Templates per role, not per agent.** `delegate_task` already takes a `role`
+  (implementation, research, review, design, test, general: `TASK_ROLES` in
+  `server/tools.rs`), but it's only a label. Let the user give each role an ordered list of
+  agent, model (and effort or mode), e.g. Research: Codex · gpt-5 · high, then Claude ·
+  Sonnet. The parent only picks the role; a role with a template runs as it says, whatever
+  agent, model or account the parent named. A role without one works as today.
+- **The account is picked for the user, the agent isn't.** Vendors' limits can't be compared
+  (Claude's 40% left isn't Codex's), so the role's list orders the agents. Within an agent,
+  skip accounts logged out or used up, and prefer the one that would waste the most at its
+  reset (60% left resetting in an hour before 80% left resetting in 6 days), from the
+  projection the limit rows already make (`usage_limits::pace`). When all of an agent's
+  accounts are used up, go to the role's next entry.
+- **Left out for now:** moving a running subthread to another account when it reaches its
+  limit mid-turn, and roles beyond the six.
+- Neither Zed nor t3code has this. It's a settings change (likely beside Subthreads at once in
+  Settings › General › Threads), so it starts on the design board.
