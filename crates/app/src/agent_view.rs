@@ -13272,6 +13272,7 @@ impl AgentView {
                                     .flex_wrap()
                                     .justify_end()
                                     .gap_1()
+                                    .children(self.render_context_usage(cx))
                                     .children(settings_loading)
                                     .children(self.render_session_settings(cx))
                                     .child(send_button),
@@ -13326,8 +13327,7 @@ impl AgentView {
 
     /// Under the composer's card (`design/composer-2`, topic 1 B, with the user's machine
     /// and branch, and who answers moved into the card on their word): where the thread works
-    /// at the left (a draft's checkout, and the machine) and its branch at the right, then the
-    /// context ring.
+    /// at the left (a draft's checkout, and the machine) and its branch at the right.
     fn render_composer_strip(&self, style: ComposerStyle, cx: &mut Context<Self>) -> AnyElement {
         let is_sent_thread = style == ComposerStyle::Thread || self.is_fresh_fork(cx);
         let is_chat = self.is_chat(cx);
@@ -13403,8 +13403,7 @@ impl AgentView {
                     .flex_wrap()
                     .justify_end()
                     .gap_1()
-                    .children(right)
-                    .children(self.render_context_usage(cx)),
+                    .children(right),
             )
             .into_any_element()
     }
@@ -18574,6 +18573,12 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // The ring is in the card, before the agent's settings, as before the strip.
+        let ring = cx.debug_bounds("context-usage").expect("the context ring");
+        let controls = cx
+            .debug_bounds("composer-controls")
+            .expect("the composer's controls");
+        assert!(controls.contains(&ring.center()));
         click_on("context-usage", cx);
         click_on("MENU_ITEM-Compact Context", cx);
         assert!(sent(&client, cx).iter().any(|request| matches!(

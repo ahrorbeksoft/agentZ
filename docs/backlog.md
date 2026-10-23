@@ -101,7 +101,3 @@ for 13m 58s" at the end of its turn, while its running shell is in a separate "1
 Task" panel above the composer.
 
 ![A Claude Agent thread's Working label, with its background shell in a panel above the composer](backlog/shells-beside-working-label.png)
-
-### Put the context indicator back where it was
-
-Put the context indicator back in its original place.

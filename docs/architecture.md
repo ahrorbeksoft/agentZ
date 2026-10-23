@@ -871,10 +871,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`render_thread_composer`, composer-2 topic 1 B, from t3code's context strip). The card holds
   what's sent and who answers: the text, then + with the agent picker, the account picker and
   a sent thread's usage gauge (`render_who_answers`; the user moved them back into the card
-  from the strip), and at the right the agent's settings and Send. Under it the strip
+  from the strip), and at the right the context ring (back where it was before the strip, on
+  the user's word), the agent's settings and Send. Under it the strip
   (`render_composer_strip`) says where the thread works: at the left the checkout and machine
   pickers on the new thread screen, or in a sent thread the machine as a label, since a
-  thread can't move; at the right the branch and the context ring. A sent thread's picker
+  thread can't move; at the right the branch. A sent thread's picker
   menus open upward. The branch is in the strip, so the header shows it only where there's no
   composer (an archived thread, a subthread, a machine offline). The activity bar sits on the card's top edge as a tab. Send is
   t3code's round button (topic 3 A): gray with nothing to send, filled with the accent color
