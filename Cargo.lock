@@ -185,6 +185,7 @@ dependencies = [
  "agentz_protocol",
  "agentz_server",
  "anyhow",
+ "child_process",
  "collections",
  "futures",
  "http_client",
@@ -227,6 +228,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "child_process",
  "chrono",
  "clap",
  "cloud",
@@ -1319,6 +1321,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "child_process"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1428,6 +1438,7 @@ version = "0.1.0"
 dependencies = [
  "agentz_protocol",
  "anyhow",
+ "child_process",
  "log",
  "serde",
  "serde_json",
@@ -6651,6 +6662,7 @@ version = "0.1.0"
 dependencies = [
  "agentz_protocol",
  "anyhow",
+ "child_process",
  "collections",
  "futures",
  "gpui_shared_string",

@@ -214,7 +214,7 @@ impl Cli {
             .first()
             .map(|arg| format!("{} {}", self.program.display(), arg.as_ref()))
             .unwrap_or_else(|| self.program.display().to_string());
-        tokio::time::timeout(timeout, command.output())
+        tokio::time::timeout(timeout, child_process::output(&mut command))
             .await
             .with_context(|| format!("{command_line} didn't finish"))?
             .with_context(|| format!("running {command_line}"))

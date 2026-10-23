@@ -148,7 +148,7 @@ async fn ssh_keygen<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> Result<Vec
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(KEYGEN_TIMEOUT, command.output())
+    let output = tokio::time::timeout(KEYGEN_TIMEOUT, child_process::output(&mut command))
         .await
         .context("ssh-keygen didn't finish")?
         .context("running ssh-keygen")?;

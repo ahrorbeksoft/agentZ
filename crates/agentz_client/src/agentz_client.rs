@@ -250,7 +250,7 @@ pub async fn start_local_server(runtime: &tokio::runtime::Handle, binary: &Path)
     let mut command = tokio::process::Command::new(binary);
     command.arg("start").stdin(std::process::Stdio::null());
     let output = runtime
-        .spawn(async move { command.output().await })
+        .spawn(async move { child_process::output(&mut command).await })
         .await
         .context("the start task ended")?
         .with_context(|| format!("running {} start", binary.display()))?;

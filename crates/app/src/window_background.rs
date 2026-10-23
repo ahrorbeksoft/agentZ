@@ -120,24 +120,32 @@ async fn read_with_sips(source: &Path) -> Result<DynamicImage> {
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
-    let output = smol::process::Command::new("/usr/bin/sips")
+    // Its errors go in a file: a pipe's end, inherited by a process started meanwhile (an
+    // `ssh`), can keep the output open long after sips exits (see `child_process`).
+    let errors = converted.with_extension("log");
+    let status = smol::process::Command::new("/usr/bin/sips")
         .args(["-s", "format", "jpeg", "-s", "formatOptions", "best"])
         .arg(source)
         .arg("--out")
         .arg(&converted)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&errors).context("creating sips's log")?)
+        .status()
         .await
-        .context("running sips")?;
-    let picture = if output.status.success() {
-        read_picture(&converted)
-    } else {
-        Err(anyhow::anyhow!(
-            "sips failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        .context("running sips");
+    let picture = match status {
+        Ok(status) if status.success() => read_picture(&converted),
+        Ok(status) => Err(anyhow::anyhow!(
+            "sips failed ({status}): {}",
+            std::fs::read_to_string(&errors).unwrap_or_default().trim()
+        )),
+        Err(error) => Err(error),
     };
-    if converted.exists() {
-        std::fs::remove_file(&converted).log_err();
+    for file in [&converted, &errors] {
+        if file.exists() {
+            std::fs::remove_file(file).log_err();
+        }
     }
     picture
 }

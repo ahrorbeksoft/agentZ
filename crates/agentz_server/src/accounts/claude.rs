@@ -2,14 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use agentz_protocol::accounts::{AccountStatus, ExtraUsage, LimitWindow};
 use agentz_protocol::agents::AgentCommand;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt as _;
 
 use super::login_checks::{account_command, run_with_account_env};
 use super::readers::{Read, format_number};
@@ -125,25 +123,18 @@ pub(super) async fn read(agent: AgentCommand, folder: &Path) -> Result<Read> {
 async fn read_usage(agent: &AgentCommand, folder: &Path) -> Result<Usage> {
     std::fs::create_dir_all(folder).with_context(|| format!("creating {}", folder.display()))?;
     let args: Vec<String> = agent.args.iter().cloned().chain(cli_args(&USAGE)).collect();
-    let mut command = account_command(&agent.path, &args, agent);
-    command
-        .envs(USAGE_ENV)
-        .current_dir(folder)
-        .stdin(Stdio::piped());
-    let mut child = command.spawn().context("starting Claude Code")?;
-    let mut input = child.stdin.take().context("Claude Code has no input")?;
     let request = serde_json::json!({
         "type": "control_request",
         "request_id": USAGE_REQUEST,
         "request": {"subtype": "get_usage", "skip_behaviors": true},
     });
-    input
-        .write_all(format!("{request}\n").as_bytes())
-        .await
-        .context("asking Claude Code for its usage")?;
     // At the end of its input it answers what it was asked, then quits.
-    drop(input);
-    let output = tokio::time::timeout(USAGE_TIMEOUT, child.wait_with_output())
+    let input = child_process::input(format!("{request}\n").as_bytes())
+        .context("asking Claude Code for its usage")?;
+    let mut command = account_command(&agent.path, &args, agent);
+    command.envs(USAGE_ENV).current_dir(folder).stdin(input);
+    let child = command.spawn().context("starting Claude Code")?;
+    let output = tokio::time::timeout(USAGE_TIMEOUT, child_process::wait_with_output(child))
         .await
         .map_err(|_| anyhow!("Claude Code didn't answer in {}s", USAGE_TIMEOUT.as_secs()))?
         .context("reading Claude Code's usage")?;

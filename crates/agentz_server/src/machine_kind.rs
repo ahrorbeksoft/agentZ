@@ -152,10 +152,11 @@ async fn detect_linux() -> Option<MachineKind> {
 async fn probe(program: &str, args: &[&str]) -> Option<String> {
     let output = tokio::time::timeout(
         PROBE_TIMEOUT,
-        tokio::process::Command::new(program)
-            .args(args)
-            .kill_on_drop(true)
-            .output(),
+        child_process::output(
+            tokio::process::Command::new(program)
+                .args(args)
+                .kill_on_drop(true),
+        ),
     )
     .await
     .ok()?

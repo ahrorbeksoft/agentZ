@@ -145,6 +145,7 @@ runs in `agentz-server`, not the app.
 | `agentz_protocol` | Wire format and shared types: threads (`thread.rs`), agents (`agents.rs`), agents' accounts (`accounts.rs`), agentZ's skills (`skills.rs`) and MCP servers (`mcp_servers.rs`), diffs (`diff.rs`), the editors a folder opens in (`editors.rs`), artifacts (`artifacts.rs`), worktrees and pastures (`workspace.rs`), terminals (`terminal.rs`, `terminal_keys.rs`), spaces and their pane trees (`spaces.rs`, `layout.rs`), cloud providers and their machines (`cloud.rs`). |
 | `agentz_client` | A connection to a server, and starting a local one; `ssh.rs` reaches remote ones. |
 | `cloud` | Cloud providers' CLIs: finding each one, running it and reading what it prints (`proton.rs`, `ssh_config.rs`). |
+| `child_process` | Running a command for what it prints without waiting on its pipes past its exit, and giving it input in a file: see the pipe pitfall in `AGENTS.md`. Clippy forbids tokio's and smol's `output` and `wait_with_output` for it. |
 | `agent_thread` | One ACP connection and session: process, protocol, entries, permissions, requests for input (elicitations), config options, login (with an API key, a gateway, a browser or a terminal), the reported account, logout, reload, the per-turn hook; where a thread's images and uploaded files are kept (`attachments.rs`); ACP v2 under the SDK's v1 connection (`acp_v2.rs`). `test_support/mock_agent.py` is the scripted test agent. |
 | `projects` | `ProjectStore`: projects, threads (and subthread tasks), workspaces, scope, order, pins; `order_key.rs` is t3code's fractional order keys; `state.json`. |
 | `registry` | `AgentRegistryStore`: the ACP Registry, installs (binary archives, or npm), launch commands; `node_runtime.rs` finds or downloads Node.js. |
@@ -2379,8 +2380,8 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
   `refs/agentz/checkpoints/<machine>/<thread>/<turn>`. Turn 0 when the first turn starts, turn N
   when it ends, through `agent_thread`'s turn hook. Never touches branches or the user's index.
   Folders outside git get none. Git's output is read only 200 ms past its exit
-  (`git::OUTPUT_AFTER_EXIT`; see the pitfall in `AGENTS.md`), so a pipe another process holds
-  can't stall a checkpoint or a task's changes, and with them the task's result.
+  (`child_process`), so a pipe another process holds can't stall a checkpoint or a task's
+  changes, and with them the task's result.
 - **Terminal agents' turns** (`terminal_requests.rs`): an agent CLI in a terminal thread is
   checkpointed in the folder its shell is in, with turns read by agent detection: the baseline
   once the agent is seen or starts working, then a turn each time working ends. The thread
@@ -2498,7 +2499,10 @@ herdr's connection model, Zed's remote server mechanics, t3code's UI.
   `BatchMode` and a shared ControlMaster; `uname -sm`; the server uploaded to
   `~/.agentz/server/`, one path for every version as herdr's install is, since a server hands
   off to the binary at its own path (skipped when the SHA-256 matches; streamed in chunks with
-  its progress shown on the machine's row, and given up only when it stops moving for a minute); `proxy` over stdio. States:
+  its progress shown on the machine's row, and given up only when it stops moving for a
+  minute; the remote side takes the binary's size with `head -c` rather than reading to the
+  end of ssh's input); `proxy` over stdio, which ends with ssh's exit rather than its output's
+  end (`SshOutput`: see the pipe pitfall in `AGENTS.md`). States:
   Online, Reconnecting (backoff to 2 minutes), Attention (the error and the command to run).
 - **Stuck connections** (herdr's handshake deadlines, shared-connection recovery and wake
   recovery): the server's welcome must come within 5 seconds on this Mac and a minute over

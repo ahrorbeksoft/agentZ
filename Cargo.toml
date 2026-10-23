@@ -42,6 +42,7 @@ members = [
     "crates/agentz_protocol",
     "crates/agentz_server",
     "crates/app",
+    "crates/child_process",
     "crates/cloud",
     "crates/paths",
     "crates/projects",
@@ -72,6 +73,7 @@ agentz_protocol = { path = "crates/agentz_protocol" }
 agentz_server = { path = "crates/agentz_server" }
 assets = { path = "crates/assets" }
 bench_metrics = { path = "crates/bench_metrics" }
+child_process = { path = "crates/child_process" }
 cloud = { path = "crates/cloud" }
 collections = { path = "crates/collections", version = "0.1.0" }
 component = { path = "crates/component" }

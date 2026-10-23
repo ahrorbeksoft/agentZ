@@ -156,12 +156,13 @@ impl NodeRuntime {
 async fn system_node() -> Result<Node> {
     let node = find_program("node").context("system Node.js wasn't found on PATH")?;
     let npm = find_program("npm").context("system npm wasn't found on PATH")?;
-    let output = tokio::process::Command::new(&node)
-        .arg("--version")
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("running {}", node.display()))?;
+    let output = child_process::output(
+        tokio::process::Command::new(&node)
+            .arg("--version")
+            .kill_on_drop(true),
+    )
+    .await
+    .with_context(|| format!("running {}", node.display()))?;
     if !output.status.success() {
         bail!(
             "{} --version failed: {}",
@@ -272,12 +273,13 @@ async fn managed_node_runs(node: &Node) -> bool {
     if !node.exists() {
         return false;
     }
-    match tokio::process::Command::new(node.node_path())
-        .arg(managed_npm_cli(home))
-        .arg("--version")
-        .kill_on_drop(true)
-        .output()
-        .await
+    match child_process::output(
+        tokio::process::Command::new(node.node_path())
+            .arg(managed_npm_cli(home))
+            .arg("--version")
+            .kill_on_drop(true),
+    )
+    .await
     {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
@@ -385,11 +387,11 @@ ccc  node-v24.11.0-linux-x64.tar.gz
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project)?;
         std::fs::write(project.join("package.json"), "{\"private\": true}\n")?;
-        let output = node
-            .npm("install", &["is-number@7.0.0", "--no-fund", "--no-audit"])
-            .current_dir(&project)
-            .output()
-            .await?;
+        let output = child_process::output(
+            node.npm("install", &["is-number@7.0.0", "--no-fund", "--no-audit"])
+                .current_dir(&project),
+        )
+        .await?;
         assert!(
             output.status.success(),
             "{}",

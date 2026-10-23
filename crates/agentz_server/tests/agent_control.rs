@@ -195,13 +195,14 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
     // It returns at once, and the CLI reads its result once it has ended.
     let status = tokio::time::timeout(TIMEOUT, async {
         loop {
-            let output = tokio::process::Command::new(BRIDGE)
-                .args(["call", "task_status", &json!({"taskId": task}).to_string()])
-                .env("AGENTZ_SOCKET", &socket)
-                .env("AGENTZ_THREAD_ID", thread_id.0.to_string())
-                .output()
-                .await
-                .expect("run the CLI");
+            let output = child_process::output(
+                tokio::process::Command::new(BRIDGE)
+                    .args(["call", "task_status", &json!({"taskId": task}).to_string()])
+                    .env("AGENTZ_SOCKET", &socket)
+                    .env("AGENTZ_THREAD_ID", thread_id.0.to_string()),
+            )
+            .await
+            .expect("run the CLI");
             let status: Value = serde_json::from_slice(&output.stdout).expect("JSON");
             if status["status"] == json!("completed") {
                 return status;
@@ -214,17 +215,18 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
     assert_eq!(status["summary"], json!("Echo: delegated"));
 
     // A thread's agent can run the CLI from its shell with the environment it was given.
-    let output = tokio::process::Command::new(BRIDGE)
-        .args([
-            "call",
-            "agentz_thread_wait",
-            &json!({"threadId": worker}).to_string(),
-        ])
-        .env("AGENTZ_SOCKET", &socket)
-        .env("AGENTZ_THREAD_ID", thread_id.0.to_string())
-        .output()
-        .await
-        .expect("run the CLI");
+    let output = child_process::output(
+        tokio::process::Command::new(BRIDGE)
+            .args([
+                "call",
+                "agentz_thread_wait",
+                &json!({"threadId": worker}).to_string(),
+            ])
+            .env("AGENTZ_SOCKET", &socket)
+            .env("AGENTZ_THREAD_ID", thread_id.0.to_string()),
+    )
+    .await
+    .expect("run the CLI");
     assert!(
         output.status.success(),
         "{}",
@@ -234,13 +236,14 @@ async fn agents_call_tools_through_the_mcp_bridge_and_the_cli() {
     assert_eq!(waited["lastAgentMessage"], json!("Echo: from the bridge"));
 
     // Failures come back as tool errors, with a non-zero exit from the CLI.
-    let output = tokio::process::Command::new(BRIDGE)
-        .args(["call", "agentz_thread_read", r#"{"threadId": 999}"#])
-        .env("AGENTZ_SOCKET", &socket)
-        .env("AGENTZ_THREAD_ID", thread_id.0.to_string())
-        .output()
-        .await
-        .expect("run the CLI");
+    let output = child_process::output(
+        tokio::process::Command::new(BRIDGE)
+            .args(["call", "agentz_thread_read", r#"{"threadId": 999}"#])
+            .env("AGENTZ_SOCKET", &socket)
+            .env("AGENTZ_THREAD_ID", thread_id.0.to_string()),
+    )
+    .await
+    .expect("run the CLI");
     assert!(!output.status.success());
     let failure: Value = serde_json::from_slice(&output.stdout).expect("JSON");
     assert_eq!(failure["code"], json!("thread_not_found"));

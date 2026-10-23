@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 agentz_protocol.workspace = true
 anyhow.workspace = true
+child_process.workspace = true
 collections.workspace = true
 futures.workspace = true
 hex.workspace = true

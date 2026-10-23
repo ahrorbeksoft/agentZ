@@ -335,7 +335,7 @@ impl Cli {
             .insert("BROWSER".into(), open.to_string_lossy().into_owned());
         let mut command = account_command(program, &CLI_USAGE.map(String::from), &agent);
         command.current_dir(folder).stdin(Stdio::null());
-        let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
+        let output = tokio::time::timeout(CLI_TIMEOUT, child_process::output(&mut command))
             .await
             .map_err(|_| {
                 anyhow!(

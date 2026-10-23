@@ -7554,12 +7554,13 @@ impl TestClient {
 }
 
 async fn git(dir: &std::path::Path, args: &[&str]) -> String {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .expect("git runs");
+    let output = child_process::output(
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(dir),
+    )
+    .await
+    .expect("git runs");
     assert!(output.status.success(), "git {args:?} failed");
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -7580,9 +7581,7 @@ fn diff_files(diff: &ThreadDiff) -> Vec<(&str, FileChange, u32, u32)> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn turns_are_checkpointed_for_diffs() {
-    if tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
+    if child_process::output(tokio::process::Command::new("git").arg("--version"))
         .await
         .is_err()
     {
@@ -7742,9 +7741,7 @@ async fn wait_for_file(path: &std::path::Path) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn threads_work_in_worktrees_and_pastures() {
-    if tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
+    if child_process::output(tokio::process::Command::new("git").arg("--version"))
         .await
         .is_err()
     {
@@ -8139,9 +8136,7 @@ async fn threads_work_in_worktrees_and_pastures() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn threads_started_in_panes_work_in_any_folder() {
-    if tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
+    if child_process::output(tokio::process::Command::new("git").arg("--version"))
         .await
         .is_err()
     {
@@ -8714,9 +8709,7 @@ async fn terminal_threads_show_their_agents_state() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn terminal_agents_turns_are_checkpointed() {
-    if tokio::process::Command::new("git")
-        .arg("--version")
-        .output()
+    if child_process::output(tokio::process::Command::new("git").arg("--version"))
         .await
         .is_err()
     {

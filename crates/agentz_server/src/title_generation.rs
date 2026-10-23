@@ -13,7 +13,6 @@ use agentz_protocol::title_generation::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt as _;
 
 use crate::agent_settings::{read_json, write_json};
 
@@ -185,7 +184,8 @@ async fn codex_models(program: &Path, search_path: Option<&OsString>) -> Vec<Tit
     if let Some(search_path) = search_path {
         command.env("PATH", search_path);
     }
-    let listed = match tokio::time::timeout(MODELS_TIMEOUT, command.output()).await {
+    let output = child_process::output(&mut command);
+    let listed = match tokio::time::timeout(MODELS_TIMEOUT, output).await {
         Ok(Ok(output)) if output.status.success() => {
             parse_codex_models(&output.stdout).unwrap_or_default()
         }
@@ -232,7 +232,8 @@ async fn codex_mcp_servers(
     if let Some(search_path) = search_path {
         command.env("PATH", search_path);
     }
-    let failure = match tokio::time::timeout(MCP_LIST_TIMEOUT, command.output()).await {
+    let output = child_process::output(&mut command);
+    let failure = match tokio::time::timeout(MCP_LIST_TIMEOUT, output).await {
         Ok(Ok(output)) if output.status.success() => {
             match parse_codex_mcp_servers(&output.stdout) {
                 Some(servers) => return servers,
@@ -636,24 +637,20 @@ async fn run(
         }
         TitleProvider::Unknown(_) => return Err(anyhow!("unknown provider")),
     };
+    // In a file, whose end shows the CLI the prompt is all there.
+    let input = match stdin {
+        Some(prompt) => child_process::input(prompt.as_bytes())?,
+        None => Stdio::null(),
+    };
     command
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("running {}", program.display()))?;
-    if let (Some(prompt), Some(mut input)) = (stdin, child.stdin.take()) {
-        input.write_all(prompt.as_bytes()).await?;
-        // Closed, so the CLI knows the prompt is all there.
-        drop(input);
-    }
-    let output = tokio::time::timeout(GENERATION_TIMEOUT, child.wait_with_output())
+    let output = tokio::time::timeout(GENERATION_TIMEOUT, child_process::wait_with_output(child))
         .await
         .map_err(|_| anyhow!("{} timed out", program.display()))??;
     if !output.status.success() {

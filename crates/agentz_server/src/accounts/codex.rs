@@ -30,6 +30,8 @@ const CONSUME_REQUEST: u64 = 4;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// t3code gives the reset alone 20 seconds; the read after it comes in the same run.
 const RESET_TIMEOUT: Duration = Duration::from_secs(50);
+/// How long it has to quit once its answers are in, as Grok's reader gives it.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The limit every model counts against. Others, such as one model's own, come beside it.
 const MAIN_LIMIT: &str = "codex";
 const SESSION_MINUTES: u64 = 5 * 60;
@@ -170,13 +172,19 @@ impl AppServer {
             .context("asking Codex about the account")
     }
 
-    /// At the end of its input it quits.
+    /// At the end of its input it quits, or it's stopped: a process that inherited the
+    /// input's pipe can keep that end from it.
     async fn quit(self) -> Result<()> {
         let Self {
             mut child, input, ..
         } = self;
         drop(input);
-        child.wait().await.context("waiting for Codex to quit")?;
+        if tokio::time::timeout(QUIT_TIMEOUT, child.wait())
+            .await
+            .is_err()
+        {
+            child.kill().await.context("stopping Codex")?;
+        }
         Ok(())
     }
 }

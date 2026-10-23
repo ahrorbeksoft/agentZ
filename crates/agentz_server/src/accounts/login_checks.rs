@@ -96,7 +96,7 @@ pub(super) async fn run_with_account_env(
     command
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null());
-    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+    tokio::time::timeout(COMMAND_TIMEOUT, child_process::output(&mut command))
         .await
         .with_context(|| format!("{} didn't finish", program.display()))?
         .with_context(|| format!("running {}", program.display()))

@@ -144,11 +144,13 @@ async fn replaces_an_install_cut_short() {
     let binary = std::fs::read(env!("CARGO_BIN_EXE_agentz-server")).expect("reads the server");
     std::fs::write(installed.join("agentz-server"), &binary[..binary.len() / 2])
         .expect("writes half");
-    let hash = tokio::process::Command::new("shasum")
-        .args(["-a", "256", env!("CARGO_BIN_EXE_agentz-server")])
-        .output()
-        .await
-        .expect("hashes the server");
+    let hash = child_process::output(tokio::process::Command::new("shasum").args([
+        "-a",
+        "256",
+        env!("CARGO_BIN_EXE_agentz-server"),
+    ]))
+    .await
+    .expect("hashes the server");
     let hash = String::from_utf8(hash.stdout).expect("UTF-8");
     let hash = hash.split_whitespace().next().expect("a hash");
     std::fs::write(installed.join("agentz-server.sha256"), format!("{hash}\n"))

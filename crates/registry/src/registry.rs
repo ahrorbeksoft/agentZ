@@ -1056,15 +1056,15 @@ async fn install_npm_package(node: &Node, install_dir: &Path, package: &str) -> 
     }
     let mut last_error = None;
     for spec in specs {
-        let output = node
-            .npm(
+        let output = child_process::output(
+            node.npm(
                 "install",
                 &[spec.as_str(), "--save-exact", "--no-fund", "--no-audit"],
             )
-            .current_dir(install_dir)
-            .output()
-            .await
-            .context("running npm install")?;
+            .current_dir(install_dir),
+        )
+        .await
+        .context("running npm install")?;
         if output.status.success() {
             return Ok(());
         }

@@ -1,0 +1,20 @@
+[package]
+name = "child_process"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/child_process.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }

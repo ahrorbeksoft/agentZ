@@ -17,11 +17,10 @@ use std::time::Duration;
 use agentz_protocol::ClientKind;
 use agentz_protocol::cloud::{SshAddress, SshOptions};
 use anyhow::{Context as _, Result, anyhow, bail};
+use futures::channel::oneshot;
 use sha2::{Digest as _, Sha256};
-use tokio::io::{
-    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _,
-};
-use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::process::{ChildStdin, ChildStdout};
 
 use crate::{Connection, Events};
 
@@ -410,12 +409,7 @@ impl Ssh {
         mut command: tokio::process::Command,
         timeout: Duration,
     ) -> Result<std::process::Output> {
-        let output = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
+        let output = child_process::output(command.kill_on_drop(true));
         tokio::time::timeout(timeout, output)
             .await
             .map_err(|_| {
@@ -578,7 +572,7 @@ impl Ssh {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("running {}", self.program.display()))?;
-        let output = tokio::time::timeout(COMMAND_TIMEOUT, child.wait_with_output())
+        let output = tokio::time::timeout(COMMAND_TIMEOUT, child_process::wait_with_output(child))
             .await
             .map_err(|_| {
                 anyhow!(
@@ -623,14 +617,16 @@ impl Ssh {
         on_progress: &(dyn Fn(UploadProgress) + Send + Sync),
     ) -> Result<()> {
         let directory = INSTALL_DIRECTORY;
-        // `cat` ends the same way when ssh is cut off as when the upload is done, so what
-        // arrived is checked before it's put in place.
+        // `head -c` takes the binary's size, not waiting for the end of ssh's input, which a
+        // process that inherited the pipe here can keep from it. It ends the same way when ssh
+        // is cut off as when the upload is done, so what arrived is checked before it's put in
+        // place.
         let script = format!(
             "set -eu\n\
              dir={directory}\n\
              mkdir -p \"$dir\"\n\
              tmp=\"$dir/agentz-server.tmp.$$\"\n\
-             cat > \"$tmp\"\n\
+             head -c {size} > \"$tmp\"\n\
              size=$(wc -c < \"$tmp\" | tr -d ' ')\n\
              if [ \"$size\" != {size} ]; then\n\
                rm -f \"$tmp\"\n\
@@ -663,7 +659,7 @@ impl Ssh {
             .spawn()
             .with_context(|| format!("running {}", self.program.display()))?;
         let mut stdin = child.stdin.take().context("ssh has no stdin")?;
-        let output = child.wait_with_output();
+        let output = child_process::wait_with_output(child);
         futures::pin_mut!(output);
         let total = binary.len() as u64;
         let upload = async {
@@ -716,7 +712,19 @@ impl Ssh {
         let stdin = child.stdin.take().context("ssh's stdin")?;
         let stdout = child.stdout.take().context("ssh's stdout")?;
         let mut stderr = child.stderr.take().context("ssh's stderr")?;
-        let mut reader = tokio::io::BufReader::new(stdout);
+        // Its exit is watched beside its output, whose end can come long after it, or never,
+        // when a process that inherited the pipe holds it open. Dropping the watch kills ssh
+        // (`kill_on_drop`).
+        let (exited, exit) = oneshot::channel();
+        let watch = AbortOnDrop(tokio::spawn(async move {
+            exited.send(child.wait().await).ok();
+        }));
+        let mut reader = tokio::io::BufReader::new(SshOutput {
+            pipe: stdout,
+            exit: Some(exit),
+            status: None,
+            ends_at: None,
+        });
         let ready = tokio::time::timeout(PROXY_READY_TIMEOUT, async {
             let mut line = Vec::new();
             loop {
@@ -734,24 +742,19 @@ impl Ssh {
         .await
         .map_err(|_| anyhow!("ssh {} didn't start the proxy in time", self.target))??;
         if !ready {
-            let mut error = Vec::new();
-            (&mut stderr)
-                .take(STDERR_LIMIT as u64)
-                .read_to_end(&mut error)
-                .await
-                .ok();
-            let status = child.wait().await.context("waiting for ssh")?;
+            let error = child_process::read_rest(&mut stderr, STDERR_LIMIT).await;
+            let status = reader.get_mut().exit_status().await?;
             bail!("{}", failure_message(&status, &error));
         }
         let target = self.target.clone();
-        tokio::spawn(async move {
+        let log = AbortOnDrop(tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 log::warn!("ssh {target}: {line}");
             }
-        });
+        }));
         Ok(SshStream {
-            _child: child,
+            _tasks: [watch, log],
             reader,
             writer: stdin,
         })
@@ -886,13 +889,11 @@ impl Ssh {
             .arg(format!("ControlPath={}", control_path.display()))
             .args(["-O", operation, "-L", &forward.specification()]);
         self.destination(&mut command);
-        let output = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("SSH_ASKPASS_REQUIRE", "never")
-            .kill_on_drop(true)
-            .output();
+        let output = child_process::output(
+            command
+                .env("SSH_ASKPASS_REQUIRE", "never")
+                .kill_on_drop(true),
+        );
         let output = tokio::time::timeout(COMMAND_TIMEOUT, output)
             .await
             .map_err(|_| anyhow!("ssh {} didn't answer in time", self.target))?
@@ -1176,9 +1177,75 @@ impl Drop for PinnedControlSocket {
 
 /// The proxy's stdout and stdin as one stream. ssh is killed when it's dropped.
 struct SshStream {
-    _child: Child,
-    reader: tokio::io::BufReader<ChildStdout>,
+    /// ssh's exit watch, which holds ssh, and its error log.
+    _tasks: [AbortOnDrop; 2],
+    reader: tokio::io::BufReader<SshOutput>,
     writer: ChildStdin,
+}
+
+/// Stops a task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// ssh's output, which ends once ssh has exited and what it printed has been read, though a
+/// process that inherited the pipe holds it open.
+struct SshOutput {
+    pipe: ChildStdout,
+    exit: Option<oneshot::Receiver<std::io::Result<std::process::ExitStatus>>>,
+    status: Option<std::io::Result<std::process::ExitStatus>>,
+    /// From ssh's exit, when what it printed has all arrived.
+    ends_at: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl SshOutput {
+    fn poll_exit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(exit) = &mut self.exit {
+            let Poll::Ready(exited) = Pin::new(exit).poll(cx) else {
+                return Poll::Pending;
+            };
+            self.exit = None;
+            self.status = Some(exited.unwrap_or_else(|_| Err(std::io::Error::other("unwatched"))));
+            self.ends_at = Some(Box::pin(tokio::time::sleep(
+                child_process::OUTPUT_AFTER_EXIT,
+            )));
+        }
+        Poll::Ready(())
+    }
+
+    /// How ssh exited, once it has.
+    async fn exit_status(&mut self) -> Result<std::process::ExitStatus> {
+        std::future::poll_fn(|cx| self.poll_exit(cx)).await;
+        match self.status.take() {
+            Some(status) => status.context("waiting for ssh"),
+            None => bail!("ssh's exit was read already"),
+        }
+    }
+}
+
+impl AsyncRead for SshOutput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if let Poll::Ready(read) = Pin::new(&mut this.pipe).poll_read(cx, buf) {
+            return Poll::Ready(read);
+        }
+        if this.poll_exit(cx).is_pending() {
+            return Poll::Pending;
+        }
+        // Nothing read past that is ssh's: its end.
+        match &mut this.ends_at {
+            Some(ends_at) => ends_at.as_mut().poll(cx).map(Ok),
+            None => Poll::Ready(Ok(())),
+        }
+    }
 }
 
 impl AsyncRead for SshStream {
@@ -1504,5 +1571,62 @@ esac
             prepare_with(scratch.path(), "no-master", BROKEN_MASTER, LOCKED, false).await;
         assert!(prepared.expect("checks"));
         assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    /// A stand-in for `ssh` running `script`, which leaves a process holding its output open,
+    /// as one started at the same moment elsewhere in the app can.
+    fn ssh_leaving_its_output_open(scratch: &Path, script: &str) -> Ssh {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let program = scratch.join("ssh");
+        std::fs::write(&program, format!("#!/bin/sh\nsleep 5 &\n{script}\n"))
+            .expect("writes the fake ssh");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        Ssh::with_program(program, "devbox").expect("valid target")
+    }
+
+    /// The proxy's stream ends with ssh, though a process holds its output open.
+    #[tokio::test]
+    async fn the_proxy_ends_with_ssh() {
+        use tokio::io::AsyncReadExt as _;
+
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let ssh = ssh_leaving_its_output_open(
+            scratch.path(),
+            &format!("echo {OUTPUT_READY_MARKER}\necho more"),
+        );
+        let started = std::time::Instant::now();
+        let mut stream = ssh.proxy().await.expect("starts the proxy");
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).await.expect("reads");
+        assert_eq!(rest, b"more\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// ssh failing to start the proxy says why at once, though a process holds its output open.
+    #[tokio::test]
+    async fn a_proxy_that_fails_to_start_says_why_at_once() {
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let ssh = ssh_leaving_its_output_open(
+            scratch.path(),
+            "echo 'me@devbox: Permission denied (publickey).' >&2\nexit 255",
+        );
+        let started = std::time::Instant::now();
+        let Err(error) = ssh.proxy().await else {
+            panic!("the proxy started");
+        };
+        assert!(
+            format!("{error:#}").contains("Permission denied"),
+            "{error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

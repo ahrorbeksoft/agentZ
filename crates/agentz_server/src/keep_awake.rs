@@ -12,13 +12,14 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use futures::channel::oneshot;
-use tokio::io::AsyncReadExt as _;
 use util::ResultExt as _;
 
 /// Zed's reason, which `systemd-inhibit --list` shows.
 const REASON: &str = "Agent thread in progress";
 /// How long a released command has to end once its pipe closes, before it's killed.
 const RELEASE_GRACE: Duration = Duration::from_secs(5);
+/// How much of the hold's error is kept, when it ends by itself.
+const STDERR_LIMIT: usize = 16 * 1024;
 
 /// A command that keeps the machine awake while it runs, and ends once its stdin closes.
 #[derive(Clone, Debug)]
@@ -161,11 +162,15 @@ async fn hold(command: KeepAwakeCommand, released: oneshot::Receiver<()>) -> Res
         status = child.wait() => {
             // Its `cat`, if it got that far, holds the error output open until this closes.
             drop(pipe);
-            let mut output = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                stderr.read_to_string(&mut output).await.log_err();
-            }
-            bail!("it ended ({}): {}", status?, output.trim())
+            let output = match child.stderr.take() {
+                Some(mut stderr) => child_process::read_rest(&mut stderr, STDERR_LIMIT).await,
+                None => Vec::new(),
+            };
+            bail!(
+                "it ended ({}): {}",
+                status?,
+                String::from_utf8_lossy(&output).trim()
+            )
         }
     }
 }

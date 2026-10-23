@@ -66,9 +66,9 @@ installed: `{"mock": {"name": "Mock", "command": {"path": "/usr/bin/python3", "a
   ```sh
   cargo fmt --all
   cargo clippy -p app -p agent_thread -p projects -p registry -p text_input -p agentz_protocol \
-    -p agentz_server -p agentz_client -p cloud --all-targets
+    -p agentz_server -p agentz_client -p cloud -p child_process --all-targets
   cargo test -p app -p agent_thread -p projects -p registry -p agentz_protocol -p agentz_server \
-    -p agentz_client -p cloud
+    -p agentz_client -p cloud -p child_process
   ```
   `cargo clippy --workspace` fails on a gpui example that needs an unported crate; that's
   expected.
@@ -313,11 +313,13 @@ From Zed's guidelines, which this code follows:
   (`ServerWelcome::build`), and the app compares it with the installed one.
 - **On macOS a pipe can outlive its process.** Without `pipe2`, Rust makes a pipe
   close-on-exec only after creating it, so a process another thread starts meanwhile (an
-  agent) inherits its end and holds it open for as long as it runs. Waiting for the output's
-  end (`Command::output`) then hangs long after the command exited: a `git rev-parse` reading
-  a task's changes hung, and the task's parent never heard of its end. Read output only
-  briefly past the exit, as `git.rs` and `agentz_command_run` do; the other `output()` calls
-  rely on their timeouts.
+  agent, a terminal's shell, an `ssh`) inherits its end and holds it open for as long as it
+  runs. Waiting for the end of a command's output then hangs long after the command exited (a
+  `git rev-parse` reading a task's changes hung, and the task's parent never heard of its
+  end), and a command reading its input to the end never sees the end of a pipe we closed.
+  Run commands for their output with `child_process` (clippy forbids `output` and
+  `wait_with_output`), give a command what it reads to the end with `child_process::input`,
+  and end a long-running child's stream with its exit, as the SSH proxy's does.
 - **A server started from an account's agent inherits the account's folder.** That agent runs
   with its home variable (Droid's `FACTORY_HOME_OVERRIDE`) set to `accounts/<agent>/<id>/`, and
   one that relaunched the app with `open` passed it to every server after. External threads

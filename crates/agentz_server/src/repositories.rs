@@ -52,10 +52,13 @@ pub(crate) async fn resolve(path: PathBuf) -> Result<Option<RepositoryIdentity>>
 /// What git printed, or `None` when it answered with a failure, as it does outside a
 /// repository.
 async fn git(cwd: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = tokio::time::timeout(GIT_TIMEOUT, crate::git::command(cwd, args, &[]).output())
-        .await
-        .map_err(|_| anyhow!("git {} took over {GIT_TIMEOUT:?}", args.join(" ")))?
-        .context("running git")?;
+    let output = tokio::time::timeout(
+        GIT_TIMEOUT,
+        child_process::output(&mut crate::git::command(cwd, args, &[])),
+    )
+    .await
+    .map_err(|_| anyhow!("git {} took over {GIT_TIMEOUT:?}", args.join(" ")))?
+    .context("running git")?;
     match output.status.code() {
         Some(0) => Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned())),
         Some(_) => Ok(None),
