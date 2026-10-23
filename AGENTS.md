@@ -311,6 +311,13 @@ From Zed's guidelines, which this code follows:
 - **A running server outlives its binary.** Installing renames the new binary into place, so an
   older server keeps running; it reports the hash beside its executable at start
   (`ServerWelcome::build`), and the app compares it with the installed one.
+- **On macOS a pipe can outlive its process.** Without `pipe2`, Rust makes a pipe
+  close-on-exec only after creating it, so a process another thread starts meanwhile (an
+  agent) inherits its end and holds it open for as long as it runs. Waiting for the output's
+  end (`Command::output`) then hangs long after the command exited: a `git rev-parse` reading
+  a task's changes hung, and the task's parent never heard of its end. Read output only
+  briefly past the exit, as `git.rs` and `agentz_command_run` do; the other `output()` calls
+  rely on their timeouts.
 - **A server started from an account's agent inherits the account's folder.** That agent runs
   with its home variable (Droid's `FACTORY_HOME_OVERRIDE`) set to `accounts/<agent>/<id>/`, and
   one that relaunched the app with `open` passed it to every server after. External threads

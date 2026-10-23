@@ -2374,7 +2374,9 @@ t3code's checkpoints (`apps/server/src/checkpointing/`).
 - **Checkpoints** (`checkpoints.rs`): a commit of the whole tree with a private index, under
   `refs/agentz/checkpoints/<machine>/<thread>/<turn>`. Turn 0 when the first turn starts, turn N
   when it ends, through `agent_thread`'s turn hook. Never touches branches or the user's index.
-  Folders outside git get none.
+  Folders outside git get none. Git's output is read only 200 ms past its exit
+  (`git::OUTPUT_AFTER_EXIT`; see the pitfall in `AGENTS.md`), so a pipe another process holds
+  can't stall a checkpoint or a task's changes, and with them the task's result.
 - **Terminal agents' turns** (`terminal_requests.rs`): an agent CLI in a terminal thread is
   checkpointed in the folder its shell is in, with turns read by agent detection: the baseline
   once the agent is seen or starts working, then a turn each time working ends. The thread
