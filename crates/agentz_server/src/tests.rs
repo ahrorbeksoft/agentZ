@@ -6143,6 +6143,7 @@ async fn a_roles_task_runs_on_the_users_picks() {
     client.wait_until_ready(parent).await;
     let pick = |agent: &str| agentz_protocol::subthread_roles::RolePick {
         agent: AgentId::new(agent),
+        accounts: None,
         model: None,
         effort: None,
     };
@@ -6211,6 +6212,100 @@ async fn a_roles_task_runs_on_the_users_picks() {
             .and_then(|thread| thread.account),
         None
     );
+}
+
+/// A role's pick may keep to some of its agent's accounts. With the switch for usage on, the
+/// one with the most to spare runs the task; off, the first in order with usage left does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_roles_task_takes_the_most_usage_or_the_first_with_some() {
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let read = |used_percent: u32| {
+        json!({
+            "status": {"windows": [{
+                "label": "5-hour",
+                "used_percent": used_percent,
+                "resets_at": {"secs_since_epoch": now + 3600, "nanos_since_epoch": 0},
+                "length": {"secs": 5 * 3600, "nanos": 0},
+            }]},
+            "read_at": {"secs_since_epoch": now, "nanos_since_epoch": 0},
+        })
+    };
+    let agents = data_dir.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("create agents");
+    std::fs::write(
+        agents.join("accounts.json"),
+        json!({"mock": {
+            "accounts": [
+                {"id": 1, "logged_in": true, "status": read(100)},
+                {"id": 2, "logged_in": true, "status": read(60)},
+                {"id": 3, "logged_in": true, "status": read(10)},
+            ],
+            "last_id": 3,
+        }})
+        .to_string(),
+    )
+    .expect("write accounts.json");
+    for id in 1..=3 {
+        account_home(data_dir.path(), AccountId(id));
+    }
+    let Some(server) = TestServer::start_with(data_dir, tempfile::tempdir().expect("temp dir"))
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+    let chosen = vec![Some(AccountId(1)), Some(AccountId(2)), Some(AccountId(3))];
+    for (by_usage, expected, why) in [
+        (
+            true,
+            AccountId(3),
+            "the most to spare, not the External account, which isn't chosen",
+        ),
+        (
+            false,
+            AccountId(2),
+            "the first in order with usage left, past the used-up one",
+        ),
+    ] {
+        client
+            .ok(Request::SetSubthreadRoles(
+                agentz_protocol::subthread_roles::SubthreadRoles {
+                    worker: vec![agentz_protocol::subthread_roles::RolePick {
+                        agent: AgentId::new("mock"),
+                        accounts: Some(chosen.clone()),
+                        model: None,
+                        effort: None,
+                    }],
+                    by_usage,
+                    ..Default::default()
+                },
+            ))
+            .await;
+        let delegated = client
+            .tool(
+                parent,
+                "delegate_task",
+                json!({"task": "hello", "role": "worker"}),
+            )
+            .await;
+        assert_eq!(
+            client
+                .project_thread(task_id(&delegated))
+                .and_then(|thread| thread.account),
+            Some(expected),
+            "{why}"
+        );
+    }
 }
 
 /// A parent can hand a hundred tasks to subthreads in one call, which run a few at a time and

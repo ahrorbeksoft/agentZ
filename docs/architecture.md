@@ -213,7 +213,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › Threads), a number or null |
 | `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › Subthreads › Subthreads at once), a number |
-| `subthread-roles.json` | server | What each role of delegated task runs on (researcher, reviewer, worker, other): the user's picks of agent, model and effort, in the order to try |
+| `subthread-roles.json` | server | What each role of delegated task runs on (researcher, reviewer, worker, other): the user's picks of agent, accounts, model and effort, in the order added, and whether to choose by usage |
 | `acp-v2.json` | server | Whether agents are asked for ACP v2 (Settings › General › Experimental › ACP v2), true or false |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
@@ -493,7 +493,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   picture behind the window, and Zed's Reduce motion), Notifications (sounds and system
   notifications, see Attention states). Threads: Threads (order, sending, thinking, the
   Working group, auto-archive, the composer's usage window, and Chats), Subthreads
-  (Subthreads at once and the roles), Thread titles (its machine picker in the header, as
+  (Subthreads at once, and the roles: `settings_page/subthread_roles.rs`, see Subthreads),
+  Thread titles (its machine picker in the header, as
   Agents has) and Artifacts. Agents: Agents, Usage, Skills, MCP Servers. Machines: Machines,
   Storage. Then Projects, a page per project (below). As in Zed's settings, a page is a `list` of its header and sections
   (`SettingsPage::render_content_list`, `ContentRow`), and an agent's account cards and lines
@@ -2136,19 +2137,28 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   `capability_denied` otherwise).
 - **Roles** (`server/subthread_roles.rs`, `agentz_protocol::subthread_roles`): a task is a
   researcher's, reviewer's, worker's or other's (`role`, other when not given). The user
-  picks what each role runs on, an ordered list of agent, model and effort
-  (`SubthreadRoles`, `Request::SetSubthreadRoles`, the app's setting given to every server),
-  and agents see the picks in `orchestrator_capabilities` (`roles`). A task that names no
-  agent, account or model runs on the first pick with an account to spare
-  (`choose_for_role`): installed, logged in, not used up, and offering the model; of the
-  agent's accounts, the one whose usage would go to waste soonest
-  (`accounts::spare_per_hour`: what the pace projects to be left at each window's reset, as
-  far as its other windows allow, per hour until it; 60% left resetting in an hour before 80%
-  left resetting in 6 days), then the one for new threads. Vendors' limits can't be
-  compared, so the list orders the agents. With none to spare, the call fails
-  (`role_unavailable`) saying why, each pick in turn. A task on another machine is left to
-  that machine's picks, where its accounts are. A role without picks is left to the agent,
-  as is a task that names its own agent, account or model (the user asked for other agents).
+  picks what each role runs on, a list of agent, accounts (All, or some), model and effort
+  in the order added (`SubthreadRoles`, `RolePick`, `Request::SetSubthreadRoles`, the app's
+  setting given to every server), and agents see the picks in `orchestrator_capabilities`
+  (`roles`). A task that names no agent, account or model runs on one of the accounts its
+  role's picks may use (`choose_for_role`): installed, logged in, not used up, offering the
+  pick's model, and among the pick's accounts. With Choose by usage on (`by_usage`, the
+  default), the one with the most usage to spare, across every pick: the one whose usage
+  would go to waste soonest (`accounts::spare_per_hour`: what the pace projects to be left
+  at each window's reset, as far as its other windows allow, per hour until it; 60% left
+  resetting in an hour before 80% left resetting in 6 days), ties going to the earlier pick,
+  then the account for new threads. Off, the first in order with usage left. With none, the
+  call fails (`role_unavailable`) saying why, each pick in turn. A task on another machine is
+  left to that machine's picks, where its accounts are: the app sends other machines the
+  picks with All accounts, since the accounts chosen are This Mac's
+  (`machines::sync_subthread_roles`). A role without picks is left to the agent, as is a task
+  that names its own agent, account or model (the user asked for other agents).
+- **Settings › Subthreads' Roles** (`settings_page/subthread_roles.rs`, `design/settings-2`
+  topic 4 D): the Choose by usage switch, then a row per role with its picks as chips
+  ("Claude Agent (Work) · Sonnet 5.5 · High"), dragged to reorder, and + for a menu of the
+  agents installed on any machine. A chip's menu (kept open while its checks change) has the
+  agent, This Mac's accounts (All, or some, at least one) when it has more than one, the model
+  and effort from the account's known options (or another machine's), and Remove.
 - **Ending the turn**: `delegate_task` and `delegate_tasks` return at once, with a `note`
   telling the agent to end its turn: the end of each task reaches it as a message. There's no
   blocking wait; `agentz_thread_wait` on one's own task answers at once with its status and

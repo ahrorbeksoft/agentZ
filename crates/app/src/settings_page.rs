@@ -10,6 +10,7 @@ mod mcp_servers;
 mod new_cloud_machine;
 mod skills;
 mod storage;
+mod subthread_roles;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1145,11 +1146,10 @@ impl SettingsPage {
 
     /// How subthreads run: how many at once, and what each role runs on.
     fn render_subthreads(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        vec![render_section(
-            "Subthreads",
-            vec![self.render_subthread_limit_row(cx)],
-            cx,
-        )]
+        vec![
+            render_section("Subthreads", vec![self.render_subthread_limit_row(cx)], cx),
+            self.render_roles_section(cx),
+        ]
     }
 
     /// What a publish opens, and the design defaults given to agents.
@@ -11909,7 +11909,7 @@ mod tests {
 
     /// This Mac with two checkouts of one repository and a folder, and Devbox 1 with a third
     /// checkout and a folder of its own.
-    fn machines_with_copies(
+    pub(super) fn machines_with_copies(
         cx: &mut TestAppContext,
     ) -> (Entity<ServerClient>, Entity<ServerClient>) {
         cx.update(|cx| {

@@ -1,6 +1,7 @@
 //! What each role of delegated task runs on (`Request::SetSubthreadRoles`): the user's picks of
-//! agent, model and effort, tried in order, and within a pick's agent the account with the most
-//! usage to spare. The setting is the app's; the server keeps its own copy so tasks delegated
+//! agent, accounts, model and effort. Of every account the role's picks may use, the one with
+//! the most usage to spare runs the task, or, with the user's switch off, the first in order
+//! with usage left. The setting is the app's; the server keeps its own copy so tasks delegated
 //! while the app is closed keep to it.
 
 use std::path::{Path, PathBuf};
@@ -32,6 +33,15 @@ pub(super) struct RoleChoice {
 /// Why none of a role's picks could run its task, one line each, for the agent that delegated.
 pub(super) struct RoleUnavailable(pub Vec<String>);
 
+/// One of a pick's accounts that can run a task now.
+struct UsableAccount {
+    /// `None` is the External account.
+    account: Option<AccountId>,
+    spare: Option<f64>,
+    /// The agent's account for new threads.
+    is_default: bool,
+}
+
 impl Server {
     pub(super) fn set_subthread_roles(&mut self, roles: SubthreadRoles) -> Result<()> {
         if roles == self.subthread_roles {
@@ -42,10 +52,12 @@ impl Server {
         Ok(())
     }
 
-    /// The first of the role's picks with an account to run it: installed here, logged in,
-    /// not used up, and offering the pick's model. Of a pick's agent's accounts, the one with
-    /// the most usage to spare ([`spare_per_hour`]), then the one for new threads. `None` when
-    /// the role has no picks, so the delegating agent chooses.
+    /// The pick and account a role's task runs on. Every pick's accounts that can run it count:
+    /// installed here, logged in, not used up, offering the pick's model, and among the pick's
+    /// accounts. Of those, the one with the most usage to spare ([`spare_per_hour`]), ties
+    /// going to the earlier pick, then the account for new threads; with
+    /// [`SubthreadRoles::by_usage`] off, the first in order. `None` when the role has no
+    /// picks, so the delegating agent chooses.
     pub(super) fn choose_for_role(
         &self,
         role: TaskRole,
@@ -57,7 +69,8 @@ impl Server {
         let now = SystemTime::now();
         let registry = self.registry_snapshot();
         let mut reasons = Vec::new();
-        for pick in picks {
+        let mut candidates = Vec::new();
+        for (place, pick) in picks.iter().enumerate() {
             let name = self.agent_name(&pick.agent).to_string();
             if !matches!(
                 registry.install_state(&pick.agent),
@@ -66,34 +79,58 @@ impl Server {
                 reasons.push(format!("{name} isn't installed on this machine."));
                 continue;
             }
-            match self.account_to_spare(&pick.agent, pick.model.as_deref(), now) {
-                Ok(account) => {
-                    return Some(Ok(RoleChoice {
-                        pick: pick.clone(),
-                        account,
-                    }));
+            match self.usable_accounts(pick, now) {
+                Ok(accounts) => {
+                    candidates.extend(accounts.into_iter().map(|account| (place, account)))
                 }
                 Err(reason) => reasons.push(format!("{name}: {reason}")),
             }
         }
-        Some(Err(RoleUnavailable(reasons)))
+        if self.subthread_roles.by_usage {
+            // Known spare first, the most first; then the order they're listed in, with the
+            // agent's account for new threads first among its own.
+            candidates.sort_by(|(a_place, a), (b_place, b)| {
+                b.spare
+                    .is_some()
+                    .cmp(&a.spare.is_some())
+                    .then(b.spare.unwrap_or(0.).total_cmp(&a.spare.unwrap_or(0.)))
+                    .then(a_place.cmp(b_place))
+                    .then(b.is_default.cmp(&a.is_default))
+            });
+        }
+        match candidates.first() {
+            Some((place, usable)) => Some(Ok(RoleChoice {
+                pick: picks[*place].clone(),
+                account: usable.account,
+            })),
+            None => Some(Err(RoleUnavailable(reasons))),
+        }
     }
 
-    /// The agent's account with the most usage to spare that can run `model`, or why none
-    /// can.
-    fn account_to_spare(
+    /// The pick's accounts that can run its task, in the order the agent lists them, or why
+    /// none can.
+    fn usable_accounts(
         &self,
-        agent: &AgentId,
-        model: Option<&str>,
+        pick: &RolePick,
         now: SystemTime,
-    ) -> Result<Option<AccountId>, String> {
+    ) -> Result<Vec<UsableAccount>, String> {
+        let agent = &pick.agent;
+        let model = pick.model.as_deref();
         let accounts = self.accounts.get(agent);
         let default = accounts.new_thread_account();
-        let listed = accounts.listed();
-        let mut candidates = Vec::new();
+        let considered: Vec<Option<AccountId>> = accounts
+            .listed()
+            .into_iter()
+            .filter(|account| {
+                pick.accounts
+                    .as_ref()
+                    .is_none_or(|chosen| chosen.contains(account))
+            })
+            .collect();
+        let mut usable = Vec::new();
         let mut used_up = 0;
         let mut without_model = 0;
-        for (order, account) in listed.iter().copied().enumerate() {
+        for account in considered.iter().copied() {
             if accounts.logged_in(account) == Some(false) {
                 continue;
             }
@@ -111,27 +148,28 @@ impl Server {
                 without_model += 1;
                 continue;
             }
-            let spare = spare_per_hour(windows, now);
-            candidates.push((spare, account == default, order, account));
+            usable.push(UsableAccount {
+                account,
+                spare: spare_per_hour(windows, now),
+                is_default: account == default,
+            });
         }
-        // Known spare first, the most first; then the account for new threads, then the order
-        // they're listed in.
-        candidates.sort_by(|a, b| {
-            b.0.is_some()
-                .cmp(&a.0.is_some())
-                .then(b.0.unwrap_or(0.).total_cmp(&a.0.unwrap_or(0.)))
-                .then(b.1.cmp(&a.1))
-                .then(a.2.cmp(&b.2))
-        });
-        if let Some((_, _, _, account)) = candidates.first() {
-            return Ok(*account);
+        if !usable.is_empty() {
+            return Ok(usable);
         }
-        Err(if used_up > 0 && used_up + without_model == listed.len() {
-            "every account is used up until its limit resets.".to_string()
-        } else if without_model > 0 {
-            format!("no logged-in account offers {}.", model.unwrap_or_default())
+        let which = if pick.accounts.is_some() {
+            "of the accounts chosen for it"
         } else {
-            "no account is logged in.".to_string()
+            "account"
+        };
+        Err(if considered.is_empty() {
+            "the accounts chosen for it are gone.".to_string()
+        } else if used_up > 0 && used_up + without_model == considered.len() {
+            format!("every {which} is used up until its limit resets.")
+        } else if without_model > 0 {
+            format!("no logged-in {which} offers {}.", model.unwrap_or_default())
+        } else {
+            format!("no {which} is logged in.")
         })
     }
 

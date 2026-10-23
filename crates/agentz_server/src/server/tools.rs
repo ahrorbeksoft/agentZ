@@ -1115,10 +1115,10 @@ impl Server {
             })
             .collect();
         json!({
-            "note": "Delegate by role. A role with picks runs its tasks on the first pick with \
-                     an account to spare, chosen for the user, so leave agentId, account and \
-                     model out for it unless the user asked for other agents. A role with no \
-                     picks is left to you.",
+            "note": "Delegate by role. A role with picks runs its tasks on one of them, with an \
+                     account that has usage left, chosen for the user, so leave agentId, \
+                     account and model out for it unless the user asked for other agents. A \
+                     role with no picks is left to you.",
             "picks": roles,
         })
     }

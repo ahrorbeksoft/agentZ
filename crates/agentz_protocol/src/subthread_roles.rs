@@ -1,11 +1,14 @@
 //! What each kind of delegated task runs on (Settings › Subthreads): the four roles
-//! agents delegate by, each with the user's picks of agent, model and effort in the order to
-//! try them. Agents see the picks (`orchestrator_capabilities`) and name an agent or model only
-//! when a role has none, or when the user asked for other agents. Within a pick's agent, the
-//! account is chosen for the user ([`crate::accounts::spare_per_hour`]).
+//! agents delegate by, each with the user's picks of agent, accounts, model and effort in the
+//! order they were added. Agents see the picks (`orchestrator_capabilities`) and name an agent
+//! or model only when a role has none, or when the user asked for other agents. Of the picks'
+//! accounts, the one with the most usage to spare runs the task
+//! ([`crate::accounts::spare_per_hour`]), or with [`SubthreadRoles::by_usage`] off, the first
+//! in order with usage left.
 
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::AccountId;
 use crate::agents::AgentId;
 
 /// The kind of work a delegated task is. A task the parent gives no role is [`Self::Other`].
@@ -42,15 +45,31 @@ impl TaskRole {
     }
 }
 
-/// The user's picks for each role, in the order to try them: the first whose agent has an
-/// account to spare runs the task. An empty list leaves the role to the agent that delegates.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// The user's picks for each role, in the order they were added. An empty list leaves the role
+/// to the agent that delegates.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubthreadRoles {
     pub researcher: Vec<RolePick>,
     pub reviewer: Vec<RolePick>,
     pub worker: Vec<RolePick>,
     pub other: Vec<RolePick>,
+    /// Of every account a role's picks may use, the one with the most usage to spare runs its
+    /// task. Off, the picks and their accounts are tried in order, and the first with usage
+    /// left runs it.
+    pub by_usage: bool,
+}
+
+impl Default for SubthreadRoles {
+    fn default() -> Self {
+        Self {
+            researcher: Vec::new(),
+            reviewer: Vec::new(),
+            worker: Vec::new(),
+            other: Vec::new(),
+            by_usage: true,
+        }
+    }
 }
 
 impl SubthreadRoles {
@@ -73,10 +92,16 @@ impl SubthreadRoles {
     }
 }
 
-/// One choice for a role: an agent, and the model and effort to run it with.
+/// One choice for a role: an agent, which of its accounts, and the model and effort to run it
+/// with.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RolePick {
     pub agent: AgentId,
+    /// The accounts it may run on, `None` in the list being the External account; `None` is
+    /// all of them. They're tried in the order the agent lists them. Accounts are each
+    /// machine's, so only This Mac's server is sent the user's choice; others use all of theirs.
+    #[serde(default)]
+    pub accounts: Option<Vec<Option<AccountId>>>,
     /// The model's value, as the agent's model setting names it. `None` is the account's
     /// default model.
     #[serde(default)]

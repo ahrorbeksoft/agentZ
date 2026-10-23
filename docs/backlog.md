@@ -61,54 +61,6 @@ be buttons like that at all, maybe there should; to be decided.
 
 On the design board: `design/subthreads-3/`.
 
-### Subthread templates per role, on the account with the most to spare
-
-Requested October 23, 2026: "we have subthreads, but now agents choose the models themselves,
-but i am thinking why not let users choose subthread templates like idk, they choose workers,
-researchers etc per agent provider and we also introduce clever selction that (idk some kinda
-system that chooses the agent/acount with the most usage for the selected subthread type or
-something idk". Agreed in the conversation that followed:
-
-Then, on the roles: "we have research, review, worker, and other. users should be able choose
-for these. no agent overrides, agents see these availabe ones and use them if not or asked other
-agents to do things they use those", and "call them better, researcher, reviewer, worker and
-other".
-
-- **Four roles: researcher, reviewer, worker and other.** They replace today's six
-  (implementation, research, review, design, test, general: `TASK_ROLES` in
-  `server/tools.rs`), which are only a label on the task's message. A task the parent gives no
-  role is other.
-- **The user picks what each role runs on**, per role and not per agent: an ordered list of
-  agent and model (and effort or mode), e.g. Researcher: Codex · gpt-5 · high, then Claude ·
-  Sonnet.
-- **No agent overrides.** Agents see the four roles and the user's picks for them
-  (`orchestrator_capabilities`), and delegate by role. They name an agent or model themselves
-  only when the role has no pick, or when the user asked for other agents to do the work; then
-  they use those. (That's my reading of "use them if not or asked other agents to do things
-  they use those".)
-- **The account is picked for the user, the agent isn't.** Vendors' limits can't be compared
-  (Claude's 40% left isn't Codex's), so the role's list orders the agents. Within an agent,
-  skip accounts logged out or used up, and prefer the one that would waste the most at its
-  reset (60% left resetting in an hour before 80% left resetting in 6 days), from the
-  projection the limit rows already make (`usage_limits::pace`). When all of an agent's
-  accounts are used up, go to the role's next entry.
-- **Left out for now:** moving a running subthread to another account when it reaches its
-  limit mid-turn, and roles beyond the four.
-- Neither Zed nor t3code has this. It's a settings change (likely beside Subthreads at once in
-  Settings › General › Threads), so it starts on the design board.
-
-Built (3b4bf5a): the four roles, the picks the app sends every server
-(`Request::SetSubthreadRoles`, `subthread-roles.json`), `orchestrator_capabilities` listing
-them, and the account choice by spare usage. Left: the Settings screen for the picks, decided
-on the design board (`design/settings-2/` topic 4 D: a role per row, its picks as chips; an
-account selector with All under the agent).
-
-Requested October 23, 2026, after the board: "we should need a optional clever selection that
-chooses the agent (and account) with the most usage for subthreads if there are more agents
-selected, or if one agent but with all accounts, maybe accounts also should be selectable […]
-if that option is turned off then it uses in an added order depending on availablity (if
-there is usage left)". One switch on the Subthreads page (the user's answer), for every role.
-
 ### Reorganize Settings
 
 The whole Settings page is a mess; organize it better now that there are so many settings.

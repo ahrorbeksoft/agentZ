@@ -28,6 +28,7 @@ use agentz_protocol::artifacts::{
 };
 use agentz_protocol::cloud::{CloudActivity, CloudNotice, SshAddress};
 use agentz_protocol::spaces::{PaneAgentState, PaneContent};
+use agentz_protocol::subthread_roles::TaskRole;
 use agentz_protocol::{
     MachineKind, PeerCheckout, PeerCheckouts, PeerMachine, Peers, RelayToolCall, Request, Response,
     ToolCaller, ToolResult,
@@ -700,15 +701,27 @@ impl Machines {
         }
     }
 
-    /// Gives each server what each role of delegated task runs on, which it keeps.
+    /// Gives each server what each role of delegated task runs on, which it keeps. The
+    /// accounts chosen for a pick are This Mac's, so other machines use all of theirs.
     fn sync_subthread_roles(&mut self, cx: &mut Context<Self>) {
         let roles = AppSettingsStore::global(cx)
             .read(cx)
             .settings()
             .subthread_roles
             .clone();
+        let mut every_account = roles.clone();
+        for role in TaskRole::ALL {
+            for pick in every_account.picks_mut(role) {
+                pick.accounts = None;
+            }
+        }
         for client in self.clients.clone() {
-            client.update(cx, |client, cx| client.set_subthread_roles(&roles, cx));
+            let roles = if client.read(cx).machine() == MachineId::Local {
+                &roles
+            } else {
+                &every_account
+            };
+            client.update(cx, |client, cx| client.set_subthread_roles(roles, cx));
         }
     }
 
