@@ -93,3 +93,11 @@ Also:
 
 - For machine-specific settings, a general setting that applies to all machines when set.
 - Likewise for profile-specific settings: a general one for all profiles.
+
+### Show shells next to the Working label
+
+Show shells next to the Working label. In the screenshot, a Claude Agent thread shows "Working
+for 13m 58s" at the end of its turn, while its running shell is in a separate "1 Background
+Task" panel above the composer.
+
+![A Claude Agent thread's Working label, with its background shell in a panel above the composer](backlog/shells-beside-working-label.png)
