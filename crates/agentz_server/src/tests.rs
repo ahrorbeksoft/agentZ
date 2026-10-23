@@ -436,6 +436,46 @@ async fn lists_the_editors_installed_and_refuses_one_it_doesnt_know() {
     );
 }
 
+/// A state file it can't read stops the server, which would otherwise start with no threads
+/// and remove every thread's transcript and attachments as those of deleted threads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_state_stops_the_server_and_keeps_the_threads_files() {
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let state = data_dir.path().join("state.json");
+    std::fs::write(&state, b"{broken").expect("state");
+    let transcript = data_dir.path().join("transcripts").join("42.json");
+    let attachment = data_dir
+        .path()
+        .join("attachments")
+        .join("42")
+        .join("shot.png");
+    for path in [&transcript, &attachment] {
+        std::fs::create_dir_all(path.parent().expect("a folder")).expect("folder");
+        std::fs::write(path, b"the user's").expect("file");
+    }
+    let config = ServerConfig {
+        data_dir: data_dir.path().to_path_buf(),
+        version: "0.0.0-test".into(),
+        http_client: Arc::new(http_client::BlockedHttpClient),
+        shell_environment_ready: futures::future::ready(()).boxed().shared(),
+        custom_agents: BTreeMap::new(),
+        agent_control: None,
+        hands_pages_to_clients: false,
+        terminal_shell: Some("/bin/sh".into()),
+        title_generation_path: None,
+        cloud_path: None,
+        keep_awake: Vec::new(),
+        listener: None,
+        handed_over: None,
+    };
+    let Err(error) = crate::start(tokio::runtime::Handle::current(), config) else {
+        panic!("the server started without its threads");
+    };
+    assert!(format!("{error:#}").contains("state.json"), "{error:#}");
+    assert_eq!(std::fs::read(&state).expect("state"), b"{broken");
+    assert!(transcript.exists() && attachment.exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prompts_a_thread_and_names_it() {
     let Some(server) = TestServer::start() else {
@@ -1126,12 +1166,20 @@ async fn stops_the_agent_of_an_archived_thread_left_idle() {
     assert!(!closed.exists());
 
     client.ok(Request::UnsubscribeThread(connection)).await;
+    // The file is there as soon as the mock opens it, before it has written the session.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !closed.exists() && Instant::now() < deadline {
+    let closed_sessions = loop {
+        let closed_sessions = std::fs::read_to_string(&closed).unwrap_or_default();
+        if !closed_sessions.is_empty() || Instant::now() >= deadline {
+            break closed_sessions;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let closed_sessions = std::fs::read_to_string(&closed).expect("the agent closed its session");
-    assert_eq!(closed_sessions.lines().count(), 1);
+    };
+    assert_eq!(
+        closed_sessions.lines().count(),
+        1,
+        "the agent closed its session once"
+    );
 
     client.subscribe_thread(connection).await;
     client

@@ -224,7 +224,7 @@ pub fn start(runtime: tokio::runtime::Handle, config: ServerConfig) -> Result<Se
             inputs.clone(),
             next_client_id.clone(),
             handed_off.clone(),
-        )
+        )?
     };
     runtime.spawn(async move {
         server.run(inbox).await;

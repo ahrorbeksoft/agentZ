@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
@@ -974,14 +974,14 @@ pub struct ProjectStore {
 
 impl ProjectStore {
     /// Loads the store from `state_path`, and saves every change back to it. With `None`,
-    /// nothing is read or saved.
-    pub fn load(state_path: Option<PathBuf>) -> Self {
-        let state = state_path
-            .as_deref()
-            .and_then(|path| read_state::<PersistedState>(path).log_err())
-            .flatten()
-            .unwrap_or_default();
-        Self::from_state(state, state_path)
+    /// nothing is read or saved. A file that's there but can't be read is an error, never an
+    /// empty store that would be saved over it.
+    pub fn load(state_path: Option<PathBuf>) -> Result<Self> {
+        let state = match &state_path {
+            Some(path) => read_state::<PersistedState>(path)?.unwrap_or_default(),
+            None => PersistedState::default(),
+        };
+        Ok(Self::from_state(state, state_path))
     }
 
     fn from_state(state: PersistedState, state_path: Option<PathBuf>) -> Self {
@@ -2640,6 +2640,12 @@ pub fn write_durably(
 ) -> Result<()> {
     let written = std::fs::File::create(temporary)
         .and_then(|mut file| {
+            // Only its owner reads what agentZ saves: agents' settings and MCP servers keep
+            // API keys. Set before anything is written, and on a temporary file a crash left.
+            #[cfg(unix)]
+            file.set_permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+            )?;
             write(&mut file)?;
             file.sync_all()
         })
@@ -2657,6 +2663,45 @@ pub fn write_durably(
         return Err(error);
     }
     sync_folder_of(path)
+}
+
+/// Writes of one file from background tasks, one at a time and in the order they were asked
+/// for: a write that a newer one overtook is skipped. Two at once would share
+/// [`write_durably`]'s temporary file, and the older could land last, or inside the newer.
+#[derive(Default)]
+pub struct OrderedWrites {
+    asked: u64,
+    written: Arc<Mutex<u64>>,
+}
+
+impl OrderedWrites {
+    /// The next write's turn, to make on another thread.
+    pub fn next(&mut self) -> OrderedWrite {
+        self.asked += 1;
+        OrderedWrite {
+            turn: self.asked,
+            written: self.written.clone(),
+        }
+    }
+}
+
+pub struct OrderedWrite {
+    turn: u64,
+    written: Arc<Mutex<u64>>,
+}
+
+impl OrderedWrite {
+    pub fn write(self, write: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut written = self
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *written > self.turn {
+            return Ok(());
+        }
+        *written = self.turn;
+        write()
+    }
 }
 
 /// Syncs the folder `path` is in, so what was renamed into it is on disk too.
@@ -2705,6 +2750,60 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_state_is_an_error_and_stays() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        std::fs::write(&state_path, b"{\"projects\": 7}").expect("writes");
+        assert!(ProjectStore::load(Some(state_path.clone())).is_err());
+        assert_eq!(
+            std::fs::read(&state_path).expect("reads"),
+            b"{\"projects\": 7}"
+        );
+        // One that isn't there yet is a new, empty store.
+        let store = ProjectStore::load(Some(dir.path().join("new.json"))).expect("loads");
+        assert!(store.projects().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_writes_are_for_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let folder = tempfile::tempdir().expect("temp dir");
+        let path = folder.path().join("mcp-servers.json");
+        let temporary = path.with_extension("json.tmp");
+        // Left by a crash, as anyone could read it.
+        std::fs::write(&temporary, b"").expect("writes");
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+            .expect("opens it up");
+        write_durably(&path, &temporary, |file| {
+            file.write_all(b"{\"API_KEY\": \"x\"}")
+        })
+        .expect("writes");
+        let mode = std::fs::metadata(&path)
+            .expect("there")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// An older write that runs after a newer one, as background tasks can, is skipped.
+    #[test]
+    fn ordered_writes_never_put_an_older_over_a_newer() {
+        let mut writes = OrderedWrites::default();
+        let older = writes.next();
+        let newer = writes.next();
+        let written = std::cell::RefCell::new(Vec::new());
+        let record = |name: &'static str| {
+            written.borrow_mut().push(name);
+            Ok(())
+        };
+        newer.write(|| record("newer")).expect("writes");
+        older.write(|| record("older")).expect("skips");
+        writes.next().write(|| record("newest")).expect("writes");
+        assert_eq!(*written.borrow(), ["newer", "newest"]);
+    }
+
+    #[test]
     fn monograms() {
         assert_eq!(monogram("dramabot"), "DT");
         assert_eq!(monogram("shop-landing"), "SL");
@@ -2731,7 +2830,7 @@ mod tests {
         std::fs::create_dir_all(&first_folder).expect("create first");
         std::fs::create_dir_all(&second_folder).expect("create second");
 
-        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let mut store = ProjectStore::load(Some(state_path.clone())).expect("loads");
         let revision = store.revision();
         let first = store.add_project(first_folder.clone());
         let second = store.add_project(second_folder);
@@ -2749,7 +2848,7 @@ mod tests {
 
         // Dropping the store writes what's pending.
         drop(store);
-        let mut store = ProjectStore::load(Some(state_path));
+        let mut store = ProjectStore::load(Some(state_path)).expect("loads");
         assert_eq!(store.projects().len(), 2);
         assert_eq!(store.scope(), ProjectScope::Project(second));
         assert_eq!(store.project(first).map(|p| p.name()), Some("first".into()));
@@ -2825,7 +2924,7 @@ mod tests {
     #[test]
     fn pinning_and_arranging_threads() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let first = store.add_thread(project, "First", None).expect("thread");
         let second = store.add_thread(project, "Second", None).expect("thread");
@@ -2901,7 +3000,7 @@ mod tests {
     #[test]
     fn subthreads_belong_to_their_parent() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let parent = store.add_thread(project, "Parent", None).expect("thread");
         let task = |parent| Task {
@@ -2944,7 +3043,7 @@ mod tests {
     #[test]
     fn updates_carry_only_the_threads_that_changed() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let first = store.add_thread(project, "First", None).expect("thread");
         let second = store.add_thread(project, "Second", None).expect("thread");
@@ -2974,7 +3073,7 @@ mod tests {
     #[test]
     fn threads_await_input_until_answered_or_deleted() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let thread = store.add_thread(project, "Thread", None).expect("thread");
 
@@ -2993,7 +3092,7 @@ mod tests {
     #[test]
     fn a_waiting_thread_completes_once_its_work_is_over() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let thread = store.add_thread(project, "Thread", None).expect("thread");
         let completed_at = |store: &ProjectStore| store.thread(thread)?.completed_at;
@@ -3030,7 +3129,7 @@ mod tests {
     #[test]
     fn unsent_text_keeps_only_mentions_in_it() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let thread = store.add_thread(project, "Thread", None).expect("thread");
         let mention = |range: Range<usize>| UnsentMention {
@@ -3062,7 +3161,7 @@ mod tests {
     fn saves_after_changes_pause() {
         let dir = tempfile::tempdir().expect("temp dir");
         let state_path = dir.path().join("state.json");
-        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let mut store = ProjectStore::load(Some(state_path.clone())).expect("loads");
         store.add_project(dir.path().to_path_buf());
         assert!(!state_path.exists(), "saving waits for changes to pause");
         std::thread::sleep(SAVE_DEBOUNCE * 3);
@@ -3073,7 +3172,7 @@ mod tests {
     #[test]
     fn threads_work_in_workspaces() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let project_path = store.project(project).expect("project").path.clone();
         let pasture = dir.path().join("pastures/demo/agentz-1");
@@ -3132,7 +3231,7 @@ mod tests {
         let project_folder = dir.path().join("storefront");
         let outside = dir.path().join("docs");
         std::fs::create_dir_all(project_folder.join("src")).expect("create project");
-        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let mut store = ProjectStore::load(Some(state_path.clone())).expect("loads");
         let project = store.add_project(project_folder);
         let project_path = store.project(project).expect("project").path.clone();
         let worktree = dir.path().join("worktrees/storefront/agentz-1");
@@ -3174,7 +3273,7 @@ mod tests {
         assert!(!store.workspaces_expanded());
         store.toggle_workspaces_expanded();
         drop(store);
-        let mut store = ProjectStore::load(Some(state_path));
+        let mut store = ProjectStore::load(Some(state_path)).expect("loads");
         assert_eq!(store.threads().len(), 3);
         assert!(store.workspaces_expanded());
 
@@ -3222,7 +3321,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let state_path = dir.path().join("state.json");
         let chats_folder = dir.path().join("chats");
-        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let mut store = ProjectStore::load(Some(state_path.clone())).expect("loads");
         store.set_chats_folder(chats_folder.clone());
         let chat = store
             .add_thread(ProjectId::CHATS, "Async Rust", None)
@@ -3265,7 +3364,7 @@ mod tests {
 
         // It outlives a restart, archived, and comes back as a thread does.
         drop(store);
-        let mut store = ProjectStore::load(Some(state_path));
+        let mut store = ProjectStore::load(Some(state_path)).expect("loads");
         assert_eq!(archived(&store), vec![chat]);
         store.unarchive_thread(chat);
         assert!(archived(&store).is_empty());
@@ -3274,7 +3373,7 @@ mod tests {
     #[test]
     fn only_idle_unpinned_threads_left_alone_are_stale() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(Some(dir.path().join("state.json")));
+        let mut store = ProjectStore::load(Some(dir.path().join("state.json"))).expect("loads");
         let project = store.add_project(dir.path().join("storefront"));
         let long_ago = SystemTime::now() - std::time::Duration::from_secs(5 * 86_400);
         let cutoff = SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
@@ -3325,7 +3424,7 @@ mod tests {
     fn snoozed_threads_wake_on_time_or_once_they_need_the_user() {
         let dir = tempfile::tempdir().expect("temp dir");
         let state_path = dir.path().join("state.json");
-        let mut store = ProjectStore::load(Some(state_path.clone()));
+        let mut store = ProjectStore::load(Some(state_path.clone())).expect("loads");
         let project = store.add_project(dir.path().join("storefront"));
         let thread = store
             .add_thread(project, "Fix the cart", None)
@@ -3369,7 +3468,7 @@ mod tests {
             "an earlier turn doesn't wake it"
         );
         drop(store);
-        let mut store = ProjectStore::load(Some(state_path));
+        let mut store = ProjectStore::load(Some(state_path)).expect("loads");
         assert!(store.is_thread_snoozed(thread, now), "kept");
         store.pin_thread(thread, None).expect("pin");
         assert!(!store.has_thread_woken(thread, now), "pinning wakes it");
@@ -3388,7 +3487,7 @@ mod tests {
     #[test]
     fn imported_sessions_become_threads_in_their_folder() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = ProjectStore::load(None);
+        let mut store = ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let project_path = store.project(project).expect("project").path.clone();
         let worktree = dir.path().join("worktrees/demo/agentz-1");

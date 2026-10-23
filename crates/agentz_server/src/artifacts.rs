@@ -1175,6 +1175,11 @@ pub(crate) fn file_name(name: &str) -> Result<&str> {
         name.chars().count() <= MAX_FILE_NAME_CHARS,
         "a file name is over {MAX_FILE_NAME_CHARS} characters"
     );
+    // The name goes into the HTTP header it's served with, where a line break would end it.
+    ensure!(
+        !name.chars().any(char::is_control),
+        "a file name can't have control characters"
+    );
     Ok(name)
 }
 
@@ -1211,6 +1216,29 @@ mod tests {
             project_id: ProjectId(7),
             agent_id: None,
         }
+    }
+
+    /// A file's name goes into the header it's served with, which a line break in it would
+    /// end, and the sandbox after it would become the page.
+    #[test]
+    fn a_file_name_has_no_path_and_no_line_breaks() {
+        assert_eq!(file_name("../notes/a.png").expect("a name"), "a.png");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut store = ArtifactStore::load(temp.path());
+        let mut publish = document("Report", "See the file.");
+        publish.content = Content::Document {
+            source: "See the file.".into(),
+            files: vec![(
+                "report\r\n\r\n<svg onload=alert(1)>\r\npreview.html".into(),
+                b"X".to_vec(),
+            )],
+        };
+        let error = store.publish(publish).expect_err("refused");
+        assert!(
+            format!("{error:#}").contains("control characters"),
+            "{error:#}"
+        );
+        assert!(file_name("tab\there.txt").is_err());
     }
 
     fn variant(name: &str, description: &str) -> DesignVariant {

@@ -520,7 +520,13 @@ async fn serve(
             let headers = [
                 (
                     "content-disposition",
-                    format!("{disposition}; filename=\"{}\"", name.replace('"', "_")),
+                    format!(
+                        "{disposition}; filename=\"{}\"",
+                        name.replace(
+                            |character: char| character == '"' || character.is_control(),
+                            "_"
+                        )
+                    ),
                 ),
                 ("content-security-policy", SANDBOX.to_string()),
                 ("cache-control", "private, max-age=86400".to_string()),
@@ -832,6 +838,11 @@ async fn reply(
         head.push_str("cache-control: no-store\r\n");
     }
     for (name, value) in extra {
+        // A line break would end the headers early, and what follows would be read as others.
+        anyhow::ensure!(
+            !value.contains(['\r', '\n']),
+            "the {name} header has a line break"
+        );
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");

@@ -236,7 +236,11 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 
 Both sides replace a file as herdr saves its state (`projects::write_durably`): written beside
 it, synced to disk, renamed into place, then the folder synced, so a crash or power loss leaves
-the old file or the whole new one.
+the old file or the whole new one. Only its owner can read it (0600): agents' settings and MCP
+servers keep API keys. Writes from background tasks go in the order they were asked for
+(`projects::OrderedWrites`), so an older one never lands over a newer. A `state.json` that's
+there but can't be read stops the server from starting, since an empty store would take every
+thread for deleted and remove its files.
 
 ## Features
 

@@ -178,10 +178,7 @@ async fn read_checkout(checkout: &mut CheckoutStorage, project_folder: Option<&P
         // Its branch is the project's, and stays when it's deleted.
         (WorkspaceKind::Worktree, _) => false,
         (WorkspaceKind::Pasture, Some(project_folder)) => {
-            match workspaces::head_commit(&path).await {
-                Some(head) => !workspaces::has_commit(project_folder, &head).await,
-                None => false,
-            }
+            workspaces::has_own_commits(project_folder, &path).await
         }
         (WorkspaceKind::Pasture, None) => workspaces::has_unpushed_commits(&path).await,
     };

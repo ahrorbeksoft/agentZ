@@ -452,6 +452,7 @@ pub struct AppSettingsStore {
     path: PathBuf,
     /// Where Shared's skills keep their files.
     shared_skills_folder: PathBuf,
+    writes: projects::OrderedWrites,
     _save: Option<Task<()>>,
 }
 
@@ -469,6 +470,7 @@ pub fn init(cx: &mut App) {
         settings,
         path,
         shared_skills_folder: paths::data_dir().join("shared-skills"),
+        writes: projects::OrderedWrites::default(),
         _save: None,
     });
     cx.set_global(GlobalAppSettings(store));
@@ -488,6 +490,7 @@ pub fn init_for_test(cx: &mut App) {
             "agentz-test-shared-skills-{}-{folder}",
             std::process::id()
         )),
+        writes: projects::OrderedWrites::default(),
         _save: None,
     });
     cx.set_global(GlobalAppSettings(store));
@@ -516,8 +519,9 @@ impl AppSettingsStore {
         cx.set_reduce_motion(self.settings.reduce_motion);
         let path = self.path.clone();
         let settings = self.settings.clone();
+        let write = self.writes.next();
         self._save = Some(cx.background_spawn(async move {
-            write_settings(&path, &settings).log_err();
+            write.write(|| write_settings(&path, &settings)).log_err();
         }));
         cx.notify();
     }

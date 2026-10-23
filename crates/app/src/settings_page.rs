@@ -10991,7 +10991,7 @@ mod tests {
     fn the_threads_tab_shows_a_projects_sessions_to_import_or_open(cx: &mut TestAppContext) {
         let empty_dir = tempfile::tempdir().expect("temp dir");
         let project_dir = tempfile::tempdir().expect("temp dir");
-        let mut store = projects::ProjectStore::load(None);
+        let mut store = projects::ProjectStore::load(None).expect("loads");
         let empty = store.add_project(empty_dir.path().to_path_buf());
         let project = store.add_project(project_dir.path().to_path_buf());
         let thread = store

@@ -58,6 +58,7 @@ pub struct ProjectStore {
     /// in the app's own file rather than on the server (herdr).
     viewed: BTreeMap<u64, SystemTime>,
     viewed_path: Option<PathBuf>,
+    viewed_writes: projects::OrderedWrites,
     _save_viewed: Option<Task<()>>,
     /// Notifies as the soonest snooze ends ([`Self::schedule_wake`]).
     _wake_timer: Option<Task<()>>,
@@ -89,6 +90,7 @@ impl ProjectStore {
             has_snapshot: false,
             viewed,
             viewed_path: Some(viewed_path),
+            viewed_writes: projects::OrderedWrites::default(),
             _save_viewed: None,
             _wake_timer: None,
         }
@@ -247,8 +249,9 @@ impl ProjectStore {
             .retain(|id, _| threads.iter().any(|thread| thread.id.0 == *id));
         if let Some(path) = self.viewed_path.clone() {
             let viewed = self.viewed.clone();
+            let write = self.viewed_writes.next();
             self._save_viewed = Some(cx.background_spawn(async move {
-                write_viewed(&path, &viewed).log_err();
+                write.write(|| write_viewed(&path, &viewed)).log_err();
             }));
         }
         cx.notify();
@@ -867,7 +870,7 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = projects::ProjectStore::load(None);
+        let mut store = projects::ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let thread = store.add_thread(project, "Thread", None).expect("thread");
         let show = |store: &projects::ProjectStore, cx: &mut TestAppContext| {
@@ -923,7 +926,7 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = projects::ProjectStore::load(None);
+        let mut store = projects::ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let thread = store.add_thread(project, "Thread", None).expect("thread");
         let show = |store: &projects::ProjectStore, cx: &mut TestAppContext| {
@@ -973,7 +976,7 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let mut store = projects::ProjectStore::load(None);
+        let mut store = projects::ProjectStore::load(None).expect("loads");
         let project = store.add_project(dir.path().to_path_buf());
         let parent = store.add_thread(project, "Parent", None).expect("thread");
         let child = store

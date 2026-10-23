@@ -362,9 +362,12 @@ impl Server {
         inputs: mpsc::UnboundedSender<Input>,
         next_client_id: Arc<AtomicU64>,
         handed_off: Arc<AtomicBool>,
-    ) -> Self {
+    ) -> Result<Self> {
         let data_dir = config.data_dir;
-        let mut projects = ProjectStore::load(Some(data_dir.join("state.json")));
+        // Started empty instead, the server would take every thread for deleted, and remove
+        // their transcripts and attachments as it starts.
+        let mut projects = ProjectStore::load(Some(data_dir.join("state.json")))
+            .context("the threads can't be read, so the server won't start")?;
         projects.set_chats_folder(data_dir.join("chats"));
         tools::interrupt_unfinished_tasks(&mut projects);
         let agent_settings = AgentSettingsStore::load(
@@ -663,7 +666,7 @@ impl Server {
         server.check_external_logins();
         server.start_usage_refreshes();
         server.resume_limit_waits();
-        server
+        Ok(server)
     }
 
     /// Looks up the repository of each project whose last lookup is stale. A lookup git

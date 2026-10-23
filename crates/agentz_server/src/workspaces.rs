@@ -438,7 +438,11 @@ async fn run_cow_config(path: &Path, config: &Path) -> Result<()> {
 /// only matching folders are read.
 fn expand_pattern(root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
     let mut matches = vec![root.to_path_buf()];
-    for component in pattern.split('/').filter(|component| !component.is_empty()) {
+    let components: Vec<&str> = pattern
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    for (index, &component) in components.iter().enumerate() {
         anyhow::ensure!(
             component != ".." && component != "**",
             "unsupported .cow.json pattern `{pattern}`"
@@ -466,6 +470,14 @@ fn expand_pattern(root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
             }
         }
         matches = next;
+        // A link to a folder isn't gone through: it can point out of the clone, at the
+        // project's own files among others. The last component's links are removed as links.
+        if index + 1 < components.len() {
+            matches.retain(|path| {
+                path.symlink_metadata()
+                    .is_ok_and(|metadata| metadata.is_dir())
+            });
+        }
     }
     matches.retain(|path| path != root);
     Ok(matches)
@@ -507,9 +519,7 @@ pub(crate) async fn remove(
                 if changed > 0 {
                     losses.push(plural(changed, "uncommitted change"));
                 }
-                if let Some(head) = head_commit(path).await
-                    && !has_commit(repo, &head).await
-                {
+                if has_own_commits(repo, path).await {
                     losses.push("commits the project doesn't have".to_string());
                 }
                 if !losses.is_empty() {
@@ -1137,12 +1147,45 @@ pub(crate) async fn has_commit(repo: &Path, commit: &str) -> bool {
     .is_ok()
 }
 
+/// Whether the pasture has commits the project doesn't: at its `HEAD`, on any of its branches
+/// or in a stash. A pasture is a repository of its own, so removing it loses them all, not
+/// only those of the branch it's on.
+pub(crate) async fn has_own_commits(repo: &Path, pasture: &Path) -> bool {
+    let mut tips = std::collections::BTreeSet::new();
+    tips.extend(head_commit(pasture).await);
+    for args in [
+        &["for-each-ref", "--format=%(objectname)", "refs/heads"][..],
+        &["stash", "list", "--format=%H"][..],
+    ] {
+        match git(pasture, args, &[]).await {
+            Ok(output) => tips.extend(output.split_whitespace().map(str::to_string)),
+            // Commits it can't list may be lost.
+            Err(_) => return true,
+        }
+    }
+    if tips.is_empty() {
+        return false;
+    }
+    // A commit the project has comes with all before it, and rev-list fails on one it lacks.
+    let mut args = vec!["rev-list", "--no-walk", "--quiet"];
+    args.extend(tips.iter().map(String::as_str));
+    git(repo, &args, &[]).await.is_err()
+}
+
 /// For a pasture no project keeps, whose project can't say which commits are its own: those no
-/// remote has.
+/// remote has, on any of its branches or in a stash.
 pub(crate) async fn has_unpushed_commits(folder: &Path) -> bool {
     git(
         folder,
-        &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+        &[
+            "rev-list",
+            "--count",
+            "HEAD",
+            "--branches",
+            "--glob=refs/stash",
+            "--not",
+            "--remotes",
+        ],
         &[],
     )
     .await
@@ -1451,6 +1494,48 @@ prunable gitdir file points to non-existent location
         assert!(!path.exists());
     }
 
+    /// A pasture's commits on a branch it isn't on, or in a stash, go with it too.
+    #[tokio::test]
+    async fn removing_a_pasture_asks_for_commits_on_its_other_branches_and_stashes() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let repo = repository(root.path()).await;
+        // A second clone stands in for a pasture, which works the same on any file system.
+        let path = root.path().join("pasture");
+        let path_arg = path.to_string_lossy().into_owned();
+        run(
+            root.path(),
+            &["clone", "-q", &repo.to_string_lossy(), &path_arg],
+        )
+        .await;
+        let pasture = Workspace {
+            kind: WorkspaceKind::Pasture,
+            path: path.clone(),
+            branch: Some("main".into()),
+            base: None,
+            created_at: SystemTime::now(),
+        };
+        assert!(!has_own_commits(&repo, &path).await);
+
+        run(&path, &["checkout", "-q", "-b", "valuable"]).await;
+        std::fs::write(path.join("valuable.txt"), "the only copy\n").expect("write");
+        run(&path, &["add", "valuable.txt"]).await;
+        run(&path, &["commit", "-q", "-m", "valuable"]).await;
+        run(&path, &["checkout", "-q", "main"]).await;
+        let removal = remove(&repo, &pasture, false).await.expect("checks");
+        assert!(
+            matches!(removal, WorkspaceRemoval::NeedsConfirmation(_)),
+            "{removal:?}"
+        );
+
+        // Once the project has the branch, a stash is still the pasture's own.
+        run(&repo, &["fetch", "-q", &path_arg, "valuable:valuable"]).await;
+        assert!(!has_own_commits(&repo, &path).await);
+        std::fs::write(path.join("README.md"), "# Stashed\n").expect("write");
+        run(&path, &["stash", "-q"]).await;
+        assert!(has_own_commits(&repo, &path).await);
+        assert!(path.exists());
+    }
+
     #[tokio::test]
     async fn sync_undoes_conflicts() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -1701,5 +1786,30 @@ prunable gitdir file points to non-existent location
             ]
         );
         assert!(expand_pattern(root.path(), "../outside").is_err());
+    }
+
+    /// A link to a folder outside isn't gone through, so a pattern can't remove what it
+    /// points at; the link itself can be removed.
+    #[cfg(unix)]
+    #[test]
+    fn patterns_dont_go_through_links_to_folders() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let clone = root.path().join("clone");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(outside.join("dist")).expect("create");
+        std::fs::create_dir_all(clone.join("apps")).expect("create");
+        std::os::unix::fs::symlink(&outside, clone.join("linked")).expect("link");
+        std::os::unix::fs::symlink(&outside, clone.join("apps/linked")).expect("link");
+        for pattern in ["linked/*", "linked/dist", "apps/*/dist"] {
+            assert_eq!(
+                expand_pattern(&clone, pattern).expect("expands"),
+                Vec::<PathBuf>::new(),
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            expand_pattern(&clone, "linked").expect("expands"),
+            vec![clone.join("linked")]
+        );
     }
 }
