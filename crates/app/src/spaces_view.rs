@@ -244,7 +244,7 @@ pub enum SpacesViewEvent {
     },
     /// Manage Agents, from a new thread's agent picker.
     OpenAgentSettings,
-    /// Manage Accounts…, from a thread's account picker.
+    /// Manage Accounts…, from an agent's accounts in a thread's agent picker.
     OpenAgentAccounts {
         machine: MachineId,
         agent_id: AgentId,

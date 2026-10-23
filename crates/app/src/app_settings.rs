@@ -93,7 +93,7 @@ impl ArtifactAutoOpen {
     }
 }
 
-/// Which of an account's usage windows the composer's gauge and the account pickers show.
+/// Which of an account's usage windows the composer's gauge and the agent pickers show.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageWindow {
@@ -287,7 +287,7 @@ pub struct AppSettings {
     pub acp_v2: bool,
     /// When a published artifact's page opens in the browser.
     pub artifact_auto_open: ArtifactAutoOpen,
-    /// Which of an account's windows the composer's usage gauge and its account picker show.
+    /// Which of an account's windows the composer's usage gauge and its agent picker show.
     pub usage_window: UsageWindow,
     /// What agents' designs are like unless they hear otherwise (`design/artifacts-2`, topic
     /// 21), given to every machine's server for its agents' design tool.

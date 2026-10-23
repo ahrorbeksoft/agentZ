@@ -108,6 +108,9 @@ for a dragged one (`SlideDrag::offset`) are in their places at once. Any new mot
 draws itself should check `App::reduce_motion` too.
 `markdown`'s `MarkdownElement::image_renderer` lets the thread draw markdown images its own way,
 and `MarkdownStyle::link_chip` draws chosen links as chips (see Images).
+`ui`'s `ContextMenu::custom_submenu` is a submenu whose row is drawn by the caller and picks
+something itself when clicked, opening the submenu only on hover (the agent picker's accounts,
+see Switching agents); Zed's submenu rows are a label and only open their submenu.
 `Markdown::request_autoscroll_to_source_index_at_top` scrolls the list holding a markdown so a
 place in it sits a given distance below the view's top (see Find in a thread), where Zed's
 autoscroll only brings it into view. `gpui` latches each scroll gesture to one area that
@@ -903,8 +906,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   and `design/composer-2/`): Zed's message editor, in a card (rounded, outlined, with a
   shadow) in a sent thread as on the new thread screen, 16 px in from the thread's sides
   (`render_thread_composer`, composer-2 topic 1 B, from t3code's context strip). The card holds
-  what's sent and who answers: the text, then + with the agent picker, the account picker and
-  a sent thread's usage gauge (`render_who_answers`; the user moved them back into the card
+  what's sent and who answers: the text, then + with the agent picker (an agent's accounts in
+  its submenu) and a sent thread's usage gauge (`render_who_answers`; the user moved them back into the card
   from the strip), and at the right the context ring (back where it was before the strip, on
   the user's word), the agent's settings and Send. Under it the strip
   (`render_composer_strip`) says where the thread works: at the left the checkout and machine
@@ -1338,25 +1341,29 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Terminal's running dot moves onto "⋯". Where the header has the branch (no composer, see
   Composer), it gives way first, as it shrinks faster than the rest (to 72 px, and under
   560 px only its icon, its name and folder in the tooltip), and under 480 px heads "⋯" as a
-  line. Under 560 px the card's agent picker shows only its icon and a sent thread's account
-  picker only its avatar, their names in the tooltips, and when the card's controls wrap,
+  line. Under 560 px the card's agent picker shows only its icon, its name in the tooltip, and
+  when the card's controls wrap,
   they keep to the right, so Send stays in the corner.
 - **Switching agents** (`Request::SwitchAgent`, `Server::switch_agent` in
   `server/workspace_requests.rs`, `ProjectStore::switch_thread_agent`,
   `agentz_protocol::thread::switch_handoff`, `agent_view.rs`'s `render_agent_picker`,
-  `render_account_picker` and `render_switch_divider`; t3code's in-thread provider switch and
-  context handoff, design round `design/agent-switching/`): a sent thread's composer card has
-  the agent picker, and beside it the account picker while the agent has more
-  than one account (the current one under "This thread", the others under "Switch to";
-  `design/thread-narrow/`, 1 D). They work between turns. Both pickers, here and on the new
-  thread screen, mark what's working (`design/composer-2/`, topic 9 A; `working_threads`): the
-  sidebar's working dot after the name of an agent or account with a thread on the machine
-  working right now, the row's tooltip saying "Working in 2 threads". The agent picker ends
-  each agent's row with what's left of the account a switch would use (topic 10 A,
-  `usage_left_label`): this thread's for its own agent, the agent's account for new threads
-  (`AgentAccounts::new_thread_account`) for another, in the account picker's words, yellow at
-  15% or less and red once used up, and nothing while it isn't read or is logged out. Picking another agent
-  or account stops the thread's agent, keeping the conversation in its transcript, and starts
+  `render_agent_picker_row`, `render_account_row` and `render_switch_divider`; t3code's
+  in-thread provider switch and context handoff, design rounds `design/agent-switching/` and
+  `design/chats-2/`, topics 9 A, 10 B and 11 A): a sent thread's composer card has the agent
+  picker, its chip the agent's icon on the thread's account's color (`AgentIcon`), with
+  "Claude Agent · Personal" in its tooltip while the agent has more than one account. It works
+  between turns. An agent with more than one account has a chevron on its row, and its accounts
+  in a submenu that opens on hover (`ContextMenu::custom_submenu`): one line each, the avatar,
+  the name (External marked), the working dot, what's left and a check on the thread's, then
+  Manage Accounts…. Clicking the agent's row picks it as before, on its account for new threads.
+  The picker, here and on the new thread screen, marks what's working (`design/composer-2/`,
+  topic 9 A; `working_threads`): the sidebar's working dot after the name of an agent or
+  account with a thread on the machine working right now, the row's tooltip saying "Working in
+  2 threads". It ends each agent's row with what's left of the account a switch would use
+  (topic 10 A, `usage_left_label`): this thread's for its own agent, the agent's account for
+  new threads (`AgentAccounts::new_thread_account`) for another, in the accounts' words,
+  yellow at 15% or less and red once used up, and nothing while it isn't read or is logged out.
+  Picking another agent or account (of any agent) stops the thread's agent, keeping the conversation in its transcript, and starts
   the new one in the same thread and folder: in the session it had in the thread, if it was
   there before (`Thread::other_sessions`, each with how many entries it saw), or in a new one.
   Nothing more shows until the next message, which brings what that session hasn't seen of
@@ -1424,7 +1431,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (of several, the last to reset), a notice over the composer takes the error's place: whose
   limit ran out ("Your account" with one account listed, else its name), and when it resets,
   with the agent's error in the body's tooltip. To go on with another account, the user picks
-  it in the composer's account picker (Switching agents), whose new session is told the
+  it in the agent picker's accounts (Switching agents), whose new session is told the
   conversation, the stopped turn included (`design/agent-switching/`, 9 B). "Continue at
   16:10" waits for the reset (below), and once the thread waits, the body says
   so and Don't Continue cancels it. Usage ↗ opens the agent's usage page. Closed, it stays
@@ -1456,7 +1463,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   windows past their reset) on a borderless button like the pickers' beside it, yellow at 15%
   or less and red when used up, with the window's name in its tooltip ("Weekly: 3% left").
   Which window is Settings › Threads › Usage shown in the composer
-  (`AppSettings::usage_window`, `usage_limits::shown_window`), which the account picker's rows
+  (`AppSettings::usage_window`, `usage_limits::shown_window`), which the agent picker's rows
   follow too: the current session, the account's shortest window (the 5-hour one), unless a
   longer window is used up (then the one that resets last, since nothing works until it does),
   or the lowest of them all. It shows once the account has a
@@ -1466,7 +1473,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   (`usage_limits::LimitResetAction`), and a footer with when the account was read ("Read 2m
   ago") and Refresh (`Request::RefreshUsage`). It redraws every 5 seconds, so its countdowns
   move on. Escape or a click outside closes it without stopping the turn. A new thread shows the
-  accounts' limits in its account picker instead.
+  accounts' limits in its agent picker instead.
 - **New Thread** (`Shell::new_thread`, `Shell::start_draft`, `new_thread_modal.rs`; t3code's
   `useHandleNewThread`, the user's choice): opens a draft right away in the shown project, or
   asks which project first when several are shown (the modal is only that picker, with Chat
@@ -1479,8 +1486,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   opens a menu of Chat, the projects shown and Add Project… that makes the draft again there,
   keeping what's typed, with "or start a chat" under it; a Workspaces draft's is "What should
   we work on?" and a continuation's "Continue “title”". The composer's card has the agent
-  picker (installed agents, then Terminal, which replaces the draft with a shell, and Manage
-  Agents…) and the account picker beside +, and the strip under it the checkout picker (Local,
+  picker beside + (installed agents, an agent's accounts in its submenu, then Terminal, which
+  replaces the draft with a shell, and Manage Agents…), and the strip under it the checkout picker (Local,
   a new worktree or pasture, or an existing one) and the machine picker (each copy of a
   combined project, see Project copies in sync) at the left, and at the right the branch, which reads "From main"
   for a new worktree or pasture (see Worktrees and pastures). A new worktree or pasture is
@@ -1494,12 +1501,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   in `AgentViewEvent::Replaced`): its images are copied to the new thread first, as the old
   one's are deleted with it (`AgentView::copy_composer_images`), with the marks not yet drawn
   on them, and its mentions stay chips, a file's or thread's as its text on another machine.
-  The account picker (`AgentView::render_account_picker`,
-  §12 of the accounts round) shows only while the agent lists more than one account: the
-  draft's account with its avatar, and a menu of the accounts with their plan (or "Logged
-  out") and the window the usage setting picks (`usage_limits::shown_window`), the draft's
-  under "This thread" and the others under "Switch to", as a sent thread's, then Manage
-  Accounts…, which opens the agent's Account tab on the thread's machine
+  The agent picker's chip has the agent's icon on the draft's account's color, and an agent
+  with more than one account has them in its submenu, as a sent thread's (Switching agents),
+  with what's left of the window the usage setting picks (`usage_limits::shown_window`), "Logged
+  out" for one that is: picking one makes the draft again with that agent on it. Manage
+  Accounts… opens the agent's Account tab on the thread's machine
   (`AgentViewEvent::OpenAgentAccounts`, `SettingsPage::show_agent_accounts`). Another
   checkout keeps the draft's account; another agent or machine takes its account for new
   threads (`AccountChoice::Default`).
@@ -1644,7 +1650,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Each thread keeps the account it started on (`Thread::account`, `None` for External), since
   accounts share no sessions. New threads take the account marked Use for New Threads, else the
   External one while the agent's normal home is logged in, else the first agentZ account
-  (`AccountChoice::Default`), unless the new thread screen's account picker names one.
+  (`AccountChoice::Default`), unless the new thread screen's agent picker names one.
   Whether each account is logged in is its last login check (`server/login_checks.rs`): what
   its threads and login sessions found, or, where the agent's sessions open logged out too,
   its own status command (`accounts/login_checks.rs`), run as the agent's settings open and

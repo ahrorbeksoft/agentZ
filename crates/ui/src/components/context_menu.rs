@@ -63,6 +63,11 @@ pub enum ContextMenuItem {
         icon: Option<IconName>,
         icon_color: Option<Color>,
         builder: Rc<dyn Fn(ContextMenu, &mut Window, &mut Context<ContextMenu>) -> ContextMenu>,
+        /// Draws the row in place of the icon and label ([`ContextMenu::custom_submenu`]).
+        entry_render: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
+        /// Run when the row is clicked or confirmed, which then opens the submenu only on hover
+        /// or →.
+        handler: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     },
 }
 
@@ -814,6 +819,29 @@ impl ContextMenu {
             icon: None,
             icon_color: None,
             builder: Rc::new(builder),
+            entry_render: None,
+            handler: None,
+        });
+        self
+    }
+
+    /// A submenu whose row `entry_render` draws, as [`Self::custom_entry`]'s, with the chevron
+    /// after it. Clicking the row or confirming it runs `handler` and closes the menu; hovering
+    /// it or → opens the submenu.
+    pub fn custom_submenu(
+        mut self,
+        label: impl Into<SharedString>,
+        entry_render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+        builder: impl Fn(ContextMenu, &mut Window, &mut Context<ContextMenu>) -> ContextMenu + 'static,
+    ) -> Self {
+        self.items.push(ContextMenuItem::Submenu {
+            label: label.into(),
+            icon: None,
+            icon_color: None,
+            builder: Rc::new(builder),
+            entry_render: Some(Rc::new(entry_render)),
+            handler: Some(Rc::new(handler)),
         });
         self
     }
@@ -829,6 +857,8 @@ impl ContextMenu {
             icon: Some(icon),
             icon_color: None,
             builder: Rc::new(builder),
+            entry_render: None,
+            handler: None,
         });
         self
     }
@@ -845,6 +875,8 @@ impl ContextMenu {
             icon: Some(icon),
             icon_color: Some(icon_color),
             builder: Rc::new(builder),
+            entry_render: None,
+            handler: None,
         });
         self
     }
@@ -896,6 +928,14 @@ impl ContextMenu {
             return cx.emit(DismissEvent);
         };
 
+        if let Some(ContextMenuItem::Submenu {
+            handler: Some(handler),
+            ..
+        }) = self.items.get(ix)
+        {
+            return self.pick_submenu_row(handler.clone(), window, cx);
+        }
+
         if let Some(ContextMenuItem::Submenu { builder, .. }) = self.items.get(ix) {
             self.open_submenu(
                 ix,
@@ -940,6 +980,20 @@ impl ContextMenu {
         } else {
             cx.emit(DismissEvent);
         }
+    }
+
+    /// A [`Self::custom_submenu`]'s row picked, as an entry is.
+    fn pick_submenu_row(
+        &mut self,
+        handler: Rc<dyn Fn(&mut Window, &mut App)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        handler(window, cx);
+        if self.main_menu.is_some() {
+            self.clicked = true;
+        }
+        cx.emit(DismissEvent);
     }
 
     pub fn secondary_confirm(
@@ -1530,17 +1584,21 @@ impl ContextMenu {
                 label,
                 icon,
                 icon_color,
+                entry_render,
                 ..
-            } => self
-                .render_submenu_item_trigger(
+            } => {
+                let content = entry_render.as_ref().map(|render| render(window, cx));
+                self.render_submenu_item_trigger(
                     ix,
                     label.clone(),
                     *icon,
                     *icon_color,
+                    content,
                     is_active_descendant(true),
                     cx,
                 )
-                .into_any_element(),
+                .into_any_element()
+            }
         }
     }
 
@@ -1550,6 +1608,7 @@ impl ContextMenu {
         label: SharedString,
         icon: Option<IconName>,
         icon_color: Option<Color>,
+        content: Option<AnyElement>,
         is_active_descendant: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1656,6 +1715,13 @@ impl ContextMenu {
                         }
                     }))
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(ContextMenuItem::Submenu {
+                            handler: Some(handler),
+                            ..
+                        }) = this.items.get(ix)
+                        {
+                            return this.pick_submenu_row(handler.clone(), window, cx);
+                        }
                         if matches!(
                             &this.submenu_state,
                             SubmenuState::Open(open_submenu) if open_submenu.item_index == ix
@@ -1673,8 +1739,17 @@ impl ContextMenu {
                             );
                         }
                     }))
-                    .child(
-                        h_flex()
+                    .child(match content {
+                        Some(content) => h_flex()
+                            .w_full()
+                            .gap_1p5()
+                            .child(div().flex_1().min_w_0().child(content))
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        None => h_flex()
                             .w_full()
                             .gap_2()
                             .justify_between()
@@ -1695,7 +1770,7 @@ impl ContextMenu {
                                     .size(IconSize::Small)
                                     .color(Color::Muted),
                             ),
-                    ),
+                    }),
             )
     }
 

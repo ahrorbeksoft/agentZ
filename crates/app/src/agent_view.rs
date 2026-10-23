@@ -196,8 +196,8 @@ const BRANCH_SHRINK: f32 = 1000.;
 /// The least the branch shrinks to before the project and title do: its icon and a few
 /// letters.
 const MIN_BRANCH_WIDTH: Pixels = px(72.);
-/// Narrower than this, the composer's agent and account show only their icon and avatar
-/// (`design/thread-narrow`, topic 3B).
+/// Narrower than this, the composer's agent shows only its icon (`design/thread-narrow`,
+/// topic 3B).
 const COMPACT_COMPOSER_WIDTH: Pixels = px(560.);
 /// Narrower or shorter than this, the new thread screen shrinks its headline and gaps and
 /// wraps what's under its composer, as in a pane of a 3×3 Workspaces view.
@@ -431,8 +431,8 @@ pub enum AgentViewEvent {
     },
     /// Manage Agents, from the new thread's agent picker: Settings › Agents.
     OpenAgentSettings,
-    /// Manage Accounts…, from the thread's account picker: the agent's Account tab on the
-    /// thread's machine.
+    /// Manage Accounts…, from an agent's accounts in the agent picker: the agent's Account tab
+    /// on the thread's machine.
     OpenAgentAccounts {
         agent_id: AgentId,
     },
@@ -4774,8 +4774,8 @@ impl AgentView {
         }
     }
 
-    /// The agent's icon along a conversation: muted, on the thread's account's color. The new
-    /// thread screen shows the account beside the agent in its composer instead.
+    /// The agent's icon along a conversation and in the composer: muted, on the thread's
+    /// account's color.
     fn thread_agent_icon(&self, cx: &App) -> AgentIcon {
         let account_color = self.agent_id.as_ref().and_then(|agent_id| {
             let account = self.store.read(cx).thread(self.thread_id)?.account;
@@ -13259,8 +13259,8 @@ impl AgentView {
             .into_any_element()
     }
 
-    /// Who answers, in the card beside +, as the user asked: the agent, its account (with two
-    /// or more) and, in a sent thread, the account's usage.
+    /// Who answers, in the card beside +, as the user asked: the agent, whose picker has its
+    /// accounts, and in a sent thread, the account's usage.
     fn render_who_answers(&self, style: ComposerStyle, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut controls = Vec::new();
         if style == ComposerStyle::Thread || self.is_fresh_fork(cx) {
@@ -13268,16 +13268,12 @@ impl AgentView {
                 Some(can_switch) => {
                     let picker = PickerFor::SentThread { can_switch };
                     controls.push(self.render_agent_picker(picker, cx));
-                    controls.extend(self.render_account_picker(picker, cx));
                 }
                 None => controls.push(self.render_thread_agent_name(cx)),
             }
             controls.extend(self.render_usage_gauge(cx));
         } else {
             controls.push(self.render_agent_picker(PickerFor::NewThread, cx));
-            if self.replacing.is_none() {
-                controls.extend(self.render_account_picker(PickerFor::NewThread, cx));
-            }
         }
         controls
     }
@@ -13654,7 +13650,9 @@ impl AgentView {
     }
 
     /// The agent, in the composer: a menu of the machine's installed agents. A new thread is
-    /// made again with the one picked; a sent thread goes on with it.
+    /// made again with the one picked; a sent thread goes on with it. An agent with two or more
+    /// accounts has them in a submenu that opens on hover (`design/chats-2`, topics 9 A and
+    /// 10 B), where picking one goes on with the agent on it; the agent's row picks as before.
     fn render_agent_picker(&self, picker: PickerFor, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.weak_entity();
         let registry = self.registry.clone();
@@ -13663,24 +13661,23 @@ impl AgentView {
         // to open one in.
         let offers_terminal =
             picker == PickerFor::NewThread && !self.in_workspaces(cx) && !self.is_chat(cx);
-        let (id, trigger_id, disabled) = match picker {
+        let (id, trigger_id, accounts_id, disabled) = match picker {
             PickerFor::NewThread => (
                 "new-thread-agent",
                 "new-thread-agent-trigger",
+                "new-thread-account",
                 self.replacing.is_some(),
             ),
-            PickerFor::SentThread { can_switch } => {
-                ("thread-agent", "thread-agent-trigger", !can_switch)
-            }
+            PickerFor::SentThread { can_switch } => (
+                "thread-agent",
+                "thread-agent-trigger",
+                "thread-account",
+                !can_switch,
+            ),
         };
         // Narrow, only its icon, with its name in the tooltip.
         let is_compact = self.is_composer_compact();
         let agent_name = self.agent_name(cx);
-        let tooltip: SharedString = if is_compact {
-            agent_name.clone()
-        } else {
-            "Change Agent".into()
-        };
         let store = self.store.clone();
         let client = self.client.clone();
         let thread_account = self
@@ -13688,9 +13685,21 @@ impl AgentView {
             .read(cx)
             .thread(self.thread_id)
             .and_then(|thread| thread.account);
+        // With two or more accounts, the tooltip names the thread's (`design/chats-2`, topic
+        // 11 A).
+        let account_name = self.agent_id.as_ref().and_then(|agent_id| {
+            let accounts = self.client.read(cx).accounts(agent_id);
+            (account_entries(&accounts).len() >= 2)
+                .then(|| account_entry(&accounts, thread_account).name)
+        });
+        let tooltip: SharedString = match account_name {
+            Some(account) => format!("{agent_name} · {account}").into(),
+            None if is_compact => agent_name.clone(),
+            None => "Change Agent".into(),
+        };
         let menu = PopoverMenu::new(id)
             .menu(move |window, cx| {
-                let agents: Vec<(AgentId, SharedString)> = {
+                let installed: Vec<(AgentId, SharedString)> = {
                     let registry = registry.read(cx);
                     registry
                         .agents()
@@ -13712,99 +13721,120 @@ impl AgentView {
                     .settings()
                     .usage_window;
                 let now = SystemTime::now();
-                let agents: Vec<(AgentId, SharedString, usize, Option<LimitWindow>)> = agents
+                let rows: Vec<AgentPickerRow> = installed
                     .into_iter()
                     .map(|(agent_id, name)| {
                         let accounts = client.read(cx).accounts(&agent_id);
-                        let account = if current_agent.as_ref() == Some(&agent_id) {
+                        let is_current = current_agent.as_ref() == Some(&agent_id);
+                        let account = if is_current {
                             thread_account
                         } else {
                             accounts.new_thread_account()
                         };
                         let entry = account_entry(&accounts, account);
-                        let window = (!entry.is_logged_out)
+                        let limit_window = (!entry.is_logged_out)
                             .then(|| shown_window(&entry.windows, which, now).cloned())
                             .flatten();
-                        let working = working_threads(store.read(cx), &agent_id, None);
-                        (agent_id, name, working, window)
+                        let store = store.read(cx);
+                        let working = working_threads(store, &agent_id, None);
+                        let entries = account_entries(&accounts);
+                        let accounts = if entries.len() < 2 {
+                            Vec::new()
+                        } else {
+                            entries
+                                .into_iter()
+                                .map(|entry| {
+                                    let working =
+                                        working_threads(store, &agent_id, Some(entry.account));
+                                    (entry, working)
+                                })
+                                .collect()
+                        };
+                        AgentPickerRow {
+                            agent_id,
+                            name,
+                            is_current,
+                            working,
+                            limit_window,
+                            accounts,
+                        }
                     })
                     .collect();
+                let has_submenus = rows.iter().any(|row| !row.accounts.is_empty());
                 let view = view.clone();
-                let current_agent = current_agent.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    for (agent_id, name, working, limit_window) in &agents {
-                        let view = view.clone();
-                        let render_id = agent_id.clone();
-                        let agent_id = agent_id.clone();
-                        let name = name.clone();
-                        let working = *working;
-                        let limit_window = limit_window.clone();
-                        let is_current = current_agent.as_ref() == Some(&agent_id);
-                        menu = menu.custom_entry(
-                            move |_, cx| {
-                                let selector = format!("{id}-{}", render_id.0);
-                                h_flex()
-                                    .id(SharedString::from(format!("{id}-row-{}", render_id.0)))
-                                    .debug_selector(move || selector)
-                                    .w_full()
-                                    .gap_1p5()
-                                    .child(
-                                        agent_icon(&render_id, cx)
-                                            .map(Icon::from_svg_markup)
-                                            .unwrap_or_else(|| Icon::new(IconName::Sparkle))
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_1p5()
-                                            .child(Label::new(name.clone()).truncate())
-                                            .when(working > 0, |name| {
-                                                name.child(render_working_dot(
-                                                    format!("{id}-working-{}", render_id.0),
-                                                    cx,
-                                                ))
-                                            }),
-                                    )
-                                    .children(limit_window.as_ref().map(|window| {
-                                        let selector = format!("{id}-left-{}", render_id.0);
-                                        div()
-                                            .debug_selector(move || selector)
-                                            .pl_3()
-                                            .child(usage_left_label(window, now))
-                                    }))
-                                    .child(div().w(IconSize::Small.rems()).when(
-                                        is_current,
-                                        |row| {
-                                            row.child(
-                                                Icon::new(IconName::Check)
-                                                    .size(IconSize::Small)
-                                                    .color(Color::Accent),
+                    for row in &rows {
+                        let render = {
+                            let row = row.clone();
+                            let chevron_room = has_submenus && row.accounts.is_empty();
+                            move |_: &mut Window, cx: &mut App| {
+                                render_agent_picker_row(id, &row, chevron_room, now, cx)
+                            }
+                        };
+                        let pick = {
+                            let view = view.clone();
+                            let agent_id = row.agent_id.clone();
+                            move |_: &mut Window, cx: &mut App| {
+                                let agent_id = agent_id.clone();
+                                view.update(cx, |view, cx| view.pick_agent(picker, agent_id, cx))
+                                    .log_err();
+                            }
+                        };
+                        if row.accounts.is_empty() {
+                            menu = menu.custom_entry(render, pick);
+                            continue;
+                        }
+                        let accounts = {
+                            let view = view.clone();
+                            let row = row.clone();
+                            move |mut menu: ContextMenu,
+                                  _: &mut Window,
+                                  _: &mut Context<ContextMenu>| {
+                                for (entry, working) in &row.accounts {
+                                    let account = entry.account;
+                                    let is_current = row.is_current && account == thread_account;
+                                    let entry = entry.clone();
+                                    let working = *working;
+                                    let view = view.clone();
+                                    let agent_id = row.agent_id.clone();
+                                    menu = menu.custom_entry(
+                                        move |_, cx| {
+                                            render_account_row(
+                                                accounts_id,
+                                                &entry,
+                                                working,
+                                                is_current,
+                                                now,
+                                                cx,
                                             )
                                         },
-                                    ))
-                                    .when(working > 0, |row| {
-                                        row.tooltip(Tooltip::text(working_tooltip(working)))
-                                    })
-                                    .into_any_element()
-                            },
-                            move |_, cx| {
-                                let agent_id = agent_id.clone();
-                                view.update(cx, |view, cx| match picker {
-                                    PickerFor::NewThread => {
-                                        view.change_new_thread_starter(Starter::Agent(agent_id), cx)
-                                    }
-                                    PickerFor::SentThread { .. } => {
-                                        if view.agent_id.as_ref() != Some(&agent_id) {
-                                            view.switch_agent(agent_id, AccountChoice::Default, cx)
-                                        }
-                                    }
-                                })
-                                .log_err();
-                            },
-                        );
+                                        move |_, cx| {
+                                            let agent_id = agent_id.clone();
+                                            view.update(cx, |view, cx| {
+                                                view.pick_account(picker, agent_id, account, cx)
+                                            })
+                                            .log_err();
+                                        },
+                                    );
+                                }
+                                let view = view.clone();
+                                let agent_id = row.agent_id.clone();
+                                menu.separator().item(
+                                    ContextMenuEntry::new("Manage Accounts…")
+                                        .icon(IconName::Settings)
+                                        .icon_color(Color::Muted)
+                                        .handler(move |_, cx| {
+                                            view.update(cx, |_, cx| {
+                                                cx.emit(AgentViewEvent::OpenAgentAccounts {
+                                                    agent_id: agent_id.clone(),
+                                                })
+                                            })
+                                            .log_err();
+                                        }),
+                                )
+                            }
+                        };
+                        menu = menu.custom_submenu(row.name.clone(), render, pick, accounts);
                     }
                     menu = menu.separator();
                     if offers_terminal {
@@ -13834,9 +13864,9 @@ impl AgentView {
             })
             .trigger_with_tooltip(
                 if is_compact {
-                    icon_picker_chip(trigger_id, self.agent_icon(cx))
+                    icon_picker_chip(trigger_id, self.thread_agent_icon(cx))
                 } else {
-                    picker_chip(trigger_id, self.agent_icon(cx), agent_name)
+                    picker_chip(trigger_id, self.thread_agent_icon(cx), agent_name)
                 }
                 .disabled(disabled),
                 Tooltip::text(tooltip),
@@ -13847,6 +13877,44 @@ impl AgentView {
             .debug_selector(move || id.into())
             .child(menu)
             .into_any_element()
+    }
+
+    /// An agent picked in the agent picker: a draft is made again with it, on its account for
+    /// new threads, and a sent thread goes on with it.
+    fn pick_agent(&mut self, picker: PickerFor, agent_id: AgentId, cx: &mut Context<Self>) {
+        match picker {
+            PickerFor::NewThread => self.change_new_thread_starter(Starter::Agent(agent_id), cx),
+            PickerFor::SentThread { .. } => {
+                if self.agent_id.as_ref() != Some(&agent_id) {
+                    self.switch_agent(agent_id, AccountChoice::Default, cx)
+                }
+            }
+        }
+    }
+
+    /// An account picked in an agent's submenu, `None` being the External one: the draft is
+    /// made again, or the thread goes on, with that agent on it.
+    fn pick_account(
+        &mut self,
+        picker: PickerFor,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        cx: &mut Context<Self>,
+    ) {
+        match picker {
+            PickerFor::NewThread => self.change_new_thread_account(agent_id, account, cx),
+            PickerFor::SentThread { .. } => {
+                let current = self
+                    .store
+                    .read(cx)
+                    .thread(self.thread_id)
+                    .map(|thread| thread.account);
+                if self.agent_id.as_ref() == Some(&agent_id) && current == Some(account) {
+                    return;
+                }
+                self.switch_agent(agent_id, AccountChoice::of(account), cx)
+            }
+        }
     }
 
     /// The branch the thread's folder has checked out, marked as a worktree's or pasture's,
@@ -14368,154 +14436,6 @@ impl AgentView {
         )
     }
 
-    /// The account the new thread runs on, shown only when its agent has more than one: its
-    /// avatar and name, with a menu of the accounts, their plans and the windows closest to
-    /// running out, then Manage Accounts….
-    fn render_account_picker(
-        &self,
-        picker: PickerFor,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let agent_id = self.agent_id.clone()?;
-        let accounts = self.client.read(cx).accounts(&agent_id);
-        let entries = account_entries(&accounts);
-        if entries.len() < 2 {
-            return None;
-        }
-        // A draft made before its account was found logged out still shows it.
-        let current = self.store.read(cx).thread(self.thread_id)?.account;
-        let shown = account_entry(&accounts, current);
-        let (id, trigger_id, selector, disabled) = match picker {
-            PickerFor::NewThread => (
-                "new-thread-account",
-                "new-thread-account-trigger",
-                "new-thread-account",
-                false,
-            ),
-            PickerFor::SentThread { can_switch } => (
-                "thread-account",
-                "thread-account-trigger",
-                "thread-account",
-                !can_switch,
-            ),
-        };
-        // Narrow, the composer's shows only its avatar, with its name in the tooltip. The new
-        // thread's sits with the other pickers under its composer, which keep their names.
-        let is_compact =
-            matches!(picker, PickerFor::SentThread { .. }) && self.is_composer_compact();
-        let chip = ButtonLike::new(trigger_id)
-            .style(ButtonStyle::Subtle)
-            .size(ButtonSize::Compact)
-            .disabled(disabled)
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap_1()
-                    .child(render_entry_avatar(&shown, px(14.), cx))
-                    .when(!is_compact, |chip| {
-                        chip.child(
-                            Label::new(shown.name.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                        )
-                    })
-                    .child(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            );
-        let tooltip: SharedString = if is_compact {
-            shown.name.clone()
-        } else {
-            "Account".into()
-        };
-        let view = cx.weak_entity();
-        let store = self.store.clone();
-        let now = SystemTime::now();
-        let menu = PopoverMenu::new(id)
-            .menu(move |window, cx| {
-                let view = view.clone();
-                let entries = entries.clone();
-                let shown = shown.clone();
-                let agent_id = agent_id.clone();
-                let working: Vec<(Option<AccountId>, usize)> = entries
-                    .iter()
-                    .map(|entry| {
-                        let working =
-                            working_threads(store.read(cx), &agent_id, Some(entry.account));
-                        (entry.account, working)
-                    })
-                    .collect();
-                Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                    let add_row = |menu: ContextMenu, entry: &AccountEntry| {
-                        let account = entry.account;
-                        let entry = entry.clone();
-                        let view = view.clone();
-                        let agent_id = agent_id.clone();
-                        let working = working
-                            .iter()
-                            .find(|(account, _)| *account == entry.account)
-                            .map_or(0, |(_, working)| *working);
-                        menu.custom_entry(
-                            move |_, cx| render_account_row(selector, &entry, working, now, cx),
-                            move |_, cx| {
-                                if account == current {
-                                    return;
-                                }
-                                let agent_id = agent_id.clone();
-                                view.update(cx, |view, cx| match picker {
-                                    PickerFor::NewThread => {
-                                        view.change_new_thread_account(account, cx)
-                                    }
-                                    PickerFor::SentThread { .. } => {
-                                        view.switch_agent(agent_id, AccountChoice::of(account), cx)
-                                    }
-                                })
-                                .log_err();
-                            },
-                        )
-                    };
-                    let mut menu = add_row(menu.header("This thread"), &shown);
-                    let mut others = entries
-                        .iter()
-                        .filter(|entry| entry.account != current)
-                        .peekable();
-                    if others.peek().is_some() {
-                        menu = menu.separator().header("Switch to");
-                    }
-                    for entry in others {
-                        menu = add_row(menu, entry);
-                    }
-                    let view = view.clone();
-                    let agent_id = agent_id.clone();
-                    menu.separator().item(
-                        ContextMenuEntry::new("Manage Accounts…")
-                            .icon(IconName::Settings)
-                            .icon_color(Color::Muted)
-                            .handler(move |_, cx| {
-                                view.update(cx, |_, cx| {
-                                    cx.emit(AgentViewEvent::OpenAgentAccounts {
-                                        agent_id: agent_id.clone(),
-                                    })
-                                })
-                                .log_err();
-                            }),
-                    )
-                }))
-            })
-            .trigger_with_tooltip(chip, Tooltip::text(tooltip))
-            .anchor(picker.menu_anchor())
-            .offset(picker.menu_offset());
-        Some(
-            div()
-                .debug_selector(move || selector.into())
-                .child(menu)
-                .into_any_element(),
-        )
-    }
-
     /// Asks for the project's repository once, for the checkout picker.
     fn load_new_thread_git(&mut self, cx: &mut Context<Self>) {
         if self._draft_git_load.is_some() {
@@ -14739,18 +14659,22 @@ impl AgentView {
         self.change_new_thread_project(chats, cx);
     }
 
-    /// `account` being `None` for the External one.
-    fn change_new_thread_account(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+    /// The draft made again with the agent on the account, `None` being the External one.
+    fn change_new_thread_account(
+        &mut self,
+        agent_id: AgentId,
+        account: Option<AccountId>,
+        cx: &mut Context<Self>,
+    ) {
         let current = self
             .store
             .read(cx)
             .thread(self.thread_id)
             .map(|thread| thread.account);
-        if current == Some(account) {
+        if self.agent_id.as_ref() == Some(&agent_id) && current == Some(account) {
             return;
         }
-        let (Some(project), Some(agent_id)) = (self.current_project(cx), self.agent_id.clone())
-        else {
+        let Some(project) = self.current_project(cx) else {
             return;
         };
         let workspace = self.current_workspace_choice(cx);
@@ -15203,22 +15127,123 @@ fn render_folder_crumb(folder: PathBuf) -> AnyElement {
         .into_any_element()
 }
 
-/// An account in a thread's account picker: its avatar, its name over its plan and the window
-/// closest to running out, and while it's working in threads, a dot that says how many.
+/// An account in an agent's submenu in the agent picker (`design/chats-2`, topic 10 B), on one
+/// line: its avatar, its name (and while it's working in threads, a dot that says how many),
+/// the window the usage setting picks, closest to running out, and a check on the thread's.
 fn render_account_row(
     picker: &'static str,
     entry: &AccountEntry,
     working: usize,
+    is_current: bool,
     now: SystemTime,
     cx: &App,
 ) -> AnyElement {
+    let which = crate::app_settings::AppSettingsStore::global(cx)
+        .read(cx)
+        .settings()
+        .usage_window;
     let selector = account_selector(entry.account);
     let working_selector = format!("{picker}-working-{selector}");
     let row_id = SharedString::from(format!("{picker}-row-{selector}"));
-    let working_dot = (working > 0).then(|| render_working_dot(working_selector, cx));
-    account_row(entry, false, working_dot, now, cx)
-        .debug_selector(move || format!("{picker}-{selector}"))
+    // Unnamed, the External account is already called "External".
+    let is_external = entry.account.is_none() && entry.is_named;
+    // Logged out, its last read is out of date.
+    let end = if entry.is_logged_out {
+        Some(
+            Label::new("Logged out")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+    } else {
+        shown_window(&entry.windows, which, now).map(|window| usage_left_label(window, now))
+    };
+    h_flex()
         .id(row_id)
+        .debug_selector(move || format!("{picker}-{selector}"))
+        .w_full()
+        .gap_1p5()
+        .child(render_entry_avatar(entry, px(16.), cx))
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(Label::new(entry.name.clone()).truncate())
+                .when(is_external, |name| {
+                    name.child(
+                        Label::new("· External")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
+                })
+                .when(working > 0, |name| {
+                    name.child(render_working_dot(working_selector, cx).ml_0p5())
+                }),
+        )
+        .children(end.map(|end| div().pl_3().child(end)))
+        .child(div().w(IconSize::Small.rems()).when(is_current, |row| {
+            row.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        }))
+        .when(working > 0, |row| {
+            row.tooltip(Tooltip::text(working_tooltip(working)))
+        })
+        .into_any_element()
+}
+
+/// An agent in the agent picker: its icon, its name (and while it's working in threads, a dot
+/// that says how many), what's left of the account it would answer on, and a check on the
+/// thread's. `chevron_room` leaves a submenu's chevron's room after it, so the checks line up.
+fn render_agent_picker_row(
+    picker: &'static str,
+    row: &AgentPickerRow,
+    chevron_room: bool,
+    now: SystemTime,
+    cx: &App,
+) -> AnyElement {
+    let agent = &row.agent_id.0;
+    let working = row.working;
+    h_flex()
+        .id(SharedString::from(format!("{picker}-row-{agent}")))
+        .debug_selector(|| format!("{picker}-{agent}"))
+        .w_full()
+        .gap_1p5()
+        .child(
+            agent_icon(&row.agent_id, cx)
+                .map(Icon::from_svg_markup)
+                .unwrap_or_else(|| Icon::new(IconName::Sparkle))
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1p5()
+                .child(Label::new(row.name.clone()).truncate())
+                .when(working > 0, |name| {
+                    name.child(render_working_dot(format!("{picker}-working-{agent}"), cx))
+                }),
+        )
+        .children(row.limit_window.as_ref().map(|window| {
+            div()
+                .debug_selector(|| format!("{picker}-left-{agent}"))
+                .pl_3()
+                .child(usage_left_label(window, now))
+        }))
+        .child(div().w(IconSize::Small.rems()).when(row.is_current, |row| {
+            row.child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+        }))
+        .when(chevron_room, |row| {
+            row.child(div().flex_none().w(IconSize::Small.rems()))
+        })
         .when(working > 0, |row| {
             row.tooltip(Tooltip::text(working_tooltip(working)))
         })
@@ -15267,66 +15292,6 @@ fn usage_left_label(window: &LimitWindow, now: SystemTime) -> Label {
     } else {
         label
     }
-}
-
-/// An account as the menus that pick one show it: its avatar, its name (and the working dot)
-/// over its plan, and the window the usage setting picks. Greyed, it can't be picked.
-fn account_row(
-    entry: &AccountEntry,
-    is_greyed: bool,
-    working_dot: Option<Div>,
-    now: SystemTime,
-    cx: &App,
-) -> Div {
-    let which = crate::app_settings::AppSettingsStore::global(cx)
-        .read(cx)
-        .settings()
-        .usage_window;
-    let note: Option<SharedString> = if entry.is_logged_out {
-        Some("Logged out".into())
-    } else {
-        entry.plan.clone().map(SharedString::from)
-    };
-    let (name_color, note_color) = if is_greyed {
-        (Color::Disabled, Color::Disabled)
-    } else {
-        (Color::Default, Color::Muted)
-    };
-    // Unnamed, the External account is already called "External".
-    let is_external = entry.account.is_none() && entry.is_named;
-    h_flex()
-        .w_full()
-        .gap_2()
-        .child(render_entry_avatar(entry, px(18.), cx))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Label::new(entry.name.clone()).color(name_color).truncate())
-                        .when(is_external, |name| {
-                            name.child(
-                                Label::new("· External")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Placeholder),
-                            )
-                        })
-                        .children(working_dot.map(|dot| dot.ml_0p5())),
-                )
-                .children(
-                    note.map(|note| Label::new(note).size(LabelSize::XSmall).color(note_color)),
-                ),
-        )
-        .children(shown_window(&entry.windows, which, now).map(|window| {
-            let left = left_label(window, now).size(LabelSize::XSmall);
-            div().pl(px(14.)).child(if is_greyed {
-                left.color(Color::Disabled)
-            } else {
-                left
-            })
-        }))
 }
 
 /// What the limit notice shows: the thread's account, the window it ran out of, and the
@@ -15450,6 +15415,21 @@ fn model_chip_label(
     }
 }
 
+/// An installed agent in the agent picker.
+#[derive(Clone)]
+struct AgentPickerRow {
+    agent_id: AgentId,
+    name: SharedString,
+    /// The thread's agent.
+    is_current: bool,
+    /// How many threads it's working in.
+    working: usize,
+    /// What's left of the account it would answer on.
+    limit_window: Option<LimitWindow>,
+    /// With two or more, its accounts, each with how many threads it's working in.
+    accounts: Vec<(AccountEntry, usize)>,
+}
+
 /// Which composer a picker is in: a new thread's, made again with what's picked, or a sent
 /// thread's, which goes on with it once it `can_switch`.
 #[derive(Clone, Copy, PartialEq)]
@@ -15533,7 +15513,7 @@ fn round_button(
 }
 
 /// A borderless button that opens one of the new thread's pickers.
-fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike {
+fn picker_chip(id: &'static str, icon: impl Into<AgentIcon>, label: SharedString) -> ButtonLike {
     ButtonLike::new(id)
         .style(ButtonStyle::Subtle)
         .size(ButtonSize::Compact)
@@ -15547,14 +15527,14 @@ fn picker_chip(id: &'static str, icon: Icon, label: SharedString) -> ButtonLike 
 }
 
 /// A picker's chip with only its icon, for a narrow composer.
-fn icon_picker_chip(id: &'static str, icon: Icon) -> ButtonLike {
+fn icon_picker_chip(id: &'static str, icon: impl Into<AgentIcon>) -> ButtonLike {
     ButtonLike::new(id)
         .style(ButtonStyle::Subtle)
         .size(ButtonSize::Compact)
         .child(
             h_flex()
                 .gap_1()
-                .child(icon.size(IconSize::XSmall).color(Color::Muted))
+                .child(icon.into().size(IconSize::XSmall).color(Color::Muted))
                 .child(
                     Icon::new(IconName::ChevronDown)
                         .size(IconSize::XSmall)
@@ -15619,11 +15599,11 @@ fn static_chip(id: &'static str, icon: Icon, label: SharedString) -> gpui::State
     chip_content(icon, label).id(id).h(px(22.)).px_1p5()
 }
 
-fn chip_content(icon: Icon, label: SharedString) -> Div {
+fn chip_content(icon: impl Into<AgentIcon>, label: SharedString) -> Div {
     h_flex()
         .min_w_0()
         .gap_1()
-        .child(icon.size(IconSize::XSmall).color(Color::Muted))
+        .child(icon.into().size(IconSize::XSmall).color(Color::Muted))
         .child(
             Label::new(label)
                 .size(LabelSize::Small)
@@ -17995,6 +17975,20 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// Opens the agent picker and hovers an agent's row, which opens its accounts beside it.
+    /// The submenu is placed once the menu has measured its row, on the next mouse move.
+    fn open_accounts(picker: &'static str, row: &'static str, cx: &mut VisualTestContext) {
+        click_on(picker, cx);
+        let bounds = cx
+            .debug_bounds(row)
+            .unwrap_or_else(|| panic!("{row} is shown"));
+        for nudge in [0., 1.] {
+            let position = bounds.center() + gpui::point(px(nudge), px(0.));
+            cx.simulate_mouse_move(position, None, gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
+    }
+
     /// A draft in its project's folder only plans its new worktree, from what's checked out
     /// unless another branch is picked in its From list, where Fetch brings origin's new
     /// ones. Local checkout drops the plan.
@@ -18192,16 +18186,22 @@ mod tests {
         assert!(sent(&client, cx).contains(&Request::RetryWorkspaceSetup(ThreadId(1))));
     }
 
-    /// With two accounts, the composer shows the draft's account beside its agent, and picking
-    /// another makes the draft again on it. Another checkout keeps the account; another agent
-    /// takes its own account for new threads.
+    /// With two accounts, the agent picker has the draft's agent's accounts in a submenu, and
+    /// picking another makes the draft again on it. Another checkout keeps the account; another
+    /// agent takes its own account for new threads.
     #[gpui::test]
-    fn the_strip_picks_the_new_threads_account(cx: &mut TestAppContext) {
+    fn the_agent_picker_picks_the_new_threads_account(cx: &mut TestAppContext) {
         use agentz_protocol::accounts::{AccountStatus, AgentAccounts, LimitWindow, StatusRead};
         use std::cell::RefCell;
 
         let (view, cx) = open(1, false, cx);
-        assert!(cx.debug_bounds("new-thread-account").is_none());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        cx.update(|_, cx| install_agents(&client, &[("mock", "Mock")], cx));
+        cx.run_until_parked();
+        // With one account, its row has no submenu.
+        open_accounts("new-thread-agent", "new-thread-agent-mock", cx);
+        assert!(cx.debug_bounds("new-thread-account-external").is_none());
+        dismiss_menu(cx);
 
         let mock = AgentId::new("mock");
         let mut accounts = AgentAccounts {
@@ -18229,7 +18229,6 @@ mod tests {
         }
         let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
         let events: Rc<RefCell<Vec<AgentId>>> = Rc::default();
-        let client = view.read_with(cx, |view, _| view.client.clone());
         client.update(cx, |client, cx| {
             let requests = requests.clone();
             client.answer_for_test(move |request| {
@@ -18267,7 +18266,7 @@ mod tests {
         };
 
         // The External account first, then agentZ's.
-        click("new-thread-account", cx);
+        open_accounts("new-thread-agent", "new-thread-agent-mock", cx);
         let external = cx
             .debug_bounds("new-thread-account-external")
             .expect("the External account is offered");
@@ -18311,7 +18310,7 @@ mod tests {
         );
         // Another account makes the draft again with its plan.
         requests.borrow_mut().clear();
-        click("new-thread-account", cx);
+        open_accounts("new-thread-agent", "new-thread-agent-mock", cx);
         click("new-thread-account-external", cx);
         assert!(
             requests
@@ -18337,7 +18336,7 @@ mod tests {
         // Manage Accounts… opens the agent's accounts, and there's no Add Account… beside it.
         store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
         cx.run_until_parked();
-        click("new-thread-account", cx);
+        open_accounts("new-thread-agent", "new-thread-agent-mock", cx);
         assert!(cx.debug_bounds("MENU_ITEM-Add Account…").is_none());
         click("MENU_ITEM-Manage Accounts…", cx);
         assert_eq!(*events.borrow(), vec![mock]);
@@ -18408,7 +18407,7 @@ mod tests {
         assert!(at_limit(&view, cx));
         assert!(cx.debug_bounds("limit-notice").is_some());
         assert!(cx.debug_bounds("limit-continue-at-reset").is_some());
-        assert!(cx.debug_bounds("thread-account").is_some());
+        assert!(cx.debug_bounds("thread-agent").is_some());
 
         // Closed, it comes back with the next turn's stop.
         let dismiss = cx
@@ -19064,9 +19063,10 @@ mod tests {
         assert!(cx.debug_bounds("usage-gauge").is_none());
     }
 
-    /// A sent thread's composer has its agent and, with several, its account: another account
-    /// picked there goes on with the thread, between turns. The message that brought what the
-    /// new account hadn't seen has the Context handoff divider over it.
+    /// A sent thread's agent picker has, with several, the agent's accounts in a submenu:
+    /// another account picked there goes on with the thread, between turns, and so does another
+    /// agent's, with that agent, while the agent's own row picks it on its default. The message
+    /// that brought what the new account hadn't seen has the Context handoff divider over it.
     #[gpui::test]
     fn a_sent_thread_goes_on_with_another_account(cx: &mut TestAppContext) {
         use agentz_protocol::thread::HandoffMark;
@@ -19083,15 +19083,25 @@ mod tests {
             account.choices.label = Some("Work".into());
             account.logged_in = Some(true);
         }
+        let codex = AgentId::new("codex");
+        let mut codex_accounts = AgentAccounts {
+            external_logged_in: Some(true),
+            ..AgentAccounts::default()
+        };
+        let side = codex_accounts.add();
         let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
         let client = view.read_with(cx, |view, _| view.client.clone());
+        cx.update(|_, cx| install_agents(&client, &[("mock", "Mock"), ("codex", "Codex")], cx));
         client.update(cx, |client, cx| {
             let requests = requests.clone();
             client.answer_for_test(move |request| {
                 requests.borrow_mut().push(request.clone());
                 matches!(request, Request::SwitchAgent { .. }).then_some(Response::Ok)
             });
-            client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+            client.set_accounts_for_test(
+                [(mock.clone(), accounts), (codex.clone(), codex_accounts)].into(),
+                cx,
+            );
         });
         let agent = |account| ThreadAgent {
             agent_id: "mock".into(),
@@ -19151,40 +19161,51 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // The thread's own account changes nothing.
-        click("thread-account", cx);
+        open_accounts("thread-agent", "thread-agent-mock", cx);
         click("thread-account-external", cx);
         assert!(switched(&requests).is_empty());
-        click("thread-account", cx);
+        open_accounts("thread-agent", "thread-agent-mock", cx);
         click("thread-account-1", cx);
         assert_eq!(
             switched(&requests),
-            vec![(ThreadId(2), mock, AccountChoice::Account(work))]
+            vec![(ThreadId(2), mock.clone(), AccountChoice::Account(work))]
         );
 
-        // The thread's account comes first, under "This thread", the others under "Switch to".
+        // The accounts keep their order, the thread's checked.
         let top = |selector: &'static str, cx: &mut VisualTestContext| {
             cx.debug_bounds(selector)
                 .unwrap_or_else(|| panic!("{selector} is shown"))
                 .top()
         };
-        click("thread-account", cx);
-        assert!(top("thread-account-external", cx) < top("thread-account-1", cx));
-        dismiss_menu(cx);
-        assert!(cx.debug_bounds("thread-account-external").is_none());
+        requests.borrow_mut().clear();
         let store = view.read_with(cx, |view, _| view.store.clone());
         let mut on_work = snapshot(Some("Fix the login"));
         on_work.threads[1].account = Some(work);
         store.update(cx, |store, cx| store.set_snapshot(on_work, cx));
         cx.run_until_parked();
-        click("thread-account", cx);
-        assert!(top("thread-account-1", cx) < top("thread-account-external", cx));
+        open_accounts("thread-agent", "thread-agent-mock", cx);
+        assert!(top("thread-account-external", cx) < top("thread-account-1", cx));
         dismiss_menu(cx);
+        assert!(cx.debug_bounds("thread-account-external").is_none());
+
+        // Another agent's account goes on with that agent on it; its row, on its default.
+        open_accounts("thread-agent", "thread-agent-codex", cx);
+        click("thread-account-1", cx);
+        open_accounts("thread-agent", "thread-agent-codex", cx);
+        click("thread-agent-codex", cx);
+        assert_eq!(
+            switched(&requests),
+            vec![
+                (ThreadId(2), codex.clone(), AccountChoice::Account(side)),
+                (ThreadId(2), codex, AccountChoice::Default),
+            ]
+        );
 
         // Not while the agent works.
         thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
         cx.run_until_parked();
-        click("thread-account", cx);
-        assert!(cx.debug_bounds("thread-account-1").is_none());
+        click("thread-agent", cx);
+        assert!(cx.debug_bounds("thread-agent-mock").is_none());
     }
 
     /// As the thread narrows, its header gives way in order (`design/thread-narrow`, topic
@@ -19572,7 +19593,7 @@ mod tests {
         };
         let footer = bounds_of("composer-footer", cx);
         assert!(footer.contains(&bounds_of("thread-agent", cx).center()));
-        assert!(footer.contains(&bounds_of("thread-account", cx).center()));
+        assert!(cx.debug_bounds("thread-account").is_none());
         let strip = bounds_of("composer-strip", cx);
         assert!(strip.top() > footer.bottom());
         let machine = bounds_of("thread-machine", cx);
@@ -19591,12 +19612,10 @@ mod tests {
 
         resize(720., cx);
         let agent = bounds_of("thread-agent", cx).size.width;
-        let account = bounds_of("thread-account", cx).size.width;
         assert!(!at_the_right(cx));
 
         resize(520., cx);
         assert!(bounds_of("thread-agent", cx).size.width < agent);
-        assert!(bounds_of("thread-account", cx).size.width < account);
         assert!(!at_the_right(cx));
 
         // Too narrow for one line, the controls wrap to a line of their own.
@@ -22094,7 +22113,8 @@ mod tests {
     /// The agent picker marks the agents working in a thread right now with the sidebar's
     /// dot, and ends each with what's left of the account a switch would use: this thread's
     /// for its own agent, the default for another (`design/composer-2`, topics 9 A and 10 A).
-    /// The account picker marks the accounts working.
+    /// An agent's accounts mark the accounts working, and its row leaves room for the chevron
+    /// of a row with accounts, so the checks line up.
     #[gpui::test]
     fn the_pickers_say_what_is_working_and_whats_left(cx: &mut TestAppContext) {
         use agentz_protocol::accounts::{AccountStatus, StatusRead};
@@ -22188,10 +22208,20 @@ mod tests {
         assert!(dot.right() < left.left() && mock_row.contains(&left.center()));
         dismiss_menu(cx);
 
-        click_on("thread-account", cx);
+        open_accounts("thread-agent", "thread-agent-mock", cx);
         assert!(cx.debug_bounds("thread-account-working-1").is_some());
         assert!(cx.debug_bounds("thread-account-working-external").is_none());
+        let right = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+                .right()
+        };
+        assert!(
+            (right("thread-agent-left-mock", cx) - right("thread-agent-left-codex", cx)).abs()
+                < px(1.)
+        );
     }
+
     /// What the agent left running shows above the composer, each with Stop, which asks the
     /// server to stop it.
     #[gpui::test]

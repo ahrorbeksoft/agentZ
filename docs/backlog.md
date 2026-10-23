@@ -36,8 +36,3 @@ version of another machine's artifact ("there's no artifact … to update").
 Requested October 23, 2026: redesign chats. They don't need their own grouping any more: a chat
 should be just like any other thread, but show "Chat" or something like it in place of a
 project name. In the project selector, it should be possible to select Chat to show only chats.
-
-### Pick the account in a submenu of the agent selector
-
-Requested October 23, 2026: "why not put the account selector inside the agent selector in a
-submenu". Also, in the composer, show the agent's icon in the account's color.

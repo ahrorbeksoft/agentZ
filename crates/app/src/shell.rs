@@ -871,7 +871,7 @@ impl Shell {
         }
     }
 
-    /// Manage Accounts…, from a thread's account picker.
+    /// Manage Accounts…, from an agent's accounts in a thread's agent picker.
     fn open_agent_accounts(
         &mut self,
         machine: MachineId,

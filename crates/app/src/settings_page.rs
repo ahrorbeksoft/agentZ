@@ -1497,7 +1497,7 @@ impl SettingsPage {
         )
     }
 
-    /// Which of an account's windows the composer's gauge and account picker show.
+    /// Which of an account's windows the composer's gauge and agent picker show.
     fn render_usage_window_row(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.app_settings.read(cx).settings().usage_window;
         let app_settings = self.app_settings.clone();
@@ -1520,7 +1520,7 @@ impl SettingsPage {
         });
         render_row(
             "Usage shown in the composer",
-            "The window of an account's limits the composer's gauge and its account picker \
+            "The window of an account's limits the composer's gauge and its agent picker \
              show. The current session is the shortest window, the 5-hour one, unless a longer \
              window is used up: then that one shows, since nothing works until it resets.",
             div()

@@ -259,6 +259,12 @@ impl AgentIcon {
         self.size = size;
         self
     }
+
+    /// The icon's color off the account's; on it, the icon is white.
+    pub(crate) fn color(mut self, color: Color) -> Self {
+        self.icon = self.icon.color(color);
+        self
+    }
 }
 
 impl From<Icon> for AgentIcon {
