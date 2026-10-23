@@ -1,0 +1,514 @@
+    Checking cfg-if v1.0.4
+    Checking serde_core v1.0.229
+    Checking libc v0.2.186
+    Checking memchr v2.8.3
+    Checking typeid v1.0.3
+    Checking smallvec v1.16.1
+    Checking pin-project-lite v0.2.16
+    Checking equivalent v1.0.2
+    Checking allocator-api2 v0.2.21
+    Checking foldhash v0.2.0
+    Checking futures-core v0.3.34
+    Checking crossbeam-utils v0.8.21
+    Checking futures-io v0.3.34
+    Checking itoa v1.0.18
+    Checking stable_deref_trait v1.2.1
+    Checking once_cell v1.21.4
+    Checking fastrand v2.3.0
+    Checking slab v0.4.11
+    Checking hashbrown v0.17.1
+    Checking zerofrom v0.1.6
+    Checking parking v2.2.1
+    Checking libm v0.2.16
+    Checking yoke v0.8.3
+    Checking simd-adler32 v0.3.7
+    Checking concurrent-queue v2.5.0
+    Checking futures-sink v0.3.34
+    Checking crc32fast v1.5.0
+    Checking adler2 v2.0.1
+    Checking zerovec v0.11.8
+    Checking futures-lite v2.6.1
+    Checking errno v0.3.14
+    Checking signal-hook-registry v1.4.6
+    Checking miniz_oxide v0.8.9
+    Checking core-foundation-sys v0.8.7
+    Checking writeable v0.6.4
+    Checking atomic-waker v1.1.2
+    Checking rustc-hash v2.1.1
+    Checking litemap v0.8.0
+    Checking zerotrie v0.2.5
+    Checking futures-channel v0.3.34
+    Checking zmij v1.0.23
+    Checking event-listener v5.4.1
+    Checking futures-task v0.3.34
+    Checking utf8_iter v1.0.4
+    Checking bytes v1.11.1
+    Checking futures-util v0.3.34
+    Checking flate2 v1.1.8
+    Checking regex-syntax v0.8.11
+    Checking event-listener-strategy v0.5.4
+    Checking num-traits v0.2.19
+    Checking icu_properties_data v2.3.0
+    Checking tinystr v0.8.4
+    Checking potential_utf v0.1.3
+    Checking icu_locale_core v2.3.0
+    Checking icu_normalizer_data v2.3.0
+    Checking icu_collections v2.3.0
+    Checking aho-corasick v1.1.3
+    Checking serde v1.0.229
+    Checking bitflags v2.13.1
+    Checking erased-serde v0.4.9
+    Checking indexmap v2.14.0
+    Checking rustix v1.1.4
+    Checking serde_fmt v1.0.3
+    Checking write16 v1.0.0
+    Checking value-bag-serde1 v1.12.0
+    Checking async-task v4.7.1 (https://github.com/smol-rs/async-task.git?rev=b4486cd71e4e94fbda54ce6302444de14f4d190e#b4486cd7)
+    Checking value-bag v1.12.0
+    Checking utf16_iter v1.0.5
+    Checking icu_provider v2.3.0
+    Checking thiserror v2.0.17
+    Checking anyhow v1.0.104
+    Checking serde_json v1.0.151
+    Checking typenum v1.19.0
+    Checking log v0.4.29
+    Checking async-channel v2.5.0
+    Checking icu_normalizer v2.3.0
+    Checking icu_properties v2.3.0
+    Checking piper v0.2.4
+    Checking tracing-core v0.1.35
+    Checking regex-automata v0.4.18
+    Checking hashbrown v0.16.1
+    Checking percent-encoding v2.3.2
+    Checking generic-array v0.14.7
+    Checking blocking v1.6.2
+    Checking form_urlencoded v1.2.2
+    Checking async-lock v3.4.2
+    Checking either v1.15.0
+    Checking scopeguard v1.2.0
+    Checking lock_api v0.4.14
+    Checking getrandom v0.4.1
+    Checking getrandom v0.3.4
+    Checking zstd-sys v2.0.16+zstd.1.5.7
+    Checking no_std_io2 v0.9.4
+    Checking same-file v1.0.6
+    Checking rle-decode-fast v1.0.3
+    Checking unicase v2.8.1
+    Checking zstd-safe v7.3.0
+    Checking idna_adapter v1.2.1
+    Checking futures-executor v0.3.34
+    Checking libflate_lz77 v2.3.0
+    Checking walkdir v2.5.0
+    Checking idna v1.1.0
+    Checking tracing v0.1.43
+    Checking pin-project v1.1.10
+    Checking crypto-common v0.1.6
+    Checking block-buffer v0.10.4
+    Checking gpui_util v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_util)
+    Checking async-executor v1.13.3
+    Checking core-foundation v0.10.0
+    Checking bstr v1.12.1
+    Checking option-ext v0.2.0
+    Checking url v2.5.7
+    Checking ryu v1.0.23
+    Checking dary_heap v0.3.9
+    Checking libbz2-rs-sys v0.2.2
+    Checking adler32 v1.2.0
+    Checking polling v3.11.0
+    Checking tempfile v3.27.0
+    Checking collections v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/collections)
+    Checking libflate v2.3.1
+    Checking dirs-sys v0.5.0
+    Checking async-io v2.6.0
+    Checking digest v0.10.7
+    Checking zstd v0.13.3
+    Checking futures v0.3.34
+    Checking derive_more v2.1.1
+    Checking cpufeatures v0.2.17
+    Checking deflate64 v0.1.10
+    Checking compression-core v0.4.29
+    Checking arrayvec v0.7.6
+    Checking sha2 v0.10.9
+    Checking ref-cast v1.0.25
+    Checking dirs v6.0.0
+    Checking memoffset v0.9.1
+    Checking parking_lot_core v0.9.12
+    Checking dyn-clone v1.0.20
+    Checking async-fs v2.2.0
+    Checking include-flate-compress v0.3.4
+    Checking nix v0.30.1
+    Checking bzip2 v0.6.1
+    Checking async-signal v0.2.13
+    Checking schemars v1.0.4
+    Checking include-flate v0.3.4
+    Checking async-process v2.5.0 (https://github.com/zed-industries/async-process.git?rev=0b6d6713570af61806e1e5cb40e0f757cb93fd9d#0b6d6713)
+    Checking compression-codecs v0.4.31
+    Checking async-net v2.0.0
+    Checking parking_lot v0.12.5
+    Checking fnv v1.0.7
+    Checking dunce v1.0.5
+    Checking async-compression v0.4.32
+    Checking serde_json_lenient v0.2.4
+    Checking itertools v0.14.0
+    Checking smol v2.0.2
+    Checking path v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/path)
+    Checking mach2 v0.5.0
+    Checking which v8.0.5
+    Checking async_zip v0.0.18
+    Checking shlex v1.3.0
+    Checking sha1_smol v1.0.1
+    Checking http v1.3.1
+    Checking strum v0.28.0
+    Checking uuid v1.18.1
+    Checking smol_str v0.3.6
+    Checking globset v0.4.20
+    Checking regex v1.12.3
+    Checking gpui_shared_string v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_shared_string)
+    Checking zerocopy v0.8.27
+    Checking fixedbitset v0.5.7
+    Checking crossbeam-epoch v0.9.18
+    Checking rust-embed-utils v8.11.0
+    Checking futures-concurrency v7.7.1
+    Checking rust-embed v8.11.0
+    Checking base64 v0.22.1
+    Checking bytemuck v1.24.0
+    Checking siphasher v1.0.1
+    Checking crossbeam-deque v0.8.6
+    Checking http-body v1.0.1
+    Checking command-fds v0.3.2
+    Checking event-listener v2.5.3
+    Checking async-global-executor v2.4.1
+    Checking kv-log-macro v1.0.7
+    Checking pin-utils v0.1.0
+    Checking util v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/util)
+    Checking async-channel v1.9.0
+    Checking rayon-core v1.13.0
+    Checking xattr v1.6.1
+    Checking serde_urlencoded v0.7.1
+    Checking filetime v0.2.29
+    Checking async-std v1.13.2
+    Checking socket2 v0.6.5
+    Checking mio v1.2.0
+    Checking fdeflate v0.3.7
+    Checking objc2-encode v4.1.0
+    Checking iana-time-zone v0.1.64
+    Checking zune-core v0.5.1
+    Checking weezl v0.1.10
+    Checking tokio v1.52.1
+    Checking quick-error v2.0.1
+    Checking zune-jpeg v0.5.15
+    Checking chrono v0.4.42
+    Checking thiserror v1.0.69
+    Checking rayon v1.11.0
+    Checking byteorder-lite v0.1.0
+    Checking color_quant v1.1.0
+    Checking gif v0.14.2
+    Checking image-webp v0.2.4
+    Checking half v2.7.1
+    Checking fax v0.2.6
+    Checking pxfm v0.1.25
+    Checking zune-inflate v0.2.54
+    Checking async-tar v0.6.1 (https://github.com/zed-industries/async-tar?rev=bd3ad6f89df9a9da7a8535958756d6bf465936a0#bd3ad6f8)
+    Checking bit_field v0.10.3
+    Checking lebe v0.5.3
+    Checking tiff v0.11.3
+    Checking exr v1.74.0
+    Checking png v0.18.0
+    Checking http_client v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/http_client)
+    Checking qoi v0.4.1
+    Checking objc2 v0.6.3
+    Checking euclid v0.22.14
+    Checking zeroize v1.8.2
+    Checking polycool v0.4.0
+    Checking rustls-pki-types v1.12.0
+    Checking core-graphics-types v0.2.0
+    Checking foreign-types-shared v0.3.1
+    Checking kurbo v0.13.1
+    Checking serde_with v3.22.0
+    Checking foreign-types v0.5.0
+    Checking moxcms v0.8.1
+    Checking byteorder v1.5.0
+    Checking lazy_static v1.5.0
+    Checking aws-lc-sys v0.46.0
+    Checking objc2-core-foundation v0.3.2
+    Checking svgtypes v0.16.1
+    Checking rand_core v0.9.3
+    Checking core_maths v0.1.1
+    Checking malloc_buf v0.0.6
+    Checking getrandom v0.2.16
+    Checking untrusted v0.9.0
+    Checking block v0.1.6
+    Checking float-cmp v0.9.0
+    Checking unsafe-libyaml v0.2.11
+    Checking mime v0.3.17
+    Checking strict-num v0.1.1
+    Checking ring v0.17.14
+    Checking objc v0.2.7
+    Checking ttf-parser v0.25.1
+    Checking aws-lc-rs v1.18.2
+    Checking slotmap v1.0.7
+    Checking sharded-slab v0.1.7
+    Checking serde_yaml_ng v0.10.0
+    Checking lyon_geom v1.0.17
+    Checking agent-client-protocol-schema v1.12.0
+    Checking ppv-lite86 v0.2.21
+    Checking projects v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/projects)
+    Checking tracing-log v0.2.0
+    Checking roxmltree v0.21.1
+    Checking encoding_rs v0.8.35
+    Checking thread_local v1.1.9
+    Checking tinyvec_macros v0.1.1
+    Checking arrayref v0.3.9
+   Compiling ztracing v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/ztracing)
+    Checking nu-ansi-term v0.50.3
+    Checking data-url v0.3.2
+    Checking tiny-skia-path v0.11.4
+    Checking tracing-subscriber v0.3.22
+    Checking tinyvec v1.10.0
+    Checking rustls-webpki v0.103.15
+    Checking lyon_path v1.0.16
+    Checking image v0.25.10
+    Checking rand_chacha v0.9.0
+    Checking hash32 v0.3.1
+    Checking zlog v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/zlog)
+    Checking phf_shared v0.13.1
+    Checking security-framework-sys v2.15.0
+    Checking memmap2 v0.9.8
+    Checking gimli v0.32.3
+    Checking leak v0.1.2
+    Checking bitflags v1.3.2
+    Checking unicode-script v0.5.8
+   Compiling ztracing_macro v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/ztracing_macro)
+    Checking unicode-bidi-mirroring v0.4.0
+    Checking unicode-ccc v0.4.0
+    Checking subtle v2.6.1
+    Checking unicode-properties v0.1.3
+    Checking png v0.17.16
+    Checking rustls v0.23.45
+    Checking security-framework v3.5.1
+    Checking rustybuzz v0.20.1
+    Checking fontdb v0.23.0
+    Checking leaky-cow v0.1.1
+    Checking accesskit v0.24.1
+    Checking rand v0.9.4
+    Checking heapless v0.9.2
+    Checking object v0.37.3
+    Checking objc2-core-video v0.3.2
+    Checking tokio-util v0.7.18
+    Checking child_process v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/child_process)
+    Checking spin v0.9.8
+    Checking simplecss v0.2.2
+    Checking wait-timeout v0.2.1
+    Checking cgl v0.3.2
+    Checking addr2line v0.25.1
+    Checking imagesize v0.14.0
+    Checking unicode-vo v0.1.0
+    Checking unicode-bidi v0.3.18
+    Checking quick-error v1.2.3
+    Checking xmlwriter v0.1.0
+    Checking float_next_after v1.0.0
+    Checking rustc-demangle v0.1.26
+    Checking bit-vec v0.8.0
+    Checking pico-args v0.5.0
+    Checking try-lock v0.2.5
+    Checking usvg v0.46.0
+    Checking lyon_tessellation v1.0.16
+    Checking want v0.3.1
+    Checking rusty-fork v0.3.1
+    Checking bit-set v0.8.0
+    Checking io-surface v0.16.1
+    Checking h2 v0.4.19
+    Checking flume v0.12.0
+    Checking phf v0.13.1
+    Checking sum_tree v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/sum_tree)
+    Checking metal v0.33.0
+   Compiling perf v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/tooling/perf)
+    Checking httparse v1.10.1
+    Checking tiny-skia v0.11.4
+   Compiling gpui v0.2.2 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui)
+    Checking lyon_algorithms v1.0.16
+    Checking core-graphics2 v0.5.2
+    Checking rand_xorshift v0.4.0
+    Checking rgb v0.8.52
+    Checking semver v1.0.28
+    Checking backtrace v0.3.76
+    Checking crossbeam-queue v0.3.12
+   Compiling derive_refineable v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/refineable/derive_refineable)
+    Checking atomic v0.5.3
+    Checking tower-service v0.3.3
+    Checking svg_fmt v0.4.5
+    Checking unarray v0.1.4
+    Checking pollster v0.2.5
+    Checking static_assertions v1.1.0
+    Checking link-section v0.19.2
+    Checking web-time v1.1.0
+    Checking proptest v1.10.0 (https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a)
+    Checking postage v0.5.0
+    Checking scheduler v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/scheduler)
+    Checking ctor v1.0.12
+    Checking etagere v0.2.15
+    Checking resvg v0.46.0
+    Checking profiling v1.0.17
+    Checking lyon v1.0.16
+    Checking hyper v1.11.1
+   Compiling util_macros v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/util_macros)
+    Checking taffy v0.13.0
+    Checking hdrhistogram v7.5.4
+   Compiling gpui_macros v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_macros)
+    Checking spin v0.10.0
+    Checking core-video v0.5.2
+    Checking num_cpus v1.17.0
+    Checking waker-fn v1.2.0
+    Checking pollster v0.4.0
+    Checking unicode-width v0.2.2
+    Checking seahash v4.1.0
+    Checking inventory v0.3.21
+    Checking raw-window-handle v0.6.2
+    Checking utf8parse v0.2.2
+    Checking hyper-util v0.1.17
+    Checking pulldown-cmark v0.13.4
+    Checking anstyle-parse v0.2.7
+    Checking system-configuration-sys v0.6.0
+    Checking tokio-rustls v0.26.4
+    Checking rustls-native-certs v0.8.3
+    Checking sync_wrapper v1.0.2
+    Checking colorchoice v1.0.4
+    Checking anstyle v1.0.13
+    Checking is_terminal_polyfill v1.70.1
+    Checking new_debug_unreachable v1.0.6
+    Checking tower-layer v0.3.3
+    Checking anstyle-query v1.1.4
+    Checking anstream v0.6.21
+    Checking tower v0.5.2
+    Checking system-configuration v0.8.0
+    Checking mime_guess v2.0.5
+    Checking hyper-rustls v0.27.9
+    Checking rustls-platform-verifier v0.7.0
+    Checking tokio-socks v0.5.2
+    Checking rustls-pemfile v2.2.0
+    Checking webpki-roots v1.0.8
+    Checking http-body-util v0.1.3
+    Checking precomputed-hash v0.1.1
+    Checking ipnet v2.11.0
+    Checking http_client_tls v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/http_client_tls)
+    Checking fast-srgb8 v1.0.0
+    Checking hex v0.4.3
+    Checking env_filter v0.1.4
+    Checking palette v0.7.6
+    Checking zed-reqwest v0.12.15-zed (https://github.com/zed-industries/reqwest.git?rev=33bc764aa15ff7b200bf7c93bd96e24878d53e14#33bc764a)
+    Checking jiff v0.2.15
+    Checking paths v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/paths)
+    Checking terminal_size v0.4.4
+    Checking toml_datetime v0.6.11
+    Checking serde_spanned v0.6.9
+    Checking cursor-icon v1.2.0
+    Checking toml_write v0.1.2
+    Checking reqwest_client v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/reqwest_client)
+    Checking winnow v0.7.13
+    Checking strsim v0.11.1
+    Checking clap_lex v0.7.6
+    Checking clap_builder v4.5.49
+    Checking toml_edit v0.22.27
+    Checking vte v0.15.0
+    Checking env_logger v0.11.8
+    Checking signal-hook v0.4.4
+    Checking rustix-openpty v0.2.0
+    Checking home v0.5.12
+    Checking dtoa v1.0.11
+    Checking alacritty_terminal v0.26.1-dev (https://github.com/zed-industries/alacritty?rev=4c129667ce56611becdc82de6e28218c80e2e88f#4c129667)
+    Checking dtoa-short v0.3.5
+    Checking clap v4.5.49
+    Checking objc2-foundation v0.3.2
+    Checking toml v0.8.23
+    Checking agent-client-protocol v3.4.0
+    Checking ignore v0.4.33
+    Checking cssparser v0.36.0
+    Checking block2 v0.6.2
+    Checking servo_arc v0.4.3
+    Checking unicode-segmentation v1.13.3
+    Checking objc-sys v0.3.5
+    Checking icu_locale_fallback_data v2.3.0
+    Checking string_cache v0.9.0
+    Checking core-graphics v0.24.0
+    Checking selectors v0.37.0
+    Checking arraydeque v0.5.1
+    Checking ucd-trie v0.1.7
+    Checking granit-parser v1.0.0
+    Checking json5 v1.3.1
+    Checking htmlize v1.1.0
+    Checking web_atoms v0.2.6
+    Checking icu_locale_fallback v2.3.0
+    Checking lol_html v3.0.1
+    Checking objc2 v0.5.2
+    Checking lalrpop-util v0.23.1
+    Checking unicode-general-category v1.1.0
+    Checking icu_collator_data v2.3.0
+    Checking refineable v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/refineable)
+    Checking tendril v0.5.1
+    Checking dugong-graphlib v0.8.0-alpha.5
+    Checking ryu-js v1.0.2
+    Checking objc2-foundation v0.2.2
+    Checking markup5ever v0.39.0
+    Checking icu_collator v2.3.1
+    Checking pathfinder_simd v0.5.6
+    Checking merman-core v0.8.0-alpha.5
+   Compiling gpui_apple v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_apple)
+    Checking dispatch2 v0.3.1
+    Checking dugong v0.8.0-alpha.5
+    Checking agentz_protocol v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/agentz_protocol)
+    Checking roughr-merman v0.12.3
+    Checking manatee v0.8.0-alpha.5
+    Checking quick-xml v0.41.0
+    Checking unicode-linebreak v0.1.5
+    Checking pathfinder_geometry v0.5.1
+    Checking psm v0.1.30
+    Checking objc2-quartz-core v0.3.2
+    Checking objc2-core-location v0.3.2
+    Checking core-text v21.0.0
+    Checking objc2-core-media v0.3.2
+    Checking objc2-app-kit v0.2.2
+    Checking accesskit_consumer v0.38.0
+    Checking cocoa-foundation v0.2.0
+    Checking objc2-core-graphics v0.3.2
+    Checking float-ord v0.3.2
+   Compiling ui v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/ui)
+    Checking objc2-screen-capture-kit v0.3.2
+    Checking zed-font-kit v0.14.1-zed (https://github.com/zed-industries/font-kit?rev=94b0f28166665e8fd2f53ff6d268a14955c82269#94b0f281)
+    Checking objc2-user-notifications v0.3.2
+    Checking stacker v0.1.25
+    Checking cocoa v0.26.0
+    Checking documented v0.10.0
+    Checking html5ever v0.39.0
+    Checking xml5ever v0.39.0
+    Checking objc2-app-kit v0.3.2
+    Checking icons v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/icons)
+    Checking accesskit_macos v0.26.3
+    Checking num-format v0.4.4
+   Compiling ui_macros v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/ui_macros)
+   Compiling assets v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/assets)
+    Checking stacksafe v1.0.3
+    Checking markup5ever_rcdom v0.39.0+unofficial
+    Checking rope v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/rope)
+    Checking linkify v0.10.0
+   Compiling settings_macros v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/settings_macros)
+    Checking registry v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/registry)
+    Checking agentz_client v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/agentz_client)
+    Checking cloud v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/cloud)
+    Checking agent_thread v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/agent_thread)
+    Checking merman-render v0.8.0-alpha.5
+    Checking agentz_server v0.4.2 (/private/tmp/agentz-audit-5bqggwzs/crates/agentz_server)
+    Checking syntax_theme v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/syntax_theme)
+    Checking menu v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/menu)
+    Checking theme v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/theme)
+    Checking gpui_macos v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_macos)
+    Checking component v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/component)
+    Checking theme_json v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/theme_json)
+    Checking text_input v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/text_input)
+    Checking gpui_platform v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/gpui_platform)
+    Checking merman v0.8.0-alpha.5
+    Checking mermaid_render v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/mermaid_render)
+    Checking markdown v0.1.0 (/private/tmp/agentz-audit-5bqggwzs/crates/markdown)
+    Checking app v0.4.2 (/private/tmp/agentz-audit-5bqggwzs/crates/app)
+    Finished `dev` profile [unoptimized] target(s) in 58.04s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
