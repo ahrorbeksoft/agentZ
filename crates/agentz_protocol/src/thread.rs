@@ -276,11 +276,17 @@ impl ToolCall {
                 .is_some_and(|text| text.trim_start().starts_with("Task launched in background"))
     }
 
-    /// The process of a command the call left running in the background, as Factory Droid's
-    /// Execute with `fireAndForget` answers: "Background process started (PID: 22997)". Droid
-    /// wakes by itself once it ends.
+    /// The process of a command the call left running in the background that the agent wakes
+    /// with once it ends, as Factory Droid's Execute with `fireAndForget` answers: "Background
+    /// process started (PID: 22997)", ending "The command's result will be delivered
+    /// automatically when it finishes." Droid's session then waits on it. One ending "Process
+    /// will continue after CLI exits" instead (Droid without its completion wake) never wakes
+    /// it, so it isn't waited for.
     pub fn background_process_id(&self) -> Option<u32> {
         let text = self.text.first()?.trim_start();
+        if !text.contains("result will be delivered automatically") {
+            return None;
+        }
         let rest = text.strip_prefix("Background process started (PID: ")?;
         rest.split_once(')')?.0.trim().parse().ok()
     }

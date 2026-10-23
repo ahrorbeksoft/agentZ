@@ -1119,16 +1119,23 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Droid's background subagents are counted one by one, by their calls
   (`AgentThread::detached_subagents`), including those sent off during a wake
   (`count_background_work`), and each wake (the first update after a quiet check) uses up one
-  report. Commands it leaves running (an Execute with `fireAndForget`, answered "Background
-  process started (PID: …)", `ToolCall::background_process_id`) hold the turn they started
-  in while the PID lives, checked every 5 seconds (`check_background_processes`); once one
+  report. Commands it leaves running that it wakes with (an Execute with `fireAndForget`,
+  answered "Background process started (PID: …)" and "The command's result will be delivered
+  automatically when it finishes", `ToolCall::background_process_id`; Droid's session then
+  waits on them) hold the turn they started in for as long as the PID lives, with no
+  giving up (`processes_hold_turn`: a release workflow watched for an hour), checked every 5
+  seconds (`check_background_processes`). One answered "Process will continue after CLI
+  exits" (Droid without its completion wake) never wakes it, so it isn't waited for. Once one
   exits, the thread works again until Droid wakes with its end (up to 3 minutes,
   `PROCESS_WAKE_QUIET_ROUNDS`), so a message sent meanwhile waits rather than reach Droid
   mid-wake, where it folds it into its work and never answers the prompt. One left from an
   earlier turn (a dev server) doesn't hold later turns. Once awake with what its background
   work brought, Droid may pause for most of a minute as it writes its next call, so that work
-  ends only after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`). On ACP v2 none of this is
-  inferred: the agent's `state_update` says when its work starts and ends (see ACP v2).
+  ends after 3 quiet checks (`OWN_WORK_WAKE_QUIET_ROUNDS`), or 5 seconds after a reply that
+  ended its model call (`wake_is_over`: Droid ends each call with a usage update, and says
+  nothing on v1 when a wake ends), with nothing running and no background work left.
+  On ACP v2 none of this is inferred: the agent's `state_update` says when its work starts
+  and ends (see ACP v2).
 - **ACP v2** (`agent_thread/src/acp_v2.rs`, `wire.rs`; Zed's `agent_servers/src/acp/v2.rs`,
   behind its `acp-beta` flag): experimental, as most agents' v2 isn't stable yet (Claude
   Agent's stops a turn with "does not translate async_task_spawned session updates yet").

@@ -84,8 +84,13 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many quiet checks ([`OWN_WORK_QUIET`] apart) in a row a turn waits for subagents the
 /// agent sent to the background, or for a tool call that never ends, before it counts as done:
-/// twenty minutes. Background tasks the agent reports are waited for as long as they run.
+/// twenty minutes. Background tasks the agent reports, and commands it said it wakes with, are
+/// waited for as long as they run.
+#[cfg(not(test))]
 const OWN_WORK_QUIET_ROUNDS: u32 = 40;
+/// Fewer, for the tests that wait past it.
+#[cfg(test)]
+const OWN_WORK_QUIET_ROUNDS: u32 = 6;
 
 /// How many quiet checks in a row end the agent's work of its own once it woke with what its
 /// background work brought: Factory Droid sends nothing for most of a minute as it writes its
@@ -95,6 +100,14 @@ const OWN_WORK_WAKE_QUIET_ROUNDS: u32 = 3;
 /// How many quiet checks the agent may take to wake once a command it left running ended:
 /// Factory Droid took almost two minutes.
 const PROCESS_WAKE_QUIET_ROUNDS: u32 = 6;
+
+/// How long the agent, woken by its background work, may send nothing after a reply that
+/// ended a model call (its usage update after a message, with nothing running) before its wake
+/// counts as done. A call that goes on to a tool sends it at once.
+#[cfg(not(test))]
+const OWN_WORK_SETTLE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const OWN_WORK_SETTLE: Duration = Duration::from_millis(300);
 
 /// How often commands the agent left running in the background are checked.
 #[cfg(not(test))]
@@ -278,6 +291,9 @@ enum MessageKind {
     /// [`OWN_WORK_QUIET`] passed since the agent, working without a prompt, had sent this many
     /// updates.
     OwnWorkQuiet(u64),
+    /// [`OWN_WORK_SETTLE`] passed since the agent, woken by its background work, ended a
+    /// model call with a reply, after this many updates.
+    OwnWorkSettled(u64),
     /// [`OWN_WORK_GRACE`] passed since the background task with this count ended.
     OwnWorkOverdue(u64),
     /// [`PROCESS_CHECK`] passed in the checks with this count of
@@ -1480,6 +1496,7 @@ impl AgentThread {
                 // sent off that may have reported already, commands it left running, the wake
                 // a command's end brings) is given up on after a while.
                 let is_reported = self.background_tasks_hold_turn()
+                    || self.processes_hold_turn()
                     || !self.view.state.permission_requests.is_empty()
                     || !self.view.state.elicitations.is_empty();
                 let holds_turn = self.holds_turn_in_background();
@@ -1510,6 +1527,15 @@ impl AgentThread {
                     self.end_own_work();
                 } else {
                     self.check_own_work_later();
+                }
+            }
+            MessageKind::OwnWorkSettled(updates) => {
+                if self.working_on_its_own
+                    && !self.own_work_ending
+                    && updates == self.own_work_updates
+                    && self.wake_is_over()
+                {
+                    self.end_own_work();
                 }
             }
             MessageKind::OwnWorkStopOverdue => {
@@ -3405,11 +3431,35 @@ impl AgentThread {
     /// sent off, or commands it started in this turn that still run. Commands from earlier
     /// turns (a dev server) don't hold later ones.
     fn holds_turn_in_background(&self) -> bool {
-        !self.detached_subagents.is_empty()
-            || self
-                .background_processes
-                .iter()
-                .any(|process| process.entry >= self.turn_started_entries)
+        !self.detached_subagents.is_empty() || self.processes_hold_turn()
+    }
+
+    /// Whether commands the agent started in this turn still run, which it said it wakes
+    /// with: Droid's session waits on them, however long they take (a release workflow
+    /// watched for an hour).
+    fn processes_hold_turn(&self) -> bool {
+        self.background_processes
+            .iter()
+            .any(|process| process.entry >= self.turn_started_entries)
+    }
+
+    /// Whether the agent's work of its own, woken by its background work, looks over: its
+    /// latest step is a reply, nothing it started runs, and no background work it will wake
+    /// with again is left. Factory Droid says nothing on ACP v1 when a wake ends, but ends
+    /// each model call with a usage update, so a reply followed by one and then quiet is the
+    /// wake's end, where waiting out [`OWN_WORK_WAKE_QUIET_ROUNDS`] kept it Working for
+    /// minutes after its answer.
+    fn wake_is_over(&self) -> bool {
+        self.own_work_woke
+            && !self.is_v2()
+            && self.process_wakes_due == 0
+            && !self.holds_turn_in_background()
+            && !self.background_tasks_hold_turn()
+            && !self.has_running_tool_call_since(self.own_work_from)
+            && self.view.state.permission_requests.is_empty()
+            && self.view.state.elicitations.is_empty()
+            && self.view.entries.len() > self.own_work_from
+            && matches!(self.view.entries.last(), Some(Entry::AgentMessage(_)))
     }
 
     fn expect_own_work(&mut self) {
@@ -3978,6 +4028,8 @@ impl AgentThread {
                         &notification.update,
                         acp::SessionUpdate::UsageUpdate(update) if update.cost.is_some()
                     );
+                let is_usage_update =
+                    matches!(&notification.update, acp::SessionUpdate::UsageUpdate(_));
                 let wakes = self.working_on_its_own
                     && is_conversation_update(&notification.update)
                     && !std::mem::replace(&mut self.waking, true);
@@ -4005,6 +4057,12 @@ impl AgentThread {
                 }
                 if ends_own_work {
                     self.end_own_work();
+                } else if is_usage_update && self.working_on_its_own && self.wake_is_over() {
+                    let updates = self.own_work_updates;
+                    self.spawn(async move {
+                        tokio::time::sleep(OWN_WORK_SETTLE).await;
+                        MessageKind::OwnWorkSettled(updates)
+                    });
                 }
             }
             Incoming::Permission(request, responder) => {
@@ -8125,6 +8183,69 @@ mod tests {
             })
             .await;
         assert_eq!(thread.thread.state.finished_turns.len(), 2);
+    }
+
+    /// Factory Droid's session waits on a command it said it wakes with for as long as it
+    /// runs (a release workflow it watched for an hour), so the thread works past the quiet
+    /// checks that give up on work that only seems to go on. Once Droid's reply after the wake
+    /// ends its model call, the thread is done, rather than minutes after.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_it_wakes_with_holds_the_turn_for_as_long_as_it_runs() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        let quiet_checks = OWN_WORK_QUIET * (OWN_WORK_QUIET_ROUNDS + 2);
+        let command_seconds = quiet_checks.as_secs() + 2;
+        thread.update(|thread| thread.send(format!("droid-exec-bg {command_seconds}")));
+        thread
+            .wait_until(|thread| thread.state.last_stop_reason.is_some())
+            .await;
+        thread.handle_messages_for(quiet_checks).await;
+        assert!(
+            thread.thread.is_working(),
+            "the command still runs, and Droid will wake with it"
+        );
+
+        thread
+            .wait_up_to(Duration::from_secs(30), |thread| {
+                last_agent_message(thread).as_deref() == Some("The command finished.")
+            })
+            .await;
+        let answered = std::time::Instant::now();
+        thread
+            .wait_up_to(Duration::from_secs(30), |thread| !thread.is_working())
+            .await;
+        assert!(
+            answered.elapsed() < OWN_WORK_QUIET * 2,
+            "the wake ended {:?} after Droid's reply",
+            answered.elapsed()
+        );
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+    }
+
+    /// A command Factory Droid says goes on without it (Droid without its completion wake)
+    /// never wakes Droid, so it neither holds the turn nor makes the thread work once it ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_it_wont_wake_with_doesnt_hold_the_turn() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("droid-exec-bg 1 detached".into()));
+        thread
+            .wait_until(|thread| thread.state.last_stop_reason.is_some())
+            .await;
+        assert!(!thread.thread.is_working());
+        thread.handle_messages_for(Duration::from_secs(3)).await;
+        assert!(!thread.thread.is_working(), "nothing wakes it");
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
     }
 
     /// Stopping the work an agent goes on with by itself ends it at once. Factory Droid has no

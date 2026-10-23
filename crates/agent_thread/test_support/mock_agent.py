@@ -37,7 +37,9 @@ that it was launched. "droid-tasks <n> <seconds>" sends n there and ends its tur
 itself once per report, the seconds apart, sending another off in its first wake, and ends
 with "All reports are in.". "droid-exec-bg <seconds>" leaves a command ("sleep") running as
 Droid's Execute with fireAndForget does, with its PID, ends its turn, and wakes a second after
-the command exits with "The command finished.". A prompt of "slow" streams
+the command exits with "The command finished." and a usage update, as Droid ends a model call;
+"droid-exec-bg <seconds> detached" says the process goes on after it, as Droid without its
+completion wake does, and never wakes. A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. To a client that takes ACP's notices, "notice" sends
 a warning and a notice of a severity of its own, then replies; to one that takes compaction
@@ -964,10 +966,15 @@ def run_droid_tasks(request_id, session_id, count, seconds):
     threading.Thread(target=wake, daemon=True).start()
 
 
-def run_droid_background_command(request_id, session_id, seconds):
+def run_droid_background_command(request_id, session_id, seconds, wakes=True):
     """As Factory Droid's Execute with fireAndForget leaves a command running, and Droid wakes
-    once it exits."""
+    once it exits, ending its reply with a usage update as Droid ends each model call. Without
+    `wakes`, as Droid without its completion wake, it never does."""
     process = subprocess.Popen(["sleep", str(seconds)])
+    ending = ("The command's result will be delivered automatically when it finishes."
+              if wakes else
+              "Note: Process will continue after CLI exits. Use 'ps' or 'kill' commands to "
+              "manage.")
     call_id = f"exec-{request_id}"
     update(session_id, {"sessionUpdate": "tool_call", "toolCallId": call_id,
                         "title": f"sleep {seconds}", "kind": "execute", "status": "in_progress",
@@ -979,16 +986,20 @@ def run_droid_background_command(request_id, session_id, seconds):
                             "text": f"Background process started (PID: {process.pid})\n"
                                     f"Command: sleep {seconds}\n"
                                     "Output: /tmp/droid-bg.out\n"
-                                    "Status: Running in background"}}]})
+                                    "Status: Running in background\n"
+                                    f"{ending}"}}]})
     update(session_id, text_chunk("agent_message_chunk", "The command runs in the background."))
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
     def wake():
         process.wait()
+        if not wakes:
+            return
         time.sleep(1)
         for word in ["The", " command", " finished."]:
             update(session_id, text_chunk("agent_message_chunk", word))
             time.sleep(0.2)
+        update(session_id, {"sessionUpdate": "usage_update", "used": 2000, "size": 200000})
 
     threading.Thread(target=wake, daemon=True).start()
 
@@ -1665,8 +1676,9 @@ for message in incoming():
             count, seconds = prompt_text.split(" ")[1:3]
             run_droid_tasks(message["id"], params["sessionId"], int(count), float(seconds))
         elif prompt_text.startswith("droid-exec-bg "):
-            run_droid_background_command(message["id"], params["sessionId"],
-                                         float(prompt_text.split(" ")[1]))
+            words = prompt_text.split(" ")
+            run_droid_background_command(message["id"], params["sessionId"], float(words[1]),
+                                         wakes="detached" not in words)
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
             seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
             run_droid_task(message["id"], params["sessionId"], seconds)

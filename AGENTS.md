@@ -161,7 +161,9 @@ From Zed's guidelines, which this code follows:
   (`droid-task background` sends it to the background, as Droid's Task with `await: false`;
   `droid-tasks <n> <seconds>` sends n there, wakes by itself once per report and sends one
   more off in its first wake, and `droid-exec-bg <seconds>` leaves a command running as Droid's
-  Execute with `fireAndForget` does, then wakes once it exits).
+  Execute with `fireAndForget` does, then wakes once it exits, ending with a usage update as
+  Droid ends a model call; `droid-exec-bg <seconds> detached` never wakes, as Droid without
+  its completion wake).
   With `MOCK_LOGIN_FILE` in its env it needs a login, and
   offers every kind: plain, terminal, browser (a page to open), API key and gateway; with
   `MOCK_BROWSER_OPEN` too, a browser login that runs `xdg-open` and waits on a `127.0.0.1`

@@ -20,33 +20,6 @@ method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane
 terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
 which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
 
-### Factory Droid doesn't show Working while it waits on background work
-
-Reported October 23, 2026 as "this bug again", then: "while it is waiting, if there is a way to
-find out, it should still show working, it is successfully continues it, but yeah, not showing
-working, not splitting turns".
-
-So turns no longer split, and Droid does go on once its background work ends, but while it
-waits, the thread doesn't show Working. If there's a way to find out it's waiting, it should
-still show Working. In the screenshot, the turn shows as ended (1h 32m 38s) right after Droid
-said "The 0.4.1 release workflow is running … the watcher will wake me when the workflow
-finishes", with its plan still at "Current: Bump to 0.4.1, push the tag and watch the release
-workflow" (2 left).
-
-![A Factory Droid turn shown as ended while its release watcher runs](backlog/droid-turn-ends-during-background-work.png)
-
-And also, when the work is finished, it shows it's still working. In the second screenshot,
-Droid has woken, published 0.4.1 and given its final answer, its plan is All Done, but the
-thread still shows "Working for 1h 34m 32s" (circled), Working in the sidebar and the Stop
-button.
-
-![The same Droid thread, finished, still showing Working for 1h 34m 32s](backlog/droid-still-working-after-finishing.png)
-
-Earlier entries on Droid's background work ("Turns split without user messages", "A message
-sent while Factory Droid wakes by itself is never answered") were built in a7a4262 ("Keep
-Droid's turns whole while its background work runs", in v0.4.0 and v0.4.1). The account's
-email in the composer is covered in both screenshots.
-
 ## Features
 
 ### Artifacts move with their thread to another machine
