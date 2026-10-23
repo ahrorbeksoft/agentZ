@@ -559,8 +559,8 @@ pub struct Task {
     pub client_request_id: Option<String>,
     #[serde(default)]
     pub outcome: Option<TaskOutcome>,
-    /// The parent has the outcome: it waited for it, read it, cancelled the task, or was sent
-    /// word that it ended.
+    /// The parent has the outcome: it waited for it, read it, cancelled the task, or its agent
+    /// took word that it ended.
     #[serde(default)]
     pub delivered: bool,
     /// Set on the agent's own subagent, by its session under the parent's (Claude Agent's

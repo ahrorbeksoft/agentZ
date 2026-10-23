@@ -137,9 +137,11 @@ pub enum AgentThreadEvent {
     /// The user went on without a conversation the next message would have brought, or the
     /// agent knows it already (a fork's, once its session is forked).
     HandoffDropped,
-    /// A notice of these ended tasks waited for the turn to end, and went with the agent it
-    /// was for ([`AgentThread::steer_task_notice`]): they're still to tell.
-    TaskNoticeDropped(Vec<projects::ThreadId>),
+    /// The agent has the notice of these ended tasks ([`AgentThread::send_task_notice`]), so
+    /// their parent is told. Until then the notice is the thread's
+    /// ([`AgentThread::holds_task_notice`]), and one that goes with the agent is the server's to
+    /// tell again.
+    TaskNoticeSent(Vec<projects::ThreadId>),
     /// Logging in with the named method succeeded.
     LoggedIn(SharedString),
     /// The agent is logged out: agentZ logged it out, or it asked for a login.
@@ -501,6 +503,9 @@ pub struct AgentThread {
     queued_prompts: Vec<Vec<MessagePart>>,
     /// Messages sent into a turn that the agent didn't take, sent one a turn as turns end.
     after_turn: VecDeque<AfterTurn>,
+    /// The tasks whose notice was sent into the running turn, with no answer from the agent
+    /// yet ([`Self::steer_task_notice`]).
+    steering_notices: Vec<projects::ThreadId>,
     /// The first entry that changed since the server last sent this thread's changes, so it
     /// doesn't compare a long conversation's every entry on each update.
     entries_changed_from: Option<usize>,
@@ -1001,6 +1006,7 @@ impl AgentThread {
             pending_title: None,
             queued_prompts: Vec::new(),
             after_turn: VecDeque::new(),
+            steering_notices: Vec::new(),
             entries_changed_from: Some(0),
             handoff_in_flight: Vec::new(),
             agent: None,
@@ -1869,6 +1875,7 @@ impl AgentThread {
             && (self.process.is_some() || self.adopted_process.is_some())
             && self.queued_prompts.is_empty()
             && self.after_turn.is_empty()
+            && self.steering_notices.is_empty()
             && self.wire.as_ref().is_some_and(|wire| {
                 wire.prompt_in_flight()
                     .is_ok_and(|prompt| prompt.is_some() == self.is_working())
@@ -2824,6 +2831,10 @@ impl AgentThread {
         notice: Option<TaskNotice>,
         result: std::result::Result<Value, agent_client_protocol::Error>,
     ) {
+        if let Some(notice) = &notice {
+            self.steering_notices
+                .retain(|task| !notice.tasks.contains(task));
+        }
         let outcome = match &result {
             Ok(response) => response.get("outcome").and_then(Value::as_str),
             Err(_) => None,
@@ -2878,6 +2889,11 @@ impl AgentThread {
         if let Some(id) = message.steering {
             self.steering_ended(id);
         }
+        // A failed agent takes nothing: the server tells it again once it's back.
+        if message.notice.is_some() && matches!(self.view.state.status, ConnectionStatus::Failed(_))
+        {
+            return;
+        }
         let index = self.view.entries.len();
         self.send_message(message.parts);
         if let Some(notice) = message.notice
@@ -2887,16 +2903,40 @@ impl AgentThread {
         }
     }
 
-    /// Drops the messages waiting for the turn to end, with the agent they were for.
+    /// Drops the messages waiting for the turn to end, with the agent they were for. Tasks'
+    /// notices among them, and those sent into the turn, are the server's to tell again.
     fn clear_after_turn(&mut self) {
         for message in std::mem::take(&mut self.after_turn) {
             if let Some(id) = message.steering {
                 self.steering_ended(id);
             }
-            if let Some(notice) = message.notice {
-                self.emit(AgentThreadEvent::TaskNoticeDropped(notice.tasks));
-            }
         }
+        self.steering_notices.clear();
+    }
+
+    /// Whether the thread has word of `task`'s end to tell the agent: waiting for the turn to
+    /// end, or sent into it with no answer yet.
+    pub fn holds_task_notice(&self, task: projects::ThreadId) -> bool {
+        self.steering_notices.contains(&task)
+            || self.after_turn.iter().any(|message| {
+                message
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.tasks.contains(&task))
+            })
+    }
+
+    /// Drops word of `task`'s end that waits for the turn to end, as the agent read it with
+    /// `task_status` or sent the task more work. A notice of other tasks too still goes.
+    pub fn forget_task_notice(&mut self, task: projects::ThreadId) {
+        self.steering_notices.retain(|held| *held != task);
+        self.after_turn.retain_mut(|message| {
+            let Some(notice) = &mut message.notice else {
+                return true;
+            };
+            notice.tasks.retain(|held| *held != task);
+            !notice.tasks.is_empty()
+        });
     }
 
     /// Sends a message an agent wrote, marked as coming from it.
@@ -2946,28 +2986,31 @@ impl AgentThread {
         tasks: Vec<projects::ThreadId>,
     ) {
         let parts = vec![MessagePart::Text(text)];
-        let notice = Some(TaskNotice { from, tasks });
+        let notice = TaskNotice { from, tasks };
         if !self.steers_its_turn() {
             self.send_after(AfterTurn {
                 parts,
                 steering: None,
-                notice,
+                notice: Some(notice),
             });
             return;
         }
         match self.steering_request(&parts) {
-            Some(response) => self.spawn(async move {
-                MessageKind::Steered {
-                    id: None,
-                    parts,
-                    notice,
-                    result: response.await,
-                }
-            }),
+            Some(response) => {
+                self.steering_notices.extend(notice.tasks.iter().copied());
+                self.spawn(async move {
+                    MessageKind::Steered {
+                        id: None,
+                        parts,
+                        notice: Some(notice),
+                        result: response.await,
+                    }
+                })
+            }
             None => self.after_turn.push_back(AfterTurn {
                 parts,
                 steering: None,
-                notice,
+                notice: Some(notice),
             }),
         }
     }
@@ -2980,7 +3023,11 @@ impl AgentThread {
             .prompts_from_agents
             .push((index, notice.from));
         self.view.state.task_notices.push(index);
-        self.view.state.announced_tasks.push((index, notice.tasks));
+        self.view
+            .state
+            .announced_tasks
+            .push((index, notice.tasks.clone()));
+        self.emit(AgentThreadEvent::TaskNoticeSent(notice.tasks));
     }
 
     /// Keeps the open session as the one to restore. A new session is only worth restoring once it

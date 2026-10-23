@@ -2226,9 +2226,13 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   agent steers its turn by itself (`AgentThread::steers_its_turn`: Claude Agent's and
   Codex's `_session/steering` on ACP v1, not the prompt agentZ marks as steered on v2), so it
   goes on with the result; the notice is marked as one as when it starts a turn. One the agent
-  doesn't take in (its turn just ended), and results to any other agent, wait for the turn
-  to end. A notice still waiting when the agent restarts or fails is told again
-  (`AgentThreadEvent::TaskNoticeDropped`).
+  doesn't take in (its turn just ended, or it refused), and results to any other agent, wait
+  for the turn to end. A task counts as told (`Task::delivered`) only once the agent has the
+  notice (`AgentThreadEvent::TaskNoticeSent`); until then the parent's thread holds it
+  (`AgentThread::holds_task_notice`), and a notice that goes with the agent (a restart, a
+  failure, the server stopping) is told again. One the parent reads with `task_status` while
+  it waits, or whose task it sends more work, is dropped (`AgentThread::forget_task_notice`),
+  so it doesn't cost the parent a turn.
 - **The subthread limit** (`start_task_here`, `start_queued_tasks`, `running_tasks`): a
   parent runs as many tasks at once as the setting allows (Subthreads at once, 4 by default);
   more wait their turn (`Task::queued`, with the model and mode to start with:

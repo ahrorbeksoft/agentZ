@@ -414,16 +414,15 @@ impl Server {
             let Some(thread) = self.threads.get_mut(&thread_id) else {
                 continue;
             };
+            // The tasks count as told once the agent has the notice
+            // (`AgentThreadEvent::TaskNoticeSent`), not while it waits in the thread: a restart
+            // then would lose it.
             if ended_tasks.is_empty() {
                 thread.send_from(text, from);
             } else if steers {
-                thread.steer_task_notice(text, from, ended_tasks.clone());
+                thread.steer_task_notice(text, from, ended_tasks);
             } else {
-                thread.send_task_notice(text, from, ended_tasks.clone());
-            }
-            for task in ended_tasks {
-                self.projects
-                    .update_task(task, |task| task.delivered = true);
+                thread.send_task_notice(text, from, ended_tasks);
             }
             self.thread_changed(ConnectionId::Thread(thread_id));
         }
@@ -715,10 +714,14 @@ impl Server {
             if self.reading_task_changes.contains(&task) {
                 continue;
             }
-            let queued = self
-                .follow_ups
-                .get(&parent)
-                .is_some_and(|queue| queue.iter().any(|follow_up| follow_up.task == Some(task)));
+            // Queued here, or in its parent's thread until the agent takes it in.
+            let queued =
+                self.follow_ups.get(&parent).is_some_and(|queue| {
+                    queue.iter().any(|follow_up| follow_up.task == Some(task))
+                }) || self
+                    .threads
+                    .get(&parent)
+                    .is_some_and(|thread| thread.holds_task_notice(task));
             if queued {
                 continue;
             }
@@ -2114,8 +2117,17 @@ impl Server {
             task.delivered = false;
             task.changes = None;
         });
+        self.forget_task_notice(parent, task);
+    }
+
+    /// Drops word of the task's end that hasn't reached its parent's agent, queued here or in
+    /// the parent's thread: the parent read it already, or it's out of date.
+    fn forget_task_notice(&mut self, parent: ThreadId, task: ThreadId) {
         if let Some(queue) = self.follow_ups.get_mut(&parent) {
             queue.retain(|follow_up| follow_up.task != Some(task));
+        }
+        if let Some(thread) = self.threads.get_mut(&parent) {
+            thread.forget_task_notice(task);
         }
     }
 
@@ -2261,9 +2273,8 @@ impl Server {
         if acknowledge && delegated.outcome.is_some() && !delegated.delivered {
             self.projects
                 .update_task(task, |task| task.delivered = true);
-            if let Some(queue) = self.follow_ups.get_mut(&parent) {
-                queue.retain(|follow_up| follow_up.task != Some(task));
-            }
+            // So reading it doesn't cost the parent a turn to be told again.
+            self.forget_task_notice(parent, task);
         }
         result
     }

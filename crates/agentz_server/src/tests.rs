@@ -10288,6 +10288,173 @@ async fn a_tasks_result_steers_its_parents_running_turn() {
     assert_eq!(view.state.finished_turns.len(), 1, "it went into the turn");
 }
 
+/// A server with a parent thread in a "permission" turn, which waits for its answer, whose
+/// agent refuses to take messages into its turn (`MOCK_STEERING=refuse`).
+async fn parent_refusing_steering(
+    mut command: AgentCommand,
+) -> Option<(TestServer, TestClient, ThreadId)> {
+    command.env.insert("MOCK_STEERING".into(), "refuse".into());
+    let server = TestServer::start_with_agent(
+        tempfile::tempdir().expect("temp dir"),
+        tempfile::tempdir().expect("temp dir"),
+        command,
+    )?;
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+    client.start_waiting_turn(parent).await;
+    Some((server, client, parent))
+}
+
+/// Delegates `task` and waits for it to end, and for its notice to reach the parent's thread,
+/// where it waits for the turn to end, as the agent refused it.
+async fn delegate_and_end(client: &mut TestClient, parent: ThreadId, task: &str) -> ThreadId {
+    let delegated = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": task, "title": "Helper"}),
+        )
+        .await;
+    let helper = task_id(&delegated);
+    client
+        .wait_until(|client| {
+            client
+                .task(helper)
+                .is_some_and(|task| task.outcome.is_some())
+        })
+        .await;
+    // Nothing shows it: the notice goes once the task's changes are read, then is refused.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    helper
+}
+
+/// A task's result that its parent's agent didn't take into its turn waits for the turn to
+/// end, and isn't counted as told until the agent has it: a server that stops meanwhile tells
+/// the parent once it's back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tasks_result_waiting_for_its_parents_turn_is_told_after_a_restart() {
+    let Some(mut command) = mock_agent() else {
+        return;
+    };
+    let history_dir = tempfile::tempdir().expect("temp dir");
+    command.args.push(
+        history_dir
+            .path()
+            .join("history.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let Some((server, mut client, parent)) = parent_refusing_steering(command.clone()).await else {
+        return;
+    };
+    let helper = delegate_and_end(&mut client, parent, "hello").await;
+    let told = tokio::time::timeout(
+        Duration::from_millis(500),
+        client.wait_until(|client| client.task(helper).is_some_and(|task| task.delivered)),
+    )
+    .await;
+    assert!(told.is_err(), "the result waits for the turn to end");
+    assert_eq!(client.user_messages(parent), ["permission"]);
+
+    client.ok(Request::Shutdown).await;
+    tokio::time::timeout(TIMEOUT, server.handle.stopped())
+        .await
+        .expect("the server stops");
+    drop(client);
+
+    command.env.insert("MOCK_STEERING".into(), "refuse".into());
+    let Some(server) = TestServer::start_with_agent(server.data_dir, server.project_dir, command)
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    client.subscribe_thread(ConnectionId::Thread(parent)).await;
+    let notice = task_notice(&mut client, parent, helper).await;
+    assert!(notice.ends_with("Echo: hello"), "{notice}");
+    client
+        .wait_until(|client| client.task(helper).is_some_and(|task| task.delivered))
+        .await;
+}
+
+/// A result the parent reads with task_status while it waits for the turn to end isn't told
+/// again: that would cost the parent a turn for what it knows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_read_while_it_waits_for_the_turn_is_not_told_again() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let Some((_server, mut client, parent)) = parent_refusing_steering(command).await else {
+        return;
+    };
+    let connection = ConnectionId::Thread(parent);
+    let helper = delegate_and_end(&mut client, parent, "hello").await;
+    let status = client
+        .tool(parent, "task_status", json!({"taskId": helper.0}))
+        .await;
+    assert_eq!(status["summary"], json!("Echo: hello"));
+
+    client.answer_permission(parent).await;
+    client
+        .wait_until(|client| !client.thread(connection).is_working())
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!client.thread(connection).is_working());
+    assert_eq!(client.user_messages(parent), ["permission"]);
+    assert!(client.task(helper).is_some_and(|task| task.delivered));
+}
+
+/// More work for a task whose result waits for its parent's turn to end replaces that result:
+/// the parent is told only of the new end.
+#[tokio::test(flavor = "multi_thread")]
+async fn more_work_for_a_task_replaces_its_result_waiting_for_the_turn() {
+    let Some(command) = mock_agent() else {
+        return;
+    };
+    let Some((_server, mut client, parent)) = parent_refusing_steering(command).await else {
+        return;
+    };
+    let connection = ConnectionId::Thread(parent);
+    let helper = delegate_and_end(&mut client, parent, "hello").await;
+    client
+        .tool(
+            parent,
+            "task_send",
+            json!({"taskId": helper.0, "message": "again"}),
+        )
+        .await;
+    client
+        .wait_until(|client| {
+            client.task(helper).is_some_and(|task| {
+                task.outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.summary.as_deref() == Some("Echo: again"))
+            })
+        })
+        .await;
+
+    client.answer_permission(parent).await;
+    let notice = task_notice(&mut client, parent, helper).await;
+    assert!(notice.ends_with("Echo: again"), "{notice}");
+    client
+        .wait_until(|client| !client.thread(connection).is_working())
+        .await;
+    assert_eq!(
+        client.user_messages(parent),
+        ["permission", notice.as_str()]
+    );
+    assert!(client.task(helper).is_some_and(|task| task.delivered));
+}
+
 /// A steered message the agent doesn't take in yet shows as steering, out of the queue, until
 /// it shows in the thread: here once the turn ends, as the mock refuses "refuse".
 #[tokio::test(flavor = "multi_thread")]

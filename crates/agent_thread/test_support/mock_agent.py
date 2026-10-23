@@ -137,7 +137,8 @@ HTTP ones and "(acp)" after those on the ACP connection, or "MCP servers: none".
 With MOCK_STEERING set, it takes messages into a running turn (`_session/steering`), as Claude
 Agent and Codex do: one sent while a "permission" turn waits for its answer joins that turn,
 whose reply ends " (steered: <text>)". With no turn running it answers `promptRequired`, as
-Claude Agent does when asked to, and it refuses a message of "refuse".
+Claude Agent does when asked to, and it refuses a message of "refuse" (with MOCK_STEERING=refuse,
+every message, as an agent whose steering fails).
 
 With MOCK_CHILD_PID_FILE set, it starts a long `sleep` as Factory Droid starts a worker for each
 session, and writes its process id to that file.
@@ -1421,7 +1422,7 @@ for message in incoming():
     elif method == "_session/steering":
         text = "".join(block.get("text", "") for block in message["params"]["prompt"]
                        if block.get("type", "text") == "text")
-        if text == "refuse":
+        if text == "refuse" or os.environ.get("MOCK_STEERING") == "refuse":
             send({"jsonrpc": "2.0", "id": message["id"],
                   "error": {"code": -32603, "message": "Internal error"}})
         elif pending:
