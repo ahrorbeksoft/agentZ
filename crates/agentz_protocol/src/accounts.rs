@@ -203,6 +203,110 @@ impl LimitWindow {
     }
 }
 
+/// Whether a window lasts until its reset at the rate it's been used, as OpenUsage's `Pace`
+/// and `meterState` judge it. `projected_used` is the percent it would have used by the reset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pace {
+    /// On course to reset with at least 10% to spare.
+    OnCourse { projected_used: f64 },
+    /// On course to reset in its last 10%, with `spare` percent (at least 1) left.
+    Close { spare: u8, projected_used: f64 },
+    /// On course to run out before the reset: `runs_out_in` from now, or `None` when it lands
+    /// at the limit right at the reset.
+    RunsOut {
+        runs_out_in: Option<Duration>,
+        projected_used: f64,
+    },
+}
+
+/// The window's pace at `now`, or `None` with nothing to go on: no length or reset, past the
+/// reset, too early in the window (the first 1%, and at least a minute), nothing used yet, or
+/// used up, which is red whatever the pace.
+pub fn pace(window: &LimitWindow, now: SystemTime) -> Option<Pace> {
+    if window.left_percent() == 0 {
+        return None;
+    }
+    let length = window
+        .length
+        .filter(|length| !length.is_zero())?
+        .as_secs_f64();
+    let remaining = window
+        .resets_at?
+        .duration_since(now)
+        .ok()
+        .filter(|remaining| !remaining.is_zero())?
+        .as_secs_f64();
+    let elapsed = length - remaining;
+    let used = window.used_percent.clamp(0., 100.);
+    if used <= 0. || elapsed < (length * 0.01).max(60.) {
+        return None;
+    }
+    let projected_used = used / elapsed * length;
+    if projected_used <= 90. {
+        return Some(Pace::OnCourse { projected_used });
+    }
+    // A whole-percent read of 1-4% early in a window projects a run-out while nearly all of it
+    // is left; OpenUsage trusts no warning below 5% used.
+    if used < 5. {
+        return None;
+    }
+    if projected_used <= 100. {
+        let spare = (100. - projected_used).round() as u8;
+        return Some(if spare >= 1 {
+            Pace::Close {
+                spare,
+                projected_used,
+            }
+        } else {
+            Pace::RunsOut {
+                runs_out_in: None,
+                projected_used,
+            }
+        });
+    }
+    let runs_out_in = (100. - used) / (projected_used / length);
+    Some(Pace::RunsOut {
+        runs_out_in: (runs_out_in > 0. && runs_out_in < remaining)
+            .then(|| Duration::from_secs_f64(runs_out_in)),
+        projected_used,
+    })
+}
+
+/// How much of an account's usage would go to waste unless it's spent soon, per hour: of each
+/// limit window, what the pace projects to be left at its reset, as far as the account's other
+/// windows let it be spent, over the hours until that reset; the most of any window. Of an
+/// agent's accounts, the one with the most to spare runs a role's task: 60% left resetting in
+/// an hour before 80% left resetting in 6 days. `None` with no window to go on (no reset, or
+/// past it, so the read is out of date).
+pub fn spare_per_hour(windows: &[LimitWindow], now: SystemTime) -> Option<f64> {
+    windows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, window)| {
+            let hours = window.resets_at?.duration_since(now).ok()?.as_secs_f64() / 3600.;
+            if hours <= 0. {
+                return None;
+            }
+            let spare = match pace(window, now) {
+                Some(Pace::OnCourse { projected_used } | Pace::Close { projected_used, .. }) => {
+                    (100. - projected_used).max(0.)
+                }
+                Some(Pace::RunsOut { .. }) => 0.,
+                // No rate to go on: what's left now would be left then.
+                None => f64::from(window.left_percent()),
+            };
+            let others_left = windows
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, other)| f64::from(other.left_percent()))
+                .fold(100., f64::min);
+            // A quarter of an hour at least, so a reset moments away doesn't swamp the rest.
+            Some(spare.min(others_left) / hours.max(0.25))
+        })
+        .reduce(f64::max)
+}
+
 /// The window that stops the account until it resets: of those used up, the last to reset. One
 /// whose reset has passed is no longer spent, though the last read still says so.
 pub fn used_up_window(windows: &[LimitWindow], now: SystemTime) -> Option<&LimitWindow> {
@@ -604,6 +708,29 @@ impl AgentAccounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account whose usage would go to waste soonest comes first: 60% left resetting in an
+    /// hour before 80% left resetting in 6 days, and one that runs out before its reset has
+    /// nothing to spare.
+    #[test]
+    fn what_resets_soonest_with_most_left_is_spared_first() {
+        let now = SystemTime::now();
+        let window = |used_percent: f64, resets_in_hours: u64, length_hours: u64| LimitWindow {
+            label: String::new(),
+            used_percent,
+            resets_at: Some(now + Duration::from_secs(resets_in_hours * 3600)),
+            length: Some(Duration::from_secs(length_hours * 3600)),
+        };
+        let soon = spare_per_hour(&[window(40., 1, 5)], now).expect("a rate");
+        let later = spare_per_hour(&[window(5., 144, 168)], now).expect("a rate");
+        assert!(soon > later, "{soon} vs {later}");
+        let runs_out = spare_per_hour(&[window(20., 144, 168)], now);
+        assert_eq!(runs_out, Some(0.));
+        // The weekly window has 10% left, so the 5-hour one can't spend more.
+        let held_back = spare_per_hour(&[window(40., 1, 5), window(90., 100, 168)], now);
+        assert!(held_back.is_some_and(|rate| rate <= 10.), "{held_back:?}");
+        assert_eq!(spare_per_hour(&[], now), None);
+    }
 
     #[test]
     fn new_threads_take_the_default_then_external_then_the_first() {

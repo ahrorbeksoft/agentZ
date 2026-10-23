@@ -602,6 +602,9 @@ pub struct QueuedStart {
     /// The model's setting and value.
     #[serde(default)]
     pub model: Option<(String, String)>,
+    /// The effort's setting and value, from the user's pick for the task's role.
+    #[serde(default)]
+    pub effort: Option<(String, String)>,
     /// The parent's mode, which it may not go beyond.
     #[serde(default)]
     pub mode: Option<String>,

@@ -493,17 +493,27 @@ impl Server {
         let target = self.relay_target(caller, machine, true)?;
         let mut arguments = arguments.0.clone();
         arguments.remove("machine");
-        // The other machine has no calling thread to take the agent from.
-        let agent_id = arguments
+        // The other machine has no calling thread to take the agent from. A task its role's
+        // picks run is left to them there, where its accounts are.
+        let named_agent = arguments
             .get("agentId")
             .and_then(Value::as_str)
-            .map(String::from)
-            .or_else(|| {
-                caller
-                    .thread_id
-                    .and_then(|thread_id| self.projects.thread(thread_id))
-                    .and_then(|thread| thread.agent_id.clone())
-            });
+            .map(String::from);
+        let names_its_own = named_agent.is_some()
+            || arguments.contains_key("model")
+            || arguments.contains_key("account");
+        let runs_on_picks = !names_its_own
+            && !self
+                .subthread_roles
+                .picks(delegation.role.unwrap_or_default())
+                .is_empty();
+        let agent_id = named_agent.or_else(|| {
+            caller
+                .thread_id
+                .and_then(|thread_id| self.projects.thread(thread_id))
+                .and_then(|thread| thread.agent_id.clone())
+                .filter(|_| !runs_on_picks)
+        });
         if let Some(agent_id) = &agent_id {
             arguments.insert("agentId".into(), json!(agent_id));
         }

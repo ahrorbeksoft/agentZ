@@ -213,6 +213,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `cloud/id_ed25519`, `.pub` | server | agentZ's own SSH key for cloud machines, made with `ssh-keygen` when a machine first needs it: every machine agentZ makes is given it, and agentZ reaches them with it |
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › General › Threads), a number or null |
 | `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › General › Threads › Subthreads at once), a number |
+| `subthread-roles.json` | server | What each role of delegated task runs on (researcher, reviewer, worker, other): the user's picks of agent, model and effort, in the order to try |
 | `acp-v2.json` | server | Whether agents are asked for ACP v2 (Settings › General › Experimental › ACP v2), true or false |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
@@ -2128,6 +2129,21 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   a `clientRequestId` that's each one's with `#1`, `#2`, … after it). A subthread may
   delegate tasks of its own only with `canDelegate` (`Task::can_delegate`, false by default;
   `capability_denied` otherwise).
+- **Roles** (`server/subthread_roles.rs`, `agentz_protocol::subthread_roles`): a task is a
+  researcher's, reviewer's, worker's or other's (`role`, other when not given). The user
+  picks what each role runs on, an ordered list of agent, model and effort
+  (`SubthreadRoles`, `Request::SetSubthreadRoles`, the app's setting given to every server),
+  and agents see the picks in `orchestrator_capabilities` (`roles`). A task that names no
+  agent, account or model runs on the first pick with an account to spare
+  (`choose_for_role`): installed, logged in, not used up, and offering the model; of the
+  agent's accounts, the one whose usage would go to waste soonest
+  (`accounts::spare_per_hour`: what the pace projects to be left at each window's reset, as
+  far as its other windows allow, per hour until it; 60% left resetting in an hour before 80%
+  left resetting in 6 days), then the one for new threads. Vendors' limits can't be
+  compared, so the list orders the agents. With none to spare, the call fails
+  (`role_unavailable`) saying why, each pick in turn. A task on another machine is left to
+  that machine's picks, where its accounts are. A role without picks is left to the agent,
+  as is a task that names its own agent, account or model (the user asked for other agents).
 - **Ending the turn**: `delegate_task` and `delegate_tasks` return at once, with a `note`
   telling the agent to end its turn: the end of each task reaches it as a message. There's no
   blocking wait; `agentz_thread_wait` on one's own task answers at once with its status and

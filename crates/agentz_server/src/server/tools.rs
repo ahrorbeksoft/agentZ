@@ -33,6 +33,7 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::{AgentId, AgentSettings, InstallState};
 use agentz_protocol::artifacts::DesignDefaults;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange};
+use agentz_protocol::subthread_roles::TaskRole;
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
 use collections::HashMap;
@@ -45,6 +46,7 @@ use projects::{
 use serde_json::{Map, Value, json};
 use util::ResultExt as _;
 
+use super::subthread_roles::RoleUnavailable;
 use super::{ClientId, FollowUp, Input, Server};
 use workspaces::{Folder, Placement, workspace_strategy};
 
@@ -74,14 +76,6 @@ const END_TURN_NOTE: &str = "This thread is sent a message with each task's resu
 const MAX_TOOL_RESULTS_KEPT: usize = 1_000;
 const DEFAULT_PATCH_CHARS: u64 = 50_000;
 const MAX_PATCH_CHARS: u64 = 1_000_000;
-const TASK_ROLES: [&str; 6] = [
-    "implementation",
-    "research",
-    "review",
-    "design",
-    "test",
-    "general",
-];
 
 /// A call waiting for a thread, retried after every change until it's done or its time is up.
 pub(super) struct PendingToolCall {
@@ -688,6 +682,9 @@ impl Server {
             model: queued
                 .model
                 .map(|(config_id, value)| (acp::SessionConfigId::new(config_id), value)),
+            effort: queued
+                .effort
+                .map(|(config_id, value)| (acp::SessionConfigId::new(config_id), value)),
             mode: queued.mode.map(acp::SessionModeId::new),
             mode_option: queued
                 .mode_option
@@ -904,7 +901,7 @@ impl Server {
             },
             "agentz_thread_read" => self.thread_read(caller, &arguments, timed_out),
             "agentz_thread_launch" => {
-                let mut spec = self.launch_spec(caller, &arguments, "prompt")?;
+                let mut spec = self.launch_spec(caller, &arguments, "prompt", None)?;
                 let placement = std::mem::take(&mut spec.placement);
                 self.with_folders(caller, vec![placement], move |server, folders| {
                     let folder = folders.into_iter().next().unwrap_or(Folder::Default);
@@ -1080,6 +1077,7 @@ impl Server {
                 "status": "connected",
             },
             "agents": agents,
+            "roles": self.role_picks(),
             "features": {
                 "threadManagement": true,
                 "batchThreadCreation": true,
@@ -1092,6 +1090,37 @@ impl Server {
                 "terminals": true,
             },
         })))
+    }
+
+    /// The roles tasks are delegated by, each with the user's picks in the order they're
+    /// tried, as `orchestrator_capabilities` lists them.
+    fn role_picks(&self) -> Value {
+        let roles: Map<String, Value> = TaskRole::ALL
+            .into_iter()
+            .map(|role| {
+                let picks: Vec<Value> = self
+                    .subthread_roles
+                    .picks(role)
+                    .iter()
+                    .map(|pick| {
+                        json!({
+                            "agentId": pick.agent.0.as_ref(),
+                            "agentName": self.agent_name(&pick.agent).to_string(),
+                            "model": pick.model,
+                            "effort": pick.effort,
+                        })
+                    })
+                    .collect();
+                (role.id().to_string(), Value::Array(picks))
+            })
+            .collect();
+        json!({
+            "note": "Delegate by role. A role with picks runs its tasks on the first pick with \
+                     an account to spare, chosen for the user, so leave agentId, account and \
+                     model out for it unless the user asked for other agents. A role with no \
+                     picks is left to you.",
+            "picks": roles,
+        })
     }
 
     fn thread_list(&self, caller: Caller, arguments: &Arguments) -> Outcome {
@@ -1282,7 +1311,9 @@ impl Server {
         let mut specs = requests
             .iter()
             .map(|request| match request {
-                Value::Object(request) => self.launch_spec(caller, &Arguments(request), "prompt"),
+                Value::Object(request) => {
+                    self.launch_spec(caller, &Arguments(request), "prompt", None)
+                }
                 _ => Err(invalid("Each thread must be an object.")),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1300,11 +1331,14 @@ impl Server {
         })
     }
 
+    /// What a launched thread or delegated task starts with. A task (`role` given) that names
+    /// no agent, account or model runs on the user's picks for its role, when it has any.
     fn launch_spec(
         &self,
         caller: Caller,
         arguments: &Arguments,
         prompt_key: &str,
+        role: Option<Option<TaskRole>>,
     ) -> Result<LaunchSpec, Failure> {
         caller.project()?;
         let prompt = arguments
@@ -1316,9 +1350,35 @@ impl Server {
         let caller_thread = caller
             .thread_id
             .and_then(|thread_id| self.projects.thread(thread_id));
-        let agent_id = match arguments.string("agentId", 256)? {
-            Some(agent_id) => AgentId::new(agent_id.to_string()),
-            None => caller_thread
+        let names_its_own = arguments.string("agentId", 256)?.is_some()
+            || arguments.string("model", 256)?.is_some()
+            || arguments.0.contains_key("account");
+        let role_choice = match role {
+            Some(role) if !names_its_own => {
+                let role = role.unwrap_or_default();
+                match self.choose_for_role(role) {
+                    None => None,
+                    Some(Ok(choice)) => Some(choice),
+                    Some(Err(RoleUnavailable(reasons))) => {
+                        return Err(failure(
+                            "role_unavailable",
+                            format!(
+                                "None of the user's picks for the {} role can run a task now. \
+                                 {} Wait for a limit to reset, or, if the user asked for \
+                                 another agent, name it with agentId.",
+                                role.id(),
+                                reasons.join(" ")
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => None,
+        };
+        let agent_id = match (&role_choice, arguments.string("agentId", 256)?) {
+            (Some(choice), _) => choice.pick.agent.clone(),
+            (None, Some(agent_id)) => AgentId::new(agent_id.to_string()),
+            (None, None) => caller_thread
                 .and_then(|thread| thread.agent_id.clone())
                 .map(AgentId::new)
                 .ok_or_else(|| invalid("agentId is required outside a thread."))?,
@@ -1344,7 +1404,10 @@ impl Server {
             ));
         }
 
-        let account = self.launch_account(&agent_id, arguments)?;
+        let account = match &role_choice {
+            Some(choice) => choice.account,
+            None => self.launch_account(&agent_id, arguments)?,
+        };
         // Named in errors only when the agent has accounts to tell apart.
         let offered_by = match self.accounts.get(&agent_id).listed().len() {
             0 | 1 => agent_id.0.to_string(),
@@ -1368,7 +1431,14 @@ impl Server {
         } else {
             caller_options.clone()
         };
-        let model = match arguments.string("model", 256)? {
+        let requested_model = match &role_choice {
+            Some(choice) => choice.pick.model.as_deref(),
+            None => arguments.string("model", 256)?,
+        };
+        let model = match requested_model {
+            // An account that hasn't said which models it offers starts a role's task with
+            // its default.
+            Some(_) if role_choice.is_some() && model_choices(&known_options).is_none() => None,
             Some(requested) => {
                 let Some((config_id, choices, _)) = model_choices(&known_options) else {
                     return Err(failure(
@@ -1407,12 +1477,27 @@ impl Server {
             }
             None => None,
         };
+        // The pick's effort, where the account offers it; else the model's own.
+        let effort = role_choice
+            .as_ref()
+            .and_then(|choice| choice.pick.effort.as_deref())
+            .and_then(|requested| {
+                let (config_id, choices, _) = select_choices(
+                    &known_options,
+                    acp::SessionConfigOptionCategory::ThoughtLevel,
+                )?;
+                let (value, _) = choices.iter().find(|(id, name)| {
+                    id.eq_ignore_ascii_case(requested) || name.eq_ignore_ascii_case(requested)
+                })?;
+                Some((config_id, value.clone()))
+            });
         Ok(LaunchSpec {
             prompt,
             title,
             agent_id,
             account,
             model,
+            effort,
             mode,
             mode_option,
             placement: workspace_strategy(arguments)?,
@@ -1534,7 +1619,12 @@ impl Server {
         let mut defaults = self
             .account_settings(&spec.agent_id, spec.account)
             .session_defaults();
-        for (config_id, value) in spec.model.iter().chain(&spec.mode_option) {
+        for (config_id, value) in spec
+            .model
+            .iter()
+            .chain(&spec.effort)
+            .chain(&spec.mode_option)
+        {
             defaults.config_options.retain(|(id, _)| id != config_id);
             defaults.config_options.push((
                 config_id.clone(),
@@ -1647,7 +1737,7 @@ impl Server {
             }
             return self.prepare_elsewhere(caller, parent, machine, arguments, prompt, delegation);
         }
-        let mut spec = self.launch_spec(caller, arguments, "task")?;
+        let mut spec = self.launch_spec(caller, arguments, "task", Some(delegation.role))?;
         spec.prompt = Some(prompt.clone());
         Ok(Delegated::Here {
             spec,
@@ -1780,6 +1870,9 @@ impl Server {
             model: spec
                 .model
                 .map(|(config_id, value)| (config_id.0.to_string(), value)),
+            effort: spec
+                .effort
+                .map(|(config_id, value)| (config_id.0.to_string(), value)),
             mode: spec.mode.map(|mode| mode.0.to_string()),
             mode_option: spec
                 .mode_option
@@ -1873,7 +1966,7 @@ impl Server {
         if let Some(task) = existing {
             return Ok(Step::Done(self.task_result(task, false)));
         }
-        let mut spec = self.launch_spec(caller, arguments, "task")?;
+        let mut spec = self.launch_spec(caller, arguments, "task", Some(delegation.role))?;
         let Some(prompt) = spec.prompt.clone() else {
             return Err(invalid("task is required."));
         };
@@ -2665,6 +2758,8 @@ struct LaunchSpec {
     /// `None` is the External account.
     account: Option<AccountId>,
     model: Option<(acp::SessionConfigId, String)>,
+    /// The effort a role's pick runs with: the setting and value.
+    effort: Option<(acp::SessionConfigId, String)>,
     /// The caller's mode, for a thread of the same agent: a delegated task never gets more
     /// room than its parent.
     mode: Option<acp::SessionModeId>,
@@ -2675,7 +2770,8 @@ struct LaunchSpec {
 /// What a delegation asks besides the task's thread: the task's role, whether it may
 /// delegate in turn, and its idempotency key.
 struct Delegation {
-    role: Option<String>,
+    /// `None` when the parent gave none, which is [`TaskRole::Other`].
+    role: Option<TaskRole>,
     can_delegate: bool,
     client_request_id: Option<String>,
 }
@@ -2707,13 +2803,10 @@ enum Slot {
 impl Delegation {
     fn new(arguments: &Arguments) -> Result<Self, Failure> {
         let role = match arguments.string("role", 32)? {
-            Some(role) if TASK_ROLES.contains(&role) => Some(role.to_string()),
-            Some(role) => {
-                return Err(invalid(format!(
-                    "Unknown role {role}. Roles: {}.",
-                    TASK_ROLES.join(", ")
-                )));
-            }
+            Some(role) => Some(TaskRole::from_id(role).ok_or_else(|| {
+                let roles: Vec<&str> = TaskRole::ALL.iter().map(|role| role.id()).collect();
+                invalid(format!("Unknown role {role}. Roles: {}.", roles.join(", ")))
+            })?),
             None => None,
         };
         Ok(Self {
@@ -2727,7 +2820,7 @@ impl Delegation {
         Task {
             parent,
             prompt,
-            role: self.role.clone(),
+            role: self.role.map(|role| role.id().to_string()),
             client_request_id: self.client_request_id.clone(),
             outcome: None,
             delivered: false,
@@ -2895,7 +2988,7 @@ fn advertised_modes(settings: &AgentSettings) -> Vec<Value> {
 
 /// The model selector among the options: its id, its choices (value id and name), and the
 /// current value.
-fn model_choices(
+pub(super) fn model_choices(
     options: &[acp::SessionConfigOption],
 ) -> Option<(acp::SessionConfigId, Vec<(String, String)>, String)> {
     select_choices(options, acp::SessionConfigOptionCategory::Model)
@@ -3027,10 +3120,10 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
         let mut properties = json!({
             "task": {"type": "string", "maxLength": MAX_PROMPT_CHARS, "description": "A self-contained task for one delegated child agent."},
             "title": {"type": "string", "maxLength": MAX_TITLE_CHARS},
-            "role": {"type": "string", "enum": TASK_ROLES},
-            "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to this thread's agent."},
+            "role": {"type": "string", "enum": ["researcher", "reviewer", "worker", "other"], "description": "The kind of work: researcher (finds things out), reviewer (checks work), worker (does it), or other. Defaults to other. A role the user picked agents for (roles in orchestrator_capabilities) runs on those picks, with an account chosen for the user; leave agentId, account and model out then, unless the user asked for another agent."},
+            "agentId": {"type": "string", "description": "An installed agent from orchestrator_capabilities. Defaults to the user's picks for the role, else this thread's agent."},
             "account": account,
-            "model": {"type": "string", "description": "A model id or name the agent (or the chosen account) advertises. Defaults to this thread's model for the same agent, or the agent's default."},
+            "model": {"type": "string", "description": "A model id or name the agent (or the chosen account) advertises. Defaults to the user's picks for the role, else this thread's model for the same agent, or the agent's default."},
             "canDelegate": {"type": "boolean", "description": "Let the child delegate tasks of its own. Defaults to false."},
             "workspaceStrategy": workspace_strategy("Defaults to this thread's own folder, so parallel tasks that edit files should each get a worktree or pasture."),
         });
@@ -3212,7 +3305,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
         {
             "name": "delegate_task",
             "title": "Delegate a child task",
-            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Choose agents and models from orchestrator_capabilities. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. For several tasks at once, use delegate_tasks. The agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows under this thread. A thread runs a few tasks at once (the user's setting); more are queued (status queued) and start in order as others end. It returns at once: when the task ends, this thread is sent a message with its result, sent into this turn if this agent takes messages mid-turn and otherwise queued until it ends, so end the turn instead of polling or waiting; use task_status only when the result is needed mid-turn. A child can't delegate tasks of its own unless canDelegate is true. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status, task_send and task_cancel without machine. Keep the taskId for task_status, task_send and task_cancel.",
+            "description": "Delegate one task to an agentZ-owned child agent (a subagent) of THIS thread, which runs it with only the supplied task prompt, without the parent's conversation. Give each task its role (researcher, reviewer, worker or other): the user picks the agents and models each role runs on (roles in orchestrator_capabilities), and a role with picks runs on them, so name an agent or model only for a role without picks, or when the user asked for other agents. Prefer your own native subagent tools for same-agent work when they support the chosen model; use this for other agents or models, or for explicitly agentZ-owned child tasks. For several tasks at once, use delegate_tasks. Without picks for its role, the agent and model inherit from this thread unless given, and the child keeps this thread's mode. The child is not an ordinary top-level thread: it shows under this thread. A thread runs a few tasks at once (the user's setting); more are queued (status queued) and start in order as others end. It returns at once: when the task ends, this thread is sent a message with its result, sent into this turn if this agent takes messages mid-turn and otherwise queued until it ends, so end the turn instead of polling or waiting; use task_status only when the result is needed mid-turn. A child can't delegate tasks of its own unless canDelegate is true. With machine, the child runs on that machine and still shows under this thread; its taskId is this machine's, so call task_status, task_send and task_cancel without machine. Keep the taskId for task_status, task_send and task_cancel.",
             "inputSchema": {
                 "type": "object",
                 "properties": delegated_task_properties(true),

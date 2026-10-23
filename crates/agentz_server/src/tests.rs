@@ -5676,7 +5676,7 @@ async fn agents_work_on_other_machines_through_the_app() {
         .tool(
             orchestrator,
             "delegate_task",
-            json!({"task": "hi", "machine": "devbox", "role": "research"}),
+            json!({"task": "hi", "machine": "devbox", "role": "researcher"}),
         )
         .await;
     assert_eq!(
@@ -6092,6 +6092,127 @@ fn relay_as_the_app_then(
     })
 }
 
+/// A task delegated by role runs on the user's picks for it, on the account of the pick's
+/// agent with the most to spare: not one used up. A role whose picks can't run says why, and
+/// the agents see the picks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_roles_task_runs_on_the_users_picks() {
+    let data_dir = tempfile::tempdir().expect("temp dir");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let read = |used_percent: u32| {
+        json!({
+            "status": {"windows": [{
+                "label": "5-hour",
+                "used_percent": used_percent,
+                "resets_at": {"secs_since_epoch": now + 3600, "nanos_since_epoch": 0},
+                "length": {"secs": 5 * 3600, "nanos": 0},
+            }]},
+            "read_at": {"secs_since_epoch": now, "nanos_since_epoch": 0},
+        })
+    };
+    let agents = data_dir.path().join("agents");
+    std::fs::create_dir_all(&agents).expect("create agents");
+    std::fs::write(
+        agents.join("accounts.json"),
+        json!({"mock": {
+            "accounts": [
+                {"id": 1, "logged_in": true, "status": read(100)},
+                {"id": 2, "logged_in": true, "status": read(20)},
+            ],
+            "last_id": 2,
+        }})
+        .to_string(),
+    )
+    .expect("write accounts.json");
+    account_home(data_dir.path(), AccountId(1));
+    account_home(data_dir.path(), AccountId(2));
+    let Some(server) = TestServer::start_with(data_dir, tempfile::tempdir().expect("temp dir"))
+    else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+    let pick = |agent: &str| agentz_protocol::subthread_roles::RolePick {
+        agent: AgentId::new(agent),
+        model: None,
+        effort: None,
+    };
+    client
+        .ok(Request::SetSubthreadRoles(
+            agentz_protocol::subthread_roles::SubthreadRoles {
+                worker: vec![pick("mock")],
+                reviewer: vec![pick("missing")],
+                ..Default::default()
+            },
+        ))
+        .await;
+
+    let capabilities = client
+        .tool(parent, "orchestrator_capabilities", json!({}))
+        .await;
+    assert_eq!(
+        capabilities["roles"]["picks"]["worker"][0]["agentId"],
+        json!("mock"),
+        "{capabilities}"
+    );
+    assert_eq!(capabilities["roles"]["picks"]["researcher"], json!([]));
+
+    let delegated = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "hello", "role": "worker"}),
+        )
+        .await;
+    let worker = task_id(&delegated);
+    assert_eq!(
+        client
+            .project_thread(worker)
+            .and_then(|thread| thread.account),
+        Some(AccountId(2)),
+        "the account with usage to spare, not the one used up"
+    );
+    assert_eq!(
+        client
+            .task(worker)
+            .and_then(|task| task.role.clone())
+            .as_deref(),
+        Some("worker")
+    );
+
+    let code = client
+        .tool_failure(
+            ToolCaller::Thread(parent),
+            "delegate_task",
+            json!({"task": "hello", "role": "reviewer"}),
+        )
+        .await;
+    assert_eq!(code, "role_unavailable");
+    // Named by the agent, the task runs as it says.
+    let named = client
+        .tool(
+            parent,
+            "delegate_task",
+            json!({"task": "hello", "role": "reviewer", "agentId": "mock", "account": "external"}),
+        )
+        .await;
+    assert_eq!(
+        client
+            .project_thread(task_id(&named))
+            .and_then(|thread| thread.account),
+        None
+    );
+}
+
 /// A parent can hand a hundred tasks to subthreads in one call, which run a few at a time and
 /// all come back to it. The app is sent only the threads that change as they do.
 #[tokio::test(flavor = "multi_thread")]
@@ -6178,7 +6299,7 @@ async fn agents_delegate_tasks_to_subthreads() {
         .tool(
             parent,
             "delegate_task",
-            json!({"task": "hello", "title": "Helper", "role": "research"}),
+            json!({"task": "hello", "title": "Helper", "role": "researcher"}),
         )
         .await;
     let helper = task_id(&delegated);

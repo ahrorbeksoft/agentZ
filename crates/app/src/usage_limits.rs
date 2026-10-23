@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use agentz_protocol::Request;
 use agentz_protocol::accounts::{AccountId, ExtraUsage, LimitResets, LimitWindow, used_up_window};
+pub(crate) use agentz_protocol::accounts::{Pace, pace};
 use agentz_protocol::agents::AgentId;
 use gpui::{
     AnyElement, App, ClickEvent, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -27,75 +28,6 @@ const LABEL_WIDTH: Pixels = px(140.);
 const RESET_WIDTH: Pixels = px(116.);
 /// How often the gauge's popover redraws, so its countdowns and "Read 2m ago" move on.
 const POPOVER_TICK: Duration = Duration::from_secs(5);
-
-/// Whether a window lasts until its reset at the rate it's been used, as OpenUsage's `Pace`
-/// and `meterState` judge it. `projected_used` is the percent it would have used by the reset.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Pace {
-    /// On course to reset with at least 10% to spare.
-    OnCourse { projected_used: f64 },
-    /// On course to reset in its last 10%, with `spare` percent (at least 1) left.
-    Close { spare: u8, projected_used: f64 },
-    /// On course to run out before the reset: `runs_out_in` from now, or `None` when it lands
-    /// at the limit right at the reset.
-    RunsOut {
-        runs_out_in: Option<Duration>,
-        projected_used: f64,
-    },
-}
-
-/// The window's pace at `now`, or `None` with nothing to go on: no length or reset, past the
-/// reset, too early in the window (the first 1%, and at least a minute), nothing used yet, or
-/// used up, which is red whatever the pace.
-pub(crate) fn pace(window: &LimitWindow, now: SystemTime) -> Option<Pace> {
-    if window.left_percent() == 0 {
-        return None;
-    }
-    let length = window
-        .length
-        .filter(|length| !length.is_zero())?
-        .as_secs_f64();
-    let remaining = window
-        .resets_at?
-        .duration_since(now)
-        .ok()
-        .filter(|remaining| !remaining.is_zero())?
-        .as_secs_f64();
-    let elapsed = length - remaining;
-    let used = window.used_percent.clamp(0., 100.);
-    if used <= 0. || elapsed < (length * 0.01).max(60.) {
-        return None;
-    }
-    let projected_used = used / elapsed * length;
-    if projected_used <= 90. {
-        return Some(Pace::OnCourse { projected_used });
-    }
-    // A whole-percent read of 1-4% early in a window projects a run-out while nearly all of it
-    // is left; OpenUsage trusts no warning below 5% used.
-    if used < 5. {
-        return None;
-    }
-    if projected_used <= 100. {
-        let spare = (100. - projected_used).round() as u8;
-        return Some(if spare >= 1 {
-            Pace::Close {
-                spare,
-                projected_used,
-            }
-        } else {
-            Pace::RunsOut {
-                runs_out_in: None,
-                projected_used,
-            }
-        });
-    }
-    let runs_out_in = (100. - used) / (projected_used / length);
-    Some(Pace::RunsOut {
-        runs_out_in: (runs_out_in > 0. && runs_out_in < remaining)
-            .then(|| Duration::from_secs_f64(runs_out_in)),
-        projected_used,
-    })
-}
 
 /// What the row says beside its reset: `~4% spare` when it will be close, `runs out in 9h 12m`
 /// when it won't last. Nothing while it's on course.

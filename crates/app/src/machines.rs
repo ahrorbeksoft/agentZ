@@ -676,6 +676,7 @@ impl Machines {
         self.sync_design_defaults(cx);
         self.sync_auto_archive(cx);
         self.sync_subthread_limit(cx);
+        self.sync_subthread_roles(cx);
         self.sync_acp_v2(cx);
         self.sync_cloud_activity(cx);
     }
@@ -696,6 +697,18 @@ impl Machines {
             .subthread_limit;
         for client in self.clients.clone() {
             client.update(cx, |client, cx| client.set_subthread_limit(limit, cx));
+        }
+    }
+
+    /// Gives each server what each role of delegated task runs on, which it keeps.
+    fn sync_subthread_roles(&mut self, cx: &mut Context<Self>) {
+        let roles = AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .subthread_roles
+            .clone();
+        for client in self.clients.clone() {
+            client.update(cx, |client, cx| client.set_subthread_roles(&roles, cx));
         }
     }
 

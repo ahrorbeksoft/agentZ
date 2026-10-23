@@ -210,6 +210,7 @@ pub struct ServerClient {
     auto_archive_sent: Option<Option<u32>>,
     /// How many subthreads the server was last told a thread runs at once, this connection.
     subthread_limit_sent: Option<u32>,
+    subthread_roles_sent: Option<agentz_protocol::subthread_roles::SubthreadRoles>,
     /// Whether the server was last told to ask agents for ACP v2, this connection.
     acp_v2_sent: Option<bool>,
     /// What this Mac's server was last told of the provider machines' use, this connection.
@@ -270,6 +271,7 @@ impl ServerClient {
                 design_settings_sent: None,
                 auto_archive_sent: None,
                 subthread_limit_sent: None,
+                subthread_roles_sent: None,
                 acp_v2_sent: None,
                 cloud_activity_sent: None,
                 #[cfg(test)]
@@ -579,6 +581,19 @@ impl ServerClient {
         }
         self.send(Request::SetSubthreadLimit(limit), cx);
         self.subthread_limit_sent = Some(limit);
+    }
+
+    /// Tells the server what each role of delegated task runs on, when that's changed.
+    pub(crate) fn set_subthread_roles(
+        &mut self,
+        roles: &agentz_protocol::subthread_roles::SubthreadRoles,
+        cx: &App,
+    ) {
+        if !self.is_online() || self.subthread_roles_sent.as_ref() == Some(roles) {
+            return;
+        }
+        self.send(Request::SetSubthreadRoles(roles.clone()), cx);
+        self.subthread_roles_sent = Some(roles.clone());
     }
 
     /// Tells the server whether to ask agents for ACP v2, when that's changed.
@@ -1092,6 +1107,7 @@ impl ServerClient {
         self.design_settings_sent = None;
         self.auto_archive_sent = None;
         self.subthread_limit_sent = None;
+        self.subthread_roles_sent = None;
         self.acp_v2_sent = None;
         self.cloud_activity_sent = None;
         self.is_outdated = is_outdated;

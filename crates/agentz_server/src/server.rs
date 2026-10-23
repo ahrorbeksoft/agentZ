@@ -25,6 +25,7 @@ mod space_requests;
 mod storage_reads;
 mod subagents;
 mod subthread_limit;
+mod subthread_roles;
 mod terminal_requests;
 mod title_requests;
 mod tools;
@@ -293,6 +294,8 @@ pub(crate) struct Server {
     auto_archive_days: Option<u32>,
     /// How many delegated tasks a thread runs at once ([`Self::start_queued_tasks`]).
     subthread_limit: u32,
+    /// What each role of delegated task runs on.
+    subthread_roles: agentz_protocol::subthread_roles::SubthreadRoles,
     /// Agents are asked for ACP v2 before v1.
     acp_v2: bool,
     /// Ended tasks whose changes are being read, announced once they're known.
@@ -399,6 +402,9 @@ impl Server {
             .log_err()
             .unwrap_or(agentz_protocol::DEFAULT_SUBTHREAD_LIMIT);
         let acp_v2 = acp_v2::load(&data_dir).log_err().unwrap_or(false);
+        let subthread_roles = subthread_roles::load(&data_dir)
+            .log_err()
+            .unwrap_or_default();
         let cleanup_file = workspace_cleanup::load(&data_dir)
             .log_err()
             .unwrap_or_default();
@@ -500,6 +506,7 @@ impl Server {
             generated_titles: HashSet::default(),
             auto_archive_days,
             subthread_limit,
+            subthread_roles,
             acp_v2,
             reading_task_changes: HashSet::default(),
             clients: HashMap::default(),
@@ -1559,6 +1566,10 @@ impl Server {
             }
             Request::SetSubthreadLimit(limit) => {
                 self.set_subthread_limit(limit)?;
+                Ok(Response::Ok)
+            }
+            Request::SetSubthreadRoles(roles) => {
+                self.set_subthread_roles(roles)?;
                 Ok(Response::Ok)
             }
             Request::SetAcpV2(acp_v2) => {

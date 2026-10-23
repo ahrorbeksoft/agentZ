@@ -24,6 +24,7 @@ pub mod mcp_servers;
 pub mod skills;
 pub mod spaces;
 pub mod storage;
+pub mod subthread_roles;
 pub mod terminal;
 pub mod terminal_keys;
 pub mod thread;
@@ -883,6 +884,9 @@ pub enum Request {
     /// How many delegated tasks each thread runs at once; more wait their turn. The app's
     /// setting, given to each server as it connects and as it changes.
     SetSubthreadLimit(u32),
+    /// What each role of delegated task runs on, in the order to try. The app's setting,
+    /// given to each server as it connects and as it changes.
+    SetSubthreadRoles(subthread_roles::SubthreadRoles),
     /// Whether agents are asked for ACP v2 before v1 (Settings › General › Experimental). The
     /// app's setting, given to each server as it connects and as it changes. Agents started
     /// after it changes use it.
