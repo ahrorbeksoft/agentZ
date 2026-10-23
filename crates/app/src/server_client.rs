@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use agentz_client::Connection;
 use agentz_client::ssh::{RemotePlatform, Ssh, SshError, UploadProgress};
-use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts};
+use agentz_protocol::accounts::{AccountId, AgentAccount, AgentAccounts, SharedAccountSection};
 use agentz_protocol::agents::{AgentId, AgentSettings, InstallState, RegistrySnapshot};
 use agentz_protocol::artifacts::{
     Artifact, ArtifactId, ArtifactRequest, Artifacts, DesignSettings, PageTheme,
@@ -649,26 +649,80 @@ impl ServerClient {
             .unwrap_or_default()
     }
 
-    /// The account's settings, `None` being the External account, whose are the agent's.
+    /// What the account runs with: its settings, `None` being the External account, whose
+    /// are the agent's, with Shared's Environment and defaults where it uses them.
     pub fn account_settings(
         &self,
         agent_id: &AgentId,
         account: Option<AccountId>,
     ) -> AgentSettings {
-        match account {
+        let accounts = self.accounts.get(agent_id);
+        let own = match account {
             None => self.agent_settings(&agent_id.0),
-            Some(id) => self
-                .accounts
-                .get(agent_id)
+            Some(id) => accounts
                 .and_then(|accounts| accounts.account(id))
                 .map(|account| account.settings.clone())
                 .unwrap_or_default(),
+        };
+        match accounts {
+            Some(accounts) => accounts.with_shared(account, own),
+            None => own,
         }
     }
 
-    /// Asks the server to change the account's settings (`None` being the External account's).
-    /// The copy here follows when the server says so. The options and modes an agent offers
-    /// are the server's to remember, so changes to them are ignored.
+    /// Asks the server to change what the agent's accounts share, as
+    /// [`Self::update_account_settings`] changes an account's.
+    pub fn update_shared_account_settings(
+        &mut self,
+        agent_id: &AgentId,
+        change: impl FnOnce(&mut AgentSettings),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shared) = self
+            .accounts
+            .get(agent_id)
+            .and_then(|accounts| accounts.shared.as_ref())
+        else {
+            return;
+        };
+        let previous = shared.to_settings();
+        let mut settings = previous.clone();
+        change(&mut settings);
+        for change in agent_settings_changes(&previous, &settings) {
+            self.send(
+                Request::UpdateSharedAccountSettings {
+                    agent_id: agent_id.clone(),
+                    change,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// The account's "Use shared settings" on its Defaults or Environment tab.
+    pub fn use_shared_account_settings(
+        &self,
+        agent_id: &AgentId,
+        account: Option<AccountId>,
+        section: SharedAccountSection,
+        on: bool,
+        cx: &App,
+    ) {
+        self.send(
+            Request::UseSharedAccountSettings {
+                agent_id: agent_id.clone(),
+                account,
+                section,
+                on,
+            },
+            cx,
+        );
+    }
+
+    /// Asks the server to change the account's settings (`None` being the External account's),
+    /// Shared's Environment or defaults while it uses them. The copy here follows when the
+    /// server says so. The options and modes an agent offers are the server's to remember, so
+    /// changes to them are ignored.
     pub fn update_account_settings(
         &mut self,
         agent_id: &AgentId,

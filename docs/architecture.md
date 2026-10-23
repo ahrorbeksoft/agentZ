@@ -200,7 +200,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `attachments/<thread id>/` | server | Images in the thread's messages (named by their hash), their thumbnails, and files uploaded from another machine (`files/`) |
 | `handoffs/<thread id>.json` | server | What goes with a thread's next message, written by agentZ: what its new agent or account hasn't seen of it, the conversation it was forked with or its new session couldn't load, or what happened in a fork merged back into it; removed once the agent takes the message |
 | `agents/settings.json` | server | Per-agent env, defaults and known options: the External account's |
-| `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, and the same for the External account |
+| `agents/accounts.json` | server | Each agent's agentZ accounts with their own settings, last login check and last identity and limits read, its account for new threads, the same for the External account, and the Environment and defaults its accounts share |
 | `agents/registry/` | server | Registry cache, icons, installed agents |
 | `agents/custom.json` | server | Custom agents, run from a command (Settings › Agents › Add Custom Agent; the mock agent for tests), with how each keeps accounts, if it can |
 | `accounts/<agent id>/<account id>/` | server | An agentZ account's home: the agent's login, sessions and own settings files |
@@ -601,7 +601,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   removes. With more than one account, the Defaults,
   Environment and Threads tabs share an "Account" menu over them that picks whose settings
   or sessions they show (`AgentPanel::picked_account`), opening on the account for new
-  threads. Add Agent is Zed's
+  threads. Once the accounts share settings (below), the menu over Defaults and Environment
+  starts with Shared (the layers icon) over a line (`AgentPanel::picked_shared`,
+  `AccountView`; design/settings-2, topic 3 C): its rows change what the accounts share
+  (`Request::UpdateSharedAccountSettings`), and its note names the accounts that set their
+  own. On one account, each of the two tabs starts with "Use shared settings": on, with what
+  Shared has ("Sonnet · High", "2 shared variables.") and no other rows; off ("Work sets its
+  own."), the account's own rows (`Request::UseSharedAccountSettings`). The Threads tab lists
+  one account's sessions, so its menu has no Shared. Add Agent is Zed's
   menu: Install from Registry, Add Custom Agent, and the ACP docs. The ACP Registry
   page has search, an All / Installed / Not Installed filter, and a card for each registry agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
@@ -1771,7 +1778,16 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Each account has its own `AgentSettings` (environment, defaults, the options it last
   offered, its login), since accounts of one agent don't get the same models; the External
   account's are the agent's settings from before
-  (`Server::{account_settings, update_account_settings}`). A thread starts with its account's
+  (`Server::{account_settings, update_account_settings}`). Once an agent has an account of
+  agentZ's, its accounts share an Environment and defaults (`AgentAccounts::shared`,
+  `SharedAccountSettings`), started from the account for new threads' without the login
+  variables (`AgentAccounts::start_sharing`, as the server starts and at `AddAccount`); an
+  account whose own differed then keeps its own (`AccountChoices::{own_env, own_defaults}`).
+  What an account runs with is Shared's where it uses them (`AgentAccounts::with_shared`,
+  in the server's and the app's `account_settings`), and a change to it, from Settings, a
+  thread or the custom agent form, changes Shared's there (`Server::change_account_choices`).
+  Turning "Use shared settings" off copies Shared's to the account; back on, its copy goes
+  (`Server::use_shared_account_settings`). A thread starts with its account's
   defaults, and a choice made in it becomes its account's default. Agent control lists each
   account with its models and modes when an agent has more than one
   (`orchestrator_capabilities`' `accounts`, keyed by id or "external"), takes an `account` (key
@@ -1779,8 +1795,9 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   threads otherwise, and checks a model against that account's options. The caller's model
   carries over only where the account offers it. A new account copies
   another's settings (`Request::CopyAccountSettings`, `Account::settings_from`; at
-  `AddAccount`, the account for new threads'): its Environment without the login variables,
-  its defaults, and the description's `settings_files` from its home (`normal_home` for the
+  `AddAccount`, the account for new threads'): its Environment without the login variables
+  and its defaults, each Shared's where that account uses them (Nothing uses both), and the
+  description's `settings_files` from its home (`normal_home` for the
   External account), with the keys of the files a home starts with kept
   (`AgentDescription::copy_settings_files`), but never the login, nor the settings that
   belong to it (`login_settings`: Devin's organization). Copied defaults wait for

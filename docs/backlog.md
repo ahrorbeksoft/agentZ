@@ -31,19 +31,6 @@ notice stay on its machine), so this waits for that. Until then, a thread can't 
 version of another machine's artifact ("there's no artifact … to update").
 
 
-### Reorganize Settings
-
-The whole Settings page is a mess; organize it better now that there are so many settings.
-Also:
-
-- For machine-specific settings, a general setting that applies to all machines when set.
-- Likewise for profile-specific settings: a general one for all profiles.
-
-Decided on the design board (`design/settings-2/decisions.md`). Built: topic 1 A, headings in
-the sidebar and General split into Threads, Subthreads, Thread titles and Artifacts, and topic
-2, Shared settings for machines. Left: the shared settings for accounts (topic 3).
-
-
 ### Redesign chats
 
 Requested October 23, 2026: redesign chats. They don't need their own grouping any more: a chat

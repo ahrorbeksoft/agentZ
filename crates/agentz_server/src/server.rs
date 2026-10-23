@@ -522,6 +522,16 @@ impl Server {
             stopping: false,
             forwarders: JoinSet::new(),
         };
+        let sharing_to_start: Vec<AgentId> = server
+            .accounts
+            .all()
+            .iter()
+            .filter(|(_, accounts)| accounts.shared.is_none() && !accounts.accounts.is_empty())
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+        for agent_id in sharing_to_start {
+            server.start_account_sharing(&agent_id);
+        }
         server.forward(registry_inbox, Input::Registry);
         server.registry_sent = server.registry_snapshot();
         server.list_skills();
@@ -1412,27 +1422,27 @@ impl Server {
                         .account(id)
                         .context("there's no such account")?;
                 }
-                if let AgentSettingsChange::Unknown(change) = &change {
-                    return Err(anyhow!("unsupported agent settings change: {change}"));
+                match change {
+                    AgentSettingsChange::Unknown(change) => {
+                        Err(anyhow!("unsupported agent settings change: {change}"))
+                    }
+                    change @ AgentSettingsChange::SetLoginMethod(_) => {
+                        self.update_account_settings(&agent_id, account, |settings| {
+                            change.apply(settings)
+                        });
+                        Ok(Response::Ok)
+                    }
+                    change => {
+                        self.change_account_choices(&agent_id, account, |settings| {
+                            change.apply(settings)
+                        });
+                        Ok(Response::Ok)
+                    }
                 }
-                self.update_account_settings(&agent_id, account, |settings| match change {
-                    AgentSettingsChange::SetEnv(env) => settings.env = env,
-                    AgentSettingsChange::SetLoginMethod(method) => settings.login_method = method,
-                    AgentSettingsChange::SetDefaultConfigOption { config_id, value } => match value
-                    {
-                        Some(value) => {
-                            settings.default_config_options.insert(config_id, value);
-                        }
-                        None => {
-                            settings.default_config_options.remove(&config_id);
-                        }
-                    },
-                    AgentSettingsChange::SetDefaultMode(mode) => settings.default_mode = mode,
-                    AgentSettingsChange::Unknown(_) => {}
-                });
-                Ok(Response::Ok)
             }
             request @ (Request::AddAccount(_)
+            | Request::UpdateSharedAccountSettings { .. }
+            | Request::UseSharedAccountSettings { .. }
             | Request::CopyAccountSettings { .. }
             | Request::RemoveAccount { .. }
             | Request::UpdateAccount { .. }
@@ -2539,7 +2549,7 @@ impl Server {
                     AgentThreadEvent::ConfigOptionChanged(config_id, value),
                 ) => {
                     if let Some(agent_id) = &agent_id {
-                        self.update_account_settings(agent_id, account, |settings| {
+                        self.change_account_choices(agent_id, account, |settings| {
                             settings
                                 .default_config_options
                                 .insert(config_id.0.to_string(), value);
@@ -2548,7 +2558,7 @@ impl Server {
                 }
                 (ConnectionId::Thread(_), AgentThreadEvent::ModeChanged(mode)) => {
                     if let Some(agent_id) = &agent_id {
-                        self.update_account_settings(agent_id, account, |settings| {
+                        self.change_account_choices(agent_id, account, |settings| {
                             settings.default_mode = Some(mode)
                         });
                     }

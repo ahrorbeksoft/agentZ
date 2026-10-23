@@ -26,10 +26,11 @@ use crate::project_store::ProjectStore;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountChoices, AccountId, AccountStatus, AccountSupport,
     AgentAccounts, AtLimit, LimitResets, LimitWindow, Overage, OveragePreference, SettingsSource,
+    SharedAccountSection, SharedAccountSettings,
 };
 use agentz_protocol::agents::{
-    AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, CustomAgentChange,
-    InstallState,
+    AgentCommand, AgentId, AgentListing, AgentSession, AgentSessions, AgentSettings,
+    CustomAgentChange, InstallState,
 };
 use agentz_protocol::artifacts::{DesignDefaults, DesignSizes, VariantsAs};
 use agentz_protocol::cloud::{MachineAction, Provider};
@@ -3544,25 +3545,64 @@ impl SettingsPage {
         if entries.len() < 2 {
             return None;
         }
-        let current = panel.settings_account(&accounts);
-        let shown = entries.iter().find(|entry| entry.account == current)?;
-        let label = h_flex()
-            .gap_1p5()
-            .child(render_entry_avatar(shown, MENU_AVATAR_SIZE, cx))
-            .child(Label::new(shown.name.clone()).size(LabelSize::Small))
-            .into_any_element();
+        // The Threads tab lists one account's sessions, so it has no Shared.
+        let with_shared = panel.tab != AgentTab::Threads && offers_shared(&accounts);
+        let current = if with_shared {
+            panel.settings_view(&accounts)
+        } else {
+            AccountView::Account(panel.settings_account(&accounts))
+        };
+        let label = match current {
+            AccountView::Shared => h_flex()
+                .gap_1p5()
+                .child(render_shared_icon())
+                .child(Label::new("Shared").size(LabelSize::Small)),
+            AccountView::Account(account) => {
+                let shown = entries.iter().find(|entry| entry.account == account)?;
+                h_flex()
+                    .gap_1p5()
+                    .child(render_entry_avatar(shown, MENU_AVATAR_SIZE, cx))
+                    .child(Label::new(shown.name.clone()).size(LabelSize::Small))
+            }
+        }
+        .into_any_element();
         let page = cx.weak_entity();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            if with_shared {
+                menu = menu
+                    .custom_entry(
+                        move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_1p5()
+                                .debug_selector(|| "account-picker-shared".into())
+                                .child(render_shared_icon())
+                                .child(Label::new("Shared"))
+                                .child(div().flex_1().min_w(px(16.)))
+                                .when(current == AccountView::Shared, |row| {
+                                    row.child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                        on_page(&page, |page, _, cx| page.pick_shared(cx)),
+                    )
+                    .separator();
+            }
             for entry in entries {
                 let account = entry.account;
                 let selector = account_selector(account);
+                let is_current = current == AccountView::Account(account);
                 menu = menu.custom_entry(
                     move |_, cx| {
                         let selector = selector.clone();
                         div()
                             .w_full()
                             .debug_selector(move || format!("account-picker-{selector}"))
-                            .child(render_account_entry(&entry, entry.account == current, cx))
+                            .child(render_account_entry(&entry, is_current, cx))
                             .into_any_element()
                     },
                     on_page(&page, move |page, _, cx| page.pick_account(account, cx)),
@@ -3632,8 +3672,9 @@ impl SettingsPage {
     ) {
         let client = self.agents_client(cx);
         // The tabs open on the account for new threads.
-        let account = client.read(cx).accounts(id).new_thread_account();
-        let env_rows = self.account_env_rows(&client, id, account, cx);
+        let accounts = client.read(cx).accounts(id);
+        let account = accounts.new_thread_account();
+        let env_rows = self.view_env_rows(&client, id, AccountView::Account(account), cx);
         let external = self.open_account_session(&client, id, None, name, cx);
         // Accounts added or removed, here or in another window.
         let accounts_changed = cx.observe(&client, |this, _, cx| {
@@ -3649,7 +3690,9 @@ impl SettingsPage {
             adding_account: None,
             account_error: None,
             picked_account: AccountChoice::Default,
-            env_account: account,
+            picked_shared: false,
+            env_view: AccountView::Account(account),
+            env_follows: env_follows(&accounts, AccountView::Account(account)),
             env_rows,
             sessions_account: account,
             sessions: None,
@@ -3808,47 +3851,59 @@ impl SettingsPage {
         row
     }
 
-    /// The Environment tab's rows for the account's variables.
-    fn account_env_rows(
+    /// The Environment tab's rows for the view's variables: Shared's, or what the account
+    /// runs with.
+    fn view_env_rows(
         &self,
         client: &Entity<ServerClient>,
         agent_id: &AgentId,
-        account: Option<AccountId>,
+        view: AccountView,
         cx: &mut Context<Self>,
     ) -> Vec<EnvRow> {
-        client
-            .read(cx)
-            .account_settings(agent_id, account)
-            .env
-            .iter()
+        let env = match view {
+            AccountView::Shared => client
+                .read(cx)
+                .accounts(agent_id)
+                .shared
+                .map(|shared| shared.env)
+                .unwrap_or_default(),
+            AccountView::Account(account) => {
+                client.read(cx).account_settings(agent_id, account).env
+            }
+        };
+        env.iter()
             .map(|(key, value)| self.new_env_row(key, value, cx))
             .collect()
     }
 
-    /// Shows the account's variables on the Environment tab, read again from its settings.
-    fn show_account_env(&mut self, account: Option<AccountId>, cx: &mut Context<Self>) {
+    /// Shows the view's variables on the Environment tab, read again from its settings.
+    fn show_env(&mut self, view: AccountView, cx: &mut Context<Self>) {
         let Some(panel) = self.agent_panel() else {
             return;
         };
         let client = panel.client(cx);
         let agent_id = panel.agent_id.clone();
-        let rows = self.account_env_rows(&client, &agent_id, account, cx);
+        let follows = env_follows(&client.read(cx).accounts(&agent_id), view);
+        let rows = self.view_env_rows(&client, &agent_id, view, cx);
         if let Some(panel) = self.agent_panel_mut() {
-            panel.env_account = account;
+            panel.env_view = view;
+            panel.env_follows = follows;
             panel.env_rows = rows;
         }
         cx.notify();
     }
 
-    /// Follows the account the tabs show when it changes: picked, made the default, or gone.
+    /// Follows the account the tabs show when it changes: picked, made the default, or gone;
+    /// and its variables once it stops using Shared's.
     fn sync_settings_account(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.agent_panel() else {
             return;
         };
         let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
         let account = panel.settings_account(&accounts);
-        if panel.env_account != account {
-            self.show_account_env(account, cx);
+        let view = panel.settings_view(&accounts);
+        if panel.env_view != view || panel.env_follows != env_follows(&accounts, view) {
+            self.show_env(view, cx);
         }
         let Some(panel) = self.agent_panel_mut() else {
             return;
@@ -3869,6 +3924,16 @@ impl SettingsPage {
             return;
         };
         panel.picked_account = AccountChoice::of(account);
+        panel.picked_shared = false;
+        self.sync_settings_account(cx);
+        cx.notify();
+    }
+
+    fn pick_shared(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.agent_panel_mut() else {
+            return;
+        };
+        panel.picked_shared = true;
         self.sync_settings_account(cx);
         cx.notify();
     }
@@ -3888,9 +3953,9 @@ impl SettingsPage {
             })
             .collect();
         let agent_id = panel.agent_id.clone();
-        let account = panel.env_account;
+        let view = panel.env_view;
         panel.client(cx).update(cx, |client, cx| {
-            client.update_account_settings(&agent_id, account, |settings| settings.env = env, cx)
+            view.update_settings(client, &agent_id, |settings| settings.env = env, cx)
         });
     }
 
@@ -3910,7 +3975,7 @@ impl SettingsPage {
             env.extend(
                 self.agents_client(cx)
                     .read(cx)
-                    .agent_settings(&agent.id().0)
+                    .account_settings(agent.id(), None)
                     .env,
             );
         }
@@ -4196,26 +4261,70 @@ impl SettingsPage {
         let agent_name = panel.external.connection.read(cx).agent_name().clone();
         let client = panel.client(cx);
         let accounts = client.read(cx).accounts(&agent_id);
-        let account = panel.settings_account(&accounts);
-        let agent = client.read(cx).account_settings(&agent_id, account);
+        let view = panel.settings_view(&accounts);
+        let agent = match view {
+            AccountView::Shared => with_offers(
+                accounts
+                    .shared
+                    .as_ref()
+                    .map(SharedAccountSettings::to_settings)
+                    .unwrap_or_default(),
+                client.read(cx),
+                &agent_id,
+                &accounts,
+            ),
+            AccountView::Account(account) => client.read(cx).account_settings(&agent_id, account),
+        };
+        let note = match view {
+            AccountView::Shared => {
+                let mut note = "Accounts that use shared settings start new threads with these. \
+                                Choosing one in a thread on one of them changes it here."
+                    .to_string();
+                if let Some(own) = accounts_own_note(&accounts, SharedAccountSection::Defaults) {
+                    note.push(' ');
+                    note.push_str(&own);
+                }
+                note
+            }
+            AccountView::Account(account)
+                if !accounts.sets_own(account, SharedAccountSection::Defaults) =>
+            {
+                "Choosing one in a thread on this account changes the shared settings.".into()
+            }
+            AccountView::Account(_) if accounts.listed().len() > 1 => {
+                "Choosing one in a thread on this account also makes it the default.".into()
+            }
+            AccountView::Account(_) => "Choosing one in a thread also makes it the default.".into(),
+        };
         let mut rows: Vec<AnyElement> = Vec::new();
+        if let AccountView::Account(account) = view
+            && offers_shared(&accounts)
+        {
+            let summary = defaults_summary(
+                &agent_id,
+                &with_offers(agent.clone(), client.read(cx), &agent_id, &accounts),
+            );
+            rows.push(self.render_use_shared_account_row(
+                &accounts,
+                account,
+                SharedAccountSection::Defaults,
+                summary,
+                cx,
+            ));
+            if !accounts.sets_own(account, SharedAccountSection::Defaults) {
+                return render_section_with_note(TITLE, rows, note, cx);
+            }
+        }
+        let rows_before = rows.len();
         for option in &agent.known_config_options {
             if crate::model_picker::is_hidden_option(Some(&agent_id), option) {
                 continue;
             }
+            let Some(choices) = option_choices(option) else {
+                continue;
+            };
             let config_id = option.id.0.to_string();
             let current = agent.default_config_options.get(&config_id).cloned();
-            let choices: Vec<(SharedString, acp::SessionConfigOptionValue)> = match &option.kind {
-                acp::SessionConfigKind::Select(select) => select_choices(select)
-                    .into_iter()
-                    .map(|(name, value)| (name, acp::SessionConfigOptionValue::value_id(value)))
-                    .collect(),
-                acp::SessionConfigKind::Boolean(_) => vec![
-                    ("On".into(), acp::SessionConfigOptionValue::boolean(true)),
-                    ("Off".into(), acp::SessionConfigOptionValue::boolean(false)),
-                ],
-                _ => continue,
-            };
             let label = current
                 .as_ref()
                 .and_then(|current| {
@@ -4244,9 +4353,9 @@ impl SettingsPage {
                             let value = value.clone();
                             let config_id = config_id.clone();
                             client.update(cx, |client, cx| {
-                                client.update_account_settings(
+                                view.update_settings(
+                                    client,
                                     &agent_id,
-                                    account,
                                     |agent| match value {
                                         Some(value) => {
                                             agent.default_config_options.insert(config_id, value);
@@ -4317,9 +4426,9 @@ impl SettingsPage {
                         move |_, cx| {
                             let mode = mode.clone();
                             client.update(cx, |client, cx| {
-                                client.update_account_settings(
+                                view.update_settings(
+                                    client,
                                     &agent_id,
-                                    account,
                                     |agent| agent.default_mode = mode,
                                     cx,
                                 )
@@ -4336,7 +4445,11 @@ impl SettingsPage {
                 cx,
             ));
         }
-        if rows.is_empty() {
+        if rows.len() == rows_before {
+            let account = match view {
+                AccountView::Shared => accounts.new_thread_account(),
+                AccountView::Account(account) => account,
+            };
             let session = panel.session(account).unwrap_or(&panel.external);
             let connection = session.connection.read(cx);
             let message = match (connection.status(), connection.logged_in()) {
@@ -4344,28 +4457,119 @@ impl SettingsPage {
                 (ConnectionStatus::Connecting, _) => format!("Loading {agent_name}'s settings…"),
                 _ => format!("{agent_name} doesn't offer any settings."),
             };
-            let message = div()
-                .px_4()
-                .py_3()
-                .child(Label::new(message).color(Color::Muted))
-                .into_any_element();
-            return render_section(TITLE, vec![message], cx);
+            rows.push(
+                div()
+                    .px_4()
+                    .py_3()
+                    .child(Label::new(message).color(Color::Muted))
+                    .into_any_element(),
+            );
+            return render_section(TITLE, rows, cx);
         }
-        let note = if accounts.listed().len() > 1 {
-            "Choosing one in a thread on this account also makes it the default."
-        } else {
-            "Choosing one in a thread also makes it the default."
-        };
         render_section_with_note(TITLE, rows, note, cx)
+    }
+
+    /// "Use shared settings", first on an account's Defaults or Environment tab: on, with what
+    /// Shared has; off, the account sets its own.
+    fn render_use_shared_account_row(
+        &self,
+        accounts: &AgentAccounts,
+        account: Option<AccountId>,
+        section: SharedAccountSection,
+        summary: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(panel) = self.agent_panel() else {
+            return div().into_any_element();
+        };
+        let follows = !accounts.sets_own(account, section);
+        let description: SharedString = if follows {
+            summary.into()
+        } else {
+            format!("{} sets its own.", account_entry(accounts, account).name).into()
+        };
+        let id = match section {
+            SharedAccountSection::Defaults => "use-shared-defaults",
+            SharedAccountSection::Environment => "use-shared-env",
+        };
+        let client = panel.client(cx);
+        let agent_id = panel.agent_id.clone();
+        render_row(
+            "Use shared settings",
+            description,
+            div()
+                .debug_selector(move || id.to_string())
+                .child(
+                    Switch::new(id, follows.into()).on_click(move |state, _, cx| {
+                        let on = *state == ToggleState::Selected;
+                        client
+                            .read(cx)
+                            .use_shared_account_settings(&agent_id, account, section, on, cx);
+                    }),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// The variables the agent starts with, one row each.
     fn render_agent_env(&self, cx: &mut Context<Self>) -> AnyElement {
+        const TITLE: &str = "Environment Variables";
         let Some(panel) = self.agent_panel() else {
             return div().into_any_element();
         };
         let colors = cx.theme().colors().clone();
         let agent_name = panel.external.connection.read(cx).agent_name().clone();
+        let accounts = panel.client(cx).read(cx).accounts(&panel.agent_id);
+        let note = match panel.env_view {
+            AccountView::Shared => {
+                let mut note = format!(
+                    "Passed to {agent_name} when it starts on an account that uses shared \
+                     settings. Running threads pick them up after Reload Agent."
+                );
+                if let Some(own) = accounts_own_note(&accounts, SharedAccountSection::Environment) {
+                    note.push(' ');
+                    note.push_str(&own);
+                }
+                note
+            }
+            AccountView::Account(_) => {
+                let starts = if accounts.listed().len() > 1 {
+                    "when it starts on this account"
+                } else {
+                    "when it starts"
+                };
+                format!(
+                    "Passed to {agent_name} {starts}. Running threads pick them up after Reload \
+                     Agent."
+                )
+            }
+        };
+        let note = Label::new(note).size(LabelSize::Small).color(Color::Muted);
+        let mut shared_row = None;
+        if let AccountView::Account(account) = panel.env_view
+            && offers_shared(&accounts)
+        {
+            let count = accounts
+                .shared
+                .as_ref()
+                .map_or(0, |shared| shared.env.len());
+            let row = self.render_use_shared_account_row(
+                &accounts,
+                account,
+                SharedAccountSection::Environment,
+                sharing::count_summary(count, "shared variable", "shared variables"),
+                cx,
+            );
+            if !accounts.sets_own(account, SharedAccountSection::Environment) {
+                return v_flex()
+                    .gap_2()
+                    .child(render_section(TITLE, vec![row], cx))
+                    .child(note)
+                    .into_any_element();
+            }
+            shared_row = Some(row);
+        }
         let input_box = |input: Entity<TextInput>| {
             div()
                 .h(px(28.))
@@ -4417,6 +4621,7 @@ impl SettingsPage {
                     .into_any_element(),
             );
         }
+        rows.splice(0..0, shared_row);
         let add = Button::new("add-env", "Add Variable")
             .style(ButtonStyle::Subtle)
             .label_size(LabelSize::Small)
@@ -4433,34 +4638,15 @@ impl SettingsPage {
                 }
                 cx.notify();
             }));
-        let has_accounts = panel
-            .client(cx)
-            .read(cx)
-            .accounts(&panel.agent_id)
-            .listed()
-            .len()
-            > 1;
-        let starts = if has_accounts {
-            "when it starts on this account"
-        } else {
-            "when it starts"
-        };
         v_flex()
             .gap_2()
             .child(render_section_with_actions(
-                "Environment Variables",
+                TITLE,
                 rows,
                 add.into_any_element(),
                 cx,
             ))
-            .child(
-                Label::new(format!(
-                    "Passed to {agent_name} {starts}. Running threads pick them up after Reload \
-                     Agent."
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
+            .child(note)
             .into_any_element()
     }
 
@@ -5843,7 +6029,13 @@ impl SettingsPage {
         } else {
             "Its defaults and environment variables.".to_string()
         };
-        let description = format!("{what} Defaults this account doesn't offer are dropped.");
+        let mut description = what;
+        if accounts.shared.is_some() {
+            description.push_str(
+                " Where it uses shared settings, this account does too, as it does with Nothing.",
+            );
+        }
+        description.push_str(" Defaults this account doesn't offer are dropped.");
         let control = div()
             .debug_selector(move || format!("copy-settings-{account}"))
             .child(DropdownMenu::new_with_element(
@@ -6706,12 +6898,12 @@ impl SettingsPage {
             Some(SessionList::Listed(sessions)) => !matches!(sessions, AgentSessions::Listed(_)),
             Some(SessionList::Listing { .. }) => false,
         };
-        let env_account = panel.env_account;
+        let env_view = panel.env_view;
         if tab == AgentTab::Threads && needs_listing {
             self.list_agent_sessions(cx);
         }
         if tab == AgentTab::Environment {
-            self.show_account_env(env_account, cx);
+            self.show_env(env_view, cx);
         }
         self.sync_settings_account(cx);
         cx.notify();
@@ -8474,8 +8666,14 @@ struct AgentPanel {
     account_error: Option<SharedString>,
     /// The account picked over the Defaults, Environment and Threads tabs.
     picked_account: AccountChoice,
+    /// Shared is picked over the Defaults and Environment tabs. The Threads tab, which has no
+    /// Shared, shows `picked_account`.
+    picked_shared: bool,
     /// Whose variables `env_rows` are.
-    env_account: Option<AccountId>,
+    env_view: AccountView,
+    /// Whether `env_rows` were read while their account used Shared's, so they're read again
+    /// once it sets its own.
+    env_follows: bool,
     env_rows: Vec<EnvRow>,
     /// Whose sessions `sessions` are.
     sessions_account: Option<AccountId>,
@@ -8497,6 +8695,132 @@ struct AgentPanel {
     /// The account dialog over the page, while it's open.
     dialog: Option<AccountDialogState>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What an agent's Defaults and Environment tabs show (design/settings-2, topic 3): what its
+/// accounts share, or one account's, `None` being the External one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountView {
+    Shared,
+    Account(Option<AccountId>),
+}
+
+impl AccountView {
+    /// Changes the settings the view shows.
+    fn update_settings(
+        self,
+        client: &mut ServerClient,
+        agent_id: &AgentId,
+        change: impl FnOnce(&mut AgentSettings),
+        cx: &mut Context<ServerClient>,
+    ) {
+        match self {
+            Self::Shared => client.update_shared_account_settings(agent_id, change, cx),
+            Self::Account(account) => client.update_account_settings(agent_id, account, change, cx),
+        }
+    }
+}
+
+/// Whether the Account menu offers Shared: once the accounts share settings, while there's
+/// more than one to pick.
+fn offers_shared(accounts: &AgentAccounts) -> bool {
+    accounts.shared.is_some() && accounts.listed().len() > 1
+}
+
+/// Whether the view is an account whose variables are Shared's.
+fn env_follows(accounts: &AgentAccounts, view: AccountView) -> bool {
+    match view {
+        AccountView::Shared => false,
+        AccountView::Account(account) => {
+            !accounts.sets_own(account, SharedAccountSection::Environment)
+        }
+    }
+}
+
+/// "Work sets its own.", for Shared's tab.
+fn accounts_own_note(accounts: &AgentAccounts, section: SharedAccountSection) -> Option<String> {
+    let names: Vec<String> = accounts
+        .listed()
+        .into_iter()
+        .filter(|&account| accounts.sets_own(account, section))
+        .map(|account| account_entry(accounts, account).name.to_string())
+        .collect();
+    match names.len() {
+        0 => None,
+        1 => Some(format!("{} sets its own.", skills::join_with_and(names))),
+        _ => Some(format!("{} set their own.", skills::join_with_and(names))),
+    }
+}
+
+/// The values a config option's menu offers, `None` for a kind the Defaults tab doesn't show.
+fn option_choices(
+    option: &acp::SessionConfigOption,
+) -> Option<Vec<(SharedString, acp::SessionConfigOptionValue)>> {
+    match &option.kind {
+        acp::SessionConfigKind::Select(select) => Some(
+            select_choices(select)
+                .into_iter()
+                .map(|(name, value)| (name, acp::SessionConfigOptionValue::value_id(value)))
+                .collect(),
+        ),
+        acp::SessionConfigKind::Boolean(_) => Some(vec![
+            ("On".into(), acp::SessionConfigOptionValue::boolean(true)),
+            ("Off".into(), acp::SessionConfigOptionValue::boolean(false)),
+        ]),
+        _ => None,
+    }
+}
+
+/// `settings` with the options and modes the agent offers, where it knows none of its own:
+/// those of the account for new threads, else of any listed account that knows some. Shared
+/// has none of its own.
+fn with_offers(
+    mut settings: AgentSettings,
+    client: &ServerClient,
+    agent_id: &AgentId,
+    accounts: &AgentAccounts,
+) -> AgentSettings {
+    if !settings.known_config_options.is_empty() || settings.known_modes.is_some() {
+        return settings;
+    }
+    let offering = std::iter::once(accounts.new_thread_account())
+        .chain(accounts.listed())
+        .map(|account| client.account_settings(agent_id, account))
+        .find(|own| !own.known_config_options.is_empty() || own.known_modes.is_some());
+    if let Some(offering) = offering {
+        settings.known_config_options = offering.known_config_options;
+        settings.known_modes = offering.known_modes;
+    }
+    settings
+}
+
+/// What the defaults are, as the menus name them: "Opus 5.5 · High · Default".
+fn defaults_summary(agent_id: &AgentId, settings: &AgentSettings) -> String {
+    let mut names: Vec<String> = settings
+        .known_config_options
+        .iter()
+        .filter(|option| !crate::model_picker::is_hidden_option(Some(agent_id), option))
+        .filter_map(|option| {
+            let value = settings
+                .default_config_options
+                .get(&option.id.0.to_string())?;
+            option_choices(option)?
+                .into_iter()
+                .find(|(_, choice)| choice == value)
+                .map(|(name, _)| name.to_string())
+        })
+        .collect();
+    if let Some(mode) = &settings.default_mode
+        && let Some(modes) = &settings.known_modes
+        && let Some(mode) = modes.available_modes.iter().find(|known| known.id == *mode)
+    {
+        names.push(mode.name.clone());
+    }
+    if names.is_empty() {
+        "Agent's choice".to_string()
+    } else {
+        names.join(" · ")
+    }
 }
 
 struct AccountDialogState {
@@ -8540,6 +8864,16 @@ impl AgentPanel {
             AccountChoice::External if listed.contains(&None) => None,
             AccountChoice::Account(id) if listed.contains(&Some(id)) => Some(id),
             _ => accounts.new_thread_account(),
+        }
+    }
+
+    /// What the Defaults and Environment tabs show: Shared while it's picked and offered, else
+    /// [`Self::settings_account`].
+    fn settings_view(&self, accounts: &AgentAccounts) -> AccountView {
+        if self.picked_shared && offers_shared(accounts) {
+            AccountView::Shared
+        } else {
+            AccountView::Account(self.settings_account(accounts))
         }
     }
 
@@ -8965,6 +9299,22 @@ pub(crate) fn render_account_entry(entry: &AccountEntry, is_current: bool, cx: &
                     .color(Color::Accent),
             )
         })
+        .into_any_element()
+}
+
+/// Shared's icon in the Account menu, the size of an account's avatar there.
+fn render_shared_icon() -> AnyElement {
+    div()
+        .size(MENU_AVATAR_SIZE)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .child(
+            Icon::new(IconName::Layers)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
         .into_any_element()
 }
 
@@ -12009,15 +12359,24 @@ mod tests {
                     .iter()
                     .map(|row| row.key.read(cx).text().to_string())
                     .collect();
-                (panel.env_account, keys)
+                (panel.env_view, keys)
             })
         };
-        assert_eq!(env(cx), (None, vec!["EXTERNAL_TOKEN".to_string()]));
+        assert_eq!(
+            env(cx),
+            (
+                AccountView::Account(None),
+                vec!["EXTERNAL_TOKEN".to_string()]
+            )
+        );
         click("account-picker", cx);
         click("account-picker-1", cx);
         assert_eq!(
             env(cx),
-            (Some(AccountId(1)), vec!["WORK_TOKEN".to_string()])
+            (
+                AccountView::Account(Some(AccountId(1))),
+                vec!["WORK_TOKEN".to_string()]
+            )
         );
         page.update(cx, |page, cx| {
             if let Some(panel) = page.agent_panel_mut() {
@@ -12074,6 +12433,217 @@ mod tests {
         assert_eq!(count(&external_session), external_sessions);
     }
 
+    /// Accounts use Shared's defaults and variables unless they set their own: the Account
+    /// menu's Shared changes them, and an account's switch gives it its own.
+    #[gpui::test]
+    fn accounts_use_shared_settings_unless_they_set_their_own(cx: &mut TestAppContext) {
+        let mock = AgentId::new("mock");
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            ..AccountSupport::default()
+        });
+        let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "type": "select", "currentValue": "sonnet",
+             "options": [{"value": "sonnet", "name": "Sonnet"}, {"value": "haiku", "name": "Haiku"}]},
+        ]))
+        .expect("options");
+        let model = |model: &str| acp::SessionConfigOptionValue::value_id(model.to_string());
+        let env = |variable: &str| BTreeMap::from([(variable.to_string(), "1".to_string())]);
+        let mut work = account(1, Some("Work"), Some(AccountStatus::default()));
+        work.settings.known_config_options = options.clone();
+        work.settings.env = env("WORK_TOKEN");
+        work.choices.own_env = true;
+        let mut accounts = AgentAccounts {
+            accounts: vec![work],
+            default_account: Some(AccountId(1)),
+            external: AccountChoices {
+                own_defaults: true,
+                ..AccountChoices::default()
+            },
+            external_logged_in: Some(true),
+            last_id: 1,
+            shared: Some(SharedAccountSettings {
+                env: env("PROXY"),
+                default_config_options: BTreeMap::from([("model".to_string(), model("haiku"))]),
+                ..SharedAccountSettings::default()
+            }),
+            ..AgentAccounts::default()
+        };
+        let external = AgentSettings {
+            env: env("EXTERNAL_TOKEN"),
+            known_config_options: options,
+            default_config_options: BTreeMap::from([("model".to_string(), model("sonnet"))]),
+            ..AgentSettings::default()
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            super::init(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            let accounts = accounts.clone();
+            let external = external.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    match request {
+                        Request::OpenLoginSession { account, .. } => {
+                            Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                        }
+                        Request::SubscribeThread(ConnectionId::LoginSession(_)) => {
+                            Some(Response::Thread(login_session(true)))
+                        }
+                        Request::ListAgentSessions { .. } => {
+                            Some(Response::AgentSessions(AgentSessions::Listed(Vec::new())))
+                        }
+                        Request::UpdateAgentSettings { .. }
+                        | Request::UpdateSharedAccountSettings { .. }
+                        | Request::UseSharedAccountSettings { .. } => Some(Response::Ok),
+                        _ => None,
+                    }
+                });
+                client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+                client.set_agent_settings_for_test([(mock.clone(), external)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            client
+        });
+        let (page, cx) = open_page_with_dialogs(cx);
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let sent = |request: &Request| requests.borrow().contains(request);
+        let shown = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(selector).is_some()
+        };
+        let set_model = |model_id: &str| AgentSettingsChange::SetDefaultConfigOption {
+            config_id: "model".into(),
+            value: Some(model(model_id)),
+        };
+        click("agent-row-mock", cx);
+
+        // Work, the account for new threads, uses Shared's defaults, and its switch gives it
+        // its own.
+        click("agent-tab-defaults", cx);
+        assert!(shown("use-shared-defaults", cx));
+        assert!(!shown("agent-default-model", cx));
+        click("use-shared-defaults", cx);
+        assert!(sent(&Request::UseSharedAccountSettings {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+            section: SharedAccountSection::Defaults,
+            on: false,
+        }));
+
+        // Shared's menus change Shared, with the options Work offers.
+        click("account-picker", cx);
+        click("account-picker-shared", cx);
+        assert!(!shown("use-shared-defaults", cx));
+        click("agent-default-model", cx);
+        click("MENU_ITEM-Sonnet", cx);
+        assert!(sent(&Request::UpdateSharedAccountSettings {
+            agent_id: mock.clone(),
+            change: set_model("sonnet"),
+        }));
+
+        // The External account sets its own, so its menus are its own.
+        click("account-picker", cx);
+        click("account-picker-external", cx);
+        assert!(shown("use-shared-defaults", cx));
+        click("agent-default-model", cx);
+        click("MENU_ITEM-Haiku", cx);
+        assert!(sent(&Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: None,
+            change: set_model("haiku"),
+        }));
+
+        // Its variables are Shared's, hidden until it sets its own, then read again.
+        click("agent-tab-environment", cx);
+        let env_rows = |cx: &mut gpui::VisualTestContext| {
+            page.read_with(cx, |page, cx| {
+                let panel = page.agent_panel().expect("the agent is open");
+                let keys: Vec<String> = panel
+                    .env_rows
+                    .iter()
+                    .map(|row| row.key.read(cx).text().to_string())
+                    .collect();
+                (panel.env_view, keys)
+            })
+        };
+        assert!(shown("use-shared-env", cx));
+        assert_eq!(
+            env_rows(cx),
+            (AccountView::Account(None), vec!["PROXY".to_string()])
+        );
+        accounts.external.own_env = true;
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            env_rows(cx),
+            (
+                AccountView::Account(None),
+                vec!["EXTERNAL_TOKEN".to_string()]
+            )
+        );
+
+        // Shared's variables save to Shared.
+        click("account-picker", cx);
+        click("account-picker-shared", cx);
+        assert!(!shown("use-shared-env", cx));
+        assert_eq!(
+            env_rows(cx),
+            (AccountView::Shared, vec!["PROXY".to_string()])
+        );
+        page.update(cx, |page, cx| {
+            if let Some(panel) = page.agent_panel_mut() {
+                panel.env_rows.clear();
+            }
+            page.save_env(cx);
+        });
+        assert!(sent(&Request::UpdateSharedAccountSettings {
+            agent_id: mock.clone(),
+            change: AgentSettingsChange::SetEnv(BTreeMap::new()),
+        }));
+
+        // The Threads tab lists one account's threads, so it has no Shared.
+        click("agent-tab-threads", cx);
+        click("account-picker", cx);
+        assert!(shown("account-picker-1", cx));
+        assert!(!shown("account-picker-shared", cx));
+    }
     fn checkout(id: u64, path: &str) -> Project {
         Project {
             id: ProjectId(id),

@@ -1,9 +1,11 @@
 //! An agent's accounts: its own login (the External account) and the logins made in agentZ,
 //! each in its own home folder, with its own sessions, history and settings.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 pub use projects::AccountId;
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,9 @@ pub struct AgentAccounts {
     /// Whether its accounts were given colors ([`Self::give_colors`]), which happens once, so
     /// an account the user set to No Color keeps none.
     pub colors_given: bool,
+    /// What the accounts share, once the agent has accounts of agentZ's
+    /// ([`Self::start_sharing`]). Until then each account's settings are its own.
+    pub shared: Option<SharedAccountSettings>,
 }
 
 /// The colors an account can have, as they're kept: t3code's project colors in Tailwind's 600
@@ -364,6 +369,55 @@ pub struct AccountChoices {
     /// threads.
     pub color: Option<String>,
     pub at_limit: AtLimit,
+    /// Its Defaults tab's "Use shared settings" is off: it starts new threads with defaults of
+    /// its own, not [`AgentAccounts::shared`]'s.
+    pub own_defaults: bool,
+    /// Its Environment tab's "Use shared settings" is off.
+    pub own_env: bool,
+}
+
+/// What an agent's accounts share (`design/settings-2`, topic 3): the Environment and the
+/// defaults for new threads that each account uses unless it sets its own, as machines share
+/// Settings' Shared.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SharedAccountSettings {
+    pub env: BTreeMap<String, String>,
+    pub default_mode: Option<acp::SessionModeId>,
+    pub default_config_options: BTreeMap<String, acp::SessionConfigOptionValue>,
+}
+
+impl SharedAccountSettings {
+    /// An account's Environment and defaults.
+    pub fn of(settings: &AgentSettings) -> Self {
+        Self {
+            env: settings.env.clone(),
+            default_mode: settings.default_mode.clone(),
+            default_config_options: settings.default_config_options.clone(),
+        }
+    }
+
+    /// As an account's settings, so it changes as one's does.
+    pub fn to_settings(&self) -> AgentSettings {
+        AgentSettings {
+            env: self.env.clone(),
+            default_mode: self.default_mode.clone(),
+            default_config_options: self.default_config_options.clone(),
+            ..AgentSettings::default()
+        }
+    }
+
+    fn has_defaults_of(&self, settings: &AgentSettings) -> bool {
+        self.default_mode == settings.default_mode
+            && self.default_config_options == settings.default_config_options
+    }
+}
+
+/// An agent page's tabs that an account can take from [`AgentAccounts::shared`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SharedAccountSection {
+    Defaults,
+    Environment,
 }
 
 /// What a thread does when its account reaches a limit: "When a limit is reached" on the
@@ -442,6 +496,91 @@ impl AgentAccounts {
             None => Some(&self.external),
             Some(id) => self.account(id).map(|account| &account.choices),
         }
+    }
+
+    fn choices_mut(&mut self, account: Option<AccountId>) -> Option<&mut AccountChoices> {
+        match account {
+            None => Some(&mut self.external),
+            Some(id) => self.account_mut(id).map(|account| &mut account.choices),
+        }
+    }
+
+    /// Whether the account sets its own of `section`, which every account does until the
+    /// accounts share anything.
+    pub fn sets_own(&self, account: Option<AccountId>, section: SharedAccountSection) -> bool {
+        if self.shared.is_none() {
+            return true;
+        }
+        self.choices(account).is_none_or(|choices| match section {
+            SharedAccountSection::Defaults => choices.own_defaults,
+            SharedAccountSection::Environment => choices.own_env,
+        })
+    }
+
+    /// Notes the account's "Use shared settings" for `section`.
+    pub fn set_own(
+        &mut self,
+        account: Option<AccountId>,
+        section: SharedAccountSection,
+        own: bool,
+    ) -> Result<()> {
+        let choices = self
+            .choices_mut(account)
+            .context("there's no such account")?;
+        match section {
+            SharedAccountSection::Defaults => choices.own_defaults = own,
+            SharedAccountSection::Environment => choices.own_env = own,
+        }
+        Ok(())
+    }
+
+    /// What the account runs with: its own settings (`own`), with Shared's Environment and
+    /// defaults where it uses them.
+    pub fn with_shared(&self, account: Option<AccountId>, mut own: AgentSettings) -> AgentSettings {
+        let Some(shared) = &self.shared else {
+            return own;
+        };
+        if !self.sets_own(account, SharedAccountSection::Environment) {
+            own.env = shared.env.clone();
+        }
+        if !self.sets_own(account, SharedAccountSection::Defaults) {
+            own.default_mode = shared.default_mode.clone();
+            own.default_config_options = shared.default_config_options.clone();
+        }
+        own
+    }
+
+    /// Starts Shared from the Environment and defaults of the account for new threads, leaving
+    /// out the agent's `login_variables`, which would log every account in as one. Each
+    /// account whose own match then uses Shared's, and the others keep theirs. `external` is
+    /// the External account's settings. Returns whether it started.
+    pub fn start_sharing(&mut self, external: &AgentSettings, login_variables: &[String]) -> bool {
+        if self.shared.is_some() {
+            return false;
+        }
+        let own = |accounts: &Self, account: Option<AccountId>| match account {
+            None => external.clone(),
+            Some(id) => accounts
+                .account(id)
+                .map(|account| account.settings.clone())
+                .unwrap_or_default(),
+        };
+        let mut shared = SharedAccountSettings::of(&own(self, self.new_thread_account()));
+        shared
+            .env
+            .retain(|variable, _| !login_variables.contains(variable));
+        let every_account: Vec<Option<AccountId>> = std::iter::once(None)
+            .chain(self.accounts.iter().map(|account| Some(account.id)))
+            .collect();
+        for account in every_account {
+            let settings = own(self, account);
+            if let Some(choices) = self.choices_mut(account) {
+                choices.own_env = settings.env != shared.env;
+                choices.own_defaults = !shared.has_defaults_of(&settings);
+            }
+        }
+        self.shared = Some(shared);
+        true
     }
 
     /// The color behind the agent's icon on the account's threads: the account's own, while
@@ -730,6 +869,74 @@ mod tests {
         let held_back = spare_per_hour(&[window(40., 1, 5), window(90., 100, 168)], now);
         assert!(held_back.is_some_and(|rate| rate <= 10.), "{held_back:?}");
         assert_eq!(spare_per_hour(&[], now), None);
+    }
+
+    #[test]
+    fn sharing_starts_from_the_account_for_new_threads() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(variable, value)| (variable.to_string(), value.to_string()))
+                .collect()
+        };
+        let mut accounts = AgentAccounts::default();
+        let work = accounts.add();
+        let home = accounts.add();
+        let external = AgentSettings {
+            env: env(&[("PROXY", "1"), ("KEY", "external")]),
+            ..AgentSettings::default()
+        };
+        if let Some(account) = accounts.account_mut(work) {
+            account.settings.env = env(&[("PROXY", "1")]);
+        }
+        if let Some(account) = accounts.account_mut(home) {
+            account.settings.env = env(&[("PROXY", "2")]);
+            account.settings.default_mode = Some(acp::SessionModeId::new("plan"));
+        }
+        // Until it starts, each account's are its own.
+        assert!(accounts.sets_own(Some(work), SharedAccountSection::Environment));
+
+        assert!(accounts.start_sharing(&external, &["KEY".to_string()]));
+        assert!(!accounts.start_sharing(&AgentSettings::default(), &[]));
+        let shared = accounts.shared.clone().expect("sharing started");
+        assert_eq!(shared.env, env(&[("PROXY", "1")]));
+        // The External account keeps its key as its own.
+        assert!(accounts.sets_own(None, SharedAccountSection::Environment));
+        assert!(!accounts.sets_own(None, SharedAccountSection::Defaults));
+        assert!(!accounts.sets_own(Some(work), SharedAccountSection::Environment));
+        assert!(accounts.sets_own(Some(home), SharedAccountSection::Environment));
+        assert!(accounts.sets_own(Some(home), SharedAccountSection::Defaults));
+
+        accounts.shared = Some(SharedAccountSettings {
+            env: env(&[("PROXY", "3")]),
+            ..shared
+        });
+        let own = |accounts: &AgentAccounts, id| {
+            accounts
+                .account(id)
+                .map(|account| account.settings.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            accounts.with_shared(Some(work), own(&accounts, work)).env,
+            env(&[("PROXY", "3")])
+        );
+        assert_eq!(
+            accounts.with_shared(Some(home), own(&accounts, home)).env,
+            env(&[("PROXY", "2")])
+        );
+        accounts
+            .set_own(Some(home), SharedAccountSection::Environment, false)
+            .expect("home is listed");
+        assert_eq!(
+            accounts.with_shared(Some(home), own(&accounts, home)).env,
+            env(&[("PROXY", "3")])
+        );
+        assert!(
+            accounts
+                .set_own(Some(AccountId(9)), SharedAccountSection::Defaults, true)
+                .is_err()
+        );
     }
 
     #[test]

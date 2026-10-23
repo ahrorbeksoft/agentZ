@@ -668,12 +668,28 @@ pub enum Request {
     /// The registry's icons by id, answered with [`Response::AgentIcons`], leaving out those
     /// this machine doesn't have.
     AgentIcons(Vec<IconId>),
+    /// Changes the account's settings. Its Environment and defaults change Shared's
+    /// ([`accounts::AgentAccounts::shared`]) while it uses them.
     UpdateAgentSettings {
         agent_id: AgentId,
         /// The account whose settings change, `None` being the External one: the agent's.
         #[serde(default)]
         account: Option<AccountId>,
         change: AgentSettingsChange,
+    },
+    /// Changes the Environment or defaults the agent's accounts share.
+    UpdateSharedAccountSettings {
+        agent_id: AgentId,
+        change: AgentSettingsChange,
+    },
+    /// An account's "Use shared settings" on its Defaults or Environment tab: off, it gets a
+    /// copy of Shared's to change; back on, its copy goes.
+    UseSharedAccountSettings {
+        agent_id: AgentId,
+        /// `None` is the External account.
+        account: Option<AccountId>,
+        section: accounts::SharedAccountSection,
+        on: bool,
     },
     /// A new agentZ account for the agent, logged out until it logs in:
     /// [`Response::AccountAdded`]. Its settings are copied from the account for new threads
@@ -1066,6 +1082,25 @@ pub enum AgentSettingsChange {
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
+}
+
+impl AgentSettingsChange {
+    pub fn apply(self, settings: &mut AgentSettings) {
+        match self {
+            Self::SetEnv(env) => settings.env = env,
+            Self::SetLoginMethod(method) => settings.login_method = method,
+            Self::SetDefaultConfigOption { config_id, value } => match value {
+                Some(value) => {
+                    settings.default_config_options.insert(config_id, value);
+                }
+                None => {
+                    settings.default_config_options.remove(&config_id);
+                }
+            },
+            Self::SetDefaultMode(mode) => settings.default_mode = mode,
+            Self::Unknown(_) => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

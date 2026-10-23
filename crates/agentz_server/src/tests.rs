@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{
     AccountChange, AccountChoice, AccountId, AgentAccounts, AtLimit, DuplicateLogin,
-    OveragePreference, SettingsSource,
+    OveragePreference, SettingsSource, SharedAccountSection,
 };
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
@@ -2366,10 +2366,11 @@ async fn accounts_decide_where_new_threads_run() {
     assert_eq!(saved["mock"]["accounts"].as_array().map(Vec::len), Some(1));
 }
 
-/// Each account has its own defaults for new threads, and a choice made in a thread becomes
-/// its account's default. The External account's are the agent's settings from before.
+/// An agent's accounts share their defaults for new threads, and a choice made in a thread
+/// becomes the default of every account that uses Shared's. An account that sets its own
+/// starts from a copy of Shared's, and the choices in its threads stay its own.
 #[tokio::test(flavor = "multi_thread")]
-async fn each_account_keeps_its_own_defaults() {
+async fn accounts_share_defaults_unless_they_set_their_own() {
     let Some(server) = TestServer::start() else {
         return;
     };
@@ -2380,13 +2381,15 @@ async fn each_account_keeps_its_own_defaults() {
     let Response::AccountAdded(work) = client.ok(Request::AddAccount(mock.clone())).await else {
         panic!("expected an account");
     };
+    let value = |value: &str| acp::SessionConfigOptionValue::value_id(value.to_string());
+    // Both use Shared's, so one's default is the other's too.
     client
         .ok(Request::UpdateAgentSettings {
             agent_id: mock.clone(),
             account: Some(work),
             change: AgentSettingsChange::SetDefaultConfigOption {
                 config_id: "model".into(),
-                value: Some(acp::SessionConfigOptionValue::value_id("opus")),
+                value: Some(value("opus")),
             },
         })
         .await;
@@ -2412,7 +2415,6 @@ async fn each_account_keeps_its_own_defaults() {
         Response::ThreadCreated(thread_id) => thread_id,
         response => panic!("unexpected response: {response:?}"),
     };
-
     let on_work = create(&mut client, AccountChoice::Account(work)).await;
     let external = create(&mut client, AccountChoice::External).await;
     client.wait_until_ready(on_work).await;
@@ -2421,32 +2423,52 @@ async fn each_account_keeps_its_own_defaults() {
         config_value(client.thread(ConnectionId::Thread(thread_id)), "model")
     };
     assert_eq!(model(&client, on_work).as_deref(), Some("opus"));
-    assert_eq!(model(&client, external).as_deref(), Some("sonnet"));
+    assert_eq!(model(&client, external).as_deref(), Some("opus"));
 
+    // Work's own start as a copy of Shared's, and the choices in its threads stay its own,
+    // while the External account's thread changes Shared's.
     client
-        .ok(Request::SetConfigOption {
-            connection: ConnectionId::Thread(on_work),
-            config_id: acp::SessionConfigId::new("effort"),
-            value: acp::SessionConfigOptionValue::value_id("high"),
+        .ok(Request::UseSharedAccountSettings {
+            agent_id: mock.clone(),
+            account: Some(work),
+            section: SharedAccountSection::Defaults,
+            on: false,
         })
         .await;
+    for (thread_id, effort) in [(on_work, "high"), (external, "low")] {
+        client
+            .ok(Request::SetConfigOption {
+                connection: ConnectionId::Thread(thread_id),
+                config_id: acp::SessionConfigId::new("effort"),
+                value: value(effort),
+            })
+            .await;
+    }
+    let defaults = |client: &TestClient| {
+        let accounts = client.accounts("mock");
+        let own = accounts
+            .account(work)
+            .map(|account| account.settings.default_config_options.clone())
+            .unwrap_or_default();
+        let shared = accounts
+            .shared
+            .map(|shared| shared.default_config_options)
+            .unwrap_or_default();
+        (own, shared)
+    };
     client
         .wait_until(|client| {
-            client.events.iter().any(|event| match event {
-                Event::Accounts(accounts) => accounts
-                    .get(&AgentId::new("mock"))
-                    .and_then(|accounts| accounts.account(work))
-                    .is_some_and(|account| {
-                        account
-                            .settings
-                            .default_config_options
-                            .contains_key("effort")
-                            && !account.settings.known_config_options.is_empty()
-                    }),
-                _ => false,
-            })
+            let (own, shared) = defaults(client);
+            own.get("effort") == Some(&value("high")) && shared.get("effort") == Some(&value("low"))
         })
         .await;
+    let (own, shared) = defaults(&client);
+    assert_eq!(own.get("model"), Some(&value("opus")));
+    assert_eq!(shared.get("model"), Some(&value("opus")));
+    let accounts = client.accounts("mock");
+    assert!(accounts.sets_own(Some(work), SharedAccountSection::Defaults));
+    assert!(!accounts.sets_own(None, SharedAccountSection::Defaults));
+    // The External account's own defaults stay as they were.
     let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
         panic!("expected a session snapshot");
     };
@@ -2455,21 +2477,31 @@ async fn each_account_keeps_its_own_defaults() {
         .get(&mock)
         .cloned()
         .unwrap_or_default();
-    assert!(
-        !external_settings
-            .default_config_options
-            .contains_key("effort")
-    );
-    assert!(
-        !external_settings
-            .default_config_options
-            .contains_key("model")
-    );
+    assert!(external_settings.default_config_options.is_empty());
+
+    // Back on, its copy goes.
+    client
+        .ok(Request::UseSharedAccountSettings {
+            agent_id: mock.clone(),
+            account: Some(work),
+            section: SharedAccountSection::Defaults,
+            on: true,
+        })
+        .await;
+    client
+        .wait_until(|client| {
+            !client
+                .accounts("mock")
+                .sets_own(Some(work), SharedAccountSection::Defaults)
+                && defaults(client).0.is_empty()
+        })
+        .await;
 }
 
 /// A new account starts with the default account's Environment, defaults and settings files,
-/// but not its login, and drops the defaults its first session doesn't offer. Copy settings
-/// from puts another account's in their place, or nothing.
+/// but not its login: Shared's where that account uses them, else a copy of its own, whose
+/// defaults its first session doesn't offer are dropped. Copy settings from puts another
+/// account's in their place, or Shared's.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_accounts_copy_another_accounts_settings() {
     let Some(command) = mock_agent() else {
@@ -2548,6 +2580,12 @@ async fn new_accounts_copy_another_accounts_settings() {
         serde_json::from_str(&text).expect("json")
     };
 
+    let sets_own =
+        |client: &TestClient, account, section| client.accounts("mock").sets_own(account, section);
+
+    // The External account's login variable stays its own, so Shared starts from its
+    // Environment without it, and from its defaults, which it then uses. The new account
+    // copies its own Environment and uses Shared's defaults.
     let work = add(&mut client).await;
     client
         .wait_until(|client| settings_of(client, work).is_some())
@@ -2555,7 +2593,25 @@ async fn new_accounts_copy_another_accounts_settings() {
     let (from, settings) = settings_of(&client, work).expect("account");
     assert_eq!(from, SettingsSource::External);
     assert_eq!(settings.env, proxy);
-    assert_eq!(settings.default_config_options.len(), 2);
+    assert!(settings.default_config_options.is_empty());
+    let shared = client
+        .accounts("mock")
+        .shared
+        .expect("the accounts share settings");
+    assert_eq!(shared.env, proxy);
+    assert_eq!(shared.default_config_options.len(), 2);
+    assert!(sets_own(&client, None, SharedAccountSection::Environment));
+    assert!(!sets_own(&client, None, SharedAccountSection::Defaults));
+    assert!(sets_own(
+        &client,
+        Some(work),
+        SharedAccountSection::Environment
+    ));
+    assert!(!sets_own(
+        &client,
+        Some(work),
+        SharedAccountSection::Defaults
+    ));
     // The file the home starts with keeps sessions to itself.
     assert_eq!(
         settings_file(work),
@@ -2563,7 +2619,7 @@ async fn new_accounts_copy_another_accounts_settings() {
     );
     assert!(!home(work).join("login").exists());
 
-    // Its first session offers no Opus, so that default goes.
+    // Its first session offers no Opus, so it takes the agent's model and Shared keeps Opus.
     let on_work = match client
         .ok(Request::CreateThread {
             project_id,
@@ -2579,22 +2635,36 @@ async fn new_accounts_copy_another_accounts_settings() {
     client.wait_until_ready(on_work).await;
     client
         .wait_until(|client| {
-            settings_of(client, work).is_some_and(|(_, settings)| !settings.copied_defaults)
+            settings_of(client, work)
+                .is_some_and(|(_, settings)| !settings.known_config_options.is_empty())
                 && config_value(client.thread(ConnectionId::Thread(on_work)), "effort").as_deref()
                     == Some("high")
         })
+        .await;
+    assert_eq!(
+        config_value(client.thread(ConnectionId::Thread(on_work)), "model").as_deref(),
+        Some("sonnet")
+    );
+    assert_eq!(client.accounts("mock").shared, Some(shared.clone()));
+    // Its own copy of Shared's leaves out what it doesn't offer.
+    client
+        .ok(Request::UseSharedAccountSettings {
+            agent_id: mock.clone(),
+            account: Some(work),
+            section: SharedAccountSection::Defaults,
+            on: false,
+        })
+        .await;
+    client
+        .wait_until(|client| sets_own(client, Some(work), SharedAccountSection::Defaults))
         .await;
     let (_, settings) = settings_of(&client, work).expect("account");
     assert_eq!(
         settings.default_config_options.keys().collect::<Vec<_>>(),
         ["effort"]
     );
-    assert_eq!(
-        config_value(client.thread(ConnectionId::Thread(on_work)), "model").as_deref(),
-        Some("sonnet")
-    );
 
-    // The next one copies the account for new threads.
+    // The next one copies the account for new threads, which now sets its own of both.
     client
         .ok(Request::UpdateAccount {
             agent_id: mock.clone(),
@@ -2609,9 +2679,18 @@ async fn new_accounts_copy_another_accounts_settings() {
     let (from, settings) = settings_of(&client, side).expect("account");
     assert_eq!(from, SettingsSource::Account(work));
     assert_eq!(settings.env, proxy);
+    assert_eq!(
+        settings.default_config_options.keys().collect::<Vec<_>>(),
+        ["effort"]
+    );
+    assert!(sets_own(
+        &client,
+        Some(side),
+        SharedAccountSection::Defaults
+    ));
     assert_eq!(settings_file(side), settings_file(work));
 
-    // Nothing empties them, but keeps the file a new home starts with.
+    // Nothing leaves both to Shared, and keeps the file a new home starts with.
     client
         .ok(Request::CopyAccountSettings {
             agent_id: mock.clone(),
@@ -2626,6 +2705,16 @@ async fn new_accounts_copy_another_accounts_settings() {
         .await;
     let (_, settings) = settings_of(&client, side).expect("account");
     assert!(settings.env.is_empty() && settings.default_config_options.is_empty());
+    assert!(!sets_own(
+        &client,
+        Some(side),
+        SharedAccountSection::Environment
+    ));
+    assert!(!sets_own(
+        &client,
+        Some(side),
+        SharedAccountSection::Defaults
+    ));
     assert_eq!(settings_file(side), json!({"sync": false}));
     for from in [
         SettingsSource::Account(side),
@@ -2790,7 +2879,15 @@ async fn accounts_run_in_homes_of_their_own() {
         .await;
     assert!(home(side).join("login").exists());
 
-    // A key an account's Environment sets on purpose stays.
+    // A key an account's own Environment sets on purpose stays.
+    client
+        .ok(Request::UseSharedAccountSettings {
+            agent_id: mock.clone(),
+            account: Some(keyed),
+            section: SharedAccountSection::Environment,
+            on: false,
+        })
+        .await;
     client
         .ok(Request::UpdateAgentSettings {
             agent_id: mock.clone(),

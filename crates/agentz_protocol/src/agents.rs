@@ -286,13 +286,33 @@ impl AgentSettings {
     /// defaults are checked against what this account offers as soon as it's known.
     pub fn copy_settings(&mut self, from: &AgentSettings) {
         self.env = from.env.clone();
-        self.default_mode = from.default_mode.clone();
-        self.default_config_options = from.default_config_options.clone();
+        self.copy_defaults(
+            from.default_mode.clone(),
+            from.default_config_options.clone(),
+        );
+    }
+
+    /// Another account's or Shared's defaults in place of these, checked against what this
+    /// account offers as soon as it's known.
+    pub fn copy_defaults(
+        &mut self,
+        mode: Option<acp::SessionModeId>,
+        config_options: BTreeMap<String, acp::SessionConfigOptionValue>,
+    ) {
+        self.default_mode = mode;
+        self.default_config_options = config_options;
         if self.known_config_options.is_empty() && self.known_modes.is_none() {
             self.copied_defaults = true;
         } else {
             self.drop_unoffered_defaults();
         }
+    }
+
+    /// No defaults of its own, as while it uses Shared's.
+    pub fn clear_defaults(&mut self) {
+        self.default_mode = None;
+        self.default_config_options.clear();
+        self.copied_defaults = false;
     }
 
     fn drop_unoffered_defaults(&mut self) {

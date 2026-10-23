@@ -113,8 +113,7 @@ impl Server {
         );
         write_custom_agents(&self.data_dir, &agents)?;
         self.custom_agents = agents;
-        self.agent_settings
-            .update(&agent_id, |settings| settings.env = env);
+        self.change_account_choices(&agent_id, None, |settings| settings.env = env);
         self.registry_changed = true;
         Ok(agent_id)
     }
