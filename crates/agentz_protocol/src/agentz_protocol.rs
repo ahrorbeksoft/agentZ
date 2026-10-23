@@ -21,6 +21,7 @@ pub mod diff;
 pub mod editors;
 pub mod layout;
 pub mod mcp_servers;
+pub mod models;
 pub mod skills;
 pub mod spaces;
 pub mod storage;
@@ -902,6 +903,10 @@ pub enum Request {
     /// What each role of delegated task runs on, in the order to try. The app's setting,
     /// given to each server as it connects and as it changes.
     SetSubthreadRoles(subthread_roles::SubthreadRoles),
+    /// Shared's model preferences for each agent: the models its pickers leave out, its
+    /// favorites and the user's order. The app's setting, given to each server as it connects
+    /// and as it changes, for what `orchestrator_capabilities` tells agents.
+    SetModelPreferences(BTreeMap<agents::AgentId, models::ModelPreferences>),
     /// Whether agents are asked for ACP v2 before v1 (Settings › General › Experimental). The
     /// app's setting, given to each server as it connects and as it changes. Agents started
     /// after it changes use it.
@@ -1078,6 +1083,8 @@ pub enum AgentSettingsChange {
         value: Option<acp::SessionConfigOptionValue>,
     },
     SetDefaultMode(Option<acp::SessionModeId>),
+    /// The account's own model preferences, `None` to follow Shared's again.
+    SetModels(Option<models::ModelPreferences>),
     /// From a newer version.
     #[serde(untagged)]
     Unknown(serde_json::Value),
@@ -1097,6 +1104,7 @@ impl AgentSettingsChange {
                 }
             },
             Self::SetDefaultMode(mode) => settings.default_mode = mode,
+            Self::SetModels(models) => settings.models = models,
             Self::Unknown(_) => {}
         }
     }

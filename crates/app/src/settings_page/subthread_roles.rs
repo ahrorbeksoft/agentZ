@@ -8,6 +8,7 @@ use std::rc::Rc;
 use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::accounts::{AccountId, AgentAccounts};
 use agentz_protocol::agents::{AgentId, InstallState};
+use agentz_protocol::models::ModelPreferences;
 use agentz_protocol::subthread_roles::{RolePick, SubthreadRoles, TaskRole};
 use gpui::{AnyElement, App, Context, Entity, Window};
 use ui::{
@@ -21,6 +22,7 @@ use super::{
 use crate::agent_icons::agent_icon;
 use crate::app_settings::AppSettingsStore;
 use crate::machines::Machines;
+use crate::model_picker::followed_preferences;
 
 const ROLE_EMPTY: &str = "None: the agent that delegates chooses.";
 
@@ -46,6 +48,8 @@ struct PickChoices {
     accounts: AgentAccounts,
     /// Each choice's name and value.
     models: Vec<(SharedString, String)>,
+    /// The choices the account's pickers follow, for the Model menu.
+    model_preferences: ModelPreferences,
     efforts: Vec<(SharedString, String)>,
 }
 
@@ -76,11 +80,31 @@ impl PickChoices {
                 .find(|options| !options.is_empty())
                 .unwrap_or_default();
         }
+        let model_preferences = followed_preferences(local, &pick.agent, account, cx);
         Self {
             accounts,
+            model_preferences,
             models: choices_of(&options, acp::SessionConfigOptionCategory::Model),
             efforts: choices_of(&options, acp::SessionConfigOptionCategory::ThoughtLevel),
         }
+    }
+}
+
+impl PickChoices {
+    /// The Model menu's models: those the pickers show, in the user's order, and the pick's
+    /// own even when it's hidden (`design/model-visibility`, topic 15 B).
+    fn shown_models(&self, current: Option<&str>) -> Vec<(SharedString, String)> {
+        let mut models: Vec<(SharedString, String)> = self
+            .models
+            .iter()
+            .filter(|(_, value)| {
+                self.model_preferences.is_shown(value) || Some(value.as_str()) == current
+            })
+            .cloned()
+            .collect();
+        self.model_preferences
+            .sort(&mut models, |(_, value)| value.as_str());
+        models
     }
 }
 
@@ -634,7 +658,7 @@ fn pick_menu(
                 app_settings.clone(),
                 role,
                 index,
-                choices.models.clone(),
+                choices.shown_models(pick.model.as_deref()),
                 pick.model.clone(),
                 |pick, model| pick.model = model,
             ),
@@ -889,6 +913,7 @@ mod tests {
                 last_id: 1,
                 ..AgentAccounts::default()
             },
+            model_preferences: ModelPreferences::default(),
             models: vec![("Sonnet 5.5".into(), "sonnet".into())],
             efforts: vec![("High".into(), "high".into())],
         };

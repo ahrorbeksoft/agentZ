@@ -213,6 +213,7 @@ pub struct ServerClient {
     /// How many subthreads the server was last told a thread runs at once, this connection.
     subthread_limit_sent: Option<u32>,
     subthread_roles_sent: Option<agentz_protocol::subthread_roles::SubthreadRoles>,
+    model_preferences_sent: Option<BTreeMap<AgentId, agentz_protocol::models::ModelPreferences>>,
     /// Whether the server was last told to ask agents for ACP v2, this connection.
     acp_v2_sent: Option<bool>,
     /// What this Mac's server was last told of the provider machines' use, this connection.
@@ -279,6 +280,7 @@ impl ServerClient {
                 auto_archive_sent: None,
                 subthread_limit_sent: None,
                 subthread_roles_sent: None,
+                model_preferences_sent: None,
                 acp_v2_sent: None,
                 cloud_activity_sent: None,
                 shared_titles_sent: None,
@@ -608,6 +610,19 @@ impl ServerClient {
         }
         self.send(Request::SetSubthreadRoles(roles.clone()), cx);
         self.subthread_roles_sent = Some(roles.clone());
+    }
+
+    /// Tells the server Shared's model preferences for each agent, when they've changed.
+    pub(crate) fn set_model_preferences(
+        &mut self,
+        preferences: &BTreeMap<AgentId, agentz_protocol::models::ModelPreferences>,
+        cx: &App,
+    ) {
+        if !self.is_online() || self.model_preferences_sent.as_ref() == Some(preferences) {
+            return;
+        }
+        self.send(Request::SetModelPreferences(preferences.clone()), cx);
+        self.model_preferences_sent = Some(preferences.clone());
     }
 
     /// Tells the server whether to ask agents for ACP v2, when that's changed.
@@ -1211,6 +1226,7 @@ impl ServerClient {
         self.auto_archive_sent = None;
         self.subthread_limit_sent = None;
         self.subthread_roles_sent = None;
+        self.model_preferences_sent = None;
         self.acp_v2_sent = None;
         self.cloud_activity_sent = None;
         self.shared_titles_sent = None;
@@ -1909,6 +1925,9 @@ fn agent_settings_changes(
         changes.push(AgentSettingsChange::SetDefaultMode(
             settings.default_mode.clone(),
         ));
+    }
+    if settings.models != previous.models {
+        changes.push(AgentSettingsChange::SetModels(settings.models.clone()));
     }
     let config_ids: BTreeSet<&String> = previous
         .default_config_options

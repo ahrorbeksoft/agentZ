@@ -22,6 +22,7 @@ use agentz_protocol::artifacts::{
 };
 use agentz_protocol::attachments::{AttachmentId, MAX_ATTACHMENT_SIZE};
 use agentz_protocol::diff::DiffScope;
+use agentz_protocol::models::ModelPreferences;
 use agentz_protocol::terminal::{TerminalCommand, TerminalKey};
 use agentz_protocol::thread::{
     Compaction, ConnectionStatus, DiffLineKind, Entry, FailedMessage, FileDiff, HandoffSource,
@@ -89,8 +90,8 @@ use crate::image_markup::{
 };
 use crate::machines::{MachineId, Machines, ProjectKey, ThreadKey};
 use crate::model_picker::{
-    ModelPicker, current_choice_name, is_fast_mode, is_hidden_option, is_model_setting,
-    model_and_effort, select_choices,
+    ModelPicker, current_choice_name, followed_preferences, is_fast_mode, is_hidden_option,
+    is_model_setting, model_and_effort, picker_models, select_choices,
 };
 use crate::open_in_editor::{self, Choices, OpenWith};
 use crate::project_copies::{CopyRow, render_copy_aside, render_copy_row};
@@ -149,6 +150,10 @@ gpui::actions!(
         /// Lowers the agent's reasoning effort to its previous level, from the lowest to the
         /// highest.
         DecreaseEffort,
+        /// Opens the model picker, or closes it.
+        ToggleModelSelector,
+        /// Moves the thread to the agent's next favorite model, in their order, wrapping around.
+        CycleFavoriteModels,
         /// Finds text in the conversation, or, with find open, selects its query to type over.
         FindInThread,
         /// Goes to the next match in the conversation.
@@ -312,6 +317,9 @@ pub fn init(cx: &mut App) {
         // as `"`, with no Shift.
         KeyBinding::new("ctrl-'", IncreaseEffort, Some(KEY_CONTEXT)),
         KeyBinding::new("ctrl-\"", DecreaseEffort, Some(KEY_CONTEXT)),
+        // Zed's keys for its model selector and favorites: ⌥⌘/ (Ctrl-Alt-/ on Linux) and ⌥⇥.
+        KeyBinding::new("secondary-alt-/", ToggleModelSelector, Some(KEY_CONTEXT)),
+        KeyBinding::new("alt-tab", CycleFavoriteModels, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", menu::Confirm, Some(RENAME_KEY_CONTEXT)),
         KeyBinding::new("escape", menu::Cancel, Some(RENAME_KEY_CONTEXT)),
         // Zed's `use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
@@ -434,6 +442,10 @@ pub enum AgentViewEvent {
     /// Manage Accounts…, from an agent's accounts in the agent picker: the agent's Account tab
     /// on the thread's machine.
     OpenAgentAccounts {
+        agent_id: AgentId,
+    },
+    /// Manage Models…, from the model picker: the agent's Models tab on the thread's machine.
+    OpenAgentModels {
         agent_id: AgentId,
     },
 }
@@ -692,6 +704,8 @@ pub struct AgentView {
     composer_placeholder: SharedString,
     /// The header title's menu: Pin, Rename, Regenerate Title, Archive, Delete.
     title_menu: PopoverMenuHandle<ContextMenu>,
+    /// The model chip's picker, which ⌥⌘/ opens.
+    model_menu: PopoverMenuHandle<ModelPicker>,
     /// The header's title, while it's renamed in place.
     rename_input: Entity<TextInput>,
     renaming: bool,
@@ -917,6 +931,7 @@ impl AgentView {
             elicitation_cards: Vec::new(),
             composer_placeholder: COMPOSER_PLACEHOLDER.into(),
             title_menu: PopoverMenuHandle::default(),
+            model_menu: PopoverMenuHandle::default(),
             rename_input,
             renaming: false,
             _rename_blur: None,
@@ -9913,6 +9928,79 @@ impl AgentView {
         });
     }
 
+    fn model_preferences(&self, cx: &App) -> ModelPreferences {
+        thread_model_preferences(
+            &self.client,
+            &self.store,
+            self.thread_id,
+            self.agent_id.as_ref(),
+            cx,
+        )
+    }
+
+    /// Zed's ToggleModelSelector: the model chip's picker opens, or closes.
+    fn toggle_model_selector(
+        &mut self,
+        _: &ToggleModelSelector,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (model, _) = model_and_effort(self.thread.read(cx).config_options());
+        if model.is_none() {
+            cx.propagate();
+            return;
+        }
+        self.model_menu.toggle(window, cx);
+    }
+
+    /// The agent's favorite models the picker lists, in their order.
+    fn favorite_models(&self, cx: &App) -> Vec<acp::SessionConfigValueId> {
+        let (model, _) = model_and_effort(self.thread.read(cx).config_options());
+        let Some(acp::SessionConfigKind::Select(select)) = model.map(|model| &model.kind) else {
+            return Vec::new();
+        };
+        picker_models(&select.options, &self.model_preferences(cx), None)
+            .into_iter()
+            .filter(|model| model.is_favorite)
+            .map(|model| model.value)
+            .collect()
+    }
+
+    /// Zed's CycleFavoriteModels: the next favorite after the thread's model, wrapping around,
+    /// or the first when it's on none.
+    fn cycle_favorite_models(
+        &mut self,
+        _: &CycleFavoriteModels,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let favorites = self.favorite_models(cx);
+        let (model, _) = model_and_effort(self.thread.read(cx).config_options());
+        let Some((model, acp::SessionConfigKind::Select(select))) =
+            model.map(|model| (model, &model.kind))
+        else {
+            cx.propagate();
+            return;
+        };
+        if favorites.is_empty() {
+            cx.propagate();
+            return;
+        }
+        let next = favorites
+            .iter()
+            .position(|favorite| *favorite == select.current_value)
+            .map_or(0, |index| (index + 1) % favorites.len());
+        let config_id = model.id.clone();
+        let value = favorites[next].clone();
+        self.thread.update(cx, |thread, cx| {
+            thread.set_config_option(
+                config_id,
+                acp::SessionConfigOptionValue::value_id(value),
+                cx,
+            )
+        });
+    }
+
     /// Zed's AllowOnce, AllowAlways and RejectOnce: the first request's first choice of that
     /// kind.
     fn answer_first_request(&mut self, kind: acp::PermissionOptionKind, cx: &mut Context<Self>) {
@@ -12094,7 +12182,7 @@ impl AgentView {
 
     /// The agent's session settings (model, effort, mode, …) as Zed shows them: a muted
     /// dropdown button per choice and a switch per on/off setting.
-    fn render_session_settings(&self, cx: &App) -> Vec<AnyElement> {
+    fn render_session_settings(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let thread = self.thread.read(cx);
         let mut controls = Vec::new();
         let (model_option, effort_option) = model_and_effort(thread.config_options());
@@ -12104,6 +12192,7 @@ impl AgentView {
                     option,
                     effort_option,
                     thread.config_options(),
+                    cx,
                 ));
                 continue;
             }
@@ -12307,33 +12396,99 @@ impl AgentView {
     }
 
     /// The model and its effort as one chip, "Opus 5.5 · High" (`design/composer-2`, topic
-    /// 2 A), opening a search over the models with the effort's levels under them.
+    /// 2 A), opening a search over the models with the effort's row under them. Its tooltip
+    /// names the keys, as Zed's model selector's does (`design/model-visibility`, topic 12 A).
     fn render_model_chip(
         &self,
         model: &acp::SessionConfigOption,
         effort: Option<&acp::SessionConfigOption>,
         options: &[acp::SessionConfigOption],
+        cx: &Context<Self>,
     ) -> AnyElement {
         let ModelChipLabel {
             model_name,
             fast,
             rest,
         } = model_chip_label(model, effort, options);
-        let tooltip_title: SharedString = match effort {
-            Some(effort) => format!("{} and {}", model.name, effort.name).into(),
-            None => model.name.clone().into(),
-        };
-        let tooltip_description = model.description.clone().map(SharedString::from);
+        let show_cycle_row = self.favorite_models(cx).len() > 1;
+        let focus = self.composer.focus_handle(cx);
+        let tooltip = Tooltip::element(move |_, cx| {
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_between()
+                        .child(Label::new("Change Model"))
+                        .child(ui::KeyBinding::for_action_in(
+                            &ToggleModelSelector,
+                            &focus,
+                            cx,
+                        )),
+                )
+                .when(show_cycle_row, |this| {
+                    this.child(
+                        h_flex()
+                            .pt_1()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .justify_between()
+                            .child(Label::new("Cycle Favorite Models"))
+                            .child(ui::KeyBinding::for_action_in(
+                                &CycleFavoriteModels,
+                                &focus,
+                                cx,
+                            )),
+                    )
+                })
+                .into_any_element()
+        });
         let thread = self.thread.clone();
         let model_option = model.id.clone();
+        let view = cx.weak_entity();
+        let (client, store, thread_id, agent_id) = (
+            self.client.clone(),
+            self.store.clone(),
+            self.thread_id,
+            self.agent_id.clone(),
+        );
         div()
             .debug_selector(|| "session-model".into())
             .child(
                 PopoverMenu::new("session-model")
+                    .with_handle(self.model_menu.clone())
+                    // ⌥⌘/ opens it while the view is being updated, so the menu reads none of it.
                     .menu(move |window, cx| {
                         let thread = thread.clone();
                         let model_option = model_option.clone();
-                        Some(cx.new(|cx| ModelPicker::new(thread, model_option, window, cx)))
+                        let preferences = thread_model_preferences(
+                            &client,
+                            &store,
+                            thread_id,
+                            agent_id.as_ref(),
+                            cx,
+                        );
+                        let manage_models = agent_id.clone().map(|agent_id| {
+                            let view = view.clone();
+                            Rc::new(move |_: &mut Window, cx: &mut App| {
+                                let agent_id = agent_id.clone();
+                                view.update(cx, |_, cx| {
+                                    cx.emit(AgentViewEvent::OpenAgentModels { agent_id })
+                                })
+                                .log_err();
+                            }) as Rc<dyn Fn(&mut Window, &mut App)>
+                        });
+                        Some(cx.new(|cx| {
+                            ModelPicker::new(
+                                thread,
+                                model_option,
+                                preferences,
+                                manage_models,
+                                window,
+                                cx,
+                            )
+                        }))
                     })
                     .trigger_with_tooltip(
                         ButtonLike::new("session-model-trigger").child(
@@ -12364,7 +12519,7 @@ impl AgentView {
                                         .color(Color::Muted),
                                 ),
                         ),
-                        setting_tooltip(tooltip_title, tooltip_description),
+                        tooltip,
                     )
                     .anchor(gpui::Anchor::BottomRight),
             )
@@ -13164,6 +13319,8 @@ impl AgentView {
             .on_action(cx.listener(Self::select_previous_command))
             .on_action(cx.listener(|this, _: &IncreaseEffort, _, cx| this.step_effort(true, cx)))
             .on_action(cx.listener(|this, _: &DecreaseEffort, _, cx| this.step_effort(false, cx)))
+            .on_action(cx.listener(Self::toggle_model_selector))
+            .on_action(cx.listener(Self::cycle_favorite_models))
             .w_full()
             .justify_center()
             .child(
@@ -16013,6 +16170,24 @@ fn is_code_block(text: &str) -> bool {
         line.len() >= fence_length && line.bytes().all(|byte| byte == b'`')
     };
     fence_length >= 3 && closes(closing) && !body.iter().any(|line| closes(line))
+}
+
+/// The model choices the thread's account follows (`design/model-visibility`).
+fn thread_model_preferences(
+    client: &Entity<ServerClient>,
+    store: &Entity<ProjectStore>,
+    thread_id: ThreadId,
+    agent_id: Option<&AgentId>,
+    cx: &App,
+) -> ModelPreferences {
+    let Some(agent_id) = agent_id else {
+        return ModelPreferences::default();
+    };
+    let account = store
+        .read(cx)
+        .thread(thread_id)
+        .and_then(|thread| thread.account);
+    followed_preferences(client.read(cx), agent_id, account, cx)
 }
 
 fn setting_tooltip(
@@ -21970,7 +22145,9 @@ mod tests {
 
     /// The model and its effort are one chip, "Sonnet 4.6 · Medium" (`design/composer-2`,
     /// topic 2 A), and the effort has no menu of its own. The chip's menu searches the models:
-    /// picking one sets it and closes; the effort's levels under them set it and stay open.
+    /// picking one sets it and closes. The effort is one row at the menu's end, whose levels
+    /// open beside the menu, along its bottom, and picking one closes both
+    /// (`design/model-visibility`, topic 13 A).
     #[gpui::test]
     fn the_model_chip_searches_models_and_sets_effort(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
@@ -22011,7 +22188,7 @@ mod tests {
         };
         // Fast mode, one of the model's settings, is in its menu too, not the footer.
         assert_eq!(
-            view.read_with(cx, |view, cx| view.render_session_settings(cx).len()),
+            view.update(cx, |view, cx| view.render_session_settings(cx).len()),
             1
         );
 
@@ -22019,13 +22196,6 @@ mod tests {
         assert!(cx.debug_bounds("model-picker").is_some());
         assert!(cx.debug_bounds("model-opus").is_some());
         assert!(cx.debug_bounds("model-haiku").is_some());
-        // The levels are a list, one under another.
-        let medium = cx.debug_bounds("effort-medium").expect("Medium is offered");
-        let high = cx.debug_bounds("effort-high").expect("High is offered");
-        assert!(medium.bottom() <= high.top());
-        click_on("effort-high", cx);
-        assert_eq!(last_set("effort", cx).as_deref(), Some("high"));
-        assert!(cx.debug_bounds("model-picker").is_some());
         click_on("model-setting-fast", cx);
         assert!(sent(&client, cx).iter().any(|request| matches!(
             request,
@@ -22034,6 +22204,25 @@ mod tests {
         )));
         assert!(cx.debug_bounds("model-picker").is_some());
 
+        // The levels open beside the menu, one under another.
+        assert!(cx.debug_bounds("effort-high").is_none());
+        click_on("model-setting-effort", cx);
+        let menu = cx
+            .debug_bounds("model-picker")
+            .expect("the menu stays open");
+        let levels = cx
+            .debug_bounds("model-picker-levels")
+            .expect("the levels open");
+        assert!(levels.right() <= menu.left());
+        assert!((levels.bottom() - menu.bottom()).abs() < px(1.));
+        let medium = cx.debug_bounds("effort-medium").expect("Medium is offered");
+        let high = cx.debug_bounds("effort-high").expect("High is offered");
+        assert!(medium.bottom() <= high.top());
+        click_on("effort-high", cx);
+        assert_eq!(last_set("effort", cx).as_deref(), Some("high"));
+        assert!(cx.debug_bounds("model-picker").is_none());
+
+        click_on("session-model", cx);
         cx.simulate_input("opu");
         cx.run_until_parked();
         assert!(cx.debug_bounds("model-opus").is_some());
@@ -22083,8 +22272,157 @@ mod tests {
         assert!(bolt.left() - chip.left() < px(12.));
     }
 
-    /// Claude Agent's Agent setting is hidden: its adapter offers Claude Code's web-fetch
-    /// agent there, which Claude Code refuses. Other agents' settings of that id still show.
+    /// Sets the mock agent's Shared model choices, which a thread with no account of agentZ's
+    /// follows.
+    fn set_model_preferences(preferences: ModelPreferences, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings
+                            .model_preferences
+                            .insert(AgentId::new("mock"), preferences);
+                    },
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    fn model_options(current: &str) -> Vec<acp::SessionConfigOption> {
+        serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": current,
+             "options": [{"value": "opus", "name": "Opus 5.5"},
+                         {"value": "sonnet", "name": "Sonnet 4.6"},
+                         {"value": "haiku", "name": "Haiku 4.5"},
+                         {"value": "fable", "name": "Fable 5.1"}]},
+        ]))
+        .expect("options")
+    }
+
+    fn model_set_last(client: &Entity<ServerClient>, cx: &mut VisualTestContext) -> Option<String> {
+        sent(client, cx)
+            .into_iter()
+            .rev()
+            .find_map(|request| match request {
+                Request::SetConfigOption {
+                    config_id, value, ..
+                } if &*config_id.0 == "model" => {
+                    value.as_value_id().map(|value| value.0.to_string())
+                }
+                _ => None,
+            })
+    }
+
+    /// The picker leaves out the models hidden in Settings, even from its search, but keeps
+    /// the thread's own in its place, dimmed and tagged Hidden. The favorites come first, once,
+    /// and Manage Models… opens the agent's Models tab (`design/model-visibility`, topics 1, 2,
+    /// 3 and 10).
+    #[gpui::test]
+    fn the_picker_lists_favorites_first_and_leaves_out_hidden_models(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        set_model_preferences(
+            ModelPreferences {
+                hidden: ["haiku".to_string(), "fable".to_string()].into(),
+                favorites: ["sonnet".to_string()].into(),
+                order: Vec::new(),
+            },
+            cx,
+        );
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into())], cx);
+            thread.update_state_for_test(|state| state.config_options = model_options("haiku"), cx);
+        });
+        let events: Rc<RefCell<Vec<AgentId>>> = Rc::default();
+        cx.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&view, move |_, event: &AgentViewEvent, _| {
+                if let AgentViewEvent::OpenAgentModels { agent_id } = event {
+                    events.borrow_mut().push(agent_id.clone());
+                }
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        click_on("session-model", cx);
+        let bounds = |selector: &'static str, cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+        };
+        let sonnet = bounds("model-sonnet", cx);
+        let opus = bounds("model-opus", cx);
+        let haiku = bounds("model-haiku", cx);
+        assert!(sonnet.bottom() <= opus.top(), "the favorite comes first");
+        assert!(
+            opus.bottom() <= haiku.top(),
+            "the hidden model in use keeps its place"
+        );
+        assert!(haiku.contains(&bounds("model-hidden-tag", cx).center()));
+        assert!(cx.debug_bounds("model-fable").is_none());
+        cx.simulate_input("fab");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-fable").is_none());
+        cx.simulate_keystrokes("backspace backspace backspace");
+        cx.run_until_parked();
+
+        click_on("model-picker-manage", cx);
+        assert_eq!(*events.borrow(), [AgentId::new("mock")]);
+        assert!(cx.debug_bounds("model-picker").is_none());
+    }
+
+    /// Zed's keys: ⌥⌘/ opens the model picker, and ⌥⇥ moves the thread to the next favorite in
+    /// the picker's order, wrapping around, from the first when it's on none
+    /// (`design/model-visibility`, topic 12 A).
+    #[gpui::test]
+    fn keys_open_the_model_picker_and_cycle_through_favorites(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        set_model_preferences(
+            ModelPreferences {
+                favorites: ["opus".to_string(), "haiku".to_string()].into(),
+                order: vec!["haiku".into(), "sonnet".into(), "opus".into()],
+                ..ModelPreferences::default()
+            },
+            cx,
+        );
+        let offer = |current: &str, cx: &mut VisualTestContext| {
+            let options = model_options(current);
+            thread.update(cx, |thread, cx| {
+                thread.update_state_for_test(|state| state.config_options = options, cx)
+            });
+            cx.run_until_parked();
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_entries_for_test(vec![Entry::UserMessage("Plan it".into())], cx)
+        });
+        offer("sonnet", cx);
+        let focus = view.read_with(cx, |view, cx| view.composer.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        cx.simulate_keystrokes("secondary-alt-/");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-picker").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-picker").is_none());
+        cx.update(|window, cx| window.focus(&focus, cx));
+
+        cx.simulate_keystrokes("alt-tab");
+        assert_eq!(model_set_last(&client, cx).as_deref(), Some("haiku"));
+        offer("haiku", cx);
+        cx.simulate_keystrokes("alt-tab");
+        assert_eq!(model_set_last(&client, cx).as_deref(), Some("opus"));
+        offer("opus", cx);
+        cx.simulate_keystrokes("alt-tab");
+        assert_eq!(model_set_last(&client, cx).as_deref(), Some("haiku"));
+    }
+
+    /// Claude Agent's Agent setting is hidden: its adapter offers Claude Code's web-fetch    /// agent there, which Claude Code refuses. Other agents' settings of that id still show.
     #[gpui::test]
     fn claude_agents_agent_setting_is_hidden(cx: &mut TestAppContext) {
         let options: Vec<acp::SessionConfigOption> = serde_json::from_value(serde_json::json!([
@@ -22101,7 +22439,7 @@ mod tests {
         });
         cx.run_until_parked();
         let shown = |cx: &mut VisualTestContext| {
-            view.read_with(cx, |view, cx| view.render_session_settings(cx).len())
+            view.update(cx, |view, cx| view.render_session_settings(cx).len())
         };
         assert_eq!(shown(cx), 1);
         view.update(cx, |view, _| {

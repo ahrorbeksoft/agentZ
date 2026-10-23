@@ -184,6 +184,7 @@ pub enum IconName {
     Gitea,
     Github,
     Gitlab,
+    GripVertical,
     Hash,
     HistoryRerun,
     Image,

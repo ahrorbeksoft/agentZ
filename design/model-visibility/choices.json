@@ -7,6 +7,128 @@
       "comments": {},
       "note": "Picked in chat: one list shared by all accounts, with an account able to opt out and keep its own.",
       "also": []
+    },
+    "manage": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "hidden-picker": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "hidden-current": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "new-models": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "machines": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "effort": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "height": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "elsewhere": {
+      "pick": null,
+      "picks": [
+        "A",
+        "B",
+        "C"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "tools": {
+      "pick": null,
+      "picks": [
+        "A",
+        "B",
+        "D",
+        "E"
+      ],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "order": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "star": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "favorites-place": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "across": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "keys": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
     }
-  }
+  },
+  "updated": "2026-10-23T11:44:06.831Z"
 }

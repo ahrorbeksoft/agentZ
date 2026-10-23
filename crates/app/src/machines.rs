@@ -689,6 +689,7 @@ impl Machines {
         self.sync_auto_archive(cx);
         self.sync_subthread_limit(cx);
         self.sync_subthread_roles(cx);
+        self.sync_model_preferences(cx);
         self.sync_acp_v2(cx);
         self.sync_cloud_activity(cx);
         self.sync_shared_settings(cx);
@@ -891,6 +892,20 @@ impl Machines {
                 &every_account
             };
             client.update(cx, |client, cx| client.set_subthread_roles(roles, cx));
+        }
+    }
+
+    /// Gives each server Shared's model preferences, which it keeps.
+    fn sync_model_preferences(&mut self, cx: &mut Context<Self>) {
+        let preferences = AppSettingsStore::global(cx)
+            .read(cx)
+            .settings()
+            .model_preferences
+            .clone();
+        for client in self.clients.clone() {
+            client.update(cx, |client, cx| {
+                client.set_model_preferences(&preferences, cx)
+            });
         }
     }
 

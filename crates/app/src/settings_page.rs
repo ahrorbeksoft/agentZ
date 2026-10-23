@@ -4,6 +4,7 @@
 //! entry per project) and the chosen page's rows on the right.
 
 mod accounts_menu;
+mod agent_models;
 mod cloud_machine_page;
 mod cloud_providers;
 mod mcp_servers;
@@ -424,6 +425,28 @@ impl SettingsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_agent_tab(machine, agent_id, AgentTab::Account, window, cx);
+    }
+
+    /// The agent's Models tab on `machine`, from the model picker's Manage Models….
+    pub fn show_agent_models(
+        &mut self,
+        machine: MachineId,
+        agent_id: &AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_agent_tab(machine, agent_id, AgentTab::Models, window, cx);
+    }
+
+    fn show_agent_tab(
+        &mut self,
+        machine: MachineId,
+        agent_id: &AgentId,
+        tab: AgentTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let is_open = self.section == Section::Agents
             && self.agents_machine == machine
             && self
@@ -440,7 +463,7 @@ impl SettingsPage {
                 .unwrap_or_else(|| agent_id.0.to_string().into());
             self.open_agent(agent_id, &name, window, cx);
         }
-        self.select_agent_tab(AgentTab::Account, cx);
+        self.select_agent_tab(tab, cx);
     }
 
     fn project(&self, key: ProjectKey, cx: &App) -> Option<Project> {
@@ -3288,6 +3311,14 @@ impl SettingsPage {
                 }
                 None => self.render_account_tab(cx),
             },
+            // Its rows are the page's own, so a long list lays out only what's in view.
+            AgentTab::Models => {
+                let picker = self.render_account_picker(window, cx);
+                return std::iter::once(heading)
+                    .chain(picker.map(ContentRow::section))
+                    .chain(self.render_agent_models(cx))
+                    .collect();
+            }
             AgentTab::Defaults => self.render_agent_defaults(window, cx),
             AgentTab::Environment => self.render_agent_env(cx),
             AgentTab::Threads => self.render_agent_threads(window, cx),
@@ -3461,7 +3492,7 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    /// Account, Defaults, Environment and Threads, underlined when chosen.
+    /// Account, Defaults, Models, Environment and Threads, underlined when chosen.
     fn render_agent_tabs(&self, current: AgentTab, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         h_flex()
@@ -3472,6 +3503,7 @@ impl SettingsPage {
                 [
                     (AgentTab::Account, "Account"),
                     (AgentTab::Defaults, "Defaults"),
+                    (AgentTab::Models, "Models"),
                     (AgentTab::Environment, "Environment"),
                     (AgentTab::Threads, "Threads"),
                 ]
@@ -3524,13 +3556,25 @@ impl SettingsPage {
         if entries.len() < 2 {
             return None;
         }
-        // The Threads tab lists one account's sessions, so it has no Shared.
-        let with_shared = panel.tab != AgentTab::Threads && offers_shared(&accounts);
-        let current = if with_shared {
+        let with_shared = match panel.tab {
+            // The Threads tab lists one account's sessions, so it has no Shared.
+            AgentTab::Threads => false,
+            // Shared's models are the app's, there whether or not the accounts share settings.
+            AgentTab::Models => true,
+            _ => offers_shared(&accounts),
+        };
+        let current = if panel.tab == AgentTab::Models {
+            panel.models_view(&accounts)
+        } else if with_shared {
             panel.settings_view(&accounts)
         } else {
             AccountView::Account(panel.settings_account(&accounts))
         };
+        let note = (panel.tab == AgentTab::Models && current == AccountView::Shared)
+            .then(|| {
+                agent_models::models_own_note(panel.client(cx).read(cx), &panel.agent_id, &accounts)
+            })
+            .flatten();
         let label = match current {
             AccountView::Shared => h_flex()
                 .gap_1p5()
@@ -3604,6 +3648,11 @@ impl SettingsPage {
                             .trigger_size(ButtonSize::Compact),
                     ),
                 )
+                .children(note.map(|note| {
+                    div()
+                        .debug_selector(|| "account-picker-note".into())
+                        .child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
+                }))
                 .into_any_element(),
         )
     }
@@ -3660,6 +3709,9 @@ impl SettingsPage {
             this.sync_account_sessions(cx);
             this.sync_settings_account(cx);
         });
+        let models_filter = cx.new(|cx| TextInput::new("Filter models", cx));
+        let models_filtered =
+            cx.subscribe(&models_filter, |_, _, _: &TextInputEvent, cx| cx.notify());
         let panel = AgentPanel {
             agent_id: id.clone(),
             tab: AgentTab::Account,
@@ -3670,6 +3722,7 @@ impl SettingsPage {
             account_error: None,
             picked_account: AccountChoice::Default,
             picked_shared: false,
+            models_filter,
             env_view: AccountView::Account(account),
             env_follows: env_follows(&accounts, AccountView::Account(account)),
             env_rows,
@@ -3683,7 +3736,7 @@ impl SettingsPage {
             switching_to_core: HashSet::new(),
             using_limit_reset: HashSet::new(),
             dialog: None,
-            _subscriptions: vec![accounts_changed],
+            _subscriptions: vec![accounts_changed, models_filtered],
         };
         self.show_agents_page(AgentsPage::Agent(panel), window, cx);
         self.sync_account_sessions(cx);
@@ -4295,15 +4348,49 @@ impl SettingsPage {
             }
         }
         let rows_before = rows.len();
+        let model_option = crate::model_picker::model_and_effort(&agent.known_config_options)
+            .0
+            .map(|option| option.id.clone());
+        let model_preferences = match view {
+            AccountView::Shared => self
+                .app_settings
+                .read(cx)
+                .settings()
+                .model_preferences
+                .get(&agent_id)
+                .cloned()
+                .unwrap_or_default(),
+            AccountView::Account(account) => {
+                crate::model_picker::followed_preferences(client.read(cx), &agent_id, account, cx)
+            }
+        };
         for option in &agent.known_config_options {
             if crate::model_picker::is_hidden_option(Some(&agent_id), option) {
                 continue;
             }
-            let Some(choices) = option_choices(option) else {
+            let Some(mut choices) = option_choices(option) else {
                 continue;
             };
             let config_id = option.id.0.to_string();
             let current = agent.default_config_options.get(&config_id).cloned();
+            // The Model menu offers the models the pickers show, in the user's order, and a
+            // hidden default in its place (`design/model-visibility`, topics 3 and 15 A).
+            let mut hidden_current = None;
+            if model_option.as_ref() == Some(&option.id) {
+                let is_shown = |value: &acp::SessionConfigOptionValue| match value {
+                    acp::SessionConfigOptionValue::ValueId { value } => {
+                        model_preferences.is_shown(&value.0)
+                    }
+                    _ => true,
+                };
+                hidden_current = current.clone().filter(|current| !is_shown(current));
+                choices
+                    .retain(|(_, value)| is_shown(value) || Some(value) == hidden_current.as_ref());
+                model_preferences.sort(&mut choices, |(_, value)| match value {
+                    acp::SessionConfigOptionValue::ValueId { value } => value.0.as_ref(),
+                    _ => "",
+                });
+            }
             let label = current
                 .as_ref()
                 .and_then(|current| {
@@ -4323,31 +4410,48 @@ impl SettingsPage {
                     let client = client.clone();
                     let agent_id = menu_agent_id.clone();
                     let config_id = config_id.clone();
-                    menu = menu.toggleable_entry(
-                        name,
-                        is_current,
-                        IconPosition::End,
-                        None,
-                        move |_, cx| {
-                            let value = value.clone();
-                            let config_id = config_id.clone();
-                            client.update(cx, |client, cx| {
-                                view.update_settings(
-                                    client,
-                                    &agent_id,
-                                    |agent| match value {
-                                        Some(value) => {
-                                            agent.default_config_options.insert(config_id, value);
-                                        }
-                                        None => {
-                                            agent.default_config_options.remove(&config_id);
-                                        }
-                                    },
-                                    cx,
-                                )
-                            });
-                        },
-                    );
+                    let is_hidden = value.is_some() && value == hidden_current;
+                    let pick = move |_: &mut Window, cx: &mut App| {
+                        let value = value.clone();
+                        let config_id = config_id.clone();
+                        client.update(cx, |client, cx| {
+                            view.update_settings(
+                                client,
+                                &agent_id,
+                                |agent| match value {
+                                    Some(value) => {
+                                        agent.default_config_options.insert(config_id, value);
+                                    }
+                                    None => {
+                                        agent.default_config_options.remove(&config_id);
+                                    }
+                                },
+                                cx,
+                            )
+                        });
+                    };
+                    menu = if is_hidden {
+                        menu.custom_entry(
+                            move |_, _| {
+                                h_flex()
+                                    .w_full()
+                                    .gap_1p5()
+                                    .debug_selector(|| "agent-default-hidden-model".into())
+                                    .child(div().opacity(0.5).child(Label::new(name.clone())))
+                                    .child(ui::Chip::new("Hidden"))
+                                    .child(div().flex_1().min_w(px(16.)))
+                                    .child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    )
+                                    .into_any_element()
+                            },
+                            pick,
+                        )
+                    } else {
+                        menu.toggleable_entry(name, is_current, IconPosition::End, None, pick)
+                    };
                 }
                 menu
             });
@@ -8593,6 +8697,7 @@ pub(crate) async fn remove_workspace(
 enum AgentTab {
     Account,
     Defaults,
+    Models,
     Environment,
     Threads,
 }
@@ -8648,6 +8753,8 @@ struct AgentPanel {
     /// Shared is picked over the Defaults and Environment tabs. The Threads tab, which has no
     /// Shared, shows `picked_account`.
     picked_shared: bool,
+    /// The Models tab's Filter models.
+    models_filter: Entity<TextInput>,
     /// Whose variables `env_rows` are.
     env_view: AccountView,
     /// Whether `env_rows` were read while their account used Shared's, so they're read again
@@ -10265,6 +10372,7 @@ mod tests {
         Change, CloudMachine, CloudSnapshot, CloudState, CloudUsage, Lifecycle, MachineChange,
         MachineSize, Provider, ProviderState, ProviderStatus,
     };
+    use agentz_protocol::models::ModelPreferences;
     use agentz_protocol::spaces::SpacesSnapshot;
     use agentz_protocol::thread::{ThreadState, ThreadView};
     use agentz_protocol::{AgentSettingsChange, ConnectionId, Response};
@@ -12649,8 +12757,311 @@ mod tests {
         }
     }
 
-    /// This Mac with two checkouts of one repository and a folder, and Devbox 1 with a third
-    /// checkout and a folder of its own.
+    /// The mock agent offering `models` as its model setting's choices.
+    fn model_options(models: &[(&str, &str)]) -> Vec<acp::SessionConfigOption> {
+        let choices: Vec<serde_json::Value> = models
+            .iter()
+            .map(|(value, name)| serde_json::json!({"value": value, "name": name}))
+            .collect();
+        serde_json::from_value(serde_json::json!([
+            {"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": models[0].0, "options": choices},
+        ]))
+        .expect("options")
+    }
+
+    fn shared_model_preferences(
+        agent_id: &AgentId,
+        cx: &mut gpui::VisualTestContext,
+    ) -> ModelPreferences {
+        cx.update(|_, cx| {
+            AppSettingsStore::global(cx)
+                .read(cx)
+                .settings()
+                .model_preferences
+                .get(agent_id)
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+
+    /// The Models tab (`design/model-visibility`, topics 1, 7, 8 and 15 A): every model the
+    /// agent offers, starred for the picker's Favorites and switched off to hide it, in the
+    /// groups Favorites, All and Hidden from picker, dragged within its group, with a filter
+    /// from nine models up and Hide deprecated. With one account it changes Shared's choices,
+    /// the app's, and Defaults' Model menu then offers the shown models and a hidden default.
+    #[gpui::test]
+    fn the_models_tab_stars_hides_orders_and_filters_the_agents_models(cx: &mut TestAppContext) {
+        let mock = AgentId::new("mock");
+        let external = AgentSettings {
+            known_config_options: model_options(&[
+                ("auto", "Auto"),
+                ("opus", "Opus 5.5"),
+                ("sonnet", "Sonnet 5.5"),
+                ("haiku", "Haiku 5"),
+                ("gpt", "GPT 6"),
+                ("mini", "GPT 6 Mini"),
+                ("gemini", "Gemini 4"),
+                ("grok", "Grok 5"),
+                ("old", "Opus 4.1 [Deprecated]"),
+            ]),
+            default_config_options: BTreeMap::from([(
+                "model".to_string(),
+                acp::SessionConfigOptionValue::value_id("gpt".to_string()),
+            )]),
+            ..AgentSettings::default()
+        };
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![listing(
+                            "mock",
+                            "Mock",
+                            InstallState::Installed {
+                                version: "2.0.0".into(),
+                                update_available: false,
+                            },
+                        )],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            client.update(cx, |client, cx| {
+                client.set_agent_settings_for_test([(mock.clone(), external)].into(), cx)
+            });
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1000.), px(1600.)));
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let bounds = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"))
+        };
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let center = bounds(selector, cx).center();
+            cx.simulate_click(center, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let shown = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(selector).is_some()
+        };
+        let above = |upper: &'static str, lower: &'static str, cx: &mut gpui::VisualTestContext| {
+            bounds(upper, cx).bottom() <= bounds(lower, cx).top()
+        };
+        click("agent-row-mock", cx);
+        click("agent-tab-models", cx);
+
+        // One account, so no menu; nothing is starred or hidden yet, so there are no groups.
+        assert!(!shown("account-picker", cx));
+        assert!(shown("models-filter", cx));
+        assert!(!shown("models-group-all", cx));
+        assert!(above("model-row-auto", "model-row-opus", cx));
+
+        click("model-star-sonnet", cx);
+        assert!(shared_model_preferences(&mock, cx).is_favorite("sonnet"));
+        assert!(shown("models-group-favorites", cx));
+        assert!(shown("models-group-all", cx));
+        assert!(above("model-row-sonnet", "model-row-auto", cx));
+
+        click("model-shown-gpt", cx);
+        assert!(!shared_model_preferences(&mock, cx).is_shown("gpt"));
+        assert!(shown("models-group-hidden-from-picker", cx));
+        assert!(above("model-row-old", "model-row-gpt", cx));
+
+        click("models-hide-deprecated", cx);
+        assert!(!shared_model_preferences(&mock, cx).is_shown("old"));
+
+        // A row dragged by its grip takes the place of the one it's dropped on.
+        let grip = bounds("model-grip-grok", cx).center();
+        let target = bounds("model-row-auto", cx).center();
+        cx.simulate_mouse_down(grip, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            shared_model_preferences(&mock, cx).order,
+            [
+                "grok", "auto", "opus", "sonnet", "haiku", "gpt", "mini", "gemini", "old"
+            ]
+        );
+        assert!(above("model-row-grok", "model-row-auto", cx));
+
+        click("models-filter", cx);
+        cx.simulate_input("opus");
+        cx.run_until_parked();
+        assert!(shown("model-row-opus", cx));
+        assert!(shown("model-row-old", cx));
+        assert!(!shown("model-row-sonnet", cx));
+        cx.simulate_input("x");
+        cx.run_until_parked();
+        assert!(shown("models-no-match", cx));
+
+        // Defaults' Model menu offers the shown models, and the hidden default in its place.
+        click("agent-tab-defaults", cx);
+        click("agent-default-model", cx);
+        assert!(shown("agent-default-hidden-model", cx));
+        assert!(shown("MENU_ITEM-Sonnet 5.5", cx));
+        assert!(!shown("MENU_ITEM-Opus 4.1 [Deprecated]", cx));
+    }
+
+    /// With two accounts, the Models tab has Defaults' Account menu with Shared first, even
+    /// before the accounts share settings. On an account, "Use shared settings" says what
+    /// Shared has; off, the account gets a copy of Shared's to change, kept on its machine,
+    /// and on again the copy goes (`design/model-visibility`, topic 5 A).
+    #[gpui::test]
+    fn an_account_can_keep_its_own_models(cx: &mut TestAppContext) {
+        let mock = AgentId::new("mock");
+        let mut mock_listing = listing(
+            "mock",
+            "Mock",
+            InstallState::Installed {
+                version: "2.0.0".into(),
+                update_available: false,
+            },
+        );
+        mock_listing.accounts = Some(AccountSupport {
+            folder: "/tmp/agentz-test/accounts/mock".into(),
+            ..AccountSupport::default()
+        });
+        let mut work = account(1, Some("Work"), Some(AccountStatus::default()));
+        work.settings.known_config_options =
+            model_options(&[("sonnet", "Sonnet"), ("haiku", "Haiku"), ("opus", "Opus")]);
+        let mut accounts = AgentAccounts {
+            accounts: vec![work],
+            default_account: Some(AccountId(1)),
+            external_logged_in: Some(true),
+            last_id: 1,
+            ..AgentAccounts::default()
+        };
+        let shared = ModelPreferences {
+            hidden: ["haiku".to_string()].into(),
+            favorites: ["opus".to_string()].into(),
+            order: Vec::new(),
+        };
+        let requests: Rc<RefCell<Vec<Request>>> = Rc::default();
+        let client = cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            let registry = client.read(cx).registry().clone();
+            registry.update(cx, |registry, cx| {
+                registry.set_snapshot(
+                    RegistrySnapshot {
+                        agents: vec![mock_listing],
+                        is_fetching: false,
+                        fetch_error: None,
+                    },
+                    cx,
+                )
+            });
+            let requests = requests.clone();
+            let accounts = accounts.clone();
+            client.update(cx, |client, cx| {
+                client.answer_for_test(move |request| {
+                    requests.borrow_mut().push(request.clone());
+                    match request {
+                        Request::OpenLoginSession { account, .. } => {
+                            Some(Response::LoginSessionOpened(account.map_or(100, |id| id.0)))
+                        }
+                        Request::SubscribeThread(ConnectionId::LoginSession(_)) => {
+                            Some(Response::Thread(login_session(true)))
+                        }
+                        Request::UpdateAgentSettings { .. } => Some(Response::Ok),
+                        _ => None,
+                    }
+                });
+                client.set_accounts_for_test([(mock.clone(), accounts)].into(), cx);
+            });
+            crate::machines::init_for_test(vec![client.clone()], cx);
+            AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(
+                    |settings| {
+                        settings
+                            .model_preferences
+                            .insert(mock.clone(), shared.clone());
+                    },
+                    cx,
+                )
+            });
+            client
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| SettingsPage::new(cx));
+        cx.simulate_resize(gpui::size(px(1000.), px(1200.)));
+        page.update_in(cx, |page, window, cx| page.show_agents(window, cx));
+        cx.run_until_parked();
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} is shown"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        let shown = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            cx.debug_bounds(selector).is_some()
+        };
+        let set_models = |models: Option<ModelPreferences>| Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(AccountId(1)),
+            change: AgentSettingsChange::SetModels(models),
+        };
+        click("agent-row-mock", cx);
+        click("agent-tab-models", cx);
+
+        // Work, the account for new threads, uses Shared's.
+        assert!(shown("account-picker", cx));
+        assert!(shown("use-shared-models", cx));
+        assert!(!shown("model-row-sonnet", cx));
+        click("use-shared-models", cx);
+        assert!(
+            requests
+                .borrow()
+                .contains(&set_models(Some(shared.clone())))
+        );
+
+        // Once the server has Work's copy, the list is Work's.
+        accounts.accounts[0].settings.models = Some(shared.clone());
+        client.update(cx, |client, cx| {
+            client.set_accounts_for_test([(mock.clone(), accounts.clone())].into(), cx)
+        });
+        cx.run_until_parked();
+        assert!(shown("model-row-sonnet", cx));
+        click("model-shown-sonnet", cx);
+        let mut own = shared.clone();
+        own.set_shown("sonnet", false);
+        assert!(requests.borrow().contains(&set_models(Some(own))));
+
+        // Shared's list says Work sets its own.
+        click("account-picker", cx);
+        click("account-picker-shared", cx);
+        assert!(shown("account-picker-note", cx));
+        assert!(!shown("use-shared-models", cx));
+        assert!(shown("model-row-sonnet", cx));
+
+        // On again, Work's copy goes.
+        click("account-picker", cx);
+        click("account-picker-1", cx);
+        click("use-shared-models", cx);
+        assert!(requests.borrow().contains(&set_models(None)));
+    }
+
+    /// This Mac with two checkouts of one repository and a folder, and Devbox 1 with a third    /// checkout and a folder of its own.
     pub(super) fn machines_with_copies(
         cx: &mut TestAppContext,
     ) -> (Entity<ServerClient>, Entity<ServerClient>) {

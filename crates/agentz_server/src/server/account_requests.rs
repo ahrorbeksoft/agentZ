@@ -378,6 +378,7 @@ impl Server {
     ) -> Result<()> {
         match &change {
             AgentSettingsChange::SetLoginMethod(_) => bail!("Shared settings have no login."),
+            AgentSettingsChange::SetModels(_) => bail!("Shared's models are the app's."),
             AgentSettingsChange::Unknown(change) => {
                 bail!("unsupported agent settings change: {change}")
             }

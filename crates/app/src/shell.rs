@@ -267,6 +267,9 @@ impl Shell {
                     SpacesViewEvent::OpenAgentAccounts { machine, agent_id } => {
                         this.open_agent_accounts(*machine, agent_id, window, cx)
                     }
+                    SpacesViewEvent::OpenAgentModels { machine, agent_id } => {
+                        this.open_agent_models(*machine, agent_id, window, cx)
+                    }
                 },
             ),
             cx.observe_in(&machines, window, |this, _, window, cx| {
@@ -899,6 +902,22 @@ impl Shell {
         }
     }
 
+    /// Manage Models…, from a thread's model picker.
+    fn open_agent_models(
+        &mut self,
+        machine: MachineId,
+        agent_id: &AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(&OpenSettings, window, cx);
+        if let Some((page, _)) = &self.settings_page {
+            page.update(cx, |page, cx| {
+                page.show_agent_models(machine, agent_id, window, cx)
+            });
+        }
+    }
+
     /// Cmd-J with focus outside the thread view (the Changes panel, the sidebar): the open
     /// thread's terminal. With focus inside, the thread view handles it first.
     fn toggle_terminal_drawer(
@@ -1381,6 +1400,9 @@ impl Shell {
                 AgentViewEvent::OpenAgentSettings => this.open_agent_settings(window, cx),
                 AgentViewEvent::OpenAgentAccounts { agent_id } => {
                     this.open_agent_accounts(key.machine, agent_id, window, cx)
+                }
+                AgentViewEvent::OpenAgentModels { agent_id } => {
+                    this.open_agent_models(key.machine, agent_id, window, cx)
                 }
                 AgentViewEvent::Replaced { thread, draft } => {
                     this.open_thread(*thread, window, cx);

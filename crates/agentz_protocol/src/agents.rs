@@ -197,6 +197,9 @@ pub struct AgentSettings {
     /// settings for all its accounts, so Settings › MCP Servers can name agents that can't
     /// take remote ones. `None` until it has started.
     pub mcp_capabilities: Option<acp::McpCapabilities>,
+    /// The account's own model preferences, in place of Shared's (its Models tab's "Use shared
+    /// settings" off). `None` follows Shared's, which are the app's.
+    pub models: Option<crate::models::ModelPreferences>,
 }
 
 /// [`crate::Request::ListAgentSessions`]'s answer: the conversations an agent keeps on the

@@ -283,6 +283,13 @@ pub struct AppSettings {
     /// What each role of delegated task runs on, in the order to try. Given to every
     /// machine's server.
     pub subthread_roles: agentz_protocol::subthread_roles::SubthreadRoles,
+    /// Shared's model preferences for each agent: the models its pickers leave out, its
+    /// favorites and their order (Settings › Agents › an agent › Models). Every machine's
+    /// agent follows them, unless an account sets its own; given to every machine's server.
+    pub model_preferences: std::collections::BTreeMap<
+        agentz_protocol::agents::AgentId,
+        agentz_protocol::models::ModelPreferences,
+    >,
     /// Agents are asked for ACP v2 before v1, on every machine. Experimental and off by
     /// default: most agents' v2 isn't stable yet.
     pub acp_v2: bool,
@@ -349,6 +356,7 @@ impl Default for AppSettings {
             auto_archive: AutoArchive::default(),
             subthread_limit: agentz_protocol::DEFAULT_SUBTHREAD_LIMIT,
             subthread_roles: Default::default(),
+            model_preferences: Default::default(),
             acp_v2: false,
             artifact_auto_open: ArtifactAutoOpen::default(),
             usage_window: UsageWindow::default(),

@@ -13,9 +13,9 @@ use text_input::{TextInput, TextInputEvent};
 use ui::{WithScrollbar as _, prelude::*};
 
 use crate::agent_view::{
-    self, AcceptSlashCommand, DecreaseEffort, DismissThreadSearch, FindInThread, IncreaseEffort,
-    SelectNextThreadMatch, SelectPreviousThreadMatch, ToggleCaseSensitive, ToggleRegex,
-    ToggleWholeWord,
+    self, AcceptSlashCommand, CycleFavoriteModels, DecreaseEffort, DismissThreadSearch,
+    FindInThread, IncreaseEffort, SelectNextThreadMatch, SelectPreviousThreadMatch,
+    ToggleCaseSensitive, ToggleModelSelector, ToggleRegex, ToggleWholeWord,
 };
 use crate::spaces_view::{
     self, ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, ActivateTab,
@@ -162,6 +162,8 @@ fn shortcut_groups(context_stack: &[KeyContext], cx: &App) -> Vec<ShortcutGroup>
                 entry("Complete Slash Command", &AcceptSlashCommand),
                 entry("Increase Effort", &IncreaseEffort),
                 entry("Decrease Effort", &DecreaseEffort),
+                entry("Change Model", &ToggleModelSelector),
+                entry("Cycle Favorite Models", &CycleFavoriteModels),
                 entry("Find in Thread", &FindInThread),
             ],
         ));

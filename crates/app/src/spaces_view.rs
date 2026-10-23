@@ -249,6 +249,11 @@ pub enum SpacesViewEvent {
         machine: MachineId,
         agent_id: AgentId,
     },
+    /// Manage Models…, from a thread's model picker.
+    OpenAgentModels {
+        machine: MachineId,
+        agent_id: AgentId,
+    },
 }
 
 #[derive(Clone)]
@@ -1173,6 +1178,12 @@ impl SpacesView {
                         }
                         AgentViewEvent::OpenAgentAccounts { agent_id } => {
                             cx.emit(SpacesViewEvent::OpenAgentAccounts {
+                                machine,
+                                agent_id: agent_id.clone(),
+                            })
+                        }
+                        AgentViewEvent::OpenAgentModels { agent_id } => {
+                            cx.emit(SpacesViewEvent::OpenAgentModels {
                                 machine,
                                 agent_id: agent_id.clone(),
                             })

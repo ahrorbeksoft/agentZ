@@ -17,6 +17,7 @@ mod limit_waits;
 mod login_checks;
 mod mcp_over_acp;
 mod mcp_server_requests;
+mod model_preferences;
 mod prompt_requests;
 mod queue_requests;
 mod session_requests;
@@ -296,6 +297,8 @@ pub(crate) struct Server {
     subthread_limit: u32,
     /// What each role of delegated task runs on.
     subthread_roles: agentz_protocol::subthread_roles::SubthreadRoles,
+    /// Shared's model preferences for each agent, the app's.
+    model_preferences: BTreeMap<AgentId, agentz_protocol::models::ModelPreferences>,
     /// Agents are asked for ACP v2 before v1.
     acp_v2: bool,
     /// Ended tasks whose changes are being read, announced once they're known.
@@ -405,6 +408,9 @@ impl Server {
         let subthread_roles = subthread_roles::load(&data_dir)
             .log_err()
             .unwrap_or_default();
+        let model_preferences = model_preferences::load(&data_dir)
+            .log_err()
+            .unwrap_or_default();
         let cleanup_file = workspace_cleanup::load(&data_dir)
             .log_err()
             .unwrap_or_default();
@@ -507,6 +513,7 @@ impl Server {
             auto_archive_days,
             subthread_limit,
             subthread_roles,
+            model_preferences,
             acp_v2,
             reading_task_changes: HashSet::default(),
             clients: HashMap::default(),
@@ -1422,7 +1429,9 @@ impl Server {
                     AgentSettingsChange::Unknown(change) => {
                         Err(anyhow!("unsupported agent settings change: {change}"))
                     }
-                    change @ AgentSettingsChange::SetLoginMethod(_) => {
+                    // An account's own, never Shared's.
+                    change @ (AgentSettingsChange::SetLoginMethod(_)
+                    | AgentSettingsChange::SetModels(_)) => {
                         self.update_account_settings(&agent_id, account, |settings| {
                             change.apply(settings)
                         });
@@ -1576,6 +1585,10 @@ impl Server {
             }
             Request::SetSubthreadRoles(roles) => {
                 self.set_subthread_roles(roles)?;
+                Ok(Response::Ok)
+            }
+            Request::SetModelPreferences(preferences) => {
+                self.set_model_preferences(preferences)?;
                 Ok(Response::Ok)
             }
             Request::SetAcpV2(acp_v2) => {

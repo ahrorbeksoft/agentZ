@@ -33,6 +33,7 @@ use agent_client_protocol::schema::v1 as acp;
 use agentz_protocol::agents::{AgentId, AgentSettings, InstallState};
 use agentz_protocol::artifacts::DesignDefaults;
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange};
+use agentz_protocol::models::ModelPreferences;
 use agentz_protocol::subthread_roles::TaskRole;
 use agentz_protocol::thread::{ConnectionStatus, Entry};
 use agentz_protocol::{ConnectionId, ServerMessage, ToolCaller, ToolResult};
@@ -1013,10 +1014,11 @@ impl Server {
                 let accounts = self.accounts.get(agent.id());
                 let default_account = accounts.new_thread_account();
                 let settings = self.account_settings(agent.id(), default_account);
+                let preferences = self.followed_model_preferences(agent.id(), default_account);
                 let mut entry = json!({
                     "agentId": agent.id().0.as_ref(),
                     "name": agent.name().as_ref(),
-                    "models": advertised_models(&settings),
+                    "models": advertised_models(&settings, &preferences),
                     "modes": advertised_modes(&settings),
                     "canRunChildTask": true,
                 });
@@ -1027,11 +1029,12 @@ impl Server {
                         .into_iter()
                         .map(|account| {
                             let settings = self.account_settings(agent.id(), account);
+                            let preferences = self.followed_model_preferences(agent.id(), account);
                             json!({
                                 "account": account_key(account),
                                 "name": accounts.name(account),
                                 "isDefault": account == default_account,
-                                "models": advertised_models(&settings),
+                                "models": advertised_models(&settings, &preferences),
                                 "modes": advertised_modes(&settings),
                             })
                         })
@@ -2971,12 +2974,14 @@ fn account_key(account: Option<AccountId>) -> String {
     account.map_or_else(|| "external".to_string(), |id| id.to_string())
 }
 
-/// The models a thread with these settings can pick, as `orchestrator_capabilities` lists them.
-fn advertised_models(settings: &AgentSettings) -> Vec<Value> {
+/// The models a thread with these settings can pick, as `orchestrator_capabilities` lists them:
+/// those the user shows in the pickers.
+fn advertised_models(settings: &AgentSettings, preferences: &ModelPreferences) -> Vec<Value> {
     model_choices(&settings.known_config_options)
         .map(|(_, choices, _)| {
             choices
                 .into_iter()
+                .filter(|(id, _)| preferences.is_shown(id))
                 .map(|(id, name)| json!({"id": id, "name": name}))
                 .collect()
         })

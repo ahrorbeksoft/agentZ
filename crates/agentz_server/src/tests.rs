@@ -13,6 +13,7 @@ use agentz_protocol::accounts::{
 use agentz_protocol::agents::{AgentId, AgentSessions, CustomAgentChange};
 use agentz_protocol::diff::{DiffScope, DiffStatus, FileChange, RestoreAvailability, ThreadDiff};
 use agentz_protocol::layout::{Direction, Node};
+use agentz_protocol::models::ModelPreferences;
 use agentz_protocol::spaces::{
     LayoutNode, PaneAgentState, PaneContent, PaneLocation, PaneTerminal, SpaceRequest,
     SpacesSnapshot,
@@ -5330,6 +5331,52 @@ async fn agents_launch_threads_on_an_account() {
         ]
     );
 
+    // Shared's model choices, the app's, leave its hidden models out for each account that
+    // follows them, and an account that keeps its own follows those
+    // (`design/model-visibility`, topic 15 C).
+    let hiding = |model: &str| ModelPreferences {
+        hidden: [model.to_string()].into(),
+        ..ModelPreferences::default()
+    };
+    client
+        .ok(Request::SetModelPreferences(BTreeMap::from([(
+            mock.clone(),
+            hiding("opus"),
+        )])))
+        .await;
+    client
+        .ok(Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(side),
+            change: AgentSettingsChange::SetModels(Some(hiding("haiku"))),
+        })
+        .await;
+    let capabilities = client
+        .tool(orchestrator, "orchestrator_capabilities", json!({}))
+        .await;
+    let shown: Vec<Vec<Value>> = capabilities["agents"][0]["accounts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|account| {
+            account["models"]
+                .as_array()
+                .map(|models| models.iter().map(|model| model["id"].clone()).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(shown, vec![vec![json!("sonnet"), json!("haiku")], vec![]]);
+    client
+        .ok(Request::UpdateAgentSettings {
+            agent_id: mock.clone(),
+            account: Some(side),
+            change: AgentSettingsChange::SetModels(None),
+        })
+        .await;
+    client
+        .ok(Request::SetModelPreferences(BTreeMap::new()))
+        .await;
     // The model is checked against the account's own.
     let code = client
         .tool_failure(
