@@ -565,10 +565,11 @@ impl Shell {
         let machines = self.machines.read(cx);
         if project.project == ProjectId::CHATS {
             return machines
-                .chat_threads(cx)
-                .first()
+                .active_threads(cx)
+                .into_iter()
+                .find(|(_, thread)| thread.is_chat())
                 .map(|(machine, thread)| ThreadKey {
-                    machine: *machine,
+                    machine,
                     thread: thread.id,
                 });
         }
@@ -586,12 +587,19 @@ impl Shell {
     }
 
     /// The project of the sidebar's first thread, as t3code lands in its most recently active
-    /// project, or else the first project shown.
+    /// project, or else the first project shown. Chats land in a chat, and only they do.
     fn latest_project(&self, cx: &App) -> Option<ProjectKey> {
         let machines = self.machines.read(cx);
+        if machines.scope(cx) == Scope::Chats {
+            return Some(ProjectKey {
+                machine: MachineId::Local,
+                project: ProjectId::CHATS,
+            });
+        }
         machines
             .active_threads(cx)
             .into_iter()
+            .filter(|(_, thread)| !thread.is_chat())
             .find_map(|(machine, thread)| {
                 let project = machines.thread_project(machine, &thread, cx)?;
                 machines
@@ -612,8 +620,12 @@ impl Shell {
     }
 
     /// A draft in the shown project, as t3code's New Thread opens one; with several shown, the
-    /// modal asks which first.
+    /// modal asks which first. With Chats shown, a chat.
     fn new_thread(&mut self, _: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
+        if self.machines.read(cx).scope(cx) == Scope::Chats {
+            self.start_chat(MachineId::Local, window, cx);
+            return;
+        }
         let machines = self.machines.read(cx);
         if machines.project_groups(cx).is_empty() {
             window.dispatch_action(Box::new(OpenFolder), cx);
@@ -1906,9 +1918,10 @@ impl Shell {
         let colors = cx.theme().colors();
         let tabs_border = colors.border;
         let machines = self.machines.read(cx);
-        let scope_group = match machines.scope(cx) {
-            Scope::Group(key) => machines.group(&key, cx),
-            Scope::All => None,
+        let scope = machines.scope(cx);
+        let scope_group = match &scope {
+            Scope::Group(key) => machines.group(key, cx),
+            Scope::All | Scope::Chats => None,
         };
         let scope_machines = scope_group
             .as_ref()
@@ -1923,6 +1936,13 @@ impl Shell {
             Some((group, (machine, project))) => (
                 render_project_icon(machine, project, px(14.), cx),
                 group.name(),
+            ),
+            None if scope == Scope::Chats => (
+                Icon::new(IconName::Chat)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+                "Chats".into(),
             ),
             None => (
                 Icon::new(IconName::ListTree)

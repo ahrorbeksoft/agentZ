@@ -269,7 +269,8 @@ pub struct AppSettings {
     pub saved_layouts: Vec<SavedLayout>,
     /// Zed's `agent.use_modifier_to_send`: Cmd-Enter sends and Enter makes a new line.
     pub use_modifier_to_send: bool,
-    /// Chats show in the sidebar, New Chat and search. Off, they're hidden and kept.
+    /// Chats show among the sidebar's threads, in the project picker, New Chat and search. Off,
+    /// they're hidden and kept.
     pub chats: bool,
     /// The sidebar groups the threads whose agents are working under Working, t3code's Working
     /// shelf. Off by default, as there.

@@ -39,7 +39,7 @@ use ui::{
 use crate::project_info::{render_project_icon, workspace_icon};
 use crate::project_switcher::compact_path;
 use crate::window_background;
-use crate::{NewChat, NewThread, OpenSettings};
+use crate::{NewThread, OpenSettings};
 
 /// How often relative activity times ("5m") are re-rendered.
 const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -61,8 +61,6 @@ pub(crate) const ARCHIVED_ROW_HEIGHT: Pixels = px(36.);
 /// behind "Show more".
 const ARCHIVED_INITIAL_COUNT: usize = 10;
 const ARCHIVED_PAGE_COUNT: usize = 25;
-/// Chats open with the latest few, and page the rest as Archived does.
-const CHATS_INITIAL_COUNT: usize = 5;
 /// How long t3code's undo notice stays after the last thread snoozed.
 const UNDO_DURATION: Duration = Duration::from_secs(5);
 
@@ -109,7 +107,6 @@ impl ThreadCheckout {
 #[derive(Clone, Copy, PartialEq)]
 enum Shelf {
     Snoozed,
-    Chats,
     Shells,
     Workspaces,
     Archived,
@@ -381,7 +378,6 @@ pub struct Sidebar {
     search_index: usize,
     search_scroll: ScrollHandle,
     archived_shown: usize,
-    chats_shown: usize,
     /// Whether the Shells shelf is open. This window's alone.
     shells_expanded: bool,
     /// Whether the Working group is open. This window's alone.
@@ -453,7 +449,6 @@ impl Sidebar {
             search_index: 0,
             search_scroll: ScrollHandle::new(),
             archived_shown: ARCHIVED_INITIAL_COUNT,
-            chats_shown: CHATS_INITIAL_COUNT,
             shells_expanded: true,
             working_expanded: true,
             snoozed_expanded: false,
@@ -571,21 +566,13 @@ impl Sidebar {
         self.search.read(cx).text().trim().to_lowercase()
     }
 
-    /// t3code's search results: every matching thread, active (with the chats among them by
-    /// when they last did something), then shells, then Workspaces threads, then archived, in
-    /// one list.
+    /// t3code's search results: every matching thread, active, then shells, then Workspaces
+    /// threads, then archived, in one list.
     fn search_results(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         let query = self.search_query(cx);
         let machines = self.machines.read(cx);
-        let mut active = machines.active_threads(cx);
-        for chat in machines.chat_threads(cx) {
-            let at = active
-                .iter()
-                .position(|(_, thread)| thread.last_activity_at < chat.1.last_activity_at)
-                .unwrap_or(active.len());
-            active.insert(at, chat);
-        }
-        active
+        machines
+            .active_threads(cx)
             .into_iter()
             .chain(machines.shell_threads(cx))
             .chain(machines.workspaces_threads(cx))
@@ -797,7 +784,7 @@ impl Sidebar {
 
     /// Pin or Unpin, Rename, Archive or Unarchive, the pasture's actions, Project Settings, and
     /// Delete, each with its icon. A Workspaces thread's has Rename, Move to Threads and Delete,
-    /// and a chat's Pin or Unpin, Rename and Delete: chats aren't archived.
+    /// and a chat's no Project Settings.
     fn thread_menu(
         &self,
         machine: MachineId,
@@ -943,14 +930,6 @@ impl Sidebar {
                     Some(client) => with_regenerate_title(menu, client, thread_id.thread, cx),
                     None => menu,
                 };
-                if is_chat {
-                    return menu.separator().item(
-                        ContextMenuEntry::new("Delete…")
-                            .icon(IconName::Trash)
-                            .icon_color(Color::Muted)
-                            .handler(delete),
-                    );
-                }
                 if in_workspaces {
                     let sidebar = sidebar.clone();
                     return menu
@@ -1064,12 +1043,14 @@ impl Sidebar {
                         )
                         .separator()
                 })
-                .item(
-                    ContextMenuEntry::new("Project Settings")
-                        .icon(IconName::Settings)
-                        .icon_color(Color::Muted)
-                        .handler(open_project_settings),
-                )
+                .when(!is_chat, |menu| {
+                    menu.item(
+                        ContextMenuEntry::new("Project Settings")
+                            .icon(IconName::Settings)
+                            .icon_color(Color::Muted)
+                            .handler(open_project_settings),
+                    )
+                })
                 .separator()
                 .item(
                     ContextMenuEntry::new("Delete…")
@@ -1797,10 +1778,14 @@ impl Sidebar {
             None => (project, None),
         };
         let details = self.thread_details(machine, &thread, project.as_ref(), cx);
-        let checkout = self.thread_checkout(machine, &thread, cx);
+        let is_chat = thread.is_chat();
+        // A chat's folder is its own, with no branch to show, as a folder without git.
+        let checkout = (!is_chat)
+            .then(|| self.thread_checkout(machine, &thread, cx))
+            .flatten();
         let machines = self.machines.read(cx);
-        // With one project selected, every card would repeat it, so the project line goes and
-        // the status moves next to the title.
+        // With one project or Chats selected, every card would repeat it, so the project line
+        // goes and the status moves next to the title.
         let shows_all_projects = machines.scope(cx) == Scope::All;
         let is_offline = !machines.is_online(machine, cx);
         // Which machine it runs on, just before the agent: the only place a card names it.
@@ -2098,6 +2083,7 @@ impl Sidebar {
                 .min_w_0()
                 .gap_1p5()
                 .child(match &folder_name {
+                    _ if is_chat => render_chat_icon(),
                     Some(_) => render_folder_icon(),
                     None => self.render_project_icon(machine, project.as_ref(), cx),
                 })
@@ -2109,6 +2095,7 @@ impl Sidebar {
                                 self.machines.read(cx).project_label(machine, project, cx)
                             })
                             .or(folder_name.clone())
+                            .or(is_chat.then(|| SharedString::from("Chat")))
                             .map(|name| {
                                 Label::new(name)
                                     .size(LabelSize::Small)
@@ -2726,8 +2713,6 @@ impl Sidebar {
         count: usize,
         is_expanded: bool,
         tone: HeaderTone,
-        // A button between the rule and the chevron, such as Chats' New Chat.
-        button: Option<AnyElement>,
         on_toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2752,7 +2737,6 @@ impl Sidebar {
                 .color(color),
             )
             .child(div().flex_1().min_w_2().h_px().bg(rule_color))
-            .children(button)
             .child(
                 Icon::new(if is_expanded {
                     IconName::ChevronUp
@@ -2782,7 +2766,6 @@ impl Sidebar {
         let is_archived = shelf == Shelf::Archived;
         let is_snoozed = shelf == Shelf::Snoozed;
         let is_shell = shelf == Shelf::Shells;
-        let is_chat = shelf == Shelf::Chats;
         let colors = cx.theme().colors();
         let hover_background = colors.ghost_element_hover;
         let selected_background = colors.ghost_element_selected;
@@ -2829,7 +2812,6 @@ impl Sidebar {
         let has_hover_action = is_archived || is_snoozed;
         let prefix = match shelf {
             Shelf::Snoozed => "snoozed",
-            Shelf::Chats => "chat",
             Shelf::Shells => "shell",
             Shelf::Workspaces => "workspaces",
             Shelf::Archived => "archived",
@@ -2891,13 +2873,6 @@ impl Sidebar {
         let group_name =
             SharedString::from(format!("{prefix}-row-{}-{}", machine.slug(), thread.id.0));
         let title = SharedString::from(thread.title.clone());
-        // A chat that's working or waiting for the user reads at full strength, with its
-        // state's dot before the time.
-        let busy_status = is_chat
-            .then(|| store.read(cx).thread_status(thread.id))
-            .flatten()
-            .filter(|status| *status != ThreadStatus::Completed);
-        let is_quiet = !is_active && busy_status.is_none();
         let store = store.clone();
 
         let time_color = if is_snoozed {
@@ -2943,7 +2918,7 @@ impl Sidebar {
             .child(
                 div()
                     .flex_none()
-                    .when(is_quiet, |this| {
+                    .when(!is_active, |this| {
                         this.opacity(0.4)
                             .group_hover(group_name.clone(), |this| this.opacity(1.))
                     })
@@ -2955,11 +2930,7 @@ impl Sidebar {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(
-                        Label::new(title.clone())
-                            .when(busy_status.is_none(), |label| label.color(Color::Muted))
-                            .truncate(),
-                    )
+                    .child(Label::new(title.clone()).color(Color::Muted).truncate())
                     .into_any_element()
             })
             .when(running.is_some() && !is_renaming, |row| {
@@ -2974,14 +2945,6 @@ impl Sidebar {
                                 .weight(FontWeight::MEDIUM)
                                 .color(Color::Accent),
                         ),
-                )
-            })
-            .when_some(busy_status.filter(|_| !is_renaming), |row, status| {
-                row.child(
-                    div()
-                        .debug_selector(move || format!("chat-state-{}", thread_id.thread.0))
-                        .flex_none()
-                        .child(render_status_dot(status, cx)),
                 )
             })
             .when_some(
@@ -3078,7 +3041,6 @@ impl Sidebar {
             snoozed.len(),
             self.snoozed_expanded,
             HeaderTone::Accent,
-            None,
             |this, cx| {
                 this.snoozed_expanded = !this.snoozed_expanded;
                 cx.notify();
@@ -3095,58 +3057,6 @@ impl Sidebar {
                 && let Some(store) = self.store(machine, cx)
             {
                 rows.push(self.render_slim_row(&store, thread, Shelf::Snoozed, None, cx));
-            }
-        }
-        rows
-    }
-
-    /// The Chats shelf, first at the bottom while chats are on: its header with New Chat,
-    /// and open, the latest chats a page at a time.
-    fn render_chats_shelf(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if !Machines::chats_enabled(cx) {
-            return Vec::new();
-        }
-        let machines = self.machines.read(cx);
-        let chats = machines.chat_threads(cx);
-        let is_expanded = machines.chats_expanded(cx);
-        let new_chat = IconButton::new("new-chat", IconName::Plus)
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .tooltip(|_, cx| Tooltip::for_action("New Chat", &NewChat, cx))
-            .on_click(|_, window, cx| {
-                cx.stop_propagation();
-                window.dispatch_action(Box::new(NewChat), cx);
-            })
-            .into_any_element();
-        let mut rows = vec![Self::render_shelf_header(
-            "chats-shelf-toggle",
-            "Chats",
-            chats.len(),
-            is_expanded,
-            HeaderTone::Muted,
-            Some(new_chat),
-            |this, cx| {
-                // Kept by this Mac's server, as Archived's is.
-                if let Some(store) = this.store(MachineId::Local, cx) {
-                    store.update(cx, |store, cx| store.toggle_chats_expanded(cx));
-                }
-            },
-            cx,
-        )];
-        if is_expanded {
-            let hidden_count = chats.len().saturating_sub(self.chats_shown);
-            for (machine, thread) in chats.into_iter().take(self.chats_shown) {
-                if let Some(store) = self.store(machine, cx) {
-                    rows.push(self.render_slim_row(&store, thread, Shelf::Chats, None, cx));
-                }
-            }
-            if hidden_count > 0 {
-                rows.push(self.render_show_more(
-                    "show-more-chats",
-                    hidden_count,
-                    |this| this.chats_shown += ARCHIVED_PAGE_COUNT,
-                    cx,
-                ));
             }
         }
         rows
@@ -3436,7 +3346,6 @@ impl Sidebar {
                         working.len(),
                         self.working_expanded,
                         HeaderTone::Muted,
-                        None,
                         |this, cx| {
                             this.working_expanded = !this.working_expanded;
                             cx.notify();
@@ -3516,7 +3425,6 @@ impl Sidebar {
         }
 
         let mut shelf = snoozed_shelf;
-        shelf.extend(self.render_chats_shelf(cx));
         // Terminal threads running no agent CLI. One that starts an agent becomes a thread
         // card, and comes back here when it ends.
         let shells = self.machines.read(cx).shell_threads(cx);
@@ -3527,7 +3435,6 @@ impl Sidebar {
                 shells.len(),
                 self.shells_expanded,
                 HeaderTone::Muted,
-                None,
                 |this, cx| {
                     this.shells_expanded = !this.shells_expanded;
                     cx.notify();
@@ -3552,7 +3459,6 @@ impl Sidebar {
                 workspaces_threads.len(),
                 is_expanded,
                 HeaderTone::Muted,
-                None,
                 |this, cx| {
                     // Kept by this Mac's server, as Archived's is.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -3589,7 +3495,6 @@ impl Sidebar {
                 archived_count,
                 is_archived_expanded,
                 archive_tone.unwrap_or(HeaderTone::Muted),
-                None,
                 |this, cx| {
                     // Kept by this Mac's server, like the thread order.
                     if let Some(store) = this.store(MachineId::Local, cx) {
@@ -4772,46 +4677,63 @@ mod view_tests {
         assert!(shown("thread-card-2", cx));
     }
 
+    /// Chats are cards among the threads, by when they were last active, archived and snoozed
+    /// as threads are. Picking Chats shows only them; turned off, they're hidden everywhere and
+    /// kept.
     #[gpui::test]
-    fn chats_list_in_their_shelf_the_latest_five_first(cx: &mut TestAppContext) {
+    fn chats_are_cards_among_the_threads(cx: &mut TestAppContext) {
         let (sidebar, store, cx) = new_sidebar(cx);
         let shown =
             |name: &'static str, cx: &mut VisualTestContext| cx.debug_bounds(name).is_some();
         let mut project_thread = thread(1, false, None);
         project_thread.last_activity_at = Some(SystemTime::now() - Duration::from_secs(150));
-        let mut threads = vec![project_thread];
-        threads.extend((2..=8).map(|id| chat(id, id)));
-        show(&store, threads, cx);
+        let mut archived = chat(4, 10);
+        archived.archived_at = Some(SystemTime::now());
+        show(
+            &store,
+            vec![project_thread, chat(2, 1), chat(3, 5), archived],
+            cx,
+        );
+        let listed = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let machines = Machines::global(cx).read(cx);
+                let ids = |threads: Vec<(MachineId, Thread)>| {
+                    threads
+                        .into_iter()
+                        .map(|(_, thread)| thread.id.0)
+                        .collect::<Vec<_>>()
+                };
+                (
+                    ids(machines.active_threads(cx)),
+                    ids(machines.archived_threads(cx)),
+                )
+            })
+        };
+        let set_scope = |scope: Scope, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| Machines::set_scope(scope, cx));
+            cx.run_until_parked();
+        };
 
-        // Not among the cards. Open at first, with the five latest and Show 2 more.
+        assert_eq!(listed(cx), (vec![2, 1, 3], vec![4]));
         assert!(shown("thread-card-1", cx));
-        assert!(!shown("thread-card-2", cx));
-        assert!(shown("chats-shelf-toggle", cx));
-        assert!(shown("chat-row-2", cx));
-        assert!(shown("chat-row-6", cx));
-        assert!(!shown("chat-row-7", cx));
-        let show_more = bounds(cx, "show-more-chats").center();
-        cx.simulate_click(show_more, Modifiers::none());
-        assert!(shown("chat-row-8", cx));
+        assert!(shown("thread-card-2", cx));
+        hover_on("thread-card-2", cx);
+        assert!(shown("snooze-thread-2", cx));
 
-        // Search finds them among the threads, by when they were last active.
-        sidebar.update(cx, |sidebar, cx| {
-            sidebar
-                .search
-                .update(cx, |search, cx| search.set_text("Thread", cx))
+        set_scope(Scope::Chats, cx);
+        assert_eq!(listed(cx), (vec![2, 3], vec![4]));
+        assert!(!shown("thread-card-1", cx));
+        assert!(shown("thread-card-2", cx));
+        let key = cx.update(|_, cx| {
+            Machines::global(cx).read(cx).project_groups(cx)[0]
+                .key
+                .clone()
         });
-        cx.run_until_parked();
-        let order: Vec<u64> = sidebar.read_with(cx, |sidebar, cx| {
-            sidebar
-                .search_results(cx)
-                .into_iter()
-                .map(|(_, thread)| thread.id.0)
-                .collect()
-        });
-        assert_eq!(order, vec![2, 1, 3, 4, 5, 6, 7, 8]);
-        assert!(shown("search-result-2", cx));
+        set_scope(Scope::Group(key), cx);
+        assert_eq!(listed(cx), (vec![1], vec![]));
 
-        // Turned off, they're hidden everywhere and kept.
+        // Off, Chats shows every project, without them.
+        set_scope(Scope::Chats, cx);
         let set_chats = |chats: bool, cx: &mut VisualTestContext| {
             cx.update(|_, cx| {
                 crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
@@ -4821,18 +4743,18 @@ mod view_tests {
             cx.run_until_parked();
         };
         set_chats(false, cx);
-        assert!(!shown("search-result-2", cx));
-        assert!(shown("search-result-1", cx));
+        assert_eq!(listed(cx), (vec![1], vec![]));
         sidebar.update(cx, |sidebar, cx| {
             sidebar
                 .search
-                .update(cx, |search, cx| search.set_text("", cx))
+                .update(cx, |search, cx| search.set_text("Thread", cx))
         });
         cx.run_until_parked();
-        assert!(!shown("chats-shelf-toggle", cx));
-        assert!(!shown("chat-row-2", cx));
+        assert!(!shown("search-result-2", cx));
+        assert!(shown("search-result-1", cx));
         set_chats(true, cx);
-        assert!(shown("chat-row-2", cx));
+        assert!(shown("search-result-2", cx));
+        assert_eq!(listed(cx), (vec![2, 3], vec![4]));
     }
 
     #[gpui::test]
@@ -5781,7 +5703,7 @@ pub(crate) fn repository_branch(
     }
 }
 
-/// A folder outside every project, in a slot as wide as a project's icon so names line up.
+/// A chat's icon, in a slot as wide as a project's icon so names line up.
 pub(crate) fn render_chat_icon() -> AnyElement {
     h_flex()
         .size_4()

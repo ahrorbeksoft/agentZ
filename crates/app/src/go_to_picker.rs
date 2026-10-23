@@ -58,33 +58,33 @@ pub struct PlaceEntry {
     pub section: SharedString,
 }
 
-/// The Agents view's threads, then its chats, as its sidebar lists them.
+/// The Agents view's threads, as its sidebar lists them, then the chats among them.
 pub fn thread_places(cx: &App) -> Vec<PlaceEntry> {
     let machines = Machines::global(cx);
     let machines = machines.read(cx);
     let has_remotes = machines.has_remotes();
-    let chats = machines
-        .chat_threads(cx)
-        .into_iter()
-        .map(|(machine, thread)| {
-            let detail = if has_remotes {
-                machines.label(machine, cx)
-            } else {
-                SharedString::default()
-            };
-            PlaceEntry {
-                place: Place::Thread(ThreadKey {
-                    machine,
-                    thread: thread.id,
-                }),
-                icon: PlaceIcon::Icon(thread_agent_icon(machine, &thread, Color::Muted, cx)),
-                label: thread.title.into(),
-                detail,
-                section: "Chats".into(),
-            }
-        });
-    machines
+    let (chats, threads): (Vec<_>, Vec<_>) = machines
         .active_threads(cx)
+        .into_iter()
+        .partition(|(_, thread)| thread.is_chat());
+    let chats = chats.into_iter().map(|(machine, thread)| {
+        let detail = if has_remotes {
+            machines.label(machine, cx)
+        } else {
+            SharedString::default()
+        };
+        PlaceEntry {
+            place: Place::Thread(ThreadKey {
+                machine,
+                thread: thread.id,
+            }),
+            icon: PlaceIcon::Icon(thread_agent_icon(machine, &thread, Color::Muted, cx)),
+            label: thread.title.into(),
+            detail,
+            section: "Chats".into(),
+        }
+    });
+    threads
         .into_iter()
         .map(|(machine, thread)| {
             let project = machines.projects(machine, cx).and_then(|store| {

@@ -1759,8 +1759,8 @@ impl SettingsPage {
         let app_settings = self.app_settings.clone();
         render_row(
             "Chats",
-            "Threads for general conversation, outside every project, in their own group in \
-             the sidebar.",
+            "Threads for general conversation, outside every project. They show among the \
+             threads, with Chat in place of a project.",
             Switch::new("chats", enabled.into())
                 .on_click(move |state, _, cx| {
                     let enabled = *state == ToggleState::Selected;

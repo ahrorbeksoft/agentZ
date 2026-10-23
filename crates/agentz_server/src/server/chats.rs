@@ -1,5 +1,5 @@
-//! Chats: threads outside every project (t3code's threads with no project), listed in the
-//! sidebar's Chats shelf. Each works in a folder of its own in the data directory, named as
+//! Chats: threads outside every project (t3code's threads with no project), listed among the
+//! sidebar's threads with Chat in place of a project. Each works in a folder of its own in the data directory, named as
 //! t3code names them (the date, the first words of its first message and its id), made when
 //! its first message is sent. Until then its agent works in the folder those are made in.
 

@@ -295,7 +295,6 @@ pub enum Request {
     SetThreadOrder(ThreadOrder),
     ToggleArchivedExpanded,
     ToggleWorkspacesExpanded,
-    ToggleChatsExpanded,
 
     /// Answered with [`Response::ThreadCreated`], once its workspace is ready.
     CreateThread {

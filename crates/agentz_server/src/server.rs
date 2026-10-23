@@ -1120,10 +1120,6 @@ impl Server {
                 self.projects.toggle_workspaces_expanded();
                 Ok(Response::Ok)
             }
-            Request::ToggleChatsExpanded => {
-                self.projects.toggle_chats_expanded();
-                Ok(Response::Ok)
-            }
             Request::MoveToAgents(thread_id) => {
                 self.move_to_agents(thread_id)?;
                 Ok(Response::Ok)

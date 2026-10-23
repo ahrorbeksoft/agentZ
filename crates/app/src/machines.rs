@@ -145,6 +145,8 @@ impl ProjectGroupingMode {
 pub enum Scope {
     #[default]
     All,
+    /// Chats only, as if they were a project of their own.
+    Chats,
     Group(GroupKey),
 }
 
@@ -1348,21 +1350,29 @@ impl Machines {
 
     /// The groups the scope shows.
     pub fn visible_groups(&self, cx: &App) -> Vec<ProjectGroup> {
+        self.groups_in(&self.scope(cx), cx)
+    }
+
+    fn groups_in(&self, scope: &Scope, cx: &App) -> Vec<ProjectGroup> {
         let groups = self.project_groups(cx);
-        match self.scope(cx) {
+        match scope {
             Scope::All => groups,
+            Scope::Chats => Vec::new(),
             Scope::Group(key) => groups
                 .into_iter()
-                .filter(|group| group.key == key)
+                .filter(|group| &group.key == key)
                 .collect(),
         }
     }
 
-    /// The scope, or all projects when its project is gone. A project combined or split off
-    /// since keeps its scope, by the group it's in now.
+    /// The scope, or all projects when its project is gone, or chats are while they're off. A
+    /// project combined or split off since keeps its scope, by the group it's in now.
     pub fn scope(&self, cx: &App) -> Scope {
-        let Scope::Group(key) = &AppSettingsStore::global(cx).read(cx).settings().scope else {
-            return Scope::All;
+        let key = match &AppSettingsStore::global(cx).read(cx).settings().scope {
+            Scope::All => return Scope::All,
+            Scope::Chats if Self::chats_enabled(cx) => return Scope::Chats,
+            Scope::Chats => return Scope::All,
+            Scope::Group(key) => key,
         };
         let groups = self.project_groups(cx);
         groups
@@ -1404,14 +1414,6 @@ impl Machines {
             .workspaces_expanded()
     }
 
-    pub fn chats_expanded(&self, cx: &App) -> bool {
-        self.clients[0]
-            .read(cx)
-            .projects()
-            .read(cx)
-            .chats_expanded()
-    }
-
     /// The app's theme for every machine's pages server.
     pub fn push_page_theme(&self, theme: PageTheme, cx: &App) {
         for client in &self.clients {
@@ -1442,12 +1444,19 @@ impl Machines {
     }
 
     /// The artifacts the Artifacts button counts and lists for the picked scope: the picked
-    /// project's threads', or every one, chats' too, under All projects (`design/artifacts-2`,
-    /// topic 1).
+    /// project's threads', chats' under Chats, or every one, chats' too, under All projects
+    /// (`design/artifacts-2`, topic 1).
     pub fn scoped_artifacts(&self, cx: &App) -> Vec<(MachineId, Artifact)> {
         let artifacts = self.artifacts(cx);
-        let Scope::Group(key) = self.scope(cx) else {
-            return artifacts;
+        let key = match self.scope(cx) {
+            Scope::All => return artifacts,
+            Scope::Chats => {
+                return artifacts
+                    .into_iter()
+                    .filter(|(_, artifact)| artifact.is_from_chat())
+                    .collect();
+            }
+            Scope::Group(key) => key,
         };
         let Some(group) = self.group(&key, cx) else {
             return Vec::new();
@@ -1515,41 +1524,29 @@ impl Machines {
         AppSettingsStore::global(cx).read(cx).settings().chats
     }
 
-    /// Every machine's chats for the Chats shelf, while chats are on: the pinned ones in the
-    /// order the user gave them, then the rest in the thread order. Drafts and subthreads
-    /// aren't listed.
-    pub fn chat_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
-        if !Self::chats_enabled(cx) {
-            return Vec::new();
-        }
-        let mut threads = self.threads_where(cx, |_, thread| {
-            thread.is_chat() && thread.task.is_none() && !thread.is_draft
-        });
-        let order = self.thread_order(cx);
-        threads.sort_by(|(a_machine, a), (b_machine, b)| {
-            let placement = match (a.is_pinned(), b.is_pinned()) {
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                (true, true) => order_key::compare(
-                    (a.pin_order_key.as_deref(), a.pinned_at),
-                    (b.pin_order_key.as_deref(), b.pinned_at),
-                    false,
-                ),
-                (false, false) => match order {
-                    ThreadOrder::LastActivity => {
-                        return by_latest_activity((*a_machine, a), (*b_machine, b));
-                    }
-                    ThreadOrder::Created => b
-                        .created_at
-                        .or(b.last_activity_at)
-                        .cmp(&a.created_at.or(a.last_activity_at)),
-                },
-            };
-            placement
-                .then(b_machine.cmp(a_machine))
-                .then(b.id.cmp(&a.id))
-        });
-        threads
+    /// Every machine's chats the Chats entry counts: those among the threads.
+    pub fn chat_count(&self, cx: &App) -> usize {
+        self.threads_where(cx, |_, thread| {
+            thread.is_chat()
+                && thread.archived_at.is_none()
+                && thread.task.is_none()
+                && !thread.is_draft
+        })
+        .len()
+    }
+
+    /// The most pressing status among every machine's chats.
+    pub fn chats_status(&self, cx: &App) -> Option<ThreadStatus> {
+        self.clients
+            .iter()
+            .filter_map(|client| {
+                client
+                    .read(cx)
+                    .projects()
+                    .read(cx)
+                    .project_status(ProjectId::CHATS)
+            })
+            .max()
     }
 
     /// Unarchived top-level threads of the visible projects: the pinned ones in the order the
@@ -1557,14 +1554,15 @@ impl Machines {
     /// active first. Shells aren't threads until an agent CLI runs in them, nor drafts until
     /// their first message.
     pub fn active_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
-        let groups = self.visible_groups(cx);
+        let scope = self.scope(cx);
+        let groups = self.groups_in(&scope, cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !thread.is_draft
                 && !thread.in_workspaces()
                 && !self.is_shell(machine, thread, cx)
-                && self.is_thread_visible(&groups, machine, thread, cx)
+                && self.is_thread_visible(&scope, &groups, machine, thread, cx)
         });
         let order = self.thread_order(cx);
         threads.sort_by(|(a_machine, a), (b_machine, b)| {
@@ -1658,14 +1656,15 @@ impl Machines {
     /// Drafts of the visible projects with something typed in them, newest first: the
     /// sidebar lists them above the threads, as t3code does.
     pub fn typed_drafts(&self, cx: &App) -> Vec<(MachineId, Thread)> {
-        let groups = self.visible_groups(cx);
+        let scope = self.scope(cx);
+        let groups = self.groups_in(&scope, cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.is_draft
                 && thread.unsent_text.is_some()
                 && thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !thread.in_workspaces()
-                && self.is_thread_visible(&groups, machine, thread, cx)
+                && self.is_thread_visible(&scope, &groups, machine, thread, cx)
         });
         threads.sort_by_key(|(_, thread)| std::cmp::Reverse((thread.created_at, thread.id)));
         threads
@@ -1674,13 +1673,14 @@ impl Machines {
     /// Threads started in a workspace pane, latest active first, for the sidebar's Workspaces
     /// section: under a project, those whose folder is in it.
     pub fn workspaces_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
-        let groups = self.visible_groups(cx);
+        let scope = self.scope(cx);
+        let groups = self.groups_in(&scope, cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.in_workspaces()
                 && thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !thread.is_draft
-                && self.is_thread_visible(&groups, machine, thread, cx)
+                && self.is_thread_visible(&scope, &groups, machine, thread, cx)
         });
         threads.sort_by_key(|(_, thread)| {
             std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
@@ -1691,13 +1691,14 @@ impl Machines {
     /// Unarchived terminal threads of the visible projects running no agent CLI, latest active
     /// first, for the sidebar's Shells shelf.
     pub fn shell_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
-        let groups = self.visible_groups(cx);
+        let scope = self.scope(cx);
+        let groups = self.groups_in(&scope, cx);
         let mut threads = self.threads_where(cx, |machine, thread| {
             thread.archived_at.is_none()
                 && thread.task.is_none()
                 && !thread.in_workspaces()
                 && self.is_shell(machine, thread, cx)
-                && self.is_thread_visible(&groups, machine, thread, cx)
+                && self.is_thread_visible(&scope, &groups, machine, thread, cx)
         });
         threads.sort_by_key(|(_, thread)| {
             std::cmp::Reverse(thread.last_activity_at.or(thread.created_at))
@@ -1728,20 +1729,28 @@ impl Machines {
     }
 
     /// Whether the scope's groups show the thread. One in no project shows with all
-    /// projects.
+    /// projects, and a chat with all projects or under Chats.
     fn is_thread_visible(
         &self,
+        scope: &Scope,
         groups: &[ProjectGroup],
         machine: MachineId,
         thread: &Thread,
         cx: &App,
     ) -> bool {
+        if thread.is_chat() {
+            return Self::shows_chats(scope, cx);
+        }
         match self.thread_project(machine, thread, cx) {
             Some(project_id) => groups
                 .iter()
                 .any(|group| group.contains(machine, project_id)),
-            None => self.scope(cx) == Scope::All,
+            None => *scope == Scope::All,
         }
+    }
+
+    fn shows_chats(scope: &Scope, cx: &App) -> bool {
+        Self::chats_enabled(cx) && matches!(scope, Scope::All | Scope::Chats)
     }
 
     /// A terminal thread with no agent CLI running in it.
@@ -1752,7 +1761,8 @@ impl Machines {
                 .is_none_or(|store| store.read(cx).terminal_agent(thread.id).is_none())
     }
 
-    /// Archived top-level threads of every project, most recently archived first.
+    /// Archived top-level threads of the visible projects, and chats while the scope shows them,
+    /// most recently archived first.
     pub fn archived_threads(&self, cx: &App) -> Vec<(MachineId, Thread)> {
         self.archived_page(usize::MAX, cx).1
     }
@@ -1761,7 +1771,9 @@ impl Machines {
     /// draws a page of them, and only while it's open, so the rest aren't cloned on every
     /// frame.
     pub fn archived_page(&self, limit: usize, cx: &App) -> (usize, Vec<(MachineId, Thread)>) {
-        let groups = self.visible_groups(cx);
+        let scope = self.scope(cx);
+        let groups = self.groups_in(&scope, cx);
+        let shows_chats = Self::shows_chats(&scope, cx);
         let mut threads: Vec<(MachineId, &Thread)> = Vec::new();
         for client in &self.clients {
             let client = client.read(cx);
@@ -1775,9 +1787,13 @@ impl Machines {
                     .filter(|thread| {
                         thread.archived_at.is_some()
                             && thread.task.is_none()
-                            && groups
-                                .iter()
-                                .any(|group| group.contains(machine, thread.project_id))
+                            && if thread.is_chat() {
+                                shows_chats
+                            } else {
+                                groups
+                                    .iter()
+                                    .any(|group| group.contains(machine, thread.project_id))
+                            }
                     })
                     .map(|thread| (machine, thread)),
             );

@@ -310,8 +310,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   names them ("workspaces: split right") with their keys. A list's and a text field's own
   keys (`menu`, `text_input`) are left out. The chosen one runs where the palette was opened.
 - **Go To** (`go_to_picker.rs`; `SpacesView::places`, `go_to_picker::thread_places`): Cmd-P
-  lists the workspaces, tabs and panes, and the Agents view's threads and chats, the view on screen's
-  first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
+  lists the workspaces, tabs and panes, and the Agents view's threads, with its chats after
+  them under Chats, the view on screen's first, filtered by name or where they are (a pane's workspace and tab). Choosing one shows
   it in its view and focuses it. The palette, Go To, the shortcut sheet, Save Layout and Custom
   snooze are the shell's overlays (`Shell::overlay`): each one's key closes it, one replaces another, and
   focus goes back to what had it.
@@ -329,7 +329,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   in the form Zed's telemetry sends, with when it was logged. Nothing is sent anywhere.
 - **Projects** (`project_store.rs`, `project_switcher.rs`, `project_info.rs`,
   `add_project_modal.rs`): several projects with an "All projects" scope, custom names and icons,
-  favicons or monograms, git branches. The switcher is Zed's recent-projects popover. Each
+  favicons or monograms, git branches. The switcher is Zed's recent-projects popover. While
+  chats are on, Chats comes second, under All projects (`design/chats-2` topic 2 A): the chat
+  icon, "Chats", how many and the most urgent chat's dot, with no gear, found by search as a
+  project is (`Scope::Chats`, `Machines::{chat_count, chats_status}`). Picked, the title
+  bar's button reads "Chats" with the chat icon. Each
   machine's server reads the branch checked out in its projects' folders, worktrees and pastures
   and Workspaces threads' folders every 5 seconds and when a new one appears
   (`Server::refresh_git_heads`, `repositories::read_git_head`), and sends them with the
@@ -424,7 +428,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   minutes, and archives (`ProjectStore::stale_threads`) the agent threads in the thread list
   whose last activity (or creation) is older than that, unless pinned, working, blocked,
   awaiting input or waiting, open in some client, or with something for their agent to do.
-  Chats, Workspaces threads, drafts, subthreads and terminal threads are never archived.
+  Workspaces threads, drafts, subthreads and terminal threads are never archived.
 - **Subthreads at once** (`AppSettings::subthread_limit`, Settings › Subthreads, a
   stepper from 1 to 16, 4 by default, `DEFAULT_SUBTHREAD_LIMIT`;
   `agentz_server::server::subthread_limit`): sent to every server as auto-archive's days are
@@ -483,14 +487,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   a thread of the project its folder is in, still working there, and outside every project
   first asks "Add “~/docs” as a project?". Search finds them, and labels them and archived
   threads in faint text.
-- **Chats shelf** (`Sidebar::render_chats_shelf`, `Machines::chat_threads`; `design/chats/`
-  topics 1 to 4): every machine's chats (see Chats), the first shelf at the bottom, with a +
-  for New Chat on its header. It starts open and is remembered by this Mac's server
-  (`Request::ToggleChatsExpanded`), showing the five latest, then Show N more. A row is one
-  line, as Archived's: the chat icon, the title and its last activity, muted, except a chat
-  that's working or waiting for the user, at full strength with its state's dot. Pinned ones
-  lead. The row menu is Pin, Rename and Delete…: chats aren't archived. Search lists chats
-  among the threads, by last activity, with the chat icon.
+- **Chat cards** (`sidebar.rs`, `Machines::is_thread_visible`; `design/chats-2` topics 1, 3
+  and 4, all A): every machine's chats (see Chats) are cards among the threads, in the thread
+  order, under All projects and under Chats. Under All projects the chat icon and "Chat" are
+  where a thread has its project, and the last line has no branch, only the machine and agent
+  icons. Under Chats, the only cards, that line goes as a project's does under it, and the +
+  and Cmd-N start a chat (`Shell::new_thread`). They're pinned, arranged, snoozed and
+  archived as threads are (the menu has no Project Settings), auto-archive takes them, and
+  Archived lists them with the chat icon, only them under Chats.
 - **Settings** (`settings_page.rs`, t3code's layout; `design/settings-2` topic 1 A): the
   sidebar's pages sit under small muted headings (`render_nav_heading`). agentZ: General
   (combining repositories, start at login, Experimental), Appearance (Zed's theme modes, a
@@ -1301,7 +1305,7 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   the same buttons. A fork has its source's title in a pill before the changes, opening Open
   Source Thread and Merge Back (below). A Workspaces thread has its folder (icon and name, the path in its
   tooltip) where the project goes, and no Archive. A chat has Chat there (a click starts
-  another), and only "⋯" at the right: no branch, changes or Terminal, and no Archive.
+  another), and only "⋯" at the right: no branch, changes or Terminal.
 - **Open in Editor** (`open_in_editor.rs`, `agentz_protocol::editors`, `agentz_server::editors`;
   t3code's OpenInPicker and `launchEditor`; design round `design/open-in-editor/`, 1 A, 2 B,
   3 C, 4 B): an outlined split button before the changes, ⌘⇧O (⌘O is Open Folder; also File
@@ -1873,13 +1877,14 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
 Threads for general conversation, outside every project: t3code's threads without a project,
 as picked in `design/chats/`.
 
-- **What a chat is** (`ProjectId::CHATS`, `Thread::is_chat`, `ProjectStore::chats`): a thread
-  under a reserved project id that no project list shows, so it has everything a thread has
-  (agents, accounts, models, images, queued messages, subthreads). It can be pinned, but not
-  archived. The Chats shelf lists them (see Window, sidebar and settings).
+- **What a chat is** (`ProjectId::CHATS`, `Thread::is_chat`): a thread under a reserved
+  project id that no project list shows, so it has everything a thread has (agents, accounts,
+  models, images, queued messages, subthreads). It's pinned, snoozed and archived as a thread
+  is, and listed among the threads, with Chats in the project picker to show only them (see
+  Chat cards and Projects).
 - **Starting one** (`Shell::new_chat`, the `NewChat` action on Cmd-Alt-N and in the command
-  palette; `new_thread_modal.rs`): also the shelf's +, Chat first in New thread in…, and the
-  new thread headline's menu and "or start a chat" (see New Thread). New Chat starts on this
+  palette; `new_thread_modal.rs`): also the + and Cmd-N while Chats is picked, Chat first in
+  New thread in…, and the new thread headline's menu and "or start a chat" (see New Thread). New Chat starts on this
   machine; a draft made a chat stays on its machine.
 - **The new chat screen**: "What do you want to talk about?", and under the composer the
   machine (`AgentView::render_chat_machine_picker`: every machine, while there are several)
@@ -1900,8 +1905,10 @@ as picked in `design/chats/`.
   diffs and workspaces, and delegated tasks, terminals and commands in its own folder; nothing
   that starts or changes a project's thread. On other machines, through the app, only the
   reading ones (`CHAT_RELAYED_TOOLS`, run there as `ToolCaller::RelayedChat`).
-- **The setting** (`AppSettings::chats`, Settings › Threads › Chats, on by default): while
-  it's off, the Chats shelf, New Chat, Chat in the pickers and chats in search and Go To are
+- **The setting** (`AppSettings::chats`, Settings › Threads › Chats, on by default; "Threads
+  for general conversation, outside every project. They show among the threads, with Chat in
+  place of a project."): while it's off, chats' cards, Chats in the project picker (a picked
+  one shows all projects), New Chat, Chat in the pickers and chats in search and Go To are
   gone. Chats are kept, and one that's working finishes its turn.
 
 ### Artifacts
@@ -2024,8 +2031,8 @@ Claude Code's artifacts, kept on each machine, as picked in `design/artifacts/` 
   Export… saves the source where the user picks.
 - **The Artifacts button** (`Shell::render_artifacts_button`, `artifacts_list.rs`;
   `design/artifacts-2` topics 1 and 2): after the project picker, once anything has been
-  published, "Artifacts" and the count: the picked project's, or every one, chats' too, under
-  All projects (`Machines::scoped_artifacts`). It opens a list like the picker's: a search
+  published, "Artifacts" and the count: the picked project's, chats' under Chats, or every
+  one, chats' too, under All projects (`Machines::scoped_artifacts`). It opens a list like the picker's: a search
   (titles, and the thread's title), All · Documents · Designs, and the rows grouped by the
   thread they came from ("Chat · …", the project first under All, "· Archived", "From a
   deleted thread"), each with its kind, title and a design's state ("Waiting for you", "2 of 3

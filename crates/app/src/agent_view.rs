@@ -5011,11 +5011,11 @@ impl AgentView {
         } else {
             self.is_archived
         };
-        // Workspaces threads and chats aren't archived.
+        // Workspaces threads aren't archived.
         let can_archive = store
             .read(cx)
             .thread(thread_id)
-            .is_some_and(|thread| !thread.in_workspaces() && !thread.is_chat());
+            .is_some_and(|thread| !thread.in_workspaces());
         // A draft has no conversation to title from.
         let is_draft = self.is_draft(cx);
         let title = self.header_title(cx);

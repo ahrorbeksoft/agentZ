@@ -8958,12 +8958,14 @@ async fn chats_work_in_their_own_folder_and_read_every_project() {
     assert!(text.contains("hello there"), "{text}");
 
     client.ok(Request::ArchiveThread(chat)).await;
-    assert!(
-        client
-            .project_thread(chat)
-            .is_some_and(|chat| chat.archived_at.is_none()),
-        "chats aren't archived"
-    );
+    client
+        .wait_until(|client| {
+            client
+                .project_thread(chat)
+                .is_some_and(|chat| chat.archived_at.is_some())
+        })
+        .await;
+    assert!(folder.is_dir(), "an archived chat keeps its folder");
     client.ok(Request::DeleteThread(chat)).await;
     tokio::time::timeout(TIMEOUT, async {
         while folder.exists() {

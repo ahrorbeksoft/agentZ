@@ -153,7 +153,7 @@ impl ArtifactsList {
                 Some(group) => format!("Search {}’s artifacts…", group.name()),
                 None => "Search artifacts…".to_string(),
             },
-            Scope::All => "Search artifacts…".to_string(),
+            Scope::All | Scope::Chats => "Search artifacts…".to_string(),
         };
         let search = cx.new(|cx| TextInput::new(placeholder, cx));
         let subscriptions = vec![
@@ -320,7 +320,7 @@ impl ArtifactsList {
         let machines = self.machines.read(cx);
         let project = match machines.scope(cx) {
             Scope::Group(key) => machines.group(&key, cx).map(|group| group.name()),
-            Scope::All => None,
+            Scope::All | Scope::Chats => None,
         };
         if let Some(link) = machines.artifacts_home_link(project.as_deref(), cx) {
             cx.open_url(&link);

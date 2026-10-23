@@ -31,7 +31,7 @@ impl ProjectId {
     /// Each works in its [`Thread::workspace`], any folder on its machine.
     pub const WORKSPACES: ProjectId = ProjectId(u64::MAX);
     /// Where chats belong (t3code's threads with no project): conversations outside every
-    /// project, listed in the sidebar's Chats shelf. Each works in a folder of its own in the
+    /// project, listed among the sidebar's threads. Each works in a folder of its own in the
     /// data directory, made with its first message ([`ProjectStore::set_chats_folder`]).
     pub const CHATS: ProjectId = ProjectId(u64::MAX - 1);
 }
@@ -512,7 +512,7 @@ impl Thread {
         self.project_id == ProjectId::WORKSPACES
     }
 
-    /// A chat ([`ProjectId::CHATS`]), listed in the Chats shelf.
+    /// A chat ([`ProjectId::CHATS`]): a thread outside every project, listed among the rest.
     pub fn is_chat(&self) -> bool {
         self.project_id == ProjectId::CHATS
     }
@@ -521,18 +521,16 @@ impl Thread {
         self.pinned_at.is_some()
     }
 
-    /// Listed among the threads, where the user can arrange it: not a subthread, a draft, a
-    /// Workspaces thread or a chat, which have places of their own.
+    /// Listed among the threads, where the user can arrange it: not a subthread, a draft or a
+    /// Workspaces thread, which have places of their own.
     pub fn can_arrange(&self) -> bool {
-        self.task.is_none() && !self.is_draft && !self.in_workspaces() && !self.is_chat()
+        self.task.is_none() && !self.is_draft && !self.in_workspaces()
     }
 
-    /// An agent thread the user can pin: one among the threads, or a chat, which leads the
-    /// Chats shelf while pinned. Terminal threads aren't: a shell can't, and an agent CLI
-    /// running in one only arranges among the rest.
+    /// An agent thread among the threads, which the user can pin. Terminal threads aren't: a
+    /// shell can't, and an agent CLI running in one only arranges among the rest.
     pub fn can_pin(&self) -> bool {
-        let is_listed_chat = self.is_chat() && self.task.is_none() && !self.is_draft;
-        (self.can_arrange() || is_listed_chat) && self.terminal.is_none()
+        self.can_arrange() && self.terminal.is_none()
     }
 
     /// An agent thread among the threads, which the user can snooze as they can archive it.
@@ -751,7 +749,6 @@ pub struct ProjectsSnapshot {
     pub thread_order: ThreadOrder,
     pub archived_expanded: bool,
     pub workspaces_expanded: bool,
-    pub chats_collapsed: bool,
     pub working_threads: Vec<ThreadId>,
     /// Threads waiting for the user to answer a permission request.
     pub blocked_threads: Vec<ThreadId>,
@@ -847,7 +844,6 @@ impl ProjectsSnapshot {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
-            chats_collapsed: self.chats_collapsed,
             working_threads: self.working_threads.clone(),
             blocked_threads: self.blocked_threads.clone(),
             awaiting_input_threads: self.awaiting_input_threads.clone(),
@@ -931,8 +927,6 @@ struct PersistedState {
     archived_expanded: bool,
     #[serde(default)]
     workspaces_expanded: bool,
-    #[serde(default)]
-    chats_collapsed: bool,
 }
 
 pub struct ProjectStore {
@@ -945,8 +939,6 @@ pub struct ProjectStore {
     archived_expanded: bool,
     /// Whether the sidebar's Workspaces section is open.
     workspaces_expanded: bool,
-    /// Whether the sidebar's Chats shelf is closed. It starts open.
-    chats_collapsed: bool,
     /// Where a chat works until its first message makes its own folder: the folder those are
     /// made in. Set by the server, which knows its data directory. Not persisted.
     chats_folder: Option<PathBuf>,
@@ -1001,7 +993,6 @@ impl ProjectStore {
             thread_order: state.thread_order,
             archived_expanded: state.archived_expanded,
             workspaces_expanded: state.workspaces_expanded,
-            chats_collapsed: state.chats_collapsed,
             chats_folder: None,
             working_threads: HashSet::default(),
             blocked_threads: HashSet::default(),
@@ -1093,15 +1084,6 @@ impl ProjectStore {
         self.changed();
     }
 
-    pub fn chats_expanded(&self) -> bool {
-        !self.chats_collapsed
-    }
-
-    pub fn toggle_chats_expanded(&mut self) {
-        self.chats_collapsed = !self.chats_collapsed;
-        self.changed();
-    }
-
     /// Where chats' own folders are made, and where a chat works until it has one.
     pub fn set_chats_folder(&mut self, folder: PathBuf) {
         self.chats_folder = Some(folder);
@@ -1109,27 +1091,6 @@ impl ProjectStore {
 
     pub fn chats_folder(&self) -> Option<&Path> {
         self.chats_folder.as_deref()
-    }
-
-    /// The chats listed in the Chats shelf, in the current [`ThreadOrder`] with the pinned ones
-    /// first. Drafts and subthreads aren't listed.
-    pub fn chats(&self) -> Vec<&Thread> {
-        let mut chats: Vec<&Thread> = self
-            .threads
-            .iter()
-            .filter(|thread| thread.is_chat() && thread.task.is_none() && !thread.is_draft)
-            .collect();
-        match self.thread_order {
-            ThreadOrder::LastActivity => chats.sort_by(|a, b| {
-                b.last_activity_at
-                    .cmp(&a.last_activity_at)
-                    .then(b.id.cmp(&a.id))
-            }),
-            ThreadOrder::Created => chats.sort_by_key(|thread| std::cmp::Reverse(thread.id)),
-        }
-        // Stable, so each part keeps the order above.
-        chats.sort_by_key(|thread| !thread.is_pinned());
-        chats
     }
 
     /// Unarchived threads of every visible project, in the current [`ThreadOrder`].
@@ -1522,11 +1483,9 @@ impl ProjectStore {
         threads
     }
 
-    /// Chats aren't archived: they're kept in the Chats shelf until deleted.
     pub fn archive_thread(&mut self, id: ThreadId) {
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id)
             && thread.archived_at.is_none()
-            && !thread.is_chat()
         {
             thread.archived_at = Some(SystemTime::now());
             // As t3code's settling does, so a thread brought back starts over among the rest,
@@ -2415,7 +2374,6 @@ impl ProjectStore {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
-            chats_collapsed: self.chats_collapsed,
             working_threads,
             blocked_threads,
             awaiting_input_threads,
@@ -2470,7 +2428,6 @@ impl ProjectStore {
                 thread_order: snapshot.thread_order,
                 archived_expanded: snapshot.archived_expanded,
                 workspaces_expanded: snapshot.workspaces_expanded,
-                chats_collapsed: snapshot.chats_collapsed,
             },
             None,
         );
@@ -2526,7 +2483,6 @@ impl ProjectStore {
             thread_order: self.thread_order,
             archived_expanded: self.archived_expanded,
             workspaces_expanded: self.workspaces_expanded,
-            chats_collapsed: self.chats_collapsed,
         });
     }
 }
@@ -3262,59 +3218,57 @@ mod tests {
     }
 
     #[test]
-    fn chats_are_kept_apart_from_projects_and_never_archived() {
+    fn chats_are_kept_apart_from_projects_and_archived_like_threads() {
         let dir = tempfile::tempdir().expect("temp dir");
         let state_path = dir.path().join("state.json");
         let chats_folder = dir.path().join("chats");
         let mut store = ProjectStore::load(Some(state_path.clone()));
         store.set_chats_folder(chats_folder.clone());
-        let project = store.add_project(dir.path().join("storefront"));
-        let thread = store
-            .add_thread(project, "Fix the cart", None)
-            .expect("thread");
-        let older = store
+        let chat = store
             .add_thread(ProjectId::CHATS, "Async Rust", None)
-            .expect("chat");
-        let newer = store
-            .add_thread(ProjectId::CHATS, "Trip ideas", None)
             .expect("chat");
         let draft = store
             .add_thread(ProjectId::CHATS, NEW_THREAD_TITLE, None)
             .expect("chat");
         store.set_draft(draft, true);
 
-        assert!(store.thread(older).is_some_and(Thread::is_chat));
-        assert_eq!(
-            store
-                .active_threads()
-                .iter()
-                .map(|t| t.id)
-                .collect::<Vec<_>>(),
-            vec![thread],
-            "not among the threads"
+        assert!(store.thread(chat).is_some_and(Thread::is_chat));
+        assert!(store.thread(chat).is_some_and(Thread::can_arrange));
+        assert!(
+            !store.thread(draft).is_some_and(Thread::can_arrange),
+            "drafts aren't listed"
         );
-        let chats = |store: &ProjectStore| store.chats().iter().map(|t| t.id).collect::<Vec<_>>();
-        assert_eq!(chats(&store), vec![newer, older], "drafts aren't listed");
 
         // Until its first message, a chat works where its folder will be made.
-        assert_eq!(store.thread_folder(older), Some(chats_folder.clone()));
+        assert_eq!(store.thread_folder(chat), Some(chats_folder.clone()));
         let own = chats_folder.join("2026-01-01-async-rust-1");
-        store.set_thread_workspace(older, Some(own.clone()));
-        assert_eq!(store.thread_folder(older), Some(own));
+        store.set_thread_workspace(chat, Some(own.clone()));
+        assert_eq!(store.thread_folder(chat), Some(own));
 
-        store.archive_thread(older);
-        assert!(store.thread(older).is_some_and(|t| t.archived_at.is_none()));
-        assert!(store.thread(older).is_some_and(Thread::can_pin));
-        store.pin_thread(older, None).expect("pin");
-        assert_eq!(chats(&store), vec![older, newer], "pinned ones lead");
+        let in_an_hour = SystemTime::now() + Duration::from_secs(3600);
+        store.snooze_thread(chat, in_an_hour).expect("snooze");
+        store.pin_thread(chat, None).expect("pin");
+        store.archive_thread(chat);
+        let archived = |store: &ProjectStore| {
+            store
+                .archived_threads()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(archived(&store), vec![chat]);
+        assert!(
+            store
+                .thread(chat)
+                .is_some_and(|t| !t.is_pinned() && t.snoozed_until.is_none())
+        );
 
-        // They outlive a restart, and so does a closed shelf, which starts open.
-        assert!(store.chats_expanded());
-        store.toggle_chats_expanded();
+        // It outlives a restart, archived, and comes back as a thread does.
         drop(store);
-        let store = ProjectStore::load(Some(state_path));
-        assert_eq!(chats(&store), vec![older, newer]);
-        assert!(!store.chats_expanded());
+        let mut store = ProjectStore::load(Some(state_path));
+        assert_eq!(archived(&store), vec![chat]);
+        store.unarchive_thread(chat);
+        assert!(archived(&store).is_empty());
     }
 
     #[test]
@@ -3355,16 +3309,16 @@ mod tests {
             .last_activity_at = Some(long_ago);
         let recent = store.add_thread(project, "Just now", None).expect("thread");
 
-        assert_eq!(store.stale_threads(cutoff), vec![stale]);
+        assert_eq!(store.stale_threads(cutoff), vec![stale, chat]);
         assert!(store.thread(recent).is_some());
         store.set_thread_working(working, false);
-        assert_eq!(store.stale_threads(cutoff), vec![stale], "just worked");
-        assert!(
-            store.snooze_thread(chat, in_an_hour).is_err(),
-            "chats aren't snoozed"
+        assert_eq!(
+            store.stale_threads(cutoff),
+            vec![stale, chat],
+            "just worked"
         );
         store.wake_thread(snoozed);
-        assert_eq!(store.stale_threads(cutoff), vec![stale], "just woken");
+        assert_eq!(store.stale_threads(cutoff), vec![stale, chat], "just woken");
     }
 
     #[test]

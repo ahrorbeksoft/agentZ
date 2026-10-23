@@ -1,6 +1,6 @@
 //! The project picker behind the title bar's project button, modeled on Zed's recent-projects
-//! popover: search, "All projects", the projects with their icons, and Add Project. With other
-//! machines, projects are listed under their machine, and combined ones above them.
+//! popover: search, "All projects", Chats, the projects with their icons, and Add Project. With
+//! other machines, projects are listed under their machine, and combined ones above them.
 
 use std::rc::Rc;
 
@@ -17,10 +17,11 @@ use ui::{
 
 use crate::OpenFolder;
 use crate::project_info::render_project_icon;
-use crate::sidebar::render_status_dot;
+use crate::sidebar::{render_chat_icon, render_status_dot};
 
 const KEY_CONTEXT: &str = "ProjectSwitcher";
 const ALL_PROJECTS_LABEL: &str = "All projects";
+const CHATS_LABEL: &str = "Chats";
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -34,6 +35,7 @@ pub fn init(cx: &mut App) {
 #[derive(Clone, PartialEq)]
 enum Entry {
     AllProjects,
+    Chats,
     Project(GroupKey),
 }
 
@@ -41,6 +43,7 @@ impl Entry {
     fn scope(&self) -> Scope {
         match self {
             Entry::AllProjects => Scope::All,
+            Entry::Chats => Scope::Chats,
             Entry::Project(key) => Scope::Group(key.clone()),
         }
     }
@@ -98,6 +101,7 @@ impl ProjectSwitcher {
         this.update_entries(cx);
         let current = match this.machines.read(cx).scope(cx) {
             Scope::All => Entry::AllProjects,
+            Scope::Chats => Entry::Chats,
             Scope::Group(key) => Entry::Project(key),
         };
         if let Some(index) = this.entries.iter().position(|entry| *entry == current) {
@@ -115,6 +119,13 @@ impl ProjectSwitcher {
         let mut match_positions = Vec::new();
         if let Some(positions) = fuzzy_match(&query, ALL_PROJECTS_LABEL) {
             entries.push(Entry::AllProjects);
+            sections.push(SharedString::default());
+            match_positions.push(positions);
+        }
+        if Machines::chats_enabled(cx)
+            && let Some(positions) = fuzzy_match(&query, CHATS_LABEL)
+        {
+            entries.push(Entry::Chats);
             sections.push(SharedString::default());
             match_positions.push(positions);
         }
@@ -266,6 +277,26 @@ impl ProjectSwitcher {
                         .children(check),
                 )
                 .into_any_element()
+            }
+            Entry::Chats => {
+                let detail = match machines.chat_count(cx) {
+                    1 => "1 chat".to_string(),
+                    count => format!("{count} chats"),
+                };
+                let status = machines
+                    .chats_status(cx)
+                    .map(|status| render_status_dot(status, cx));
+                item.start_slot(render_chat_icon())
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(HighlightedLabel::new(CHATS_LABEL, positions))
+                            .child(Label::new(detail).color(Color::Muted))
+                            .children(status)
+                            .children(check),
+                    )
+                    .into_any_element()
             }
             Entry::Project(key) => {
                 let Some(group) = machines.group(&key, cx) else {
@@ -510,9 +541,75 @@ mod view_tests {
     use gpui::TestAppContext;
     use projects::{Project, ProjectId, ProjectsSnapshot, RepositoryIdentity};
 
-    use super::ProjectSwitcher;
+    use super::{Entry, ProjectSwitcher};
     use crate::machines::{MachineId, Machines, Scope};
     use crate::server_client::ServerClient;
+
+    /// While chats are on, Chats comes second, under All projects, and picking it shows only
+    /// chats. Off, it's gone, and a picked Chats shows every project.
+    #[gpui::test]
+    fn chats_come_second_and_show_only_chats(cx: &mut TestAppContext) {
+        use gpui::AppContext as _;
+
+        cx.update(|cx| {
+            crate::init_for_test(cx);
+            let client = ServerClient::new_for_test(
+                MachineId::Local,
+                "This Mac".into(),
+                SpacesSnapshot::default(),
+                cx,
+            );
+            client.update(cx, |client, cx| client.set_online_for_test(cx));
+            let projects = client.read(cx).projects().clone();
+            projects.update(cx, |store, cx| {
+                store.set_snapshot(
+                    ProjectsSnapshot {
+                        projects: vec![Project {
+                            id: ProjectId(1),
+                            path: "/work/agentZ".into(),
+                            custom_name: None,
+                            icon: None,
+                            workspaces: Vec::new(),
+                            repository: None,
+                        }],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            crate::machines::init_for_test(vec![client], cx);
+        });
+        let (switcher, cx) =
+            cx.add_window_view(|window, cx| ProjectSwitcher::new(|_, _, _| {}, window, cx));
+        cx.run_until_parked();
+        switcher.read_with(cx, |switcher, _| {
+            assert!(matches!(
+                switcher.entries.as_slice(),
+                [Entry::AllProjects, Entry::Chats, Entry::Project(_)]
+            ))
+        });
+        cx.dispatch_action(menu::SelectNext);
+        cx.dispatch_action(menu::Confirm);
+        let scope = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| Machines::global(cx).read(cx).scope(cx))
+        };
+        assert_eq!(scope(cx), Scope::Chats);
+
+        cx.update(|_, cx| {
+            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
+                store.update(|settings| settings.chats = false, cx)
+            })
+        });
+        assert_eq!(scope(cx), Scope::All);
+        let switcher =
+            cx.update(|window, cx| cx.new(|cx| ProjectSwitcher::new(|_, _, _| {}, window, cx)));
+        switcher.read_with(cx, |switcher, _| {
+            assert!(matches!(
+                switcher.entries.as_slice(),
+                [Entry::AllProjects, Entry::Project(_)]
+            ))
+        });
+    }
 
     /// A project on several machines shows each one's icon, named in its tooltip, where it
     /// used to name them all.

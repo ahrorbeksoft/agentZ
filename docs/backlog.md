@@ -29,10 +29,3 @@ artifact moves with its thread when the thread goes on on another machine. Nothi
 thread to another machine yet (Continue with Another Agent, workspace handoff and the limit
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
-
-
-### Redesign chats
-
-Requested October 23, 2026: redesign chats. They don't need their own grouping any more: a chat
-should be just like any other thread, but show "Chat" or something like it in place of a
-project name. In the project selector, it should be possible to select Chat to show only chats.
