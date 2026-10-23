@@ -1,0 +1,49 @@
+{
+  "topics": {
+    "parent-working": {
+      "pick": "B",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "sidebar-rows": {
+      "pick": "E",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "E": "just show the completed ones at bottom, that's it, i guesss we don't need completed grouping"
+      },
+      "note": "",
+      "also": []
+    },
+    "hundreds": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "subthread-bars": {
+      "pick": "D",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "shells": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "C": "show in a popover or something not in this"
+      },
+      "note": "",
+      "also": []
+    }
+  },
+  "updated": "2026-10-23T05:41:36.485Z"
+}

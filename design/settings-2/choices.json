@@ -1,0 +1,54 @@
+{
+  "topics": {
+    "organize": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "",
+      "also": []
+    },
+    "all-machines": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "C": "maybe use defaults or something use general settings or something \"use all machines\" feel awkward"
+      },
+      "note": "",
+      "also": [
+        "B",
+        "C"
+      ]
+    },
+    "all-accounts": {
+      "pick": "C",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "C": "here too as i've said i nthe settings \"All accounts\" feel awkward, maybe default settings or osmething like that "
+      },
+      "note": "",
+      "also": []
+    },
+    "roles": {
+      "pick": "D",
+      "picks": [],
+      "none": false,
+      "comments": {
+        "D": "if agent has multiple accounts, show an account selector below \"Agent\" but we should also have \"all\" to select all."
+      },
+      "note": "",
+      "also": []
+    },
+    "roles-now": {
+      "pick": null,
+      "picks": [],
+      "none": true,
+      "comments": {},
+      "note": "i've told you what to do in the topic 4",
+      "also": []
+    }
+  },
+  "updated": "2026-10-23T05:49:27.437Z"
+}
