@@ -20,19 +20,25 @@ method, `xdotool key ctrl+comma` opened Settings with focus in a Workspaces pane
 terminal drawer and a terminal thread. Left to try: Wayland, an input method (IBus or Fcitx,
 which get every key on X11 through XIM), a desktop shortcut on Ctrl-, and non-US layouts.
 
-### Factory Droid's turn ends while its background work runs, again
+### Factory Droid doesn't show Working while it waits on background work
 
-Reported October 23, 2026 as "this bug again", with the screenshot below. A Factory Droid
-thread's turn shows as ended (1h 32m 38s) right after Droid said "The 0.4.1 release workflow is
-running … the watcher will wake me when the workflow finishes", with its plan still at
-"Current: Bump to 0.4.1, push the tag and watch the release workflow" (2 left).
+Reported October 23, 2026 as "this bug again", then: "while it is waiting, if there is a way to
+find out, it should still show working, it is successfully continues it, but yeah, not showing
+working, not splitting turns".
+
+So turns no longer split, and Droid does go on once its background work ends, but while it
+waits, the thread doesn't show Working. If there's a way to find out it's waiting, it should
+still show Working. In the screenshot, the turn shows as ended (1h 32m 38s) right after Droid
+said "The 0.4.1 release workflow is running … the watcher will wake me when the workflow
+finishes", with its plan still at "Current: Bump to 0.4.1, push the tag and watch the release
+workflow" (2 left).
 
 ![A Factory Droid turn shown as ended while its release watcher runs](backlog/droid-turn-ends-during-background-work.png)
 
-Which earlier bug wasn't said. The closest are "Turns split without user messages" and "A
-message sent while Factory Droid wakes by itself is never answered", removed as built by
-a7a4262 ("Keep Droid's turns whole while its background work runs", in v0.4.0 and v0.4.1).
-The account's email in the composer is covered in the screenshot.
+Earlier entries on Droid's background work ("Turns split without user messages", "A message
+sent while Factory Droid wakes by itself is never answered") were built in a7a4262 ("Keep
+Droid's turns whole while its background work runs", in v0.4.0 and v0.4.1). The account's
+email in the composer is covered in the screenshot.
 
 ## Features
 
