@@ -19,8 +19,8 @@ use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Context, EventEmitter, Task, WeakEntity};
 use projects::{
-    PlannedWorkspace, ProjectIcon, ProjectId, ProjectsSnapshot, Thread, ThreadCreator, ThreadId,
-    ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
+    PlannedWorkspace, ProjectIcon, ProjectId, ProjectsSnapshot, ProjectsUpdate, Thread,
+    ThreadCreator, ThreadId, ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
 };
 use util::ResultExt as _;
 
@@ -101,6 +101,13 @@ impl ProjectStore {
     /// Whether the server's projects and threads have arrived, so an empty list means none.
     pub fn has_snapshot(&self) -> bool {
         self.has_snapshot
+    }
+
+    /// Makes the server's change to the projects it last sent.
+    pub(crate) fn apply_update(&mut self, update: ProjectsUpdate, cx: &mut Context<Self>) {
+        let mut snapshot = self.store.snapshot();
+        snapshot.apply(update);
+        self.set_snapshot(snapshot, cx);
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: ProjectsSnapshot, cx: &mut Context<Self>) {

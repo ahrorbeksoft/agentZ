@@ -49,6 +49,9 @@ use super::{ClientId, FollowUp, Input, Server};
 use workspaces::{Folder, Placement, workspace_strategy};
 
 const MAX_BATCH_THREADS: usize = 20;
+/// Tasks `delegate_tasks` starts at once: a project done in one go takes hundreds, which a
+/// thread runs a few at a time.
+const MAX_BATCH_TASKS: usize = 100;
 const MAX_PROMPT_CHARS: usize = 120_000;
 const MAX_TITLE_CHARS: usize = 512;
 const DEFAULT_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -1081,6 +1084,7 @@ impl Server {
                 "threadManagement": true,
                 "batchThreadCreation": true,
                 "maxBatchThreads": MAX_BATCH_THREADS,
+                "maxBatchTasks": MAX_BATCH_TASKS,
                 "incrementalThreadRead": true,
                 "appOwnedSubagents": true,
                 "diffs": true,
@@ -1573,9 +1577,9 @@ impl Server {
         let requests = arguments
             .array("tasks")?
             .ok_or_else(|| invalid("tasks is required."))?;
-        if requests.is_empty() || requests.len() > MAX_BATCH_THREADS {
+        if requests.is_empty() || requests.len() > MAX_BATCH_TASKS {
             return Err(invalid(format!(
-                "tasks must have 1 to {MAX_BATCH_THREADS} entries."
+                "tasks must have 1 to {MAX_BATCH_TASKS} entries."
             )));
         }
         let instructions = arguments.string("instructions", MAX_PROMPT_CHARS)?;
@@ -3233,7 +3237,7 @@ pub(super) fn definitions(design_defaults: &DesignDefaults) -> Value {
                             "additionalProperties": false,
                         },
                         "minItems": 1,
-                        "maxItems": MAX_BATCH_THREADS,
+                        "maxItems": MAX_BATCH_TASKS,
                     },
                     "instructions": {"type": "string", "maxLength": MAX_PROMPT_CHARS, "description": "Shared instructions added after every task's own prompt."},
                     "clientRequestId": client_request_id,

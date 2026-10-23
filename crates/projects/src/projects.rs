@@ -779,6 +779,84 @@ pub struct ProjectsSnapshot {
     pub drawer_commands: Vec<(ThreadId, u32, String)>,
 }
 
+/// What a server sends its clients as the store changes, after the whole of it once: every
+/// part of [`ProjectsSnapshot`] but the threads, of which only those that changed come, with
+/// every thread's id in order. A parent with hundreds of subthreads made each change send them
+/// all, their task prompts and results too.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectsUpdate {
+    /// The store, with only the threads that changed or are new.
+    pub changed: ProjectsSnapshot,
+    /// Every thread's id, in the store's order: those not listed are gone.
+    pub thread_ids: Vec<ThreadId>,
+}
+
+impl ProjectsSnapshot {
+    /// What changed from this snapshot to `newer`.
+    pub fn update_to(&self, newer: &ProjectsSnapshot) -> ProjectsUpdate {
+        let before: collections::HashMap<ThreadId, &Thread> = self
+            .threads
+            .iter()
+            .map(|thread| (thread.id, thread))
+            .collect();
+        let threads = newer
+            .threads
+            .iter()
+            .filter(|thread| before.get(&thread.id) != Some(thread))
+            .cloned()
+            .collect();
+        ProjectsUpdate {
+            changed: ProjectsSnapshot {
+                threads,
+                ..newer.without_threads()
+            },
+            thread_ids: newer.threads.iter().map(|thread| thread.id).collect(),
+        }
+    }
+
+    /// The snapshot with `update` made to it.
+    pub fn apply(&mut self, update: ProjectsUpdate) {
+        let ProjectsUpdate {
+            mut changed,
+            thread_ids,
+        } = update;
+        let mut threads: collections::HashMap<ThreadId, Thread> = std::mem::take(&mut self.threads)
+            .into_iter()
+            .chain(std::mem::take(&mut changed.threads))
+            .map(|thread| (thread.id, thread))
+            .collect();
+        changed.threads = thread_ids
+            .into_iter()
+            .filter_map(|id| threads.remove(&id))
+            .collect();
+        *self = changed;
+    }
+
+    fn without_threads(&self) -> ProjectsSnapshot {
+        ProjectsSnapshot {
+            projects: self.projects.clone(),
+            threads: Vec::new(),
+            scope: self.scope,
+            thread_order: self.thread_order,
+            archived_expanded: self.archived_expanded,
+            workspaces_expanded: self.workspaces_expanded,
+            chats_collapsed: self.chats_collapsed,
+            working_threads: self.working_threads.clone(),
+            blocked_threads: self.blocked_threads.clone(),
+            awaiting_input_threads: self.awaiting_input_threads.clone(),
+            waiting_threads: self.waiting_threads.clone(),
+            terminal_agents: self.terminal_agents.clone(),
+            terminal_commands: self.terminal_commands.clone(),
+            terminal_folders: self.terminal_folders.clone(),
+            git_heads: self.git_heads.clone(),
+            favicons: self.favicons.clone(),
+            copy_statuses: self.copy_statuses.clone(),
+            drawer_commands: self.drawer_commands.clone(),
+        }
+    }
+}
+
 /// How a project's folder stands in git, as its machine's server reads it, so the copies of a
 /// project on several machines can be told apart where a new thread picks one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2865,6 +2943,38 @@ mod tests {
         store.delete_thread(parent);
         assert!(store.threads().is_empty());
         assert!(!store.is_thread_blocked(grandchild));
+    }
+
+    /// An update carries only the threads that changed, and brings an older snapshot to the
+    /// newer one: threads changed, added and gone, in the newer one's order.
+    #[test]
+    fn updates_carry_only_the_threads_that_changed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = ProjectStore::load(None);
+        let project = store.add_project(dir.path().to_path_buf());
+        let first = store.add_thread(project, "First", None).expect("thread");
+        let second = store.add_thread(project, "Second", None).expect("thread");
+        let third = store.add_thread(project, "Third", None).expect("thread");
+        let before = store.snapshot();
+
+        store.rename_thread(second, "Second, renamed".into());
+        store.delete_thread(third);
+        let fourth = store.add_thread(project, "Fourth", None).expect("thread");
+        store.set_thread_blocked(first, true);
+        let after = store.snapshot();
+
+        let update = before.update_to(&after);
+        let changed: Vec<ThreadId> = update
+            .changed
+            .threads
+            .iter()
+            .map(|thread| thread.id)
+            .collect();
+        assert_eq!(changed, [second, fourth]);
+        assert_eq!(update.changed.blocked_threads, [first]);
+        let mut applied = before;
+        applied.apply(update);
+        assert_eq!(applied, after);
     }
 
     #[test]

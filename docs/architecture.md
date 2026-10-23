@@ -77,7 +77,10 @@ script or agent CLI ─► agentz-server call <tool> [json] ─unix socket─►
 - Requests have ids; the server sends a request's changes before its response, so after
   `CreateThread` returns, the client already has the thread (`agentz_client`).
 - The session subscription (projects, threads, states, spaces) is always on; thread details and
-  terminal screens are subscribed to only while viewed.
+  terminal screens are subscribed to only while viewed. Projects come whole in the session's
+  snapshot, then as changes (`Event::Projects`, `ProjectsSnapshot::update_to` and `apply`):
+  only the threads that changed, with every thread's id in order, so a parent with hundreds
+  of subthreads doesn't send them all, prompts and results, with each change.
 - Every enum ends in `#[serde(untagged)] Unknown(serde_json::Value)`, so newer variants don't
   break older clients.
 
@@ -2121,7 +2124,7 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
 
 - A subthread is a thread with a `task` (`projects::Task`): parent, prompt, role, outcome. It
   gets the task prompt only, and the parent's mode, never broader. `delegate_tasks` starts
-  several at once (each `task` with the shared `instructions` after it, its results in order,
+  up to 100 at once (each `task` with the shared `instructions` after it, its results in order,
   a `clientRequestId` that's each one's with `#1`, `#2`, … after it). A subthread may
   delegate tasks of its own only with `canDelegate` (`Task::can_delegate`, false by default;
   `capability_denied` otherwise).

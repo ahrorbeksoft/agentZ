@@ -1200,9 +1200,9 @@ impl ServerClient {
             return;
         }
         match event {
-            Event::Projects(projects) => self
+            Event::Projects(update) => self
                 .projects
-                .update(cx, |store, cx| store.set_snapshot(projects, cx)),
+                .update(cx, |store, cx| store.apply_update(update, cx)),
             Event::Registry(registry) => self.set_registry(registry, cx),
             Event::AgentSettings(agent_settings) => self.set_agent_settings(agent_settings, cx),
             Event::Accounts(accounts) => self.set_accounts(accounts, cx),

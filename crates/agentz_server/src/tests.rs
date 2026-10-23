@@ -234,7 +234,7 @@ impl TestClient {
 
     fn apply(&mut self, event: Event) {
         match &event {
-            Event::Projects(projects) => self.projects = Some(projects.clone()),
+            Event::Projects(update) => self.projects.get_or_insert_default().apply(update.clone()),
             Event::Thread { connection, update } => {
                 if let Some(view) = self.threads.get_mut(connection) {
                     view.apply(update.clone());
@@ -6090,6 +6090,59 @@ fn relay_as_the_app_then(
             }
         }
     })
+}
+
+/// A parent can hand a hundred tasks to subthreads in one call, which run a few at a time and
+/// all come back to it. The app is sent only the threads that change as they do.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parent_runs_a_hundred_subthreads() {
+    let Some(server) = TestServer::start() else {
+        return;
+    };
+    let mut client = server.connect().await;
+    let Response::Session(session) = client.ok(Request::SubscribeSession).await else {
+        panic!("expected a session snapshot");
+    };
+    client.projects = Some(session.projects);
+    let project_id = client.add_project(server.project_dir.path()).await;
+    let parent = client.create_thread_in(project_id).await;
+    client.wait_until_ready(parent).await;
+    client.ok(Request::SetSubthreadLimit(16)).await;
+
+    let tasks: Vec<Value> = (0..100)
+        .map(|index| json!({"task": "hello", "title": format!("Part {index}")}))
+        .collect();
+    let delegated = client
+        .tool(parent, "delegate_tasks", json!({"tasks": tasks}))
+        .await;
+    let started: Vec<ThreadId> = delegated["tasks"]
+        .as_array()
+        .expect("the tasks")
+        .iter()
+        .map(task_id)
+        .collect();
+    assert_eq!(started.len(), 100, "{delegated}");
+    for task in &started {
+        client
+            .wait_until(|client| client.task(*task).is_some_and(|task| task.delivered))
+            .await;
+    }
+    let announced = |client: &TestClient| -> usize {
+        client
+            .thread(ConnectionId::Thread(parent))
+            .state
+            .announced_tasks
+            .iter()
+            .map(|(_, tasks)| tasks.len())
+            .sum()
+    };
+    client.wait_until(|client| announced(client) == 100).await;
+    assert!(started.iter().all(|task| {
+        client
+            .task(*task)
+            .and_then(|task| task.outcome.as_ref())
+            .is_some_and(|outcome| outcome.end == projects::TaskEnd::Completed)
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

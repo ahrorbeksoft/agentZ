@@ -36,8 +36,8 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use projects::{
-    PlannedWorkspace, ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ThreadId,
-    ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
+    PlannedWorkspace, ProjectIcon, ProjectId, ProjectScope, ProjectsSnapshot, ProjectsUpdate,
+    ThreadId, ThreadOrder, ThreadSection, UnsentMention, WorkspaceKind,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1147,7 +1147,8 @@ pub struct SessionSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    Projects(ProjectsSnapshot),
+    /// What changed since the [`Response::Session`] snapshot or the last of these.
+    Projects(ProjectsUpdate),
     Registry(RegistrySnapshot),
     AgentSettings(BTreeMap<AgentId, AgentSettings>),
     Accounts(BTreeMap<AgentId, AgentAccounts>),

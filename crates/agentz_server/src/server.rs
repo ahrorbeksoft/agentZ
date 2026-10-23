@@ -62,7 +62,7 @@ use collections::{HashMap, HashSet};
 use futures::channel::mpsc;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui_shared_string::SharedString;
-use projects::{ProjectId, ProjectStore, ThreadCreator, ThreadId};
+use projects::{ProjectId, ProjectStore, ProjectsSnapshot, ThreadCreator, ThreadId};
 use registry::{AgentRegistryStore, CommandFuture, RegistryMessage};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -300,6 +300,8 @@ pub(crate) struct Server {
     clients: HashMap<ClientId, Client>,
     // What session subscribers were last sent.
     projects_revision_sent: u64,
+    /// The projects as of [`Self::projects_revision_sent`], which updates are made from.
+    projects_sent: ProjectsSnapshot,
     spaces_revision_sent: u64,
     registry_sent: RegistrySnapshot,
     agent_settings_revision_sent: u64,
@@ -440,6 +442,7 @@ impl Server {
             tool_results: ToolResults::default(),
             relays: tools::Relays::default(),
             projects_revision_sent: projects.revision(),
+            projects_sent: projects.snapshot(),
             registry_sent: RegistrySnapshot::default(),
             agent_settings_revision_sent: agent_settings.revision(),
             accounts_revision_sent: accounts.revision(),
@@ -1006,6 +1009,9 @@ impl Server {
     fn handle_request(&mut self, client: ClientId, request: Request) -> Result<Response> {
         match request {
             Request::SubscribeSession => {
+                // The other subscribers catch up first, so what's sent from now on is a change
+                // from the snapshot this one gets.
+                self.broadcast_projects();
                 let client = self.client(client)?;
                 let first = !client.subscribed_to_session;
                 client.subscribed_to_session = true;
@@ -1015,7 +1021,7 @@ impl Server {
                 }
                 self.refresh_storage();
                 Ok(Response::Session(SessionSnapshot {
-                    projects: self.projects.snapshot(),
+                    projects: self.projects_sent.clone(),
                     registry: self.registry_snapshot(),
                     agent_settings: self.agent_settings.all().clone(),
                     accounts: self.accounts.all().clone(),
@@ -2726,10 +2732,7 @@ impl Server {
             });
         }
 
-        if self.projects.revision() != self.projects_revision_sent {
-            self.projects_revision_sent = self.projects.revision();
-            self.broadcast(Event::Projects(self.projects.snapshot()));
-        }
+        self.broadcast_projects();
         if self.spaces.revision() != self.spaces_revision_sent {
             self.spaces_revision_sent = self.spaces.revision();
             self.broadcast(Event::Spaces(self.spaces.snapshot()));
@@ -2831,6 +2834,18 @@ impl Server {
                 },
             );
         }
+    }
+
+    /// Sends session subscribers what changed in the projects since they were last sent them.
+    fn broadcast_projects(&mut self) {
+        if self.projects.revision() == self.projects_revision_sent {
+            return;
+        }
+        self.projects_revision_sent = self.projects.revision();
+        let projects = self.projects.snapshot();
+        let update = self.projects_sent.update_to(&projects);
+        self.projects_sent = projects;
+        self.broadcast(Event::Projects(update));
     }
 
     fn broadcast(&self, event: Event) {

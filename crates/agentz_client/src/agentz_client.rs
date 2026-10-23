@@ -496,7 +496,7 @@ mod tests {
         // The change came before the answer.
         assert!(
             received.iter().any(
-                |event| matches!(event, Event::Projects(projects) if projects.projects.len() == 1)
+                |event| matches!(event, Event::Projects(update) if update.changed.projects.len() == 1)
             ),
             "{received:?}"
         );
