@@ -7279,7 +7279,8 @@ async fn acps_subagent_sessions_work_in_subthreads() {
     assert!(agent_text(client.thread(connection)).ends_with("The subagent stopped."));
 }
 /// A parent that delegated tasks waits for them: hearing that one ended doesn't complete it
-/// while another runs, and it completes once, after hearing of the last.
+/// while another runs, and it completes once, after hearing of the last. It's busy from the
+/// start until then, through the turns their results start.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parent_completes_after_its_last_task() {
     let Some(server) = TestServer::start() else {
@@ -7301,6 +7302,15 @@ async fn a_parent_completes_after_its_last_task() {
     };
     let completed_at =
         move |client: &TestClient| client.project_thread(parent).and_then(|t| t.completed_at);
+    let busy_since = move |client: &TestClient| {
+        client.projects.as_ref().and_then(|projects| {
+            projects
+                .busy_since
+                .iter()
+                .find(|(thread, _)| *thread == parent)
+                .map(|(_, since)| *since)
+        })
+    };
 
     let blocked = task_id(
         &client
@@ -7313,6 +7323,10 @@ async fn a_parent_completes_after_its_last_task() {
             .await,
     );
     client
+        .wait_until(move |client| busy_since(client).is_some())
+        .await;
+    let since = busy_since(&client);
+    client
         .wait_until(move |client| {
             client.task(quick).is_some_and(|task| task.delivered)
                 && !client.thread(ConnectionId::Thread(parent)).is_working()
@@ -7324,6 +7338,8 @@ async fn a_parent_completes_after_its_last_task() {
         .await;
     assert!(is_waiting(&client));
     assert_eq!(completed_at(&client), None);
+    assert_eq!(busy_since(&client), since);
+    assert_eq!(busy_since(&client), since);
 
     let connection = ConnectionId::Thread(blocked);
     client.subscribe_thread(connection).await;
@@ -7352,6 +7368,7 @@ async fn a_parent_completes_after_its_last_task() {
                 && !client.thread(ConnectionId::Thread(parent)).is_working()
                 && !is_waiting(client)
                 && completed_at(client).is_some()
+                && busy_since(client).is_none()
         })
         .await;
 }

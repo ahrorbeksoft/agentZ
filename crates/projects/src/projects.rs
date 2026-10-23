@@ -760,6 +760,9 @@ pub struct ProjectsSnapshot {
     /// Threads whose turn ended with their work still going: a background task, or tasks
     /// delegated to subthreads. They complete once it's over.
     pub waiting_threads: Vec<ThreadId>,
+    /// When each working or waiting thread started to be: its turn's start, held while the
+    /// work goes on after it and through the turns that work brings.
+    pub busy_since: Vec<(ThreadId, SystemTime)>,
     /// Terminal threads running an agent CLI, with its name. The rest are plain shells.
     pub terminal_agents: Vec<(ThreadId, String)>,
     /// Terminal threads running a program in front of their shell, with its name.
@@ -849,6 +852,7 @@ impl ProjectsSnapshot {
             blocked_threads: self.blocked_threads.clone(),
             awaiting_input_threads: self.awaiting_input_threads.clone(),
             waiting_threads: self.waiting_threads.clone(),
+            busy_since: self.busy_since.clone(),
             terminal_agents: self.terminal_agents.clone(),
             terminal_commands: self.terminal_commands.clone(),
             terminal_folders: self.terminal_folders.clone(),
@@ -955,6 +959,8 @@ pub struct ProjectStore {
     awaiting_input_threads: HashSet<ThreadId>,
     /// Threads whose work goes on after their turn. Not persisted either.
     waiting_threads: HashSet<ThreadId>,
+    /// [`ProjectsSnapshot::busy_since`]. Not persisted either.
+    busy_since: BTreeMap<ThreadId, SystemTime>,
     /// Terminal threads running an agent CLI, by its name. Not persisted either.
     terminal_agents: BTreeMap<ThreadId, String>,
     /// Terminal threads running a program in front of their shell. Not persisted either.
@@ -1001,6 +1007,7 @@ impl ProjectStore {
             blocked_threads: HashSet::default(),
             awaiting_input_threads: HashSet::default(),
             waiting_threads: HashSet::default(),
+            busy_since: BTreeMap::new(),
             terminal_agents: BTreeMap::new(),
             terminal_commands: BTreeMap::new(),
             terminal_folders: BTreeMap::new(),
@@ -1272,6 +1279,8 @@ impl ProjectStore {
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
         self.waiting_threads
             .retain(|thread_id| threads.iter().any(|thread| thread.id == *thread_id));
+        self.busy_since
+            .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_agents
             .retain(|thread_id, _| threads.iter().any(|thread| thread.id == *thread_id));
         self.terminal_commands
@@ -1531,6 +1540,7 @@ impl ProjectStore {
             self.blocked_threads.remove(&id);
             self.awaiting_input_threads.remove(&id);
             self.waiting_threads.remove(&id);
+            self.busy_since.remove(&id);
             self.changed();
         }
     }
@@ -1743,6 +1753,7 @@ impl ProjectStore {
                 self.blocked_threads.remove(&id);
                 self.awaiting_input_threads.remove(&id);
                 self.waiting_threads.remove(&id);
+                self.busy_since.remove(&id);
                 self.terminal_agents.remove(&id);
                 self.terminal_commands.remove(&id);
                 self.terminal_folders.remove(&id);
@@ -2137,6 +2148,7 @@ impl ProjectStore {
             self.working_threads.remove(&id)
         };
         if changed {
+            self.update_busy_since(id);
             if !working && !self.waiting_threads.contains(&id) {
                 self.complete_thread(id);
             }
@@ -2159,6 +2171,7 @@ impl ProjectStore {
         if !changed {
             return;
         }
+        self.update_busy_since(id);
         if !waiting && !self.working_threads.contains(&id) {
             self.complete_thread(id);
             self.record_thread_activity(id);
@@ -2170,6 +2183,21 @@ impl ProjectStore {
     /// The threads whose work goes on after their turn.
     pub fn waiting_threads(&self) -> impl Iterator<Item = ThreadId> + '_ {
         self.waiting_threads.iter().copied()
+    }
+
+    /// When the thread started working, if it's working or waiting: a thread waiting on its
+    /// subthreads goes on into the turn their results start without a pause, so this holds
+    /// from the turn that started them until the one that takes the last result ends.
+    pub fn busy_since(&self, id: ThreadId) -> Option<SystemTime> {
+        self.busy_since.get(&id).copied()
+    }
+
+    fn update_busy_since(&mut self, id: ThreadId) {
+        if self.working_threads.contains(&id) || self.waiting_threads.contains(&id) {
+            self.busy_since.entry(id).or_insert_with(SystemTime::now);
+        } else {
+            self.busy_since.remove(&id);
+        }
     }
 
     fn complete_thread(&mut self, id: ThreadId) {
@@ -2375,6 +2403,11 @@ impl ProjectStore {
         awaiting_input_threads.sort();
         let mut waiting_threads: Vec<_> = self.waiting_threads.iter().copied().collect();
         waiting_threads.sort();
+        let busy_since = self
+            .busy_since
+            .iter()
+            .map(|(id, since)| (*id, *since))
+            .collect();
         ProjectsSnapshot {
             projects: self.projects.clone(),
             threads: self.threads.clone(),
@@ -2387,6 +2420,7 @@ impl ProjectStore {
             blocked_threads,
             awaiting_input_threads,
             waiting_threads,
+            busy_since,
             terminal_agents: self
                 .terminal_agents
                 .iter()
@@ -2444,6 +2478,7 @@ impl ProjectStore {
         this.blocked_threads = snapshot.blocked_threads.into_iter().collect();
         this.awaiting_input_threads = snapshot.awaiting_input_threads.into_iter().collect();
         this.waiting_threads = snapshot.waiting_threads.into_iter().collect();
+        this.busy_since = snapshot.busy_since.into_iter().collect();
         this.terminal_agents = snapshot.terminal_agents.into_iter().collect();
         this.terminal_commands = snapshot.terminal_commands.into_iter().collect();
         this.terminal_folders = snapshot.terminal_folders.into_iter().collect();
@@ -3008,18 +3043,25 @@ mod tests {
         let completed_at = |store: &ProjectStore| store.thread(thread)?.completed_at;
 
         store.set_thread_working(thread, true);
+        let since = store.busy_since(thread);
+        assert!(since.is_some());
         store.set_thread_waiting(thread, true);
         store.set_thread_working(thread, false);
         assert_eq!(completed_at(&store), None);
         let copy = ProjectStore::from_snapshot(store.snapshot());
         assert!(copy.is_thread_waiting(thread));
+        assert_eq!(copy.busy_since(thread), since);
 
-        // Work it goes on with doesn't complete it either, until it ends.
+        // Work it goes on with doesn't complete it either, until it ends, and it's been busy
+        // since the first turn.
+        std::thread::sleep(Duration::from_millis(2));
         store.set_thread_working(thread, true);
         store.set_thread_waiting(thread, false);
         assert_eq!(completed_at(&store), None);
+        assert_eq!(store.busy_since(thread), since);
         store.set_thread_working(thread, false);
         assert!(completed_at(&store).is_some());
+        assert_eq!(store.busy_since(thread), None);
 
         // Without a turn after it, the end of the wait completes it.
         let first = completed_at(&store);

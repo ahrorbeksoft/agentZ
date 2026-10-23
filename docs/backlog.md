@@ -48,9 +48,10 @@ agents that they can just end their turn once they delegate:
 Built: a result steers into the parent's running turn when its agent has steering of its own
 (Claude Agent's and Codex's `_session/steering` on ACP v1; de71e44), and the server sends the
 app only the threads that changed, with `delegate_tasks` taking up to 100 tasks (fb98ec2).
-Left, on the design board (`design/subthreads-3/`): the parent shown as working, the sidebar's
-running-only rows, and how the sidebar and the parent's cards hold up with hundreds of
-subthreads. Measured before fb98ec2, in a debug build's headless test, a sidebar with 1,000
+Decided on the design board (`design/subthreads-3/decisions.md`). Built: the parent shows
+"Working for 4m 12s · 3 subthreads running" while they work (topic 1 B). Left: the sidebar's
+rows with the completed ones last (topic 2), and caps with Show more for hundreds of
+subthreads (topic 3). Measured before fb98ec2, in a debug build's headless test, a sidebar with 1,000
 threads and 300 subthreads took about 0.9 s per redraw, as did 1,300 plain threads, so the
 sidebar's cost is the number of rows, not subthreads as such.
 

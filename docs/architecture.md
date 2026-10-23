@@ -2021,7 +2021,7 @@ Designed in `design/sounds/` and `design/notifications/`.
   it running (not a command), or
   within 15 seconds of one ending by itself, while the agent is due to go on with its result,
   `AgentThread::is_waiting`, never on ACP v2; or with subthreads whose end it hasn't heard
-  of), and each
+  of), `busy_since` (when each working or waiting thread last became so), and each
   thread's `completed_at`, set once it's neither working nor waiting, so a thread completes
   (and its sound plays) once its work is over, not as each subthread's result reaches it.
   Each client
@@ -2237,9 +2237,14 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   result, and for several "4 subthreads finished · 1 failed" (the failures in red), which
   opens to a row each. A row has the task's end ("Subthread finished: <title>"), the lines
   it changed, how long it ran and Open, and opens to its summary.
-- **Waiting** (`render_waiting_for_subthreads`): once the parent's turn ends while
-  subthreads it started still work, "Waiting for 3 subthreads" with a spinner ends its
-  conversation, until their results start its next turn.
+- **Working while they work** (`subthreads_at_work`, `render_generating`;
+  `design/subthreads-3` topic 1 B): once the parent's turn ends while subthreads it started
+  still work, its conversation goes on ending with "Working for 4m 12s · 3 subthreads
+  running" (queued ones count). The time is from the start of the turn that started them
+  until the turn that takes the last result ends: the store's `busy_since`, when the thread
+  last became working or waiting, which holds since a waiting parent goes on into the turn
+  their results start without a pause. The count goes once the last one ends. The composer
+  keeps Send.
 
 ### Agents' own subagents
 

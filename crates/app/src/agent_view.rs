@@ -822,14 +822,17 @@ impl AgentView {
                 }
             },
         ));
-        // Keeps the elapsed-time labels ticking while the agent works, or its background tasks
-        // run.
+        // Keeps the elapsed-time labels ticking while the agent works, its background tasks
+        // run, or its subthreads do.
         let elapsed_refresh = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let still_open = this.update(cx, |this, cx| {
                     let thread = this.thread.read(cx);
-                    if thread.is_working() || !thread.state.background_tasks.is_empty() {
+                    if thread.is_working()
+                        || !thread.state.background_tasks.is_empty()
+                        || this.subthreads_at_work(cx).is_some()
+                    {
                         cx.notify();
                     }
                 });
@@ -4066,7 +4069,6 @@ impl AgentView {
                 .filter(|card| !card.read(cx).is_for_request())
                 .map(|card| div().px_5().py_1p5().child(card.clone()).into_any_element()),
         );
-        rows.extend(self.render_waiting_for_subthreads(cx));
         if let Some(generating) = self.render_generating(cx) {
             rows.push(generating);
         }
@@ -9228,53 +9230,40 @@ impl AgentView {
         cx.notify();
     }
 
-    /// "Waiting for 3 subthreads" at the end of a thread whose turn ended while subthreads it
-    /// started still work (`design/subthreads-machines/decisions.md`, topic 8): its agent goes
-    /// on when they end, in a turn their results start.
-    fn render_waiting_for_subthreads(&self, cx: &App) -> Option<AnyElement> {
-        if self.thread.read(cx).is_working() {
-            return None;
-        }
-        let waiting = self
-            .store
-            .read(cx)
+    /// The parent's work that its subthreads keep going (`design/subthreads-3/decisions.md`,
+    /// topic 1 B): since when it's been at it, from the start of the turn that started them
+    /// until the turn that takes the last result ends, and how many are still at work, queued
+    /// ones too. `None` when it has started none since it was last idle.
+    fn subthreads_at_work(&self, cx: &App) -> Option<(SystemTime, usize)> {
+        let store = self.store.read(cx);
+        let subthreads: Vec<&projects::Thread> = store
             .subthreads(self.thread_id)
             .into_iter()
             .filter(|thread| {
                 thread
                     .task
                     .as_ref()
-                    .is_some_and(|task| task.outcome.is_none() && !task.is_agents_own())
+                    .is_some_and(|task| !task.is_agents_own())
             })
-            .count();
-        let (label, ends) = match waiting {
-            0 => return None,
-            1 => ("Waiting for a subthread".to_string(), "when it ends"),
-            count => (format!("Waiting for {count} subthreads"), "when they end"),
-        };
-        Some(
-            h_flex()
-                .debug_selector(|| "waiting-for-subthreads".into())
-                .py_2()
-                .px(rems_from_px(22_f32))
-                .gap_2()
-                .child(
-                    h_flex().w_2().justify_center().child(
-                        SpinnerLabel::new()
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                .child(
-                    Label::new(format!("· the agent continues {ends}"))
-                        .size(LabelSize::Small)
-                        .color(Color::Placeholder),
-                )
-                .into_any_element(),
-        )
+            .collect();
+        let running: Vec<&projects::Thread> = subthreads
+            .iter()
+            .copied()
+            .filter(|thread| {
+                thread
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.outcome.is_none())
+            })
+            .collect();
+        let since = store
+            .busy_since(self.thread_id)
+            .or_else(|| running.iter().filter_map(|thread| thread.created_at).min())?;
+        let started_any = subthreads
+            .iter()
+            .any(|thread| thread.created_at.is_some_and(|created| created >= since));
+        (started_any || !running.is_empty()).then_some((since, running.len()))
     }
-
     /// Zed's subagent card for a subthread at work: a bordered card whose header has a
     /// spinner, the title, "· model", and Stop. The step it's on shows inside, and a strip at
     /// the bottom opens it full screen; opened, it shows Zed's preview of its work.
@@ -10118,20 +10107,32 @@ impl AgentView {
         )
     }
 
+    /// t3code's "Working for 1m 12s" at the end of a turn, and of a thread whose subthreads
+    /// work after its turn ended, with how many ("· 3 subthreads running").
     fn render_generating(&self, cx: &App) -> Option<AnyElement> {
+        let subthreads = self.subthreads_at_work(cx);
         let thread = self.thread.read(cx);
-        let started_at = thread.turn_started_at()?;
+        let started_at = match (thread.turn_started_at(), subthreads) {
+            (Some(turn), Some((since, _))) => turn.min(since),
+            (None, Some((since, _))) => since,
+            (Some(turn), None) => turn,
+            (None, None) => return None,
+        };
         // The compaction's divider says it's working meanwhile, as in Zed.
         if thread.is_compacting() {
             return None;
         }
         // Any permission request, whether its tool call is shown or not.
         let awaiting_confirmation = !thread.state.permission_requests.is_empty();
-        // t3code's "Working for 1m 12s".
         let elapsed_label = format!(
             "Working for {}",
             format_elapsed(started_at.elapsed().unwrap_or_default())
         );
+        let running_label = match subthreads.map_or(0, |(_, running)| running) {
+            0 => None,
+            1 => Some("· 1 subthread running".to_string()),
+            running => Some(format!("· {running} subthreads running")),
+        };
         let status_label = if thread.status() == &ConnectionStatus::Connecting {
             Some(format!("Starting {}…", self.agent_name(cx)))
         } else if awaiting_confirmation {
@@ -10168,6 +10169,13 @@ impl AgentView {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
+                .children(running_label.map(|label| {
+                    div().debug_selector(|| "subthreads-running".into()).child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(Color::Placeholder),
+                    )
+                }))
                 .into_any_element(),
         )
     }
@@ -20937,25 +20945,46 @@ mod tests {
         assert!(failed.top() < done.top());
     }
 
-    /// A thread whose turn ended while its subthreads work says it waits for them
-    /// (`design/subthreads-machines/decisions.md`, topic 8), until they end.
+    /// A thread whose turn ended while its subthreads work goes on saying it's working
+    /// (`design/subthreads-3/decisions.md`, topic 1 B): "Working for…" from the start of the
+    /// turn that started them, with how many still run, until the turn that takes the last
+    /// result ends.
     #[gpui::test]
-    fn a_parent_says_it_waits_for_its_subthreads(cx: &mut TestAppContext) {
-        let (view, cx) = open_parent(subthreads_snapshot(&[10, 11]), cx);
-        assert!(cx.debug_bounds("waiting-for-subthreads").is_some());
+    fn a_parent_works_while_its_subthreads_do(cx: &mut TestAppContext) {
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(990);
+        let busy = |running: &[u64], busy: bool| {
+            let mut snapshot = subthreads_snapshot(running);
+            if busy {
+                snapshot.busy_since = vec![(ThreadId(2), since)];
+            }
+            snapshot
+        };
+        let (view, cx) = open_parent(busy(&[10, 11], true), cx);
+        let at_work = |view: &Entity<AgentView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.subthreads_at_work(cx))
+        };
+        assert_eq!(at_work(&view, cx), Some((since, 2)));
+        assert!(cx.debug_bounds("subthreads-running").is_some());
 
+        // A turn meanwhile counts from the same start.
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         thread.update(cx, |thread, cx| thread.set_working_for_test(true, cx));
         cx.run_until_parked();
-        assert!(cx.debug_bounds("waiting-for-subthreads").is_none());
+        assert_eq!(at_work(&view, cx), Some((since, 2)));
+        assert!(cx.debug_bounds("subthreads-running").is_some());
+
+        // The turn that takes the last result: still timed from the start, without the count.
+        let store = view.read_with(cx, |view, _| view.store.clone());
+        store.update(cx, |store, cx| store.set_snapshot(busy(&[], true), cx));
+        cx.run_until_parked();
+        assert_eq!(at_work(&view, cx), Some((since, 0)));
+        assert!(cx.debug_bounds("subthreads-running").is_none());
 
         thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
-        let store = view.read_with(cx, |view, _| view.store.clone());
-        store.update(cx, |store, cx| {
-            store.set_snapshot(subthreads_snapshot(&[]), cx)
-        });
+        store.update(cx, |store, cx| store.set_snapshot(busy(&[], false), cx));
         cx.run_until_parked();
-        assert!(cx.debug_bounds("waiting-for-subthreads").is_none());
+        assert_eq!(at_work(&view, cx), None);
+        assert!(view.read_with(cx, |view, cx| view.render_generating(cx).is_none()));
     }
 
     fn completed_call(
