@@ -136,3 +136,8 @@ Requested October 23, 2026:
 - Remove the shimmering effect from thinking.
 - Remove the Show Thinking option.
 - Use that shimmer effect on "Running for" instead.
+
+### Pick the account in a submenu of the agent selector
+
+Requested October 23, 2026: "why not put the account selector inside the agent selector in a
+submenu". Also, in the composer, show the agent's icon in the account's color.
