@@ -111,6 +111,11 @@ impl Choices {
         self.editors.first().copied()
     }
 
+    /// Whether the folder is on another machine, which only an editor can open from here.
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
     /// The menu's first line for a folder on another machine, until one has been opened over
     /// SSH from here (`design/open-in-editor`, topic 3C).
     pub fn ssh_note(&self) -> Option<String> {
@@ -369,6 +374,100 @@ pub fn open_and_log(
     .detach();
 }
 
+/// A file a link in a message names, read as t3code's `parseMarkdownFileLink` reads one: a
+/// `file:` URL, or a path with no scheme, absolute or from the thread's folder, with an
+/// optional `:line[:column]` or `#L<line>`. Agents link files this way (Codex's
+/// `[AUDIT.md](/Users/…/AUDIT.md)`), and the OS can't open a bare path as a URL.
+#[derive(Debug, PartialEq)]
+pub struct FileLink {
+    pub path: PathBuf,
+    pub line: Option<u32>,
+}
+
+impl FileLink {
+    pub fn parse(url: &str, folder: Option<&Path>) -> Option<Self> {
+        let url = url.trim();
+        let url = url
+            .strip_prefix('<')
+            .and_then(|url| url.strip_suffix('>'))
+            .unwrap_or(url);
+        if url.is_empty() || url.starts_with('#') || url.starts_with("//") {
+            return None;
+        }
+        let (path, fragment) = if url
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        {
+            let url = url::Url::parse(url).ok()?;
+            let path = url.to_file_path().ok()?.to_string_lossy().into_owned();
+            (path, url.fragment().map(str::to_string))
+        } else {
+            let (path, fragment) = match url.split_once('#') {
+                Some((path, fragment)) => (path, Some(fragment.to_string())),
+                None => (url, None),
+            };
+            let path = path.split_once('?').map_or(path, |(path, _)| path);
+            let path = percent_encoding::percent_decode_str(path)
+                .decode_utf8()
+                .map_or_else(|_| path.to_string(), |path| path.into_owned());
+            if has_scheme(&path) {
+                return None;
+            }
+            (path, fragment)
+        };
+        let (path, line) = split_line(&path);
+        let line = line.or_else(|| fragment.as_deref().and_then(fragment_line));
+        if path.is_empty() {
+            return None;
+        }
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            folder?.join(path)
+        };
+        Some(Self { path, line })
+    }
+}
+
+/// Whether a link names a scheme, as `https:` or `mailto:` do. A file's `:12` isn't one.
+fn has_scheme(link: &str) -> bool {
+    let Some((scheme, rest)) = link.split_once(':') else {
+        return false;
+    };
+    let is_scheme = scheme.starts_with(|character: char| character.is_ascii_alphabetic())
+        && scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        });
+    is_scheme
+        && (rest.starts_with("//")
+            || !rest
+                .split(':')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
+}
+
+/// A path's `:line` or `:line:column` suffix, split off.
+fn split_line(path: &str) -> (&str, Option<u32>) {
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let Some((rest, last)) = path.rsplit_once(':').filter(|(_, last)| is_number(last)) else {
+        return (path, None);
+    };
+    let (rest, line) = match rest.rsplit_once(':').filter(|(_, line)| is_number(line)) {
+        Some((rest, line)) => (rest, line),
+        None => (rest, last),
+    };
+    (rest, line.parse().ok().filter(|line| *line > 0))
+}
+
+/// The line of a GitHub-style `#L12`, `#L12C3` or `#L12-L20`.
+fn fragment_line(fragment: &str) -> Option<u32> {
+    let digits = fragment.strip_prefix(['L', 'l'])?;
+    let end = digits
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok().filter(|line| *line > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +478,59 @@ mod tests {
 
     fn installed(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_link_names_a_file_by_its_path_from_the_folder_and_its_line() {
+        let folder = Path::new("/work/demo");
+        let parse = |url: &str| FileLink::parse(url, Some(folder));
+        let file = |path: &str, line: Option<u32>| {
+            Some(FileLink {
+                path: path.into(),
+                line,
+            })
+        };
+        assert_eq!(
+            parse("/Users/me/agentZ/AUDIT.md"),
+            file("/Users/me/agentZ/AUDIT.md", None)
+        );
+        assert_eq!(
+            parse("/work/demo/src/projects.rs:978"),
+            file("/work/demo/src/projects.rs", Some(978))
+        );
+        assert_eq!(
+            parse("src/main.rs:12:5"),
+            file("/work/demo/src/main.rs", Some(12))
+        );
+        assert_eq!(
+            parse("README.md#L4-L9"),
+            file("/work/demo/README.md", Some(4))
+        );
+        assert_eq!(parse("./docs"), file("/work/demo/./docs", None));
+        assert_eq!(parse("<docs/a b.md>"), file("/work/demo/docs/a b.md", None));
+        assert_eq!(
+            parse("docs/a%20b.md?plain=1#L3"),
+            file("/work/demo/docs/a b.md", Some(3))
+        );
+        assert_eq!(
+            parse("file:///work/demo/a%20b.rs#L7"),
+            file("/work/demo/a b.rs", Some(7))
+        );
+        assert_eq!(parse("Makefile:0"), file("/work/demo/Makefile", None));
+
+        for url in [
+            "https://example.com/a.rs",
+            "mailto:me@example.com",
+            "agentz://handoff",
+            "#usage",
+            "//example.com/a.rs",
+            "",
+        ] {
+            assert_eq!(parse(url), None, "{url}");
+        }
+        // A relative path needs the thread's folder.
+        assert_eq!(FileLink::parse("src/main.rs", None), None);
+        assert_eq!(FileLink::parse("/tmp/a.rs", None), file("/tmp/a.rs", None));
     }
 
     #[test]

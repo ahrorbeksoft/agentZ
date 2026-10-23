@@ -1718,8 +1718,19 @@ impl AgentView {
         let Some((machine, folder)) = self.editor_target(cx) else {
             return;
         };
+        self.open_path_in(machine, &folder, editor, None, cx);
+    }
+
+    fn open_path_in(
+        &mut self,
+        machine: MachineId,
+        path: &Path,
+        editor: &'static agentz_protocol::editors::Editor,
+        line: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
         self.continue_error = None;
-        let opened = open_in_editor::open(machine, &folder, editor, None, cx);
+        let opened = open_in_editor::open(machine, path, editor, line, cx);
         cx.spawn(async move |this, cx| {
             if let Err(error) = opened.await {
                 this.update(cx, |this, cx| {
@@ -1732,6 +1743,34 @@ impl AgentView {
         })
         .detach();
         cx.notify();
+    }
+
+    /// A link in a message. A file it names opens in the editor Open in Editor opens, at its
+    /// line, as Zed opens one in its own editor; with no editor found, a file on this Mac
+    /// opens in its app. Anything else goes to the OS.
+    fn open_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let machine = store.machine();
+        let folder = store.thread_folder(self.thread_id);
+        let Some(link) = open_in_editor::FileLink::parse(url, folder.as_deref()) else {
+            cx.open_url(url);
+            return;
+        };
+        let choices = Choices::of(machine, cx);
+        match choices.preferred() {
+            Some(editor) => self.open_path_in(machine, &link.path, editor, link.line, cx),
+            None if choices.is_remote() => {
+                self.continue_error = Some(
+                    format!(
+                        "Couldn't open {}: no editor here opens files on another machine",
+                        link.path.display()
+                    )
+                    .into(),
+                );
+                cx.notify();
+            }
+            None => cx.open_with_system(&link.path),
+        }
     }
 
     /// The header's Open in Editor, before the changes (`design/open-in-editor`, topic 1A).
@@ -12003,7 +12042,7 @@ impl AgentView {
     }
 
     /// A message's markdown: its image links show their thumbnail on hover and open the
-    /// viewer on click.
+    /// viewer on click, and its file links open in the editor.
     fn markdown(
         &self,
         key: MarkdownKey,
@@ -12088,7 +12127,9 @@ impl AgentView {
                             })
                             .ok();
                     }
-                    None => cx.open_url(&url),
+                    None => {
+                        clicked.update(cx, |this, cx| this.open_link(&url, cx)).ok();
+                    }
                 }),
         )
     }
@@ -19640,6 +19681,33 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(requests.borrow().is_empty());
+    }
+
+    /// A file link in a message opens in the last used editor, at its line and from the
+    /// thread's folder where it's relative; a web link goes to the OS.
+    #[gpui::test]
+    fn a_file_link_opens_in_the_editor_at_its_line(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let requests = answer_editors(&client, &["vscode"], cx);
+        view.update_in(cx, |view, _, cx| {
+            view.open_link("/Users/me/agentZ/AUDIT.md", cx);
+            view.open_link("src/main.rs:12", cx);
+            view.open_link("https://example.com/a.rs", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *requests.borrow(),
+            [
+                opened("vscode", "/Users/me/agentZ/AUDIT.md"),
+                Request::OpenInEditor {
+                    editor: "vscode".into(),
+                    path: "/tmp/demo/src/main.rs".into(),
+                    line: Some(12),
+                },
+            ]
+        );
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/a.rs"));
     }
 
     /// Narrow, "⋯" heads the editors with "Open in <editor>" and an "Open in…" submenu

@@ -1365,7 +1365,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   Needs your key on <machine>" until one has been opened. No file manager is listed for it.
   The Changes panel's file headers have the same editor's icon beside Viewed ("Open in VS
   Code"), opening the file at its first change (`DiffFile::first_changed_line`; not for a
-  deleted file), hidden when no editor is found.
+  deleted file), hidden when no editor is found. A file link in a thread (an agent's
+  `[AUDIT.md](/path/AUDIT.md)`, a `file:` URL, a path from the thread's folder, with
+  `:line[:col]` or `#L12`; `FileLink::parse`) opens in that editor at its line
+  (`AgentView::open_link`), or with the system's app for it when none is found; on an SSH
+  machine with no editor that opens remote files, the thread says it couldn't open it.
 - **Narrow threads** (`AgentView::view_width`, given by GPUI's `container_query`
   (zed-industries/zed#60774) as `render_contents` lays the view out, so a resize needs no
   second frame; `render_toolbar`, `CompactHeaderItems`, `render_options_menu`; design round
