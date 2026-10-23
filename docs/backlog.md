@@ -30,12 +30,6 @@ thread to another machine yet (Continue with Another Agent, workspace handoff an
 notice stay on its machine), so this waits for that. Until then, a thread can't publish a new
 version of another machine's artifact ("there's no artifact … to update").
 
-### Improve the subagent view
-
-Improve the subagent view: its Cancel and Open Parent buttons look bad. Maybe there shouldn't
-be buttons like that at all, maybe there should; to be decided.
-
-On the design board: `design/subthreads-3/`.
 
 ### Reorganize Settings
 

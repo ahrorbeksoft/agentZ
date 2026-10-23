@@ -2206,24 +2206,25 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   one runs and fold once the last one ends, and what the user chose holds until another
   starts or the last one ends (`SubthreadFold`).
 - **An open subthread**: the header is its parent's (`header_thread`: the title and its
-  menu act on the parent), with Zed's subagent title bar under it
-  (`render_subthread_title_bar`: its title, a check or cross once it ended, Stop, and
-  Minimize to the parent). Its first message, the task, is a card ("Task from “…”" and the
-  role) instead of a bubble (`render_task_card`). The task and the parent's later messages
-  show their first four lines, fading out, with Show more for the rest
-  (`render_folded_message`, `FOLDED_MESSAGE_LINES`). t3code's `ProviderSubagentBar` takes the
-  composer's place (`render_subthread_bar`): the agent's icon, model and effort, "Working
-  1m 20s" or "Done in 2m 14s" (from the subthread's `created_at`, when it was delegated, to
-  now or its task's `ended_at`), "Runs on its own", Stop, and Open Parent. Ctrl-− (Zed's Go
-  Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread, which the
-  command palette lists there, and both ways back show it in their tooltips.
+  menu act on the parent), with Zed's subagent title bar under it, which holds everything
+  (`render_subthread_title_bar`, picked in `design/subthreads-3/`, topic 4 D): ↳, its title,
+  a check or cross once it ended, then muted, t3code's words from `ProviderSubagentBar`: the
+  agent's icon and "Opus 5.5 · Working 1m 20s" or "· Done in 2m 14s" (`subthread_status`,
+  from the subthread's `created_at`, when it was delegated, to now or its task's
+  `ended_at`), then Stop while it runs, and – (Minimize to the parent). Its first message,
+  the task, is a card ("Task from “…”" and the role) instead of a bubble
+  (`render_task_card`). The task and the parent's later messages show their first four
+  lines, fading out, with Show more for the rest (`render_folded_message`,
+  `FOLDED_MESSAGE_LINES`). It has no composer: the conversation runs to the bottom. Ctrl-−
+  (Zed's Go Back, on macOS too) runs `agent::OpenParentThread` anywhere in the subthread,
+  which the command palette lists there, and Minimize shows it in its tooltip.
 - **On another machine** (`Machines::working_thread`, `Machines::root_thread`): a task
   delegated to another machine is a row like any other, with the machine after its model.
   Opening it opens its thread on that machine, with the sidebar marking the parent. Its Stop,
   its changes and its permission requests go to that thread there
   (`AgentView::working_thread`). That thread opens under its parent's header from the other
-  machine (`header_parent`), and its bar reads "Runs on its own on Devbox 1". Open Parent
-  and Minimize go back to the parent there (`AgentViewEvent::OpenThreadOn`).
+  machine (`header_parent`), and Minimize goes back to the parent there
+  (`AgentViewEvent::OpenThreadOn`).
 - **Where it started** (`render_delegation_batch`, picked in `design/subthreads-machines/`):
   the subthreads a `delegate_tasks` call started, or `delegate_task` calls one after
   another (`delegation_batch`), share one card in place of the calls' rows

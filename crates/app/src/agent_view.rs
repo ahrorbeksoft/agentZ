@@ -1535,14 +1535,27 @@ impl AgentView {
             .is_none_or(projects::Task::can_stop)
     }
 
-    /// Zed's subagent title bar, under the parent's header: the subthread's title and how it
-    /// ended, Stop while it runs, and Minimize, which opens the parent.
+    /// Zed's subagent title bar, under the parent's header, with t3code's words: the
+    /// subthread's title and how it ended, what runs it and for how long, Stop while it runs,
+    /// and Minimize, which opens the parent.
     fn render_subthread_title_bar(
         &self,
         parent: Option<ThreadKey>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
+        let stored = self.store.read(cx).thread(self.thread_id);
+        let model = self
+            .thread
+            .read(cx)
+            .model_name()
+            .or_else(|| stored.and_then(|thread| thread.model.clone()))
+            .unwrap_or_else(|| self.agent_name(cx).to_string());
+        let started_at = stored.and_then(|thread| thread.created_at);
+        let outcome = stored
+            .and_then(|thread| thread.task.as_ref())
+            .and_then(|task| task.outcome.as_ref());
+        let status = subthread_status(started_at, outcome, SystemTime::now());
         let end = self.subthread_end(cx);
         let is_done = end.is_some();
         let is_stopped_or_failed = matches!(
@@ -1599,6 +1612,18 @@ impl AgentView {
                         h_flex()
                             .flex_none()
                             .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .debug_selector(|| "subthread-title-bar-status".into())
+                                    .gap_1()
+                                    .pr_1p5()
+                                    .child(self.thread_agent_icon(cx).size(IconSize::Small))
+                                    .child(
+                                        Label::new(format!("{model} · {status}"))
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
                             .when(can_stop, |this| {
                                 this.child(
                                     div()
@@ -1641,130 +1666,6 @@ impl AgentView {
                             }),
                     ),
             )
-            .into_any_element()
-    }
-
-    /// How the subthread runs, and where, when it was delegated from another machine.
-    fn subthread_runs(&self, cx: &App) -> String {
-        let is_from_elsewhere = self
-            .store
-            .read(cx)
-            .thread(self.thread_id)
-            .is_some_and(|thread| thread.remote_parent().is_some());
-        if is_from_elsewhere {
-            format!("Runs on its own on {}", self.client.read(cx).label())
-        } else {
-            "Runs on its own".to_string()
-        }
-    }
-
-    /// Stands in for the message editor on a subthread, as t3code's `ProviderSubagentBar` does:
-    /// what runs it, for how long, and the way back to its parent, whose messages it takes.
-    fn render_subthread_bar(
-        &self,
-        parent: Option<ThreadKey>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let thread = self.thread.read(cx);
-        let stored = self.store.read(cx).thread(self.thread_id);
-        let model = thread
-            .model_name()
-            .or_else(|| stored.and_then(|thread| thread.model.clone()))
-            .unwrap_or_else(|| self.agent_name(cx).to_string());
-        let effort = thread.effort_name();
-        let started_at = stored.and_then(|thread| thread.created_at);
-        let outcome = stored
-            .and_then(|thread| thread.task.as_ref())
-            .and_then(|task| task.outcome.as_ref());
-        let status = subthread_status(started_at, outcome, SystemTime::now());
-        let can_stop = self.can_stop_subthread(cx);
-        let runs = self.subthread_runs(cx);
-        let focus_handle = self.focus_handle.clone();
-        h_flex()
-            .debug_selector(|| "subthread-bar".into())
-            .min_h(px(44.))
-            .py_1p5()
-            .pl_5()
-            .pr_2()
-            .gap_2p5()
-            .bg(colors.editor_background)
-            .border_t_1()
-            .border_color(colors.border)
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap_2()
-                    .child(self.thread_agent_icon(cx).size(IconSize::Small))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .child(Label::new(model).size(LabelSize::Small).truncate()),
-                    )
-                    .when_some(effort, |this, effort| {
-                        this.child(
-                            div().flex_none().child(
-                                Label::new(effort)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .debug_selector(|| "subthread-bar-status".into())
-                    .child(
-                        Label::new(status)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex_none()
-                    .debug_selector(|| "subthread-bar-runs".into())
-                    .child(Label::new(runs).size(LabelSize::Small).color(Color::Muted)),
-            )
-            .when(can_stop, |this| {
-                this.child(
-                    div().debug_selector(|| "subthread-bar-stop".into()).child(
-                        Button::new("stop-subthread", "Stop")
-                            .label_size(LabelSize::Small)
-                            .start_icon(
-                                Icon::new(IconName::Stop)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Error),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.thread.update(cx, |thread, cx| thread.cancel(cx))
-                            })),
-                    ),
-                )
-            })
-            .when_some(parent, |this, parent| {
-                this.child(
-                    div().debug_selector(|| "open-parent".into()).child(
-                        Button::new("open-parent", "Open Parent")
-                            .label_size(LabelSize::Small)
-                            .start_icon(Icon::new(IconName::ArrowUpLeft).size(IconSize::XSmall))
-                            .tooltip(move |_, cx| {
-                                Tooltip::for_action_in(
-                                    "Open Parent Thread",
-                                    &OpenParentThread,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            })
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.open_thread(parent, cx)),
-                            ),
-                    ),
-                )
-            })
             .into_any_element()
     }
 
@@ -4594,8 +4495,10 @@ impl AgentView {
                     .children(self.render_snooze_notice(cx))
                     .children(self.render_activity_bar(window, cx))
                     .map(|this| {
+                        // A subthread's messages come from its parent's agent, so it has no
+                        // composer and its conversation runs to the bottom.
                         if is_subthread {
-                            this.child(self.render_subthread_bar(parent, cx))
+                            this
                         } else if self.is_archived {
                             this.child(self.render_archived_notice(cx))
                         } else if !self.client.read(cx).is_online() {
@@ -23840,8 +23743,9 @@ mod tests {
         opened
     }
 
-    /// An open subthread: the parent's header, Zed's subagent bar under it, its task as a card,
-    /// and t3code's bar in place of the composer.
+    /// An open subthread: the parent's header, Zed's subagent bar under it with the model and
+    /// how long it works, its task as a card, and no composer: the conversation runs to the
+    /// bottom.
     #[gpui::test]
     fn a_subthread_shows_where_it_belongs(cx: &mut TestAppContext) {
         let (view, cx) = open_in(subthreads_snapshot(&[10]), 10, false, cx);
@@ -23854,7 +23758,8 @@ mod tests {
                     Entry::UserMessage("Also this".into()),
                 ],
                 cx,
-            )
+            );
+            thread.set_status_for_test(ConnectionStatus::Ready, cx);
         });
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
@@ -23867,9 +23772,7 @@ mod tests {
             "minimize-subthread",
             "subthread-task",
             "subthread-task-role",
-            "subthread-bar",
-            "subthread-bar-stop",
-            "open-parent",
+            "subthread-title-bar-status",
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
         }
@@ -23879,6 +23782,11 @@ mod tests {
             .debug_bounds("thread-header-project")
             .expect("the header");
         assert!(header.bottom() <= bar.top());
+        let conversation = cx
+            .debug_bounds("agent-conversation")
+            .expect("the conversation");
+        let window_height = cx.update(|window, _| window.viewport_size().height);
+        assert_eq!(conversation.bottom(), window_height);
 
         let store = view.read_with(cx, |view, _| view.store.clone());
         store.update(cx, |store, cx| {
@@ -24242,7 +24150,7 @@ mod tests {
     }
 
     /// A task delegated from another machine opens under its parent's header there, and its
-    /// bar says where it runs and goes back to that parent.
+    /// bar goes back to that parent.
     #[gpui::test]
     fn a_task_from_another_machine_shows_its_parent_there(cx: &mut TestAppContext) {
         use std::cell::RefCell;
@@ -24255,9 +24163,8 @@ mod tests {
             assert_eq!(parent, ThreadId(2));
             assert_eq!(view.header_title(cx).as_ref(), "Spawn some subthreads");
             assert_eq!(view.parent_title(cx).as_ref(), "Spawn some subthreads");
-            assert_eq!(view.subthread_runs(cx), "Runs on its own on Devbox 1");
         });
-        for selector in ["subthread-title-bar", "minimize-subthread", "subthread-bar"] {
+        for selector in ["subthread-title-bar", "minimize-subthread"] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector} is shown");
         }
 
@@ -24271,8 +24178,8 @@ mod tests {
             })
             .detach();
         });
-        let open_parent = cx.debug_bounds("open-parent").expect("Open Parent");
-        cx.simulate_click(open_parent.center(), gpui::Modifiers::none());
+        let minimize = cx.debug_bounds("minimize-subthread").expect("Minimize");
+        cx.simulate_click(minimize.center(), gpui::Modifiers::none());
         assert_eq!(
             *opened.borrow(),
             vec![ThreadKey {
@@ -24518,9 +24425,7 @@ mod tests {
     fn an_agents_own_subagent_has_no_stop(cx: &mut TestAppContext) {
         let (_, cx) = open_in(subagent_snapshot(true), 12, false, cx);
         assert!(cx.debug_bounds("subthread-title-bar").is_some());
-        assert!(cx.debug_bounds("subthread-bar").is_some());
         assert!(cx.debug_bounds("subthread-title-bar-stop").is_none());
-        assert!(cx.debug_bounds("subthread-bar-stop").is_none());
     }
 
     /// [`subagent_snapshot`] of a running subagent whose agent lets agentZ stop it (ACP's
@@ -24540,7 +24445,6 @@ mod tests {
     fn the_subthread_of_a_stoppable_subagent_has_stop(cx: &mut TestAppContext) {
         let (_, cx) = open_in(stoppable_subagent_snapshot(), 12, false, cx);
         assert!(cx.debug_bounds("subthread-title-bar-stop").is_some());
-        assert!(cx.debug_bounds("subthread-bar-stop").is_some());
     }
 
     /// And its card in the parent has Stop while it runs, which asks its server to stop it.
@@ -24581,8 +24485,8 @@ mod tests {
         )));
     }
 
-    /// Ctrl-minus, Minimize and Open Parent all open the parent, and the command palette offers
-    /// it only in a subthread.
+    /// Ctrl-minus and Minimize both open the parent, and the command palette offers it only in
+    /// a subthread.
     #[gpui::test]
     fn ctrl_minus_opens_the_parent(cx: &mut TestAppContext) {
         let (view, cx) = open_in(subthreads_snapshot(&[10]), 10, false, cx);
@@ -24599,11 +24503,9 @@ mod tests {
         });
         cx.simulate_keystrokes("ctrl--");
         assert_eq!(*opened.borrow(), vec![ThreadId(2)]);
-        for selector in ["minimize-subthread", "open-parent"] {
-            let button = cx.debug_bounds(selector).expect("the way back");
-            cx.simulate_click(button.center(), gpui::Modifiers::none());
-        }
-        assert_eq!(*opened.borrow(), vec![ThreadId(2); 3]);
+        let minimize = cx.debug_bounds("minimize-subthread").expect("the way back");
+        cx.simulate_click(minimize.center(), gpui::Modifiers::none());
+        assert_eq!(*opened.borrow(), vec![ThreadId(2); 2]);
     }
 
     #[gpui::test]
