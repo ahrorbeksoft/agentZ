@@ -1174,8 +1174,10 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   automatically when it finishes", `ToolCall::background_process_id`; Droid's session then
   waits on them) hold the turn they started in for as long as the PID lives, with no
   giving up (`processes_hold_turn`: a release workflow watched for an hour), checked every 5
-  seconds (`check_background_processes`). One answered "Process will continue after CLI
-  exits" (Droid without its completion wake) never wakes it, so it isn't waited for. Once one
+  seconds (`check_background_processes`). They're counted as the turn ends, and one that
+  ended before that gave Droid its result while it worked, so it isn't waited for. One
+  answered "Process will continue after CLI exits" (Droid without its completion wake) never
+  wakes it, so it isn't waited for either. Once one
   exits, the thread works again until Droid wakes with its end (up to 3 minutes,
   `PROCESS_WAKE_QUIET_ROUNDS`), so a message sent meanwhile waits rather than reach Droid
   mid-wake, where it folds it into its work and never answers the prompt. One left from an

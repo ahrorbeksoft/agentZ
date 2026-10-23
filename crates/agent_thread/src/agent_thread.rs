@@ -3511,7 +3511,7 @@ impl AgentThread {
     }
 
     /// Counts the background work the calls from the entry on left: subagents sent off, and
-    /// commands left running.
+    /// commands left running that still run.
     fn count_background_work(&mut self, from: usize) {
         let from = from.min(self.view.entries.len());
         let mut counted_process = false;
@@ -3525,9 +3525,13 @@ impl AgentThread {
             if tool_call.sends_subagent_to_background() {
                 self.detached_subagents.push(tool_call.id.clone());
             } else if let Some(id) = tool_call.background_process_id() {
-                self.background_processes
-                    .push(BackgroundProcess { id, entry: index });
-                counted_process = true;
+                // A turn's calls are counted as it ends, so one that ended already did so
+                // while the agent worked, which then got its result: no wake follows it.
+                if process_is_alive(id) {
+                    self.background_processes
+                        .push(BackgroundProcess { id, entry: index });
+                    counted_process = true;
+                }
             } else {
                 continue;
             }
@@ -8355,6 +8359,34 @@ mod tests {
             .wait_until(|thread| thread.state.last_stop_reason.is_some())
             .await;
         assert!(!thread.thread.is_working());
+        thread.handle_messages_for(Duration::from_secs(3)).await;
+        assert!(!thread.thread.is_working(), "nothing wakes it");
+        assert_eq!(thread.thread.state.finished_turns.len(), 1);
+    }
+
+    /// A command Factory Droid left running that ended before its turn did gave Droid its
+    /// result as it worked, so nothing wakes Droid after it: the turn ends with Droid's answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_that_ends_within_its_turn_doesnt_hold_it() {
+        let Some(command) = mock_agent(&[]) else {
+            return;
+        };
+        let mut thread = start(command, None);
+        thread
+            .wait_until(|thread| thread.status() == &ConnectionStatus::Ready)
+            .await;
+        thread.update(|thread| thread.send("droid-exec-bg 0.2 in-turn".into()));
+        thread
+            .wait_until(|thread| thread.state.last_stop_reason.is_some())
+            .await;
+        assert_eq!(
+            last_agent_message(&thread.thread).as_deref(),
+            Some("The command finished.")
+        );
+        assert!(
+            !thread.thread.is_working(),
+            "the turn ended with its answer"
+        );
         thread.handle_messages_for(Duration::from_secs(3)).await;
         assert!(!thread.thread.is_working(), "nothing wakes it");
         assert_eq!(thread.thread.state.finished_turns.len(), 1);

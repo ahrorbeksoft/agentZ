@@ -39,7 +39,9 @@ with "All reports are in.". "droid-exec-bg <seconds>" leaves a command ("sleep")
 Droid's Execute with fireAndForget does, with its PID, ends its turn, and wakes a second after
 the command exits with "The command finished." and a usage update, as Droid ends a model call;
 "droid-exec-bg <seconds> detached" says the process goes on after it, as Droid without its
-completion wake does, and never wakes. A prompt of "slow" streams
+completion wake does, and never wakes, and "droid-exec-bg <seconds> in-turn" waits for the
+command in its turn, saying "The command finished." before it ends, and never wakes either.
+A prompt of "slow" streams
 "One two three four five" a word at a time, 200 ms apart, and "think" streams a thought a
 word at a time, 500 ms apart, then replies. To a client that takes ACP's notices, "notice" sends
 a warning and a notice of a severity of its own, then replies; to one that takes compaction
@@ -966,10 +968,12 @@ def run_droid_tasks(request_id, session_id, count, seconds):
     threading.Thread(target=wake, daemon=True).start()
 
 
-def run_droid_background_command(request_id, session_id, seconds, wakes=True):
+def run_droid_background_command(request_id, session_id, seconds, wakes=True, in_turn=False):
     """As Factory Droid's Execute with fireAndForget leaves a command running, and Droid wakes
     once it exits, ending its reply with a usage update as Droid ends each model call. Without
-    `wakes`, as Droid without its completion wake, it never does."""
+    `wakes`, as Droid without its completion wake, it never does. With `in_turn`, the command
+    ends while Droid still works, which then gets its result in that turn, so nothing wakes it
+    after."""
     process = subprocess.Popen(["sleep", str(seconds)])
     ending = ("The command's result will be delivered automatically when it finishes."
               if wakes else
@@ -988,6 +992,12 @@ def run_droid_background_command(request_id, session_id, seconds, wakes=True):
                                     "Output: /tmp/droid-bg.out\n"
                                     "Status: Running in background\n"
                                     f"{ending}"}}]})
+    if in_turn:
+        process.wait()
+        update(session_id, text_chunk("agent_message_chunk", "The command finished."))
+        update(session_id, {"sessionUpdate": "usage_update", "used": 2000, "size": 200000})
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+        return
     update(session_id, text_chunk("agent_message_chunk", "The command runs in the background."))
     send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
@@ -1678,7 +1688,8 @@ for message in incoming():
         elif prompt_text.startswith("droid-exec-bg "):
             words = prompt_text.split(" ")
             run_droid_background_command(message["id"], params["sessionId"], float(words[1]),
-                                         wakes="detached" not in words)
+                                         wakes="detached" not in words,
+                                         in_turn="in-turn" in words)
         elif prompt_text == "droid-task" or prompt_text.startswith("droid-task "):
             seconds = float(prompt_text.split(" ", 1)[1]) if " " in prompt_text else 0.5
             run_droid_task(message["id"], params["sessionId"], seconds)
