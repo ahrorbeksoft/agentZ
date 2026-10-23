@@ -1,0 +1,8 @@
+/* This round's pieces, over chats/mock-chats.css. */
+.m .ch2-shim {
+  background: linear-gradient(90deg, var(--shim-base) 0 38%, var(--t) 50%, var(--shim-base) 62% 100%);
+  background-size: 300% 100%;
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: ch2-shimmer 2.2s linear infinite;
+}
+@keyframes ch2-shimmer { from { background-position: 100% 0; } to { background-position: 0% 0; } }
