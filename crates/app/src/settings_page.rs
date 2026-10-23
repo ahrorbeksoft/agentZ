@@ -13043,7 +13043,7 @@ mod tests {
         cx.run_until_parked();
         assert!(shown("model-row-sonnet", cx));
         click("model-shown-sonnet", cx);
-        let mut own = shared.clone();
+        let mut own = shared;
         own.set_shown("sonnet", false);
         assert!(requests.borrow().contains(&set_models(Some(own))));
 
