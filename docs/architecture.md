@@ -997,9 +997,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   a plan, a fetched page's notes and reported findings are the texts drawn as markdown. Rows are
   one dim gray (`work_row_color`, t3code's secondary label: muted, a quarter of the way to the background) so they read apart
   from messages (`design/thread-rows/`). A thought is a row too (t3code's reasoning row):
-  "Thinking" with t3code's shine (`shimmering_label`) while the agent thinks, then "Thought",
-  opening to the text; Settings › Threads' "Show thinking" (`AppSettings::show_thinking`, Zed's
-  `thinking_display` as expanded or collapsed) opens them all. Each run of two or more tool
+  "Thinking", held still as Zed's, while the agent thinks, then "Thought", closed and opening to
+  the text on click (`design/chats-2/`, topic 6 A). Each run of two or more tool
   calls and thoughts folds into one line that opens to them once the agent writes a message
   after it, also mid-turn (t3code's work groups, `AgentView::folded_run`), saying what it did in
   t3code's words (`summarize_work`: "Ran 5 commands", "Read 2 files, changed 2 files, and
@@ -1014,7 +1013,8 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   23:30") and Copy on hover. The bubble is the thread's background a tenth of the way toward its
   text (`user_message_background`), so it shows in every theme: most themes give
   `element_background` the panel's own color. While a turn runs the footer says "Working for
-  12s". Under each finished reply (the last agent message of its turn) is a clock with how
+  12s", with t3code's shine (`shimmering_label`) sweeping across those words, also while a
+  permission request waits (`design/chats-2/`, topics 7 A and 8 B). Under each finished reply (the last agent message of its turn) is a clock with how
   long the turn took (t3code's durations), then a generic agent icon whose tooltip lists the
   turn's Agent, Account, Model and Effort in rows (`render_reply_footer`, picked in
   `design/agent-switching/`, 4 C), then Copy and Fork from This Response (below), which show

@@ -605,8 +605,6 @@ pub struct AgentView {
     /// The running turn's folded last run and the entry its live line showed when the rows were
     /// last measured.
     synced_live_line: Option<LiveLine>,
-    /// Settings › Threads' "Show thinking", as the rows were last measured with it.
-    synced_show_thinking: bool,
     toggled_thoughts: HashSet<usize>,
     /// The compactions whose summary is open.
     expanded_compactions: HashSet<usize>,
@@ -775,18 +773,6 @@ impl AgentView {
                 this.sync_composer_placeholder(cx);
                 cx.notify()
             }),
-            // Settings › Threads' "Show thinking" opens or closes every thought.
-            cx.observe(
-                &crate::app_settings::AppSettingsStore::global(cx),
-                |this, settings, cx| {
-                    let show_thinking = settings.read(cx).settings().show_thinking;
-                    if show_thinking != this.synced_show_thinking {
-                        this.synced_show_thinking = show_thinking;
-                        this.list_state.remeasure();
-                        cx.notify();
-                    }
-                },
-            ),
             cx.observe(&store, |this, _, cx| {
                 this.sync_agent(cx);
                 this.sync_fork_dividers(cx);
@@ -885,10 +871,6 @@ impl AgentView {
             opened_runs: HashSet::default(),
             synced_working: false,
             synced_live_line: None,
-            synced_show_thinking: crate::app_settings::AppSettingsStore::global(cx)
-                .read(cx)
-                .settings()
-                .show_thinking,
             toggled_thoughts: HashSet::default(),
             expanded_compactions: HashSet::default(),
             tall_messages: HashSet::default(),
@@ -6999,9 +6981,9 @@ impl AgentView {
         )
     }
 
-    /// A thought, as a row among the tool calls (t3code's reasoning row): "Thinking" with a
-    /// shimmer while the agent thinks, then "Thought", opening to the text. Settings › Threads'
-    /// "Show thinking" opens every thought by default (Zed's `thinking_display`).
+    /// A thought, as a row among the tool calls (t3code's reasoning row): "Thinking" while the
+    /// agent thinks, then "Thought", closed and opening to the text on click. It holds still, as
+    /// Zed's does: the Working line under it shimmers while the turn runs.
     fn render_thinking_block(
         &self,
         index: usize,
@@ -7011,19 +6993,11 @@ impl AgentView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_thinking = is_last && self.thread.read(cx).is_working();
-        let open_by_default = crate::app_settings::AppSettingsStore::global(cx)
-            .read(cx)
-            .settings()
-            .show_thinking;
         let is_live = live_run.is_some();
-        let is_open = open_by_default != (!is_live && self.toggled_thoughts.contains(&index));
+        let is_open = !is_live && self.toggled_thoughts.contains(&index);
         let color = work_row_color(cx);
         let row_group = SharedString::from(format!("thinking-row-{index}"));
-        let label = if is_thinking {
-            shimmering_label(("thinking-shimmer", index), "Thinking", color, cx).into_any_element()
-        } else {
-            div().child("Thought").into_any_element()
-        };
+        let label = if is_thinking { "Thinking" } else { "Thought" };
         let row = h_flex()
             .id(("thinking-block", index))
             .debug_selector(|| format!("thinking-row-{index}"))
@@ -10098,10 +10072,19 @@ impl AgentView {
                     status_label
                         .map(|label| Label::new(label).size(LabelSize::Small).color(Color::Muted)),
                 )
+                // The shimmer goes on while a permission request waits, so the line looks the
+                // same through the turn (`design/chats-2/`, topic 8 B).
                 .child(
-                    Label::new(elapsed_label)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    div()
+                        .debug_selector(|| "working-elapsed".into())
+                        .text_ui_sm(cx)
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(shimmering_label(
+                            "working-shimmer",
+                            elapsed_label,
+                            cx.theme().colors().text_muted,
+                            cx,
+                        )),
                 )
                 .children(running_label.map(|label| {
                     div().debug_selector(|| "subthreads-running".into()).child(
@@ -17193,14 +17176,15 @@ fn select_choice_name(
     name.map(|name| name.clone().into())
 }
 
-/// t3code's `live-tool-shine`: a band of the text color sweeps across a label in the row's
-/// gray, every 2.2 seconds, while the work it names goes on.
+/// t3code's `live-tool-shine`: a band of the text color sweeps across a label in its gray,
+/// every 2.2 seconds, while the work it names goes on.
 fn shimmering_label(
     id: impl Into<ElementId>,
-    text: &'static str,
+    text: impl Into<SharedString>,
     color: Hsla,
     cx: &App,
 ) -> impl IntoElement {
+    let text = text.into();
     let bright = cx.theme().colors().text;
     // Half the band's width, in characters: t3code's band is a little wider than "Thinking".
     const HALF_BAND: f32 = 4.;
@@ -17222,7 +17206,7 @@ fn shimmering_label(
                 };
                 highlights.push((byte..byte + character.len_utf8(), style));
             }
-            label.child(gpui::StyledText::new(text).with_highlights(highlights))
+            label.child(gpui::StyledText::new(text.clone()).with_highlights(highlights))
         },
     )
 }
@@ -17578,7 +17562,7 @@ mod tests {
     impl Render for Shimmer {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             self.renders.set(self.renders.get() + 1);
-            shimmering_label("shimmer", "Thinking", gpui::black(), cx)
+            shimmering_label("shimmer", "Working for 12s", gpui::black(), cx)
         }
     }
 
@@ -21849,9 +21833,9 @@ mod tests {
         );
     }
 
-    /// t3code's reasoning row: closed, opening on click, unless "Show thinking" is on.
+    /// t3code's reasoning row: closed, opening on click.
     #[gpui::test]
-    fn thoughts_are_closed_unless_show_thinking_is_on(cx: &mut TestAppContext) {
+    fn thoughts_are_closed_until_clicked(cx: &mut TestAppContext) {
         let (view, cx) = open(2, false, cx);
         let thread = view.read_with(cx, |view, _| view.thread.clone());
         thread.update(cx, |thread, cx| {
@@ -21875,14 +21859,6 @@ mod tests {
         cx.simulate_click(row.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert!(cx.debug_bounds("thinking-content-1").is_none());
-
-        cx.update(|_, cx| {
-            crate::app_settings::AppSettingsStore::global(cx).update(cx, |store, cx| {
-                store.update(|settings| settings.show_thinking = true, cx)
-            })
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("thinking-content-1").is_some());
     }
 
     const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";

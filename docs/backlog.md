@@ -37,14 +37,6 @@ Requested October 23, 2026: redesign chats. They don't need their own grouping a
 should be just like any other thread, but show "Chat" or something like it in place of a
 project name. In the project selector, it should be possible to select Chat to show only chats.
 
-### Move the shimmer from Thinking to "Running for"
-
-Requested October 23, 2026:
-
-- Remove the shimmering effect from thinking.
-- Remove the Show Thinking option.
-- Use that shimmer effect on "Running for" instead.
-
 ### Pick the account in a submenu of the agent selector
 
 Requested October 23, 2026: "why not put the account selector inside the agent selector in a
