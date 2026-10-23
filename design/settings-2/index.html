@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="settings-2" data-title="Settings">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Settings <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+const scopeRow = ([page, setting, scope]) => `<tr><td style="padding:3px 12px 3px 0;color:var(--muted);white-space:nowrap;vertical-align:top">${page}</td><td style="padding:3px 12px 3px 0;vertical-align:top">${setting}</td><td style="padding:3px 0;vertical-align:top;white-space:nowrap">${scope}</td></tr>`;
+const SETTINGS_INVENTORY = [
+  ['General › Threads', 'Thread order', 'All the app’s threads (kept by This Mac’s server)'],
+  ['General › Threads', 'Use modifier to send, Show thinking, Group working threads, Usage shown in the composer', 'This app'],
+  ['General › Threads', 'Auto-archive threads, Subthreads at once', 'Sent to every machine'],
+  ['General › Chats', 'Chats', 'This app'],
+  ['General › Artifacts', 'Open in the browser', 'This app'],
+  ['General › Artifacts', 'Design defaults: Variants, Include today’s, Sizes, Variants as', 'Sent to every machine; a project may use its own'],
+  ['General › Thread titles', 'Generate thread titles, Provider, Model, Reasoning effort', 'Each machine (its own picker row)'],
+  ['General › Projects', 'Combine matching repositories, Combine by, Show repository owner', 'This app'],
+  ['General › Server', 'Start at login', 'This Mac only'],
+  ['General › Experimental', 'ACP v2', 'Sent to every machine'],
+  ['(no screen yet)', 'Subthread roles: each role’s picks of agent, model and effort', 'Sent to every machine; accounts are each machine’s'],
+  ['Appearance', 'Theme mode, light and dark themes, window background, picture, soften, shows through, reduce motion', 'This app'],
+  ['Notifications', 'Sound volume, when finished, when input is needed, notify when unfocused', 'This app'],
+  ['Agents', 'Which agents are installed', 'Each machine'],
+  ['Agents › an agent', 'Defaults for New Threads, Environment Variables, Threads', 'Each account, on each machine'],
+  ['Agents › an agent › Account', 'When a limit is reached; Droid’s overage; name, color, account for new threads; Copy settings from (once)', 'Each account (Droid’s overage kept by Factory)'],
+  ['Usage', 'Each account’s limits (read only)', 'Each machine'],
+  ['Skills, MCP Servers', 'The lists, with each one’s accounts it’s kept off', 'Each machine'],
+  ['Machines', 'The machines, and each one’s icon', 'This app'],
+  ['Storage', 'Cleaning up rules', 'Each machine'],
+  ['Projects › a project', 'Name and icon (every copy); folder and grouping (each copy); Design defaults with “Use General’s”; checkouts; Remove', 'Each project'],
+];
+window.ROUND_INTRO = `<p>Two entries from the backlog. <b>Reorganize Settings</b>: “The whole Settings page is a mess; organize it better now that there are so many settings.” Also: “For machine-specific settings, a general setting that applies to all machines when set.” And: “Likewise for profile-specific settings: a general one for all profiles.” And the Settings screen left from <b>subthread roles</b> (built in 3b4bf5a without one): “users should be able choose for these”, the researcher, reviewer, worker and other roles, each an ordered list of agent and model, the account chosen by the most usage to spare.</p>
+<p>The mocks share one world: three machines, <b>This Mac</b>, <b>Devbox 1</b> (over SSH) and the cloud machine <b>agents-1</b>. This Mac has Claude Agent with two accounts, <b>Personal</b> (62% left) and <b>Work</b> (used up, resets in 1h 52m), Codex with one (81% left), Factory Droid (used up until 4:10 PM) and Google Antigravity. The models are Opus 5.5, Sonnet 5.5 and GPT-5.5. The projects are agentZ, ielts-today and fluency.uz.</p>
+<p>Words used: a <b>machine</b> is a computer with agentZ’s server on it; an <b>account</b> is one of an agent’s logins on a machine (I read “profile” as this; topic 3 says more); a <b>copy</b> is a project’s checkout on one machine; a <b>role</b> is the kind of work a subthread is delegated as. Where topics meet, the mocks use the recommended pick of the other topic, and each topic says which.</p>
+<p>Every setting today, and where it applies:</p>
+<table style="border-collapse:collapse;font-size:13px;margin:4px 0 8px">${SETTINGS_INVENTORY.map(scopeRow).join('')}</table>`;
+</script>
+<script src="mock-settings-2.js"></script>
+<script src="topics-organize.js"></script>
+<script src="topics-scopes.js"></script>
+<script src="topics-roles.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

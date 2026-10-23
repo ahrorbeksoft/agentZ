@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subthreads, Again Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="subthreads-3" data-title="Subthreads, Again">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Subthreads, Again <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Three entries from the backlog. <b>Improve subthreads again</b>: “While subthreads are working, show the agent as still working, as if it weren’t the end of its turn.” “On the left side, show only the running agents; done ones go inside a completed tasks button or something like it. If none are working, all of them can be shown.” “Users should be able to work with hundreds of subthreads, if they want to finish one whole project in one go.” (Its other point, steering a result into the parent’s running turn, is built.) <b>Improve the subagent view</b>: “its Cancel and Open Parent buttons look bad. Maybe there shouldn’t be buttons like that at all, maybe there should; to be decided.” And <b>Show shells next to the Working label</b>: “a Claude Agent thread shows ‘Working for 13m 58s’ at the end of its turn, while its running shell is in a separate ‘1 Background Task’ panel above the composer.”</p>
+<p>The mocks share one world: in agentZ on This Mac, the Claude Agent thread <b>“Implement the backlog in one go”</b> (Opus 5.5) split the backlog into eight subthreads by role. Three still run: <i>Worker: steer results into the running turn</i> (Claude Agent, in a worktree), <i>Researcher: how Droid reports background work</i> (Factory Droid) and <i>Reviewer: server side of delegated tasks</i> (Codex, GPT-5.5, waiting for your approval). Five have ended: <i>Worker: send only changed threads to the app</i>, <i>Researcher: account limits and their pace</i>, <i>Worker: roles in orchestrator_capabilities</i>, <i>Reviewer: the roles’ account choice</i> (failed) and <i>Worker: raise delegate_tasks to 100</i>. The other threads are “Record Bugs and Features in Backlog” (Claude Agent), “Update Composer and Mac App UI” (Factory Droid) and “Recent Zed changes impact” (Codex, on Devbox 1). Topic 3 scales the same thread up to 100 tasks: 8 running, 30 ended, 62 queued.</p>
+<p>Words used: a <b>subthread</b> is a thread another thread’s agent started with <code>delegate_task</code> or <code>delegate_tasks</code>; its <b>parent</b> is the thread that started it. A <b>queued</b> one waits for a free place (Subthreads at once, 4 by default). The <b>batch card</b> is “Started 8 subthreads · 3 running” in the parent’s conversation; a <b>results row</b> is “5 subthreads finished · 1 failed”. A <b>shell</b> is a command the agent left running in the background. Where topics meet, the mocks show today’s design of the other topic unless they say otherwise.</p>`;
+</script>
+<script src="mock-subthreads-3.js"></script>
+<script src="topics-subthreads.js"></script>
+<script src="topics-shells.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>

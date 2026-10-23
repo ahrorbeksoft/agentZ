@@ -45,10 +45,21 @@ agents that they can just end their turn once they delegate:
 - Users should be able to work with hundreds of subthreads, if they want to finish one whole
   project in one go.
 
+Built: a result steers into the parent's running turn when its agent has steering of its own
+(Claude Agent's and Codex's `_session/steering` on ACP v1; de71e44), and the server sends the
+app only the threads that changed, with `delegate_tasks` taking up to 100 tasks (fb98ec2).
+Left, on the design board (`design/subthreads-3/`): the parent shown as working, the sidebar's
+running-only rows, and how the sidebar and the parent's cards hold up with hundreds of
+subthreads. Measured before fb98ec2, in a debug build's headless test, a sidebar with 1,000
+threads and 300 subthreads took about 0.9 s per redraw, as did 1,300 plain threads, so the
+sidebar's cost is the number of rows, not subthreads as such.
+
 ### Improve the subagent view
 
 Improve the subagent view: its Cancel and Open Parent buttons look bad. Maybe there shouldn't
 be buttons like that at all, maybe there should; to be decided.
+
+On the design board: `design/subthreads-3/`.
 
 ### Subthread templates per role, on the account with the most to spare
 
@@ -86,6 +97,11 @@ other".
 - Neither Zed nor t3code has this. It's a settings change (likely beside Subthreads at once in
   Settings › General › Threads), so it starts on the design board.
 
+Built (3b4bf5a): the four roles, the picks the app sends every server
+(`Request::SetSubthreadRoles`, `subthread-roles.json`), `orchestrator_capabilities` listing
+them, and the account choice by spare usage. Left: the Settings screen for the picks, on the
+design board (`design/settings-2/`).
+
 ### Reorganize Settings
 
 The whole Settings page is a mess; organize it better now that there are so many settings.
@@ -94,6 +110,9 @@ Also:
 - For machine-specific settings, a general setting that applies to all machines when set.
 - Likewise for profile-specific settings: a general one for all profiles.
 
+On the design board: `design/settings-2/`. "Profile" isn't a term in agentZ; the board reads it
+as an agent's accounts and asks.
+
 ### Show shells next to the Working label
 
 Show shells next to the Working label. In the screenshot, a Claude Agent thread shows "Working
@@ -101,6 +120,8 @@ for 13m 58s" at the end of its turn, while its running shell is in a separate "1
 Task" panel above the composer.
 
 ![A Claude Agent thread's Working label, with its background shell in a panel above the composer](backlog/shells-beside-working-label.png)
+
+On the design board: `design/subthreads-3/`.
 
 ### Redesign chats
 
