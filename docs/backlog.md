@@ -29,6 +29,7 @@ link in a Codex thread's "Saved the full report at AUDIT.md".
 ![The "application can't be opened, -50" dialog after clicking a file link in a thread](backlog/file-link-cant-be-opened.png)
 
 ## Features
+
 ### Artifacts move with their thread to another machine
 
 From the Artifacts 2 round (`design/artifacts-2/`, decided in its intro and topic 7): an
