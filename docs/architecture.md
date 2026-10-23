@@ -218,6 +218,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `auto-archive.json` | server | Days of inactivity after which threads are archived (Settings › Threads), a number or null |
 | `subthread-limit.json` | server | How many delegated tasks a thread runs at once (Settings › Subthreads › Subthreads at once), a number |
 | `subthread-roles.json` | server | What each role of delegated task runs on (researcher, reviewer, worker, other): the user's picks of agent, accounts, model and effort, in the order added, and whether to choose by usage |
+| `model-preferences.json` | server | Shared's model choices for each agent (hidden models, favorites, their order), a copy of the app's, so `orchestrator_capabilities` names only the models shown |
 | `acp-v2.json` | server | Whether agents are asked for ACP v2 (Settings › General › Experimental › ACP v2), true or false |
 | `workspace-cleanup.json` | server | The cleanup rules (Settings › Storage › Cleaning up), the last run's report, deleted threads' workspaces still there, and the workspaces a cleanup removed with the commit each was at |
 | `worktrees/`, `pastures/` | server | Threads' workspaces, `<repo>/<branch>` |
@@ -226,7 +227,7 @@ In `~/Library/Application Support/agentZ/` (`~/.agentz/` on Linux):
 | `artifacts/server.json`, `artifacts/theme.json`, `artifacts/design-defaults.json` | server | The pages server's port and token, kept so links keep working, the app's theme for pages, and the design defaults from Settings |
 | `node/` | server | Downloaded Node.js, when the machine has none new enough |
 | `server.sock`, `server.pid`, `machine-id`, `logs/server.log` | server | The running server |
-| `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts, Shared settings and what each machine takes from them |
+| `settings.json` | app | Theme, the window's picture, saved machines, sidebar and terminal preferences, saved layouts, Shared settings (each agent's model choices among them) and what each machine takes from them |
 | `shared-skills/<name>/` | app | Shared's skills (Settings › Skills on Shared), given to each machine that uses shared settings |
 | `backgrounds/<name>.jpg`, `<name>-soft.jpg` | app | The picture behind the window, as Choose… copied it, sharp and softened |
 | `viewed.json` | app | Completions this client has displayed |
@@ -616,7 +617,26 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   own. On one account, each of the two tabs starts with "Use shared settings": on, with what
   Shared has ("Sonnet · High", "2 shared variables.") and no other rows; off ("Work sets its
   own."), the account's own rows (`Request::UseSharedAccountSettings`). The Threads tab lists
-  one account's sessions, so its menu has no Shared. Add Agent is Zed's
+  one account's sessions, so its menu has no Shared. The Models tab, after Defaults
+  (`settings_page/agent_models.rs`, `design/model-visibility`, topics 1, 5, 7 and 8; from
+  t3code's Settings › Providers › Models), lists every model the agent offers in the groups
+  Favorites, All (named only under Favorites) and Hidden from picker: a grip that drags a row
+  within its group (not while the list is filtered; the whole order shown is kept,
+  `ModelPreferences::move_model`), a star ("Add to favorites"), the name (dimmed once hidden)
+  and a switch ("Shown in picker" / "Hidden from picker"). Beside its heading are the counts
+  ("66 models · 3 favorites · 50 hidden", leaving out what's none) and Hide deprecated, which
+  hides the models named "… [Deprecated]"; from nine models a Filter models field narrows it
+  ("No models match."). Each row is a row of the page's list, so a long list lays out only
+  what's in view. Its Account menu has Shared first whenever the agent lists more than one
+  account, whether or not they share settings, with a note naming the accounts that set their
+  own; an agent with one account edits Shared's directly. Shared's choices are the app's
+  (`AppSettings::model_preferences`, given to every machine, `Request::SetModelPreferences`,
+  `machines::sync_model_preferences`); an account's own are on its machine
+  (`AgentSettings::models`, `AgentSettingsChange::SetModels`), and its tab starts with "Use
+  shared settings": on, "16 of 66 shown · 3 favorites" and nothing more; off, a copy of
+  Shared's to change; on again, the copy goes. A model the agent adds later is shown, since
+  only the hidden ones are kept. Defaults' Model menu offers the shown models in the user's
+  order, and a hidden default in its place, dimmed and tagged Hidden. Add Agent is Zed's
   menu: Install from Registry, Add Custom Agent, and the ACP docs. The ACP Registry
   page has search, an All / Installed / Not Installed filter, and a card for each registry agent.
   As in Zed, the cards are a `uniform_list` below a pinned search bar: scrolling re-renders the
@@ -924,9 +944,19 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   once there is; Stop is red with a white square, and Queue keeps the round shape with the list
   icon. The model and effort are one chip, "Opus 5.5 · High ⌄" (`model_picker.rs`, topic 2 A,
   from Codex's /model, with the user's search): its menu searches the models (fuzzy, under
-  their groups' headers; Up, Down and Enter pick), and the effort's levels are a list under
-  them (the user's word, in place of a row of segments that cut names short), which set it
-  and leave the menu open. The model's other settings, ACP's `model_config` category (Claude
+  their groups' headers; Up, Down and Enter pick), eight at a time (16rem). It lists only the
+  models the thread's account shows (`model_picker::{followed_preferences, picker_models}`,
+  `design/model-visibility`, topics 2, 3 and 10): hidden ones are gone, even from search,
+  but the thread's own stays in its place, dimmed and tagged Hidden, until another is picked;
+  the agent's favorites come first under Favorites, once, then the agent's groups (or All),
+  each in the user's order. Manage Models… (`AgentViewEvent::OpenAgentModels`) opens the
+  agent's Models tab on the thread's machine. The effort is one row at the menu's end
+  ("Reasoning Effort", "High ›", topic 13 A): hovering it, a click or → opens its levels
+  beside the menu, to its left along its bottom (← closes them), and picking one closes both.
+  ⌥⌘/ (Ctrl-Alt-/ on Linux) opens the menu and ⌥⇥ moves the thread to its next favorite,
+  wrapping around (Zed's `ToggleModelSelector` and `CycleFavoriteModels`, topic 12 A); the
+  chip's tooltip names both, the second only with two favorites or more, as Zed's does.
+  The model's other settings, ACP's `model_config` category (Claude
   Agent's and Codex's Fast mode), follow in the menu rather than the footer: a switch row for
   on/off, a list for choices (`model_picker::is_model_setting`). While Fast mode is on, the chip
   starts with a bolt ("⚡ Opus 5.5 · High", the user's pick over its name), which its menu row
@@ -1800,7 +1830,11 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   in the server's and the app's `account_settings`), and a change to it, from Settings, a
   thread or the custom agent form, changes Shared's there (`Server::change_account_choices`).
   Turning "Use shared settings" off copies Shared's to the account; back on, its copy goes
-  (`Server::use_shared_account_settings`). A thread starts with its account's
+  (`Server::use_shared_account_settings`). An account's model choices follow Shared's, the
+  app's, unless it keeps its own (`agentz_protocol::models::followed`,
+  `Server::followed_model_preferences`; Settings › Agents › an agent › Models), and
+  `orchestrator_capabilities` lists only the models they show (`design/model-visibility`,
+  topic 15 C). A thread starts with its account's
   defaults, and a choice made in it becomes its account's default. Agent control lists each
   account with its models and modes when an agent has more than one
   (`orchestrator_capabilities`' `accounts`, keyed by id or "external"), takes an `account` (key
@@ -2217,7 +2251,9 @@ t3code's delegated tasks (`thread-lineage-and-context-transfer.md`, `ProviderSub
   ("Claude Agent (Work) · Sonnet 5.5 · High"), dragged to reorder, and + for a menu of the
   agents installed on any machine. A chip's menu (kept open while its checks change) has the
   agent, This Mac's accounts (All, or some, at least one) when it has more than one, the model
-  and effort from the account's known options (or another machine's), and Remove.
+  and effort from the account's known options (or another machine's), and Remove. The Model
+  menu offers the models the account's pickers show, in the user's order, and keeps a pick's
+  hidden model (`PickChoices::shown_models`, `design/model-visibility` topic 15 B).
 - **Ending the turn**: `delegate_task` and `delegate_tasks` return at once, with a `note`
   telling the agent to end its turn: the end of each task reaches it as a message. There's no
   blocking wait; `agentz_thread_wait` on one's own task answers at once with its status and
