@@ -1,0 +1,12 @@
+{
+  "topics": {
+    "accounts": {
+      "pick": "A",
+      "picks": [],
+      "none": false,
+      "comments": {},
+      "note": "Picked in chat: one list shared by all accounts, with an account able to opt out and keep its own.",
+      "also": []
+    }
+  }
+}

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Visibility and Favorites Design Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../board/board.css">
+<link rel="stylesheet" href="../board/mock.css">
+</head>
+<body data-area="model-visibility" data-title="Model Visibility and Favorites">
+<div class="top">
+  <h1><a href="/" style="color:inherit;text-decoration:none">agentZ</a> · Model Visibility and Favorites <span>design board</span></h1>
+  <div class="progress"><div class="bar"><i id="bar"></i></div><span id="count"></span></div>
+  <span class="saved" id="saved"></span>
+  <span class="sp"></span>
+  <button class="tbtn" id="undecided">Only undecided</button>
+  <a class="tbtn" href="#summary" style="text-decoration:none;color:inherit">Summary</a>
+</div>
+<nav class="nav" id="nav"></nav>
+<main class="page" id="page"></main>
+<div class="lightbox" id="lightbox"><div id="lb-body"></div><div class="cap" id="lb-cap"></div></div>
+
+<script src="../board/mock.js"></script>
+<script>
+const TOPICS = [];
+window.ROUND_INTRO = `<p>Your request: “What should we do about model visibility settings, like hiding certain models and stuff, maybe favorites too. Learn how t3code does it.” Today the composer’s model picker lists every model the agent offers: Factory Droid’s 66, OpenCode’s 111, Claude Agent’s 4, and Defaults’ Model menu in Settings lists them all again.</p>
+<p><b>How t3code does it.</b> Settings › Providers has a Models list for each provider: a star, the name, Move up and Move down, and a switch (“Shown in picker” or “Hidden from picker”), in three groups (Favorites, All, Hidden from picker), with Filter models, counts and Disable all. Hidden models and their order are each provider’s, favorites are global, and all of it syncs to every device. Its picker leaves hidden models out entirely, has a rail with Favorites first and opens on it, and moves a composer whose model was hidden to the first shown one. <b>Zed</b> has favorites only: a star at a row’s end on hover, a Favorite section on top of the picker, kept per agent, with keys to open the picker and cycle favorites.</p>
+<p>The mocks share one world: the Factory Droid thread <b>“Speed up the checkout page”</b> in agentZ, on Opus 5.5 at Extra High. Droid has two accounts here, Personal and Work, and runs on This Mac and Devbox 1. You use 16 of its 66 models and hide the other 50; where favorites appear, Droid’s are Opus 5.5, GPT-6.1 Sol and Gemini 4 Argon, Claude Agent’s Opus 5.5 and Sonnet 5.5, and Codex’s 6.1 Sol. Words used: the <b>picker</b> is the menu the model chip beside Send opens; the <b>Models list</b> is where you choose which models it shows (topic 1). Where topics meet, the mocks use the recommended pick of the other topic, and each topic says which.</p>`;
+</script>
+<script src="mock-model-visibility.js"></script>
+<script src="topics-hiding.js"></script>
+<script src="topics-list.js"></script>
+<script src="topics-favorites.js"></script>
+<script src="topics-elsewhere.js"></script>
+<script src="../board/decisions.js"></script>
+<script src="../board/app.js"></script>
+</body>
+</html>
