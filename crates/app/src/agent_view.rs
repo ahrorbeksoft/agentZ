@@ -75,6 +75,9 @@ use crate::attachment_image::{
     message_images, message_pieces, render_hover_preview, web_image, with_image_names,
     without_image_links,
 };
+use crate::background_tasks::{
+    BackgroundTasksPopover, background_tasks_count, render_background_task_rows,
+};
 use crate::branch_picker::{BranchPicker, FetchOrigin};
 use crate::cloud_machines::state_label;
 use crate::confirm_dialog::ConfirmRequest;
@@ -1282,14 +1285,15 @@ impl AgentView {
     }
 
     /// What the agent left running after its turn, such as commands it sent to the background:
-    /// each with how long it has run, and Stop.
+    /// each with how long it has run, and Stop. While the Working row shows, they're in the
+    /// popover of its count instead.
     fn render_background_tasks_section(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let tasks = self.thread.read(cx).state.background_tasks.clone();
-        if tasks.is_empty() {
+        if tasks.is_empty() || self.working_since(cx).is_some() {
             return None;
         }
         let colors = cx.theme().colors();
@@ -1316,99 +1320,7 @@ impl AgentView {
                 cx.notify();
             }));
 
-        let rows: Vec<AnyElement> = tasks
-            .iter()
-            .enumerate()
-            .map(|(index, task)| {
-                let icon = if task.paused && !task.stopping {
-                    Icon::new(IconName::DebugPause)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                        .into_any_element()
-                } else {
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Small)
-                        .color(if task.stopping {
-                            Color::Muted
-                        } else {
-                            Color::Accent
-                        })
-                        .with_rotate_animation(2)
-                        .into_any_element()
-                };
-                let state = if task.stopping {
-                    "Stopping…".to_string()
-                } else if task.paused {
-                    "Paused".to_string()
-                } else {
-                    format_elapsed(task.started_at.elapsed().unwrap_or_default())
-                };
-                let details = format!("{} · {state}", background_task_kind(&task.kind));
-                let name = task.name.clone();
-                let about = task
-                    .progress
-                    .clone()
-                    .map(|progress| progress.to_string())
-                    .or_else(|| {
-                        task.output_file
-                            .as_ref()
-                            .map(|path| format!("Output in {}", path.display()))
-                    });
-                let task_id = task.id.clone();
-                h_flex()
-                    .w_full()
-                    .p_1p5()
-                    .gap_1p5()
-                    .bg(colors.editor_background)
-                    .when(index + 1 < count, |this| {
-                        this.border_b_1().border_color(colors.border_variant)
-                    })
-                    .child(icon)
-                    .child(
-                        div()
-                            .id(("background-task-name", index))
-                            .debug_selector(move || format!("background-task-name-{index}"))
-                            .flex_1()
-                            .min_w_0()
-                            .child(Label::new(name.clone()).size(LabelSize::Small).truncate())
-                            .tooltip(move |_, cx| match &about {
-                                Some(about) => {
-                                    Tooltip::with_meta(name.clone(), None, about.clone(), cx)
-                                }
-                                None => Tooltip::simple(name.clone(), cx),
-                            }),
-                    )
-                    .child(
-                        Label::new(details)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .when(task.can_stop, |this| {
-                        this.child(
-                            div()
-                                .debug_selector(move || format!("stop-background-task-{index}"))
-                                .child(
-                                    IconButton::new(
-                                        ("stop-background-task", index),
-                                        IconName::Stop,
-                                    )
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .disabled(task.stopping)
-                                    .tooltip(Tooltip::text("Stop Task"))
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.thread.update(cx, |thread, cx| {
-                                                thread.stop_background_task(&task_id, cx)
-                                            });
-                                        },
-                                    )),
-                                ),
-                        )
-                    })
-                    .into_any_element()
-            })
-            .collect();
+        let rows = render_background_task_rows(&self.thread, &tasks, cx);
         Some(
             v_flex()
                 .child(summary)
@@ -10122,21 +10034,28 @@ impl AgentView {
         )
     }
 
-    /// t3code's "Working for 1m 12s" at the end of a turn, and of a thread whose subthreads
-    /// work after its turn ended, with how many ("· 3 subthreads running").
-    fn render_generating(&self, cx: &App) -> Option<AnyElement> {
-        let subthreads = self.subthreads_at_work(cx);
+    /// Since when the Working row has shown: the turn's start, or the first subthread's while
+    /// they work after it ended. `None` while it doesn't show.
+    fn working_since(&self, cx: &App) -> Option<SystemTime> {
         let thread = self.thread.read(cx);
-        let started_at = match (thread.turn_started_at(), subthreads) {
-            (Some(turn), Some((since, _))) => turn.min(since),
-            (None, Some((since, _))) => since,
-            (Some(turn), None) => turn,
-            (None, None) => return None,
-        };
         // The compaction's divider says it's working meanwhile, as in Zed.
         if thread.is_compacting() {
             return None;
         }
+        let subthreads = self.subthreads_at_work(cx).map(|(since, _)| since);
+        match (thread.turn_started_at(), subthreads) {
+            (Some(turn), Some(since)) => Some(turn.min(since)),
+            (turn, since) => turn.or(since),
+        }
+    }
+
+    /// t3code's "Working for 1m 12s" at the end of a turn, and of a thread whose subthreads
+    /// work after its turn ended, with how many ("· 3 subthreads running"), and what the agent
+    /// left running ("· 1 shell"), which opens them.
+    fn render_generating(&self, cx: &App) -> Option<AnyElement> {
+        let started_at = self.working_since(cx)?;
+        let subthreads = self.subthreads_at_work(cx);
+        let thread = self.thread.read(cx);
         // Any permission request, whether its tool call is shown or not.
         let awaiting_confirmation = !thread.state.permission_requests.is_empty();
         let elapsed_label = format!(
@@ -10191,6 +10110,38 @@ impl AgentView {
                             .color(Color::Placeholder),
                     )
                 }))
+                .children(self.render_working_shells(cx))
+                .into_any_element(),
+        )
+    }
+
+    /// "· 1 shell" on the Working row, which opens the shells, each with Stop.
+    fn render_working_shells(&self, cx: &App) -> Option<AnyElement> {
+        let tasks = &self.thread.read(cx).state.background_tasks;
+        if tasks.is_empty() {
+            return None;
+        }
+        let label = format!("· {}", background_tasks_count(tasks));
+        let thread = self.thread.clone();
+        Some(
+            div()
+                .debug_selector(|| "working-shells".into())
+                .child(
+                    PopoverMenu::new("working-shells-menu")
+                        .trigger(
+                            Button::new("working-shells", label)
+                                .style(ButtonStyle::Transparent)
+                                .size(ButtonSize::None)
+                                .label_size(LabelSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .menu(move |_, cx| {
+                            let thread = thread.clone();
+                            Some(cx.new(|cx| BackgroundTasksPopover::new(thread, cx)))
+                        })
+                        .anchor(Anchor::BottomLeft)
+                        .offset(gpui::point(px(0.), px(-4.))),
+                )
                 .into_any_element(),
         )
     }
@@ -16516,15 +16467,7 @@ fn day_aware_time(time: SystemTime, now: SystemTime) -> String {
 
 /// The running timer counts whole seconds, so it doesn't flicker through tenths.
 /// How a background task's kind reads: Claude Agent's "shell" as "Shell".
-fn background_task_kind(kind: &str) -> String {
-    let mut characters = kind.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => "Task".to_string(),
-    }
-}
-
-fn format_elapsed(duration: Duration) -> String {
+pub(crate) fn format_elapsed(duration: Duration) -> String {
     let seconds = duration.as_secs();
     if seconds < 60 {
         format!("{seconds}s")
@@ -22318,6 +22261,56 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("background-task-name-0").is_none());
+    }
+
+    /// While the turn runs, the Working row counts the shells ("· 2 shells") and opens them in
+    /// a popover, each with Stop, and the panel above the composer leaves them out. Once the
+    /// turn ends, the panel has them again.
+    #[gpui::test]
+    fn a_running_turn_counts_its_shells_on_the_working_row(cx: &mut TestAppContext) {
+        let (view, cx) = open(2, false, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        let client = view.read_with(cx, |view, _| view.client.clone());
+        let task = |id: &str, name: &str| agentz_protocol::thread::BackgroundTask {
+            id: id.to_string().into(),
+            name: name.to_string().into(),
+            kind: "shell".into(),
+            tool_call_id: None,
+            output_file: None,
+            progress: None,
+            paused: false,
+            can_stop: true,
+            stopping: false,
+            started_at: std::time::SystemTime::now(),
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_status_for_test(ConnectionStatus::Ready, cx);
+            thread.set_entries_for_test(vec![Entry::UserMessage("Test it".into())], cx);
+            thread.set_working_for_test(true, cx);
+            thread.set_background_tasks_for_test(
+                vec![
+                    task("task-1", "Run the tests"),
+                    task("task-2", "Run the dev server"),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("background-task-name-0").is_none());
+        assert!(cx.debug_bounds("background-tasks-popover").is_none());
+
+        click_on("working-shells", cx);
+        assert!(cx.debug_bounds("background-tasks-popover").is_some());
+        assert!(cx.debug_bounds("background-task-name-1").is_some());
+        click_on("stop-background-task-1", cx);
+        assert!(sent(&client, cx).iter().any(|request| matches!(request,
+            Request::StopBackgroundTask { task_id, .. } if task_id == "task-2")));
+
+        thread.update(cx, |thread, cx| thread.set_working_for_test(false, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("working-shells").is_none());
+        assert!(cx.debug_bounds("background-tasks-popover").is_none());
+        assert!(cx.debug_bounds("background-task-name-0").is_some());
     }
 
     /// A message the agent wanted a login for is marked "Not sent" under it, with Retry, which

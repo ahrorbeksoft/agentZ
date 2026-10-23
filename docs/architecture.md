@@ -1094,13 +1094,17 @@ drawn with Vulkan through `gpui_wgpu`). What differs:
   go to a session without the conversation fails too, with Resend with Context (see Lost
   conversations).
 - **Background tasks** (`AgentThread::{apply_background_task_update, stop_background_task}`,
-  `AgentView::render_background_tasks_section`; t3code's pending background work, new UI in the
-  Agents section's style): Claude Agent reports what it leaves running after a turn (commands
-  it sent to the background) only to JetBrains AIR, so agentZ's `initialize` says it takes
-  AIR's `asyncTasks` (`_meta.jetbrains.air`). Its `async_task_*` session updates, which ACP's
-  types don't read, are caught raw (`background_task_update`) into
-  `ThreadState::background_tasks`, shown in the activity bar with how long each has run and
-  Stop (`Request::StopBackgroundTask`, the `_session/async_task/stop` request; not on ACP v2).
+  `background_tasks.rs`, `AgentView::{render_background_tasks_section, render_working_shells}`;
+  t3code's pending background work, new UI in the Agents section's style): Claude Agent
+  reports what it leaves running after a turn (commands it sent to the background) only to
+  JetBrains AIR, so agentZ's `initialize` says it takes AIR's `asyncTasks`
+  (`_meta.jetbrains.air`). Its `async_task_*` session updates, which ACP's types don't read,
+  are caught raw (`background_task_update`) into `ThreadState::background_tasks`, a row each
+  with how long it has run and Stop (`Request::StopBackgroundTask`, the
+  `_session/async_task/stop` request; not on ACP v2). While the Working row shows, it counts
+  them ("Working for 13m 58s · 1 shell", or "· 2 background tasks" once any isn't a shell,
+  picked in `design/subthreads-3/`, topic 5 C), and the count opens the rows in a popover
+  (`BackgroundTasksPopover`); once there's no Working row, they're in the activity bar.
   Being AIR also means read and search results come without the file's text, and that its subagents run in
   sessions of their own (AIR's `nativeSubagentSessions`; see Agents' own subagents).
 - **Work after a turn** (`AgentThread::{starts_own_work, end_own_work}`): when a background

@@ -5,6 +5,7 @@ mod agent_view;
 mod app_settings;
 mod artifacts_list;
 mod attachment_image;
+mod background_tasks;
 mod branch_picker;
 mod cloud_machines;
 mod command_palette;

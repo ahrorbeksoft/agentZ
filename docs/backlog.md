@@ -43,15 +43,6 @@ Decided on the design board (`design/settings-2/decisions.md`). Built: topic 1 A
 the sidebar and General split into Threads, Subthreads, Thread titles and Artifacts. Left: the
 shared settings for machines (topic 2) and for accounts (topic 3).
 
-### Show shells next to the Working label
-
-Show shells next to the Working label. In the screenshot, a Claude Agent thread shows "Working
-for 13m 58s" at the end of its turn, while its running shell is in a separate "1 Background
-Task" panel above the composer.
-
-![A Claude Agent thread's Working label, with its background shell in a panel above the composer](backlog/shells-beside-working-label.png)
-
-On the design board: `design/subthreads-3/`.
 
 ### Redesign chats
 
